@@ -2330,17 +2330,9 @@ private func renamedAliasMergedConfigYAML() -> String {
 
 private func workerMergedConfigYAML() -> String {
     [
-        "smart-aliases:",
-        "  worker:",
-        "    request-class: plain-chat",
-        "    failover: silent",
-        "    candidates:",
-        "      - glm-5-turbo",
-        "      - minimax-m2.5",
-        "      - kimi-k2.5",
-        "openai-compatibility:",
-        "- name: zai",
-        "  base-url: https://api.z.ai/api/coding/paas/v4",
+        "claude-api-key:",
+        "- api-key: test-zai-key",
+        "  base-url: https://api.z.ai/api/anthropic",
         "  models:",
         "  - alias: glm-5-turbo",
         "    name: glm-5-turbo",
@@ -2353,7 +2345,16 @@ private func workerMergedConfigYAML() -> String {
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
         "  - alias: minimax-m2.5",
-        "    name: minimaxai/minimax-m2.5"
+        "    name: minimaxai/minimax-m2.5",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5-turbo",
+        "    - minimax-m2.5",
+        "    - kimi-k2.5"
     ].joined(separator: "\n")
 }
 

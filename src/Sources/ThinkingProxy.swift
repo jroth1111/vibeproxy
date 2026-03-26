@@ -2301,11 +2301,17 @@ enum OpenAICompatTemporaryShim {
             var models: [ParsedModel] = []
         }
 
+        enum ParsedSection {
+            case none
+            case openAICompatibility
+            case claudeAPIKey
+            case smartAliases
+        }
+
         var routesByRequestModel: [String: RouteIdentity] = [:]
         var nvidiaRoutesByRequestModel: [String: RouteIdentity] = [:]
         var smartAliasesByAlias: [String: SmartAliasDefinition] = [:]
-        var insideOpenAICompatibility = false
-        var insideSmartAliases = false
+        var currentSection: ParsedSection = .none
         var currentProvider: ParsedProvider?
         var insideModels = false
         var currentModel = ParsedModel()
@@ -2348,7 +2354,34 @@ enum OpenAICompatTemporaryShim {
             currentModel = ParsedModel()
         }
 
-        func finalizeCurrentProvider() {
+        func providerIdentifier(
+            explicitName: String,
+            baseURL: String,
+            section: ParsedSection
+        ) -> String {
+            if !explicitName.isEmpty {
+                return explicitName
+            }
+
+            if baseURL.contains("integrate.api.nvidia.com") {
+                return "nvidia"
+            }
+            if baseURL.contains("api.z.ai") {
+                return "zai"
+            }
+            if baseURL.contains("api.anthropic.com") {
+                return "claude"
+            }
+
+            switch section {
+            case .claudeAPIKey:
+                return "claude"
+            default:
+                return "unknown"
+            }
+        }
+
+        func finalizeCurrentProvider(section: ParsedSection) {
             finalizeCurrentModel()
             guard let provider = currentProvider else {
                 return
@@ -2356,7 +2389,11 @@ enum OpenAICompatTemporaryShim {
             let trimmedName = provider.name.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedBaseURL = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let isNVIDIAProvider = trimmedName.hasPrefix("nvidia") || trimmedBaseURL.contains("integrate.api.nvidia.com")
-            let providerID = trimmedName.isEmpty ? "unknown" : trimmedName
+            let providerID = providerIdentifier(
+                explicitName: trimmedName,
+                baseURL: trimmedBaseURL,
+                section: section
+            )
             for model in provider.models {
                 guard let canonicalModelID = model.name?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !canonicalModelID.isEmpty else {
@@ -2416,32 +2453,42 @@ enum OpenAICompatTemporaryShim {
             let indent = indentation(of: line)
 
             if indent == 0 && trimmed == "smart-aliases:" {
-                finalizeCurrentProvider()
+                finalizeCurrentProvider(section: currentSection)
                 finalizeCurrentSmartAlias()
-                insideOpenAICompatibility = false
-                insideSmartAliases = true
+                currentSection = .smartAliases
                 continue
             }
 
             if indent == 0 && trimmed == "openai-compatibility:" {
                 finalizeCurrentSmartAlias()
-                insideSmartAliases = false
-                insideOpenAICompatibility = true
+                finalizeCurrentProvider(section: currentSection)
+                currentSection = .openAICompatibility
                 continue
             }
 
-            if !insideOpenAICompatibility {
-                if !insideSmartAliases {
-                    continue
-                }
+            if indent == 0 && trimmed == "claude-api-key:" {
+                finalizeCurrentSmartAlias()
+                finalizeCurrentProvider(section: currentSection)
+                currentSection = .claudeAPIKey
+                continue
             }
 
-            if insideSmartAliases && !insideOpenAICompatibility {
-                if indent == 0 && trimmed != "smart-aliases:" {
-                    finalizeCurrentSmartAlias()
-                    insideSmartAliases = false
-                    continue
-                }
+            if indent == 0,
+               trimmed.hasSuffix(":"),
+               trimmed != "smart-aliases:",
+               trimmed != "openai-compatibility:",
+               trimmed != "claude-api-key:" {
+                finalizeCurrentSmartAlias()
+                finalizeCurrentProvider(section: currentSection)
+                currentSection = .none
+                continue
+            }
+
+            if currentSection == .none {
+                continue
+            }
+
+            if currentSection == .smartAliases {
                 if trimmed == "smart-aliases:" {
                     continue
                 }
@@ -2461,7 +2508,7 @@ enum OpenAICompatTemporaryShim {
                 if indent == 4, trimmed == "candidates:" {
                     continue
                 }
-                if indent == 6, trimmed.hasPrefix("- ") {
+                if indent >= 4, trimmed.hasPrefix("- ") {
                     let candidate = String(trimmed.dropFirst(2)).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'")))
                     if !candidate.isEmpty {
                         currentSmartAliasCandidates.append(candidate)
@@ -2470,13 +2517,8 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
-            if indent == 0 && !trimmed.hasPrefix("- ") {
-                finalizeCurrentProvider()
-                break
-            }
-
             if indent == 0 && trimmed.hasPrefix("- ") {
-                finalizeCurrentProvider()
+                finalizeCurrentProvider(section: currentSection)
                 currentProvider = ParsedProvider()
                 if trimmed.hasPrefix("- name: "),
                    let value = scalarValue(from: trimmed) {
@@ -2538,7 +2580,7 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
-        finalizeCurrentProvider()
+        finalizeCurrentProvider(section: currentSection)
         finalizeCurrentSmartAlias()
         return (
             routesByRequestModel,
