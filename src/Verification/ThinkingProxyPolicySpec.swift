@@ -795,7 +795,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5"], "worker should try z.ai first and then fail over to the next configured candidate", recorder: recorder)
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should try z.ai first, then race the healthy NVIDIA fallbacks after the primary fails", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should return the fallback candidate's success response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker responses should preserve the outward alias instead of leaking the winner model", recorder: recorder)
@@ -892,11 +892,408 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5"], "worker should treat a route-unavailable z.ai 404 as candidate failure and fall through to the next backend", recorder: recorder)
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should treat a route-unavailable z.ai 404 as candidate failure and race the healthy NVIDIA fallbacks", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed after failing over from a z.ai 404", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias after a z.ai 404 fallback", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "route health should penalize z.ai route-unavailable 404 failures", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias ranks raced nvidia fallbacks by live route health", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "minimax-m2.5",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: "minimax-m2.5",
+                        requestedAlias: "worker",
+                        canonicalModelID: "minimaxai/minimax-m2.5",
+                        transportOutcome: "send_error",
+                        failoverDepth: 1,
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "smart_alias",
+                        firstByteLatencyMilliseconds: 5000,
+                        totalLatencyMilliseconds: 5000
+                    )
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-ranked",
+                                  "object": "chat.completion",
+                                  "model": "\(model)",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should still return a winner after ranking the fallback race")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(seenModels.prefix(3).map { $0 }, ["glm-5-turbo", "kimi-k2.5", "minimax-m2.5"], "worker should launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should keep succeeding while reordering its fallback race by route health", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary worker smart alias returns the first valid raced fallback and cancels the loser", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var kimiCanceled = false
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "minimax-m2.5":
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-race-win",
+                                      "object": "chat.completion",
+                                      "model": "minimax-m2.5",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.02, execute: workItem)
+                        return { workItem.cancel() }
+                    case "kimi-k2.5":
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-race-loser",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "SLOW"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.20, execute: workItem)
+                        return {
+                            lock.lock()
+                            kimiCanceled = true
+                            lock.unlock()
+                            workItem.cancel()
+                        }
+                    default:
+                        return {}
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should return the first valid raced fallback winner")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should return a successful raced fallback winner", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias when a raced fallback wins", recorder: recorder)
+                expectEqual(kimiCanceled, true, "worker should cancel the losing raced fallback once a valid winner is chosen", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias ignores fast invalid-success fallbacks and waits for a slower valid winner", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-invalid",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "<think>hidden reasoning only"},
+                                      "finish_reason": "length"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5":
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-valid-kimi",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "KIMI OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should wait for a valid raced fallback instead of forwarding a fast invalid-success response")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should still succeed when the first raced fallback is invalid-success junk", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "KIMI OK", "worker should return the slower valid raced fallback instead of a fast invalid-success body", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias caps total failover latency for the whole request", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                proxy.smartAliasTotalTimeoutOverrideForTesting = 0.05
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, timeoutInterval, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: nil,
+                                    response: nil,
+                                    error: URLError(.timedOut)
+                                )
+                            )
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + timeoutInterval + 0.01, execute: workItem)
+                        return { workItem.cancel() }
+                    }
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should stop once the alias-level failover budget is exhausted")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 504, "worker should return 504 when the alias-level failover budget expires before any fallback succeeds", recorder: recorder)
+                expectEqual(deliveredMessage, "Worker failover budget exhausted before any backend returned a valid response.", "worker should emit a stable timeout message when the alias-level budget expires", recorder: recorder)
             }
         }
 

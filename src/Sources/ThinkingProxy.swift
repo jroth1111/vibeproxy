@@ -713,6 +713,51 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    static func availableSmartAliasCandidateTransitions(
+        method: String,
+        path: String,
+        currentBody: String,
+        candidateModelsRemaining: [String]
+    ) -> [(body: String, model: String)] {
+        candidateModelsRemaining.compactMap { candidateModel in
+            guard resolveConfiguredRoute(forRequestModel: candidateModel) != nil,
+                  !isConfiguredRouteOpen(forRequestModel: candidateModel),
+                  let candidateBody = rewrittenRequestJSON(
+                    method: method,
+                    path: path,
+                    replacingRequestModelIn: currentBody,
+                    with: candidateModel
+                  ) else {
+                return nil
+            }
+            return (candidateBody, candidateModel)
+        }
+    }
+
+    static func rankedSmartAliasFallbackCandidateModels(_ candidateModels: [String]) -> [String] {
+        let indexedModels = Array(candidateModels.enumerated())
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return indexedModels.sorted { lhs, rhs in
+                let lhsScore = smartAliasFallbackRankingScore(forRequestModel: lhs.element, originalIndex: lhs.offset)
+                let rhsScore = smartAliasFallbackRankingScore(forRequestModel: rhs.element, originalIndex: rhs.offset)
+                if lhsScore.healthPriority != rhsScore.healthPriority {
+                    return lhsScore.healthPriority < rhsScore.healthPriority
+                }
+                if lhsScore.timeoutRate != rhsScore.timeoutRate {
+                    return lhsScore.timeoutRate < rhsScore.timeoutRate
+                }
+                if lhsScore.invalidSuccessRate != rhsScore.invalidSuccessRate {
+                    return lhsScore.invalidSuccessRate < rhsScore.invalidSuccessRate
+                }
+                if lhsScore.averageFirstByteLatencyMilliseconds != rhsScore.averageFirstByteLatencyMilliseconds {
+                    return lhsScore.averageFirstByteLatencyMilliseconds < rhsScore.averageFirstByteLatencyMilliseconds
+                }
+                return lhsScore.originalIndex < rhsScore.originalIndex
+            }.map(\.element)
+        }
+    }
+
     static func preflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
         guard method == "POST",
               let jsonData = jsonString.data(using: .utf8),
@@ -1224,6 +1269,16 @@ enum OpenAICompatTemporaryShim {
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.status
+        }
+    }
+
+    static func rollingMetrics(forRequestModel requestModel: String) -> RouteRollingMetrics? {
+        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+            return nil
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.rollingMetrics
         }
     }
 
@@ -1823,6 +1878,33 @@ enum OpenAICompatTemporaryShim {
             return fastCanaryInterval
         }
         return defaultCanaryInterval
+    }
+
+    private static func smartAliasFallbackRankingScore(
+        forRequestModel requestModel: String,
+        originalIndex: Int
+    ) -> (healthPriority: Int, timeoutRate: Double, invalidSuccessRate: Double, averageFirstByteLatencyMilliseconds: Int, originalIndex: Int) {
+        let route = resolveConfiguredRoute(forRequestModel: requestModel)
+        let state = route.flatMap { routeCircuitStatesByRouteHealthKey[$0.routeHealthKey] }
+        let metrics = state?.rollingMetrics ?? .empty
+        let healthPriority: Int
+        switch state?.status ?? .closed {
+        case .closed:
+            healthPriority = 0
+        case .suspect:
+            healthPriority = 1
+        case .halfOpen:
+            healthPriority = 2
+        case .open:
+            healthPriority = 3
+        }
+        return (
+            healthPriority: healthPriority,
+            timeoutRate: metrics.timeoutRate,
+            invalidSuccessRate: metrics.invalidSuccessRate,
+            averageFirstByteLatencyMilliseconds: metrics.averageFirstByteLatencyMilliseconds ?? Int.max,
+            originalIndex: originalIndex
+        )
     }
 
     private static func loadPersistedRouteHealthIfNeededLocked() {
@@ -2663,6 +2745,49 @@ class ThinkingProxy {
         let data: Data?
         let response: HTTPURLResponse?
         let error: Error?
+        let firstByteLatencyMilliseconds: Int?
+        let totalLatencyMilliseconds: Int?
+
+        init(
+            data: Data?,
+            response: HTTPURLResponse?,
+            error: Error?,
+            firstByteLatencyMilliseconds: Int? = nil,
+            totalLatencyMilliseconds: Int? = nil
+        ) {
+            self.data = data
+            self.response = response
+            self.error = error
+            self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
+            self.totalLatencyMilliseconds = totalLatencyMilliseconds
+        }
+    }
+
+    private enum SmartAliasCandidateAttemptOutcome {
+        case success(
+            requestModel: String,
+            statusCode: Int,
+            headers: [AnyHashable: Any],
+            body: Data,
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
+        )
+        case retryableFailure(
+            requestModel: String,
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
+        )
+        case terminalResponse(
+            requestModel: String,
+            statusCode: Int,
+            headers: [AnyHashable: Any],
+            body: Data,
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
+        )
+        case terminalError(
+            requestModel: String,
+            statusCode: Int,
+            message: String,
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent?
+        )
     }
 
     private var listener: NWListener?
@@ -2678,8 +2803,10 @@ class ThinkingProxy {
     private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
+    var bufferedProxyCancelableTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
+    var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
     
@@ -2747,6 +2874,109 @@ class ThinkingProxy {
 
         func winnerAttemptLaneValue() -> Int? {
             stateQueue.sync { winnerAttemptLane }
+        }
+    }
+
+    final class SmartAliasRaceCoordinator {
+        private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-race")
+        private var finished = false
+        private var winnerAttemptLane: Int?
+        private var cancelersByAttemptLane: [Int: () -> Void] = [:]
+
+        func registerAttempt(attemptLane: Int, cancel: @escaping () -> Void) {
+            let cancelImmediately: (() -> Void)? = stateQueue.sync {
+                if finished {
+                    return cancel
+                }
+                cancelersByAttemptLane[attemptLane] = cancel
+                return nil
+            }
+            cancelImmediately?()
+        }
+
+        func tryFinish(attemptLane: Int) -> Bool {
+            let losersToCancel: [() -> Void]? = stateQueue.sync {
+                guard !finished else { return nil }
+                finished = true
+                winnerAttemptLane = attemptLane
+                let losers = cancelersByAttemptLane.compactMap { lane, canceler in
+                    lane == attemptLane ? nil : canceler
+                }
+                cancelersByAttemptLane.removeAll()
+                return losers
+            }
+            losersToCancel?.forEach { $0() }
+            return losersToCancel != nil
+        }
+
+        func finishAttemptWithoutWinning(attemptLane: Int) {
+            _ = stateQueue.sync {
+                cancelersByAttemptLane.removeValue(forKey: attemptLane)
+            }
+        }
+
+        func isFinished() -> Bool {
+            stateQueue.sync { finished }
+        }
+
+        func winnerAttemptLaneValue() -> Int? {
+            stateQueue.sync { winnerAttemptLane }
+        }
+    }
+
+    final class SmartAliasCandidateController {
+        private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-candidate")
+        private var cancelled = false
+        private var currentCancel: (() -> Void)?
+        private var scheduledRetryWorkItem: DispatchWorkItem?
+
+        func registerCurrentCancel(_ cancel: @escaping () -> Void) {
+            let cancelImmediately: (() -> Void)? = stateQueue.sync {
+                if cancelled {
+                    return cancel
+                }
+                currentCancel = cancel
+                return nil
+            }
+            cancelImmediately?()
+        }
+
+        func clearCurrentCancel() {
+            stateQueue.sync {
+                currentCancel = nil
+            }
+        }
+
+        func scheduleRetry(after delay: DispatchTimeInterval, block: @escaping () -> Void) {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, !self.isCancelled() else { return }
+                block()
+            }
+            let runImmediately = stateQueue.sync { () -> Bool in
+                guard !cancelled else { return false }
+                scheduledRetryWorkItem?.cancel()
+                scheduledRetryWorkItem = workItem
+                return true
+            }
+            guard runImmediately else { return }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+
+        func cancel() {
+            let canceler: (() -> Void)? = stateQueue.sync {
+                guard !cancelled else { return nil }
+                cancelled = true
+                let currentCancel = self.currentCancel
+                self.currentCancel = nil
+                scheduledRetryWorkItem?.cancel()
+                scheduledRetryWorkItem = nil
+                return currentCancel
+            }
+            canceler?()
+        }
+
+        func isCancelled() -> Bool {
+            stateQueue.sync { cancelled }
         }
     }
 
@@ -3245,6 +3475,7 @@ class ThinkingProxy {
             publicAlias: publicAlias,
             remainingCandidateModels: candidateModels,
             failoverDepth: 0,
+            deadlineAt: Date().addingTimeInterval(smartAliasTotalTimeout(forRequestJSON: body)),
             originalConnection: originalConnection,
             coalescingKey: coalescingKey
         )
@@ -3258,14 +3489,68 @@ class ThinkingProxy {
         publicAlias: String,
         remainingCandidateModels: [String],
         failoverDepth: Int,
+        deadlineAt: Date,
         originalConnection: NWConnection,
         coalescingKey: String?
     ) {
+        let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
+        guard remainingBudget > 0 else {
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 504,
+                message: "Worker failover budget exhausted before any backend returned a valid response.",
+                coalescingKey: coalescingKey
+            )
+            return
+        }
+
+        let rankedCandidateModels = failoverDepth == 0
+            ? remainingCandidateModels
+            : OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(remainingCandidateModels)
+
+        if failoverDepth > 0 {
+            let raceableFallbackModels = rankedCandidateModels.filter { candidateModel in
+                guard let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+                      candidateRoute.providerID.hasPrefix("nvidia"),
+                      let candidateBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
+                        method: method,
+                        path: path,
+                        replacingRequestModelIn: currentBody,
+                        with: candidateModel
+                      ) else {
+                    return false
+                }
+                return OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+                    method: method,
+                    path: path,
+                    jsonString: candidateBody
+                )
+            }
+
+            if raceableFallbackModels.count >= 2 {
+                let deferredCandidateModels = rankedCandidateModels.filter { !raceableFallbackModels.contains($0) }
+                attemptSmartAliasFallbackRace(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: currentBody,
+                    publicAlias: publicAlias,
+                    raceCandidateModels: raceableFallbackModels,
+                    deferredCandidateModels: deferredCandidateModels,
+                    failoverDepth: failoverDepth,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
+        }
+
         guard let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
             method: method,
             path: path,
             currentBody: currentBody,
-            candidateModelsRemaining: remainingCandidateModels
+            candidateModelsRemaining: rankedCandidateModels
         ) else {
             deliverBufferedError(
                 defaultConnection: originalConnection,
@@ -3292,6 +3577,7 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     remainingCandidateModels: transition.remainingCandidateModels,
                     failoverDepth: failoverDepth + 1,
+                    deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey
                 )
@@ -3306,27 +3592,378 @@ class ThinkingProxy {
             return
         }
 
-        if let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: transition.model),
-           candidateRoute.providerID.hasPrefix("nvidia"),
-           OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+        executeSmartAliasCandidate(
             method: method,
             path: path,
-            jsonString: transition.body
-           ) {
-            let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: transition.body)
-            attemptSmartAliasMitigatedCandidate(
+            headers: headers,
+            body: transition.body,
+            publicAlias: publicAlias,
+            candidateModel: transition.model,
+            failoverDepth: failoverDepth,
+            attemptLane: 1,
+            deadlineAt: deadlineAt,
+            coalescingKey: coalescingKey,
+            controller: nil
+        ) { [weak self] outcome in
+            guard let self else { return }
+            self.handleSmartAliasSerialCandidateOutcome(
+                outcome,
+                method: method,
+                path: path,
+                headers: headers,
+                candidateBody: transition.body,
+                publicAlias: publicAlias,
+                remainingCandidateModels: transition.remainingCandidateModels,
+                failoverDepth: failoverDepth,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey
+            )
+        }
+    }
+
+    private func attemptSmartAliasFallbackRace(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        currentBody: String,
+        publicAlias: String,
+        raceCandidateModels: [String],
+        deferredCandidateModels: [String],
+        failoverDepth: Int,
+        deadlineAt: Date,
+        originalConnection: NWConnection,
+        coalescingKey: String?
+    ) {
+        let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels)
+        let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
+            method: method,
+            path: path,
+            currentBody: currentBody,
+            candidateModelsRemaining: rankedRaceCandidateModels
+        )
+
+        guard raceTransitions.count >= 2 else {
+            attemptSmartAliasCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: currentBody,
+                publicAlias: publicAlias,
+                remainingCandidateModels: raceTransitions.map(\.model) + deferredCandidateModels,
+                failoverDepth: failoverDepth,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey
+            )
+            return
+        }
+
+        NSLog(
+            "[ThinkingProxy] Racing smart alias %@ across fallback candidates %@ at depth %d",
+            publicAlias,
+            raceTransitions.map(\.model).joined(separator: ","),
+            failoverDepth
+        )
+
+        let coordinator = SmartAliasRaceCoordinator()
+        let completionQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-race-completion")
+        var remainingAttempts = raceTransitions.count
+        var terminalOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
+
+        for (index, transition) in raceTransitions.enumerated() {
+            let attemptLane = index + 1
+            let controller = SmartAliasCandidateController()
+            coordinator.registerAttempt(attemptLane: attemptLane) {
+                controller.cancel()
+            }
+            NSLog(
+                "[ThinkingProxy] Resolved smart alias %@ to candidate %@ at depth %d lane %d",
+                publicAlias,
+                transition.model,
+                failoverDepth,
+                attemptLane
+            )
+
+            executeSmartAliasCandidate(
                 method: method,
                 path: path,
                 headers: headers,
                 body: transition.body,
                 publicAlias: publicAlias,
-                currentCandidateModel: transition.model,
-                remainingCandidateModels: transition.remainingCandidateModels,
+                candidateModel: transition.model,
                 failoverDepth: failoverDepth,
-                originalConnection: originalConnection,
+                attemptLane: attemptLane,
+                deadlineAt: deadlineAt,
                 coalescingKey: coalescingKey,
+                controller: controller
+            ) { [weak self] outcome in
+                guard let self else { return }
+                completionQueue.async {
+                    guard !coordinator.isFinished() else { return }
+
+                    switch outcome {
+                    case .success(let requestModel, let statusCode, let headers, let body, let telemetryEvent):
+                        let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
+                            OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                                telemetryEvent,
+                                winnerAttemptLane: attemptLane
+                            ),
+                            requestedAlias: publicAlias,
+                            failoverDepth: failoverDepth,
+                            finalWinnerRequestModel: requestModel
+                        )
+                        guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                        OpenAICompatTemporaryShim.recordRouteSuccess(
+                            forRequestModel: requestModel,
+                            telemetryEvent: winningTelemetryEvent
+                        )
+                        self.deliverBufferedHTTPResponse(
+                            defaultConnection: originalConnection,
+                            statusCode: statusCode,
+                            headers: headers,
+                            body: body,
+                            coalescingKey: coalescingKey,
+                            overridingModel: publicAlias
+                        )
+                    case .retryableFailure(let requestModel, let telemetryEvent):
+                        OpenAICompatTemporaryShim.recordRouteFailure(
+                            forRequestModel: requestModel,
+                            telemetryEvent: telemetryEvent
+                        )
+                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                        remainingAttempts -= 1
+                    case .terminalResponse(_, _, _, _, let telemetryEvent):
+                        OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                        terminalOutcomesByLane[attemptLane] = outcome
+                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                        remainingAttempts -= 1
+                    case .terminalError(_, _, _, let telemetryEvent):
+                        if let telemetryEvent {
+                            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                        }
+                        terminalOutcomesByLane[attemptLane] = outcome
+                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                        remainingAttempts -= 1
+                    }
+
+                    guard remainingAttempts == 0, !coordinator.isFinished() else { return }
+                    _ = coordinator.tryFinish(attemptLane: 0)
+
+                    if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first {
+                        self.deliverSmartAliasTerminalOutcome(
+                            terminalOutcome,
+                            originalConnection: originalConnection,
+                            coalescingKey: coalescingKey
+                        )
+                        return
+                    }
+
+                    if !deferredCandidateModels.isEmpty {
+                        self.attemptSmartAliasCandidate(
+                            method: method,
+                            path: path,
+                            headers: headers,
+                            currentBody: currentBody,
+                            publicAlias: publicAlias,
+                            remainingCandidateModels: deferredCandidateModels,
+                            failoverDepth: failoverDepth + raceTransitions.count,
+                            deadlineAt: deadlineAt,
+                            originalConnection: originalConnection,
+                            coalescingKey: coalescingKey
+                        )
+                        return
+                    }
+
+                    let statusCode = self.remainingSmartAliasBudget(until: deadlineAt) > 0 ? 503 : 504
+                    let message = statusCode == 503
+                        ? "All configured worker backends are currently unavailable."
+                        : "Worker failover budget exhausted before any backend returned a valid response."
+                    self.deliverBufferedError(
+                        defaultConnection: originalConnection,
+                        statusCode: statusCode,
+                        message: message,
+                        coalescingKey: coalescingKey
+                    )
+                }
+            }
+        }
+    }
+
+    private func handleSmartAliasSerialCandidateOutcome(
+        _ outcome: SmartAliasCandidateAttemptOutcome,
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        candidateBody: String,
+        publicAlias: String,
+        remainingCandidateModels: [String],
+        failoverDepth: Int,
+        deadlineAt: Date,
+        originalConnection: NWConnection,
+        coalescingKey: String?
+    ) {
+        switch outcome {
+        case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            let winningTelemetryEvent = annotatedSmartAliasTelemetryEvent(
+                OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                    telemetryEvent,
+                    winnerAttemptLane: 1
+                ),
+                requestedAlias: publicAlias,
+                failoverDepth: failoverDepth,
+                finalWinnerRequestModel: requestModel
+            )
+            OpenAICompatTemporaryShim.recordRouteSuccess(
+                forRequestModel: requestModel,
+                telemetryEvent: winningTelemetryEvent
+            )
+            deliverBufferedHTTPResponse(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                headers: responseHeaders,
+                body: responseBody,
+                coalescingKey: coalescingKey,
+                overridingModel: publicAlias
+            )
+        case .retryableFailure(_, let telemetryEvent):
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: telemetryEvent.requestModel,
+                telemetryEvent: telemetryEvent
+            )
+            attemptSmartAliasCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: candidateBody,
+                publicAlias: publicAlias,
+                remainingCandidateModels: remainingCandidateModels,
+                failoverDepth: failoverDepth + 1,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey
+            )
+        case .terminalResponse(_, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+            deliverBufferedHTTPResponse(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                headers: responseHeaders,
+                body: responseBody,
+                coalescingKey: coalescingKey
+            )
+        case .terminalError(_, let statusCode, let message, let telemetryEvent):
+            if let telemetryEvent {
+                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+            }
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                message: message,
+                coalescingKey: coalescingKey
+            )
+        }
+    }
+
+    private func deliverSmartAliasTerminalOutcome(
+        _ outcome: SmartAliasCandidateAttemptOutcome,
+        originalConnection: NWConnection,
+        coalescingKey: String?
+    ) {
+        switch outcome {
+        case .terminalResponse(_, let statusCode, let responseHeaders, let responseBody, _):
+            deliverBufferedHTTPResponse(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                headers: responseHeaders,
+                body: responseBody,
+                coalescingKey: coalescingKey
+            )
+        case .terminalError(_, let statusCode, let message, _):
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                message: message,
+                coalescingKey: coalescingKey
+            )
+        case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                telemetryEvent,
+                winnerAttemptLane: telemetryEvent.attemptLane
+            )
+            OpenAICompatTemporaryShim.recordRouteSuccess(
+                forRequestModel: requestModel,
+                telemetryEvent: winningTelemetryEvent
+            )
+            deliverBufferedHTTPResponse(
+                defaultConnection: originalConnection,
+                statusCode: statusCode,
+                headers: responseHeaders,
+                body: responseBody,
+                coalescingKey: coalescingKey
+            )
+        case .retryableFailure(let requestModel, let telemetryEvent):
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: requestModel,
+                telemetryEvent: telemetryEvent
+            )
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 503,
+                message: "All configured worker backends are currently unavailable.",
+                coalescingKey: coalescingKey
+            )
+        }
+    }
+
+    private func executeSmartAliasCandidate(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        publicAlias: String,
+        candidateModel: String,
+        failoverDepth: Int,
+        attemptLane: Int,
+        deadlineAt: Date,
+        coalescingKey: String?,
+        controller: SmartAliasCandidateController?,
+        completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
+    ) {
+        let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
+        guard remainingBudget > 0 else {
+            completion(
+                .terminalError(
+                    requestModel: candidateModel,
+                    statusCode: 504,
+                    message: "Worker failover budget exhausted before any backend returned a valid response.",
+                    telemetryEvent: nil
+                )
+            )
+            return
+        }
+
+        if let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+           candidateRoute.providerID.hasPrefix("nvidia"),
+           OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+            method: method,
+            path: path,
+            jsonString: body
+           ) {
+            let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: body)
+            executeSmartAliasMitigatedCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                body: body,
+                publicAlias: publicAlias,
+                candidateModel: candidateModel,
+                failoverDepth: failoverDepth,
+                attemptLane: attemptLane,
+                deadlineAt: deadlineAt,
+                controller: controller,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: transition.model,
+                    model: candidateModel,
                     initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
@@ -3335,64 +3972,80 @@ class ThinkingProxy {
                     salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
                     bestEffortRepairedBodyData: nil,
                     coalescingKey: coalescingKey
-                )
+                ),
+                completion: completion
             )
             return
         }
 
-        let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: transition.body)
-        sendBufferedProxyRequest(
-            method: method,
-            path: path,
-            headers: headers,
-            body: transition.body,
-            timeoutInterval: timeoutInterval
-        ) { [weak self] bufferedResponse in
-            guard let self else { return }
-            self.handleSmartAliasBufferedCandidateResult(
-                bufferedResponse,
-                method: method,
-                path: path,
-                headers: headers,
-                candidateBody: transition.body,
-                publicAlias: publicAlias,
-                candidateModel: transition.model,
-                remainingCandidateModels: transition.remainingCandidateModels,
-                failoverDepth: failoverDepth,
-                originalConnection: originalConnection,
-                coalescingKey: coalescingKey
-            )
-        }
-    }
-
-    private func attemptSmartAliasMitigatedCandidate(
-        method: String,
-        path: String,
-        headers: [(String, String)],
-        body: String,
-        publicAlias: String,
-        currentCandidateModel: String,
-        remainingCandidateModels: [String],
-        failoverDepth: Int,
-        originalConnection: NWConnection,
-        coalescingKey: String?,
-        state: OpenAICompatTemporaryShim.NVIDIARetryState
-    ) {
-        let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: body)
-        sendBufferedProxyRequest(
+        let timeoutInterval = min(smartAliasCandidateTimeout(forRequestJSON: body), remainingBudget)
+        let cancel = sendBufferedProxyRequest(
             method: method,
             path: path,
             headers: headers,
             body: body,
             timeoutInterval: timeoutInterval
         ) { [weak self] bufferedResponse in
-            guard let self else { return }
+            guard let self, controller?.isCancelled() != true else { return }
+            controller?.clearCurrentCancel()
+            self.handleSmartAliasBufferedCandidateResult(
+                bufferedResponse,
+                path: path,
+                publicAlias: publicAlias,
+                candidateModel: candidateModel,
+                failoverDepth: failoverDepth,
+                attemptLane: attemptLane,
+                completion: completion
+            )
+        }
+        controller?.registerCurrentCancel(cancel)
+    }
+
+    private func executeSmartAliasMitigatedCandidate(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        publicAlias: String,
+        candidateModel: String,
+        failoverDepth: Int,
+        attemptLane: Int,
+        deadlineAt: Date,
+        controller: SmartAliasCandidateController?,
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
+    ) {
+        let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
+        guard remainingBudget > 0 else {
+            completion(
+                .terminalError(
+                    requestModel: candidateModel,
+                    statusCode: 504,
+                    message: "Worker failover budget exhausted before any backend returned a valid response.",
+                    telemetryEvent: nil
+                )
+            )
+            return
+        }
+
+        let timeoutInterval = min(smartAliasCandidateTimeout(forRequestJSON: body), remainingBudget)
+        let cancel = sendBufferedProxyRequest(
+            method: method,
+            path: path,
+            headers: headers,
+            body: body,
+            timeoutInterval: timeoutInterval
+        ) { [weak self] bufferedResponse in
+            guard let self, controller?.isCancelled() != true else { return }
+            controller?.clearCurrentCancel()
 
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
                 data: bufferedResponse.data,
                 response: bufferedResponse.response,
                 error: bufferedResponse.error,
-                deadlineStage: .none
+                deadlineStage: .none,
+                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
             )
             let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
@@ -3406,7 +4059,7 @@ class ThinkingProxy {
                     attempt: attempt,
                     outcome: outcome,
                     source: "smart_alias",
-                    attemptLane: 1
+                    attemptLane: attemptLane
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -3416,137 +4069,100 @@ class ThinkingProxy {
             switch outcome {
             case .retry(let nextState):
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                self.attemptSmartAliasMitigatedCandidate(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    body: body,
-                    publicAlias: publicAlias,
-                    currentCandidateModel: currentCandidateModel,
-                    remainingCandidateModels: remainingCandidateModels,
-                    failoverDepth: failoverDepth,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    state: nextState
-                )
+                let delay = DispatchTimeInterval.milliseconds(max(0, nextState.retryBackoffMilliseconds))
+                let retryBlock = { [weak self] in
+                    guard let self, controller?.isCancelled() != true else { return }
+                    self.executeSmartAliasMitigatedCandidate(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        publicAlias: publicAlias,
+                        candidateModel: candidateModel,
+                        failoverDepth: failoverDepth,
+                        attemptLane: attemptLane,
+                        deadlineAt: deadlineAt,
+                        controller: controller,
+                        state: nextState,
+                        completion: completion
+                    )
+                }
+                if nextState.retryBackoffMilliseconds > 0 {
+                    controller?.scheduleRetry(after: delay, block: retryBlock)
+                } else {
+                    retryBlock()
+                }
             case .sendResponse(let statusCode, let responseHeaders, let responseBody):
-                let winningTelemetry = self.annotatedSmartAliasTelemetryEvent(
-                    OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
-                        telemetryEvent,
-                        winnerAttemptLane: 1
-                    ),
-                    requestedAlias: publicAlias,
-                    failoverDepth: failoverDepth,
-                    finalWinnerRequestModel: statusCode >= 200 && statusCode < 300 ? currentCandidateModel : nil
-                )
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
                     bodyData: responseBody
                 ).shouldFailover {
-                    OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: currentCandidateModel,
-                        telemetryEvent: winningTelemetry
-                    )
-                    self.attemptSmartAliasCandidate(
-                        method: method,
-                        path: path,
-                        headers: headers,
-                        currentBody: body,
-                        publicAlias: publicAlias,
-                        remainingCandidateModels: remainingCandidateModels,
-                        failoverDepth: failoverDepth + 1,
-                        originalConnection: originalConnection,
-                        coalescingKey: coalescingKey
+                    completion(
+                        .retryableFailure(
+                            requestModel: candidateModel,
+                            telemetryEvent: telemetryEvent
+                        )
                     )
                     return
                 }
 
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordRouteSuccess(
-                        forRequestModel: currentCandidateModel,
-                        telemetryEvent: winningTelemetry
-                    )
-                    self.deliverBufferedHTTPResponse(
-                        defaultConnection: originalConnection,
-                        statusCode: statusCode,
-                        headers: responseHeaders,
-                        body: responseBody,
-                        coalescingKey: coalescingKey,
-                        overridingModel: publicAlias
+                    completion(
+                        .success(
+                            requestModel: candidateModel,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            body: responseBody,
+                            telemetryEvent: telemetryEvent
+                        )
                     )
                     return
                 }
 
-                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetry)
-                self.deliverBufferedHTTPResponse(
-                    defaultConnection: originalConnection,
-                    statusCode: statusCode,
-                    headers: responseHeaders,
-                    body: responseBody,
-                    coalescingKey: coalescingKey
+                completion(
+                    .terminalResponse(
+                        requestModel: candidateModel,
+                        statusCode: statusCode,
+                        headers: responseHeaders,
+                        body: responseBody,
+                        telemetryEvent: telemetryEvent
+                    )
                 )
             case .sendError(let statusCode, let message):
-                let winningTelemetry = self.annotatedSmartAliasTelemetryEvent(
-                    OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
-                        telemetryEvent,
-                        winnerAttemptLane: 1
-                    ),
-                    requestedAlias: publicAlias,
-                    failoverDepth: failoverDepth,
-                    finalWinnerRequestModel: nil
-                )
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
                     bodyData: nil
                 ).shouldFailover {
-                    OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: currentCandidateModel,
-                        telemetryEvent: winningTelemetry
-                    )
-                    self.attemptSmartAliasCandidate(
-                        method: method,
-                        path: path,
-                        headers: headers,
-                        currentBody: body,
-                        publicAlias: publicAlias,
-                        remainingCandidateModels: remainingCandidateModels,
-                        failoverDepth: failoverDepth + 1,
-                        originalConnection: originalConnection,
-                        coalescingKey: coalescingKey
+                    completion(
+                        .retryableFailure(
+                            requestModel: candidateModel,
+                            telemetryEvent: telemetryEvent
+                        )
                     )
                     return
                 }
 
-                if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: currentCandidateModel,
-                        telemetryEvent: winningTelemetry
+                completion(
+                    .terminalError(
+                        requestModel: candidateModel,
+                        statusCode: statusCode,
+                        message: message,
+                        telemetryEvent: telemetryEvent
                     )
-                } else {
-                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetry)
-                }
-                self.deliverBufferedError(
-                    defaultConnection: originalConnection,
-                    statusCode: statusCode,
-                    message: message,
-                    coalescingKey: coalescingKey
                 )
             }
         }
+        controller?.registerCurrentCancel(cancel)
     }
 
     private func handleSmartAliasBufferedCandidateResult(
         _ bufferedResponse: BufferedProxyResponse,
-        method: String,
         path: String,
-        headers: [(String, String)],
-        candidateBody: String,
         publicAlias: String,
         candidateModel: String,
-        remainingCandidateModels: [String],
         failoverDepth: Int,
-        originalConnection: NWConnection,
-        coalescingKey: String?
+        attemptLane: Int,
+        completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
 
@@ -3558,31 +4174,25 @@ class ThinkingProxy {
                     requestedAlias: publicAlias,
                     canonicalModelID: route?.canonicalModelID ?? candidateModel,
                     transportOutcome: "send_error",
+                    attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: transportFailureClass(error),
                     timeoutStage: .none,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
-                    source: "smart_alias"
+                    source: "smart_alias",
+                    firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: nil
             )
-            OpenAICompatTemporaryShim.recordRouteFailure(
-                forRequestModel: candidateModel,
-                telemetryEvent: telemetryEvent
-            )
-            attemptSmartAliasCandidate(
-                method: method,
-                path: path,
-                headers: headers,
-                currentBody: candidateBody,
-                publicAlias: publicAlias,
-                remainingCandidateModels: remainingCandidateModels,
-                failoverDepth: failoverDepth + 1,
-                originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+            completion(
+                .retryableFailure(
+                    requestModel: candidateModel,
+                    telemetryEvent: telemetryEvent
+                )
             )
             return
         }
@@ -3596,31 +4206,25 @@ class ThinkingProxy {
                     requestedAlias: publicAlias,
                     canonicalModelID: route?.canonicalModelID ?? candidateModel,
                     transportOutcome: "send_error",
+                    attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: "missing_response_material",
                     timeoutStage: .none,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
-                    source: "smart_alias"
+                    source: "smart_alias",
+                    firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: nil
             )
-            OpenAICompatTemporaryShim.recordRouteFailure(
-                forRequestModel: candidateModel,
-                telemetryEvent: telemetryEvent
-            )
-            attemptSmartAliasCandidate(
-                method: method,
-                path: path,
-                headers: headers,
-                currentBody: candidateBody,
-                publicAlias: publicAlias,
-                remainingCandidateModels: remainingCandidateModels,
-                failoverDepth: failoverDepth + 1,
-                originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+            completion(
+                .retryableFailure(
+                    requestModel: candidateModel,
+                    telemetryEvent: telemetryEvent
+                )
             )
             return
         }
@@ -3639,13 +4243,16 @@ class ThinkingProxy {
                 requestedAlias: publicAlias,
                 canonicalModelID: route?.canonicalModelID ?? candidateModel,
                 transportOutcome: statusCode >= 200 && statusCode < 300 ? "send_response" : "send_error",
+                attemptLane: attemptLane,
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: (!shouldFailover && statusCode >= 200 && statusCode < 300) ? candidateModel : nil,
                 failureClass: failureClass,
                 timeoutStage: .none,
                 upstreamHTTPStatus: statusCode,
                 retryCount: 0,
-                source: "smart_alias"
+                source: "smart_alias",
+                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -3653,47 +4260,36 @@ class ThinkingProxy {
         )
 
         if shouldFailover {
-            OpenAICompatTemporaryShim.recordRouteFailure(
-                forRequestModel: candidateModel,
-                telemetryEvent: telemetryEvent
-            )
-            attemptSmartAliasCandidate(
-                method: method,
-                path: path,
-                headers: headers,
-                currentBody: candidateBody,
-                publicAlias: publicAlias,
-                remainingCandidateModels: remainingCandidateModels,
-                failoverDepth: failoverDepth + 1,
-                originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+            completion(
+                .retryableFailure(
+                    requestModel: candidateModel,
+                    telemetryEvent: telemetryEvent
+                )
             )
             return
         }
 
         if statusCode >= 200 && statusCode < 300 {
-            OpenAICompatTemporaryShim.recordRouteSuccess(
-                forRequestModel: candidateModel,
-                telemetryEvent: telemetryEvent
-            )
-            deliverBufferedHTTPResponse(
-                defaultConnection: originalConnection,
-                statusCode: statusCode,
-                headers: response.allHeaderFields,
-                body: responseData,
-                coalescingKey: coalescingKey,
-                overridingModel: publicAlias
+            completion(
+                .success(
+                    requestModel: candidateModel,
+                    statusCode: statusCode,
+                    headers: response.allHeaderFields,
+                    body: responseData,
+                    telemetryEvent: telemetryEvent
+                )
             )
             return
         }
 
-        OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-        deliverBufferedHTTPResponse(
-            defaultConnection: originalConnection,
-            statusCode: statusCode,
-            headers: response.allHeaderFields,
-            body: responseData,
-            coalescingKey: coalescingKey
+        completion(
+            .terminalResponse(
+                requestModel: candidateModel,
+                statusCode: statusCode,
+                headers: response.allHeaderFields,
+                body: responseData,
+                telemetryEvent: telemetryEvent
+            )
         )
     }
 
@@ -3748,6 +4344,7 @@ class ThinkingProxy {
         )
     }
 
+    @discardableResult
     private func sendBufferedProxyRequest(
         method: String,
         path: String,
@@ -3755,15 +4352,27 @@ class ThinkingProxy {
         body: String,
         timeoutInterval: TimeInterval,
         completion: @escaping (BufferedProxyResponse) -> Void
-    ) {
+    ) -> (() -> Void) {
+        if let bufferedProxyCancelableTransportForTesting {
+            return bufferedProxyCancelableTransportForTesting(method, path, headers, body, timeoutInterval, completion)
+        }
+
         if let bufferedProxyTransportForTesting {
             bufferedProxyTransportForTesting(method, path, headers, body, timeoutInterval, completion)
-            return
+            return {}
         }
 
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
-            completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.badURL)))
-            return
+            completion(
+                BufferedProxyResponse(
+                    data: nil,
+                    response: nil,
+                    error: URLError(.badURL),
+                    firstByteLatencyMilliseconds: nil,
+                    totalLatencyMilliseconds: nil
+                )
+            )
+            return {}
         }
 
         var request = URLRequest(url: url)
@@ -3777,17 +4386,25 @@ class ThinkingProxy {
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        let session = URLSession(configuration: .ephemeral)
-        session.dataTask(with: request) { data, response, error in
+        let responseProgress = ResponseProgressDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let task = session.dataTask(with: request) { data, response, error in
+            responseProgress.finish()
             completion(
                 BufferedProxyResponse(
                     data: data,
                     response: response as? HTTPURLResponse,
-                    error: error
+                    error: error,
+                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
                 )
             )
             session.finishTasksAndInvalidate()
-        }.resume()
+        }
+        task.resume()
+        return {
+            task.cancel()
+        }
     }
 
     private func smartAliasCandidateTimeout(forRequestJSON jsonString: String) -> TimeInterval {
@@ -3795,6 +4412,17 @@ class ThinkingProxy {
             OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: jsonString) ?? Config.defaultMitigatedAttemptTimeout,
             Config.defaultMitigatedAttemptTimeout
         )
+    }
+
+    private func smartAliasTotalTimeout(forRequestJSON jsonString: String) -> TimeInterval {
+        if let smartAliasTotalTimeoutOverrideForTesting {
+            return smartAliasTotalTimeoutOverrideForTesting
+        }
+        return min(smartAliasCandidateTimeout(forRequestJSON: jsonString) + 10, 40)
+    }
+
+    private func remainingSmartAliasBudget(until deadlineAt: Date) -> TimeInterval {
+        max(0, deadlineAt.timeIntervalSinceNow)
     }
 
     private func coalescingKeyForSafeRequest(
