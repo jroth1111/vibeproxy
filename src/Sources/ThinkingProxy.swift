@@ -2,6 +2,11 @@ import Foundation
 import Network
 
 enum OpenAICompatTemporaryShim {
+    struct ClientFacingNVIDIAFailure {
+        let statusCode: Int
+        let message: String
+    }
+
     private struct CachedNVIDIAAliasMap {
         let configPath: String?
         let modificationDate: Date?
@@ -143,6 +148,12 @@ enum OpenAICompatTemporaryShim {
         case invalid(reason: String)
     }
 
+    private enum ContentNormalizationResult {
+        case unchanged
+        case flattened(String)
+        case unsupported
+    }
+
     static func transformRequest(method: String, path: String, jsonString: String) -> String? {
         guard method == "POST",
               isChatCompletionsPath(path),
@@ -153,6 +164,35 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
         var modified = false
+
+        if let messages = json["messages"] as? [[String: Any]] {
+            var normalizedMessages = messages
+            var normalizedAnyMessage = false
+            for index in normalizedMessages.indices {
+                switch normalizedContentResult(from: normalizedMessages[index]["content"]) {
+                case .unchanged:
+                    break
+                case .flattened(let flattened):
+                    normalizedMessages[index]["content"] = flattened
+                    normalizedAnyMessage = true
+                case .unsupported:
+                    break
+                }
+            }
+            if normalizedAnyMessage {
+                json["messages"] = normalizedMessages
+                modified = true
+            }
+        }
+
+        if (json["stream"] as? Bool) == true {
+            json["stream"] = false
+            modified = true
+        }
+        if json["stream_options"] != nil {
+            json.removeValue(forKey: "stream_options")
+            modified = true
+        }
 
         if let minimumMaxTokens = policy.minimumMaxTokens {
             if let currentMaxTokens = integerValue(json["max_tokens"]) {
@@ -172,10 +212,6 @@ enum OpenAICompatTemporaryShim {
         }
 
         if let tools = json["tools"] as? [Any], !tools.isEmpty {
-            if let stream = json["stream"] as? Bool, stream {
-                json["stream"] = false
-                modified = true
-            }
             if json["response_format"] != nil {
                 json.removeValue(forKey: "response_format")
                 modified = true
@@ -223,6 +259,41 @@ enum OpenAICompatTemporaryShim {
         return modifiedString
     }
 
+    static func requestedStream(forRequestJSON jsonString: String) -> Bool {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return false
+        }
+        return (json["stream"] as? Bool) == true
+    }
+
+    static func preflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
+        guard method == "POST",
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              isNVIDIAHostedModel(model) else {
+            return nil
+        }
+
+        if isResponsesPath(path) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "NVIDIA hosted inference does not reliably support /v1/responses via this proxy; use /v1/chat/completions."
+            )
+        }
+
+        if isChatCompletionsPath(path),
+           containsUnsupportedTypedMessageContent(in: json) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 400,
+                message: "NVIDIA hosted chat completions currently require string message content; typed content arrays are not supported on this route."
+            )
+        }
+
+        return nil
+    }
+
     static func isNvidiaReasoningChatRequest(method: String, path: String, jsonString: String) -> Bool {
         guard method == "POST",
               isChatCompletionsPath(path),
@@ -233,6 +304,120 @@ enum OpenAICompatTemporaryShim {
         }
 
         return policy(forModel: model) != nil
+    }
+
+    static func classifyUpstreamFailure(
+        model: String,
+        path: String,
+        statusCode: Int,
+        bodyData: Data
+    ) -> ClientFacingNVIDIAFailure? {
+        guard isNVIDIAHostedModel(model) else {
+            return nil
+        }
+
+        let body = String(data: bodyData, encoding: .utf8)?.lowercased() ?? ""
+
+        if isResponsesPath(path),
+           statusCode == 404,
+           body.contains("404 page not found") {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "NVIDIA hosted inference does not provide a reliable /v1/responses surface for this route."
+            )
+        }
+
+        if statusCode == 429 {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 429,
+                message: "Upstream NVIDIA route is rate-limited or overloaded. Retry later."
+            )
+        }
+
+        if statusCode == 400,
+           body.contains("input should be a valid string"),
+           body.contains("messages") &&
+           body.contains("content") {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 400,
+                message: "NVIDIA hosted chat completions rejected non-string message content."
+            )
+        }
+
+        if (statusCode == 403 || statusCode == 404) &&
+            (body.contains("not found for account") ||
+             body.contains("function") && body.contains("not found")) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 503,
+                message: "Upstream NVIDIA model route is unavailable for chat completions on this account."
+            )
+        }
+
+        if statusCode == 500,
+           body.contains("enginecore encountered an issue") {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 502,
+                message: "Upstream NVIDIA engine error"
+            )
+        }
+
+        return nil
+    }
+
+    static func synthesizeEventStreamBody(fromChatCompletionBody bodyData: Data) -> Data? {
+        guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              let choice = choices.first else {
+            return nil
+        }
+
+        let message = choice["message"] as? [String: Any] ?? [:]
+        let role = (message["role"] as? String) ?? "assistant"
+        let content = message["content"] as? String
+        let toolCalls = message["tool_calls"] as? [[String: Any]]
+        let finishReason = (choice["finish_reason"] as? String) ?? "stop"
+        let identifier = (json["id"] as? String) ?? UUID().uuidString
+
+        var events: [String] = []
+
+        if let roleChunk = encodeStreamChunk(
+            id: identifier,
+            delta: ["role": role],
+            finishReason: nil
+        ) {
+            events.append(roleChunk)
+        }
+
+        if let content,
+           !content.isEmpty,
+           let contentChunk = encodeStreamChunk(
+            id: identifier,
+            delta: ["content": content],
+            finishReason: nil
+           ) {
+            events.append(contentChunk)
+        }
+
+        if let toolCalls,
+           !toolCalls.isEmpty,
+           let toolCallChunk = encodeStreamChunk(
+            id: identifier,
+            delta: ["tool_calls": toolCalls],
+            finishReason: nil
+           ) {
+            events.append(toolCallChunk)
+        }
+
+        if let finalChunk = encodeStreamChunk(
+            id: identifier,
+            delta: [:],
+            finishReason: finishReason
+        ) {
+            events.append(finalChunk)
+        }
+
+        events.append("data: [DONE]\n\n")
+        return events.joined().data(using: .utf8)
     }
 
     static func attemptTimeout(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -267,6 +452,10 @@ enum OpenAICompatTemporaryShim {
     static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
         guard let policy = policy(forModel: model) else {
             return NvidiaReasoningEvaluation(retryReason: nil, repairedBodyData: nil, normalizedBodyData: nil)
+        }
+
+        if statusCode == 200, bodyData.isEmpty {
+            return NvidiaReasoningEvaluation(retryReason: "empty_content", repairedBodyData: nil, normalizedBodyData: nil)
         }
 
         guard statusCode == 200,
@@ -413,6 +602,10 @@ enum OpenAICompatTemporaryShim {
         path == "/v1/chat/completions" || path == "/api/v1/chat/completions"
     }
 
+    private static func isResponsesPath(_ path: String) -> Bool {
+        path == "/v1/responses" || path == "/api/v1/responses"
+    }
+
     private static func integerValue(_ value: Any?) -> Int? {
         switch value {
         case let intValue as Int:
@@ -466,6 +659,79 @@ enum OpenAICompatTemporaryShim {
 
     private static func startsWithThinkTag(_ value: String) -> Bool {
         value.lowercased().hasPrefix("<think>")
+    }
+
+    private static func encodeStreamChunk(
+        id: String,
+        delta: [String: Any],
+        finishReason: String?
+    ) -> String? {
+        let encodedFinishReason: Any = finishReason ?? NSNull()
+        let chunk: [String: Any] = [
+            "id": id,
+            "choices": [[
+                "index": 0,
+                "delta": delta,
+                "finish_reason": encodedFinishReason
+            ]]
+        ]
+
+        guard let data = try? JSONSerialization.data(withJSONObject: chunk),
+              let string = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return "data: \(string)\n\n"
+    }
+
+    private static func containsUnsupportedTypedMessageContent(in json: [String: Any]) -> Bool {
+        guard let messages = json["messages"] as? [[String: Any]] else {
+            return false
+        }
+
+        for message in messages {
+            if case .unsupported = normalizedContentResult(from: message["content"]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func normalizedContentResult(from content: Any?) -> ContentNormalizationResult {
+        guard let content else {
+            return .unchanged
+        }
+        guard let segments = content as? [Any] else {
+            return .unchanged
+        }
+
+        var collectedSegments: [String] = []
+        for segment in segments {
+            if let textSegment = segment as? String {
+                collectedSegments.append(textSegment)
+                continue
+            }
+
+            guard let dictionary = segment as? [String: Any] else {
+                return .unsupported
+            }
+
+            let type = (dictionary["type"] as? String)?.lowercased()
+            let textValue = dictionary["text"] as? String
+
+            if let textValue,
+               type == nil || type == "text" || type == "input_text" {
+                collectedSegments.append(textValue)
+                continue
+            }
+
+            return .unsupported
+        }
+
+        guard !collectedSegments.isEmpty else {
+            return .unsupported
+        }
+
+        return .flattened(collectedSegments.joined())
     }
 
     private static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
@@ -527,6 +793,13 @@ enum OpenAICompatTemporaryShim {
             return genericNvidiaFallbackPolicy
         }
         return nil
+    }
+
+    private static func isNVIDIAHostedModel(_ model: String) -> Bool {
+        if ["glm5", "kimi-k2.5", "minimax-m2.5"].contains(model) {
+            return true
+        }
+        return configuredNVIDIAProviderIDsByModelAlias()[model] != nil
     }
 
     private static func reasoningString(from message: [String: Any]) -> String {
@@ -764,6 +1037,7 @@ class ThinkingProxy {
 
     private struct NvidiaReasoningRetryState {
         let model: String
+        let originalStreamRequested: Bool
         var transportRetriesRemaining: Int
         var semanticRetriesRemaining: Int
         let retryBackoffMilliseconds: Int
@@ -773,7 +1047,7 @@ class ThinkingProxy {
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
-        private var hasReceivedResponse = false
+        private var hasReceivedPayload = false
         private var deadlineExceeded = false
         private var deadlineWorkItem: DispatchWorkItem?
 
@@ -788,7 +1062,7 @@ class ThinkingProxy {
             let workItem = DispatchWorkItem { [weak self, weak task] in
                 guard let self else { return }
                 let shouldCancel = self.stateQueue.sync { () -> Bool in
-                    guard !self.hasReceivedResponse else {
+                    guard !self.hasReceivedPayload else {
                         return false
                     }
                     self.deadlineExceeded = true
@@ -807,7 +1081,7 @@ class ThinkingProxy {
 
         func finish() {
             stateQueue.sync {
-                hasReceivedResponse = true
+                hasReceivedPayload = true
                 deadlineWorkItem?.cancel()
                 deadlineWorkItem = nil
             }
@@ -817,9 +1091,9 @@ class ThinkingProxy {
             stateQueue.sync { deadlineExceeded }
         }
 
-        private func markResponseReceived() {
+        private func markPayloadReceived() {
             stateQueue.sync {
-                hasReceivedResponse = true
+                hasReceivedPayload = true
                 deadlineWorkItem?.cancel()
                 deadlineWorkItem = nil
             }
@@ -831,12 +1105,12 @@ class ThinkingProxy {
             didReceive response: URLResponse,
             completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
         ) {
-            markResponseReceived()
             completionHandler(.allow)
         }
 
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-            markResponseReceived()
+            guard !data.isEmpty else { return }
+            markPayloadReceived()
         }
     }
     
@@ -1062,6 +1336,7 @@ class ThinkingProxy {
         // Try to parse and modify JSON body for POST requests
         var modifiedBody = bodyString
         var thinkingEnabled = false
+        var nvidiaOriginalStreamRequested = false
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -1072,12 +1347,22 @@ class ThinkingProxy {
             if let stripped = stripCacheControl(from: modifiedBody) {
                 modifiedBody = stripped
             }
+            nvidiaOriginalStreamRequested = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
             if let shimmed = OpenAICompatTemporaryShim.transformRequest(
                 method: method,
                 path: rewrittenPath,
                 jsonString: modifiedBody
             ) {
                 modifiedBody = shimmed
+            }
+            if let preflightError = OpenAICompatTemporaryShim.preflightError(
+                method: method,
+                path: rewrittenPath,
+                jsonString: modifiedBody
+            ) {
+                NSLog("[ThinkingProxy] NVIDIA preflight mitigation blocked request for \(rewrittenPath): \(preflightError.message)")
+                sendError(to: connection, statusCode: preflightError.statusCode, message: preflightError.message)
+                return
             }
         }
 
@@ -1096,6 +1381,7 @@ class ThinkingProxy {
                 originalConnection: connection,
                 state: NvidiaReasoningRetryState(
                     model: model,
+                    originalStreamRequested: nvidiaOriginalStreamRequested,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
@@ -1400,6 +1686,7 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
+                            originalStreamRequested: state.originalStreamRequested,
                             transportRetriesRemaining: state.transportRetriesRemaining - 1,
                             semanticRetriesRemaining: state.semanticRetriesRemaining,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
@@ -1413,11 +1700,18 @@ class ThinkingProxy {
                 if state.salvagesBestEffortRepair,
                    let repairedBodyData = state.bestEffortRepairedBodyData {
                     NSLog("[ThinkingProxy] Returning preserved best-effort repaired response after transport exhaustion")
+                    let synthesizedStreamBody = state.originalStreamRequested
+                        ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: repairedBodyData)
+                        : nil
+                    let bodyToSend = synthesizedStreamBody ?? repairedBodyData
                     self.sendHTTPResponse(
                         to: originalConnection,
                         statusCode: 200,
                         headers: ["Content-Type": "application/json; charset=utf-8"],
-                        body: repairedBodyData
+                        body: bodyToSend,
+                        overridingHeaders: synthesizedStreamBody != nil
+                            ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                            : [:]
                     )
                     return
                 }
@@ -1440,6 +1734,27 @@ class ThinkingProxy {
                 return
             }
 
+            if let classifiedFailure = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                model: state.model,
+                path: path,
+                statusCode: httpResponse.statusCode,
+                bodyData: bodyData
+            ) {
+                NSLog(
+                    "[ThinkingProxy] Classified NVIDIA upstream failure for %@ on %@ as HTTP %d: %@",
+                    state.model,
+                    path,
+                    httpResponse.statusCode,
+                    classifiedFailure.message
+                )
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: classifiedFailure.statusCode,
+                    message: classifiedFailure.message
+                )
+                return
+            }
+
             if state.transportRetriesRemaining > 0,
                OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(statusCode: httpResponse.statusCode) {
                 NSLog(
@@ -1447,19 +1762,20 @@ class ThinkingProxy {
                     httpResponse.statusCode,
                     state.transportRetriesRemaining
                 )
-                self.scheduleNvidiaReasoningRetry(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    body: body,
-                    originalConnection: originalConnection,
-                    state: NvidiaReasoningRetryState(
-                        model: state.model,
-                        transportRetriesRemaining: state.transportRetriesRemaining - 1,
-                        semanticRetriesRemaining: state.semanticRetriesRemaining,
-                        retryBackoffMilliseconds: state.retryBackoffMilliseconds,
-                        salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                        bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
+                    self.scheduleNvidiaReasoningRetry(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: NvidiaReasoningRetryState(
+                            model: state.model,
+                            originalStreamRequested: state.originalStreamRequested,
+                            transportRetriesRemaining: state.transportRetriesRemaining - 1,
+                            semanticRetriesRemaining: state.semanticRetriesRemaining,
+                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
+                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                            bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
                     )
                 )
                 return
@@ -1487,6 +1803,7 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
+                            originalStreamRequested: state.originalStreamRequested,
                             transportRetriesRemaining: state.transportRetriesRemaining,
                             semanticRetriesRemaining: state.semanticRetriesRemaining - 1,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
@@ -1499,11 +1816,18 @@ class ThinkingProxy {
 
                 if let repairedBodyData = bestEffortRepairedBodyData {
                     NSLog("[ThinkingProxy] Applied response repair for temporary provider mitigation shim")
+                    let synthesizedStreamBody = state.originalStreamRequested
+                        ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: repairedBodyData)
+                        : nil
+                    let bodyToSend = synthesizedStreamBody ?? repairedBodyData
                     self.sendHTTPResponse(
                         to: originalConnection,
                         statusCode: 200,
                         headers: httpResponse.allHeaderFields,
-                        body: repairedBodyData
+                        body: bodyToSend,
+                        overridingHeaders: synthesizedStreamBody != nil
+                            ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                            : [:]
                     )
                     return
                 }
@@ -1520,11 +1844,19 @@ class ThinkingProxy {
                 return
             }
 
+            let responseBodyData = evaluation.normalizedBodyData ?? bodyData
+            let synthesizedStreamBody = state.originalStreamRequested && httpResponse.statusCode == 200
+                ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: responseBodyData)
+                : nil
+            let bodyToSend = synthesizedStreamBody ?? responseBodyData
             self.sendHTTPResponse(
                 to: originalConnection,
                 statusCode: httpResponse.statusCode,
                 headers: httpResponse.allHeaderFields,
-                body: evaluation.normalizedBodyData ?? bodyData
+                body: bodyToSend,
+                overridingHeaders: synthesizedStreamBody != nil
+                    ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                    : [:]
             )
         }
         responseProgress.installFirstResponseDeadline(
@@ -1958,7 +2290,7 @@ class ThinkingProxy {
             return
         }
         
-        let headers = "HTTP/1.1 \(statusCode) \(message)\r\n" +
+        let headers = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n" +
                      "Content-Type: text/plain\r\n" +
                      "Content-Length: \(bodyData.count)\r\n" +
                      "Connection: close\r\n" +
@@ -1999,10 +2331,12 @@ class ThinkingProxy {
         to connection: NWConnection,
         statusCode: Int,
         headers: [AnyHashable: Any],
-        body: Data
+        body: Data,
+        overridingHeaders: [String: String] = [:]
     ) {
         var response = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n"
-        let excludedHeaders: Set<String> = ["content-length", "connection", "transfer-encoding"]
+        var excludedHeaders: Set<String> = ["content-length", "connection", "transfer-encoding"]
+        excludedHeaders.formUnion(overridingHeaders.keys.map { $0.lowercased() })
 
         for (rawName, rawValue) in headers {
             guard let name = rawName as? String,
@@ -2010,6 +2344,10 @@ class ThinkingProxy {
                 continue
             }
             response += "\(name): \(String(describing: rawValue))\r\n"
+        }
+
+        for (name, value) in overridingHeaders {
+            response += "\(name): \(value)\r\n"
         }
 
         response += "Content-Length: \(body.count)\r\n"

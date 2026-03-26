@@ -77,6 +77,104 @@ struct ThinkingProxyPolicySpec {
             expectNil(json["response_format"], "glm5 should strip response_format for the temporary mitigation", recorder: recorder)
         }
 
+        run("temporary nvidia reasoning shim forces buffered upstream mode for streaming NVIDIA requests", recorder: recorder) {
+            let request = """
+            {
+              "model": "glm5",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              },
+              "messages": [
+                {"role": "user", "content": "Return exactly: OK"}
+              ]
+            }
+            """
+
+            let transformed = OpenAICompatTemporaryShim.transformRequest(
+                method: "POST",
+                path: "/v1/chat/completions",
+                jsonString: request
+            )
+
+            let json = parseJSONObject(transformed, recorder: recorder)
+            expectEqual(json["stream"] as? Bool, false, "NVIDIA requests should be forced to non-streaming mode upstream so the proxy can validate the full response", recorder: recorder)
+            expectNil(json["stream_options"], "stream_options should be stripped once the proxy forces buffered mode", recorder: recorder)
+        }
+
+        run("temporary nvidia reasoning shim flattens text-only typed content arrays", recorder: recorder) {
+            let request = """
+            {
+              "model": "glm5",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {"type": "text", "text": "Hello "},
+                    {"type": "input_text", "text": "world"}
+                  ]
+                }
+              ]
+            }
+            """
+
+            let transformed = OpenAICompatTemporaryShim.transformRequest(
+                method: "POST",
+                path: "/v1/chat/completions",
+                jsonString: request
+            )
+
+            let json = parseJSONObject(transformed, recorder: recorder)
+            let messages = json["messages"] as? [[String: Any]]
+            expectEqual(messages?.first?["content"] as? String, "Hello world", "text-only typed content arrays should be flattened into a single string for NVIDIA chat completions", recorder: recorder)
+        }
+
+        run("temporary nvidia preflight rejects typed content arrays with unsupported segment types", recorder: recorder) {
+            let request = """
+            {
+              "model": "glm5",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "image_url",
+                      "image_url": {"url": "https://example.com/cat.png"}
+                    }
+                  ]
+                }
+              ]
+            }
+            """
+
+            let preflightError = OpenAICompatTemporaryShim.preflightError(
+                method: "POST",
+                path: "/v1/chat/completions",
+                jsonString: request
+            )
+
+            expectEqual(preflightError?.statusCode ?? 0, 400, "unsupported typed content should be rejected before the NVIDIA backend sees it", recorder: recorder)
+        }
+
+        run("temporary nvidia preflight rejects /v1/responses for NVIDIA-hosted routes", recorder: recorder) {
+            let request = """
+            {
+              "model": "glm5",
+              "messages": [
+                {"role": "user", "content": "Return exactly: OK"}
+              ]
+            }
+            """
+
+            let preflightError = OpenAICompatTemporaryShim.preflightError(
+                method: "POST",
+                path: "/v1/responses",
+                jsonString: request
+            )
+
+            expectEqual(preflightError?.statusCode ?? 0, 501, "NVIDIA-hosted routes should fail fast on the unsupported /v1/responses surface", recorder: recorder)
+        }
+
         run("temporary nvidia reasoning shim forces kimi-k2.5 instant mode and floors max_tokens", recorder: recorder) {
             let request = """
             {
@@ -248,6 +346,25 @@ struct ThinkingProxyPolicySpec {
             )
 
             expectNil(transformed, "non-chat endpoints should not be rewritten", recorder: recorder)
+        }
+
+        run("temporary nvidia failure classification normalizes function-not-found outages", recorder: recorder) {
+            let problem = """
+            {
+              "status": 404,
+              "title": "Not Found",
+              "detail": "Function 'abc': Not found for account 'acct'"
+            }
+            """
+
+            let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                model: "glm5",
+                path: "/v1/chat/completions",
+                statusCode: 404,
+                bodyData: Data(problem.utf8)
+            )
+
+            expectEqual(classification?.statusCode ?? 0, 503, "function-not-found outages should be surfaced as provider unavailability", recorder: recorder)
         }
 
         run("temporary nvidia reasoning shim retries leaked reasoning responses", recorder: recorder) {
@@ -576,6 +693,32 @@ struct ThinkingProxyPolicySpec {
 
             expectNil(evaluation.retryReason, "clean minimax responses should not be retried", recorder: recorder)
             expectNil(evaluation.repairedBodyData, "clean minimax responses should not be rewritten", recorder: recorder)
+        }
+
+        run("temporary nvidia reasoning shim can synthesize a final SSE transcript from normalized JSON", recorder: recorder) {
+            let response = """
+            {
+              "id": "chatcmpl-test",
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "message": {
+                    "role": "assistant",
+                    "content": "OK"
+                  }
+                }
+              ]
+            }
+            """
+
+            guard let sseData = OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: Data(response.utf8)),
+                  let sse = String(data: sseData, encoding: .utf8) else {
+                recorder.recordFailure("expected synthetic NVIDIA SSE body to be generated")
+                return
+            }
+
+            expectEqual(sse.contains("\"content\":\"OK\""), true, "synthetic SSE should carry the normalized assistant content", recorder: recorder)
+            expectEqual(sse.contains("data: [DONE]"), true, "synthetic SSE should terminate with [DONE]", recorder: recorder)
         }
 
         if recorder.failures == 0 {
