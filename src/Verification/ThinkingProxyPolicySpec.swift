@@ -469,6 +469,36 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia runtime outcome retries retryable transport errors", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm5",
+                    transportRetriesRemaining: 1,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+
+                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: nil,
+                        response: nil,
+                        error: URLError(.timedOut),
+                        deadlineExceeded: true
+                    )
+                )
+
+                guard case .retry(let nextState) = outcome else {
+                    recorder.recordFailure("expected retryable transport errors to schedule another attempt")
+                    return
+                }
+                expectEqual(nextState.transportRetriesRemaining, 0, "runtime outcome should decrement transport retries on retryable transport errors", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia runtime outcome fails closed on unrepaired invalid-success responses", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let body = Data("""
@@ -518,6 +548,50 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia runtime outcome propagates classified upstream failures", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = Data("""
+                {
+                  "status": 404,
+                  "title": "Not Found",
+                  "detail": "Function 'abc': Not found for account 'acct'"
+                }
+                """.utf8)
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm5",
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+
+                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: body,
+                        response: response,
+                        error: nil,
+                        deadlineExceeded: false
+                    )
+                )
+
+                guard case .sendError(let statusCode, let message) = outcome else {
+                    recorder.recordFailure("expected classified upstream failures to become client-facing errors")
+                    return
+                }
+                expectEqual(statusCode, 503, "classified function-not-found failures should surface as 503", recorder: recorder)
+                expectEqual(message, "Upstream NVIDIA model route is unavailable for chat completions on this account.", "classified runtime errors should preserve the client-facing outage message", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia runtime outcome retries retryable upstream HTTP statuses", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let body = Data("{\"error\":{\"message\":\"gateway timeout\"}}".utf8)
@@ -552,6 +626,93 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
                 expectEqual(nextState.transportRetriesRemaining, 0, "runtime outcome should decrement transport retries on retryable HTTP statuses", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia runtime outcome emits normalized successful bodies", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = Data("""
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": " OK",
+                        "reasoning": "hidden chain of thought",
+                        "reasoning_content": "duplicate hidden chain of thought"
+                      }
+                    }
+                  ]
+                }
+                """.utf8)
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "kimi-k2.5",
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+
+                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: body,
+                        response: response,
+                        error: nil,
+                        deadlineExceeded: false
+                    )
+                )
+
+                guard case .sendResponse(let statusCode, _, let normalizedBody) = outcome else {
+                    recorder.recordFailure("expected successful kimi responses to be emitted as normalized HTTP responses")
+                    return
+                }
+                expectEqual(statusCode, 200, "normalized successful responses should preserve the upstream HTTP status", recorder: recorder)
+                let normalizedJSON = parseDataJSONObject(normalizedBody, recorder: recorder)
+                let normalizedChoices = normalizedJSON["choices"] as? [[String: Any]]
+                let normalizedMessage = normalizedChoices?.first?["message"] as? [String: Any]
+                expectEqual(normalizedMessage?["content"] as? String, " OK", "normalized runtime responses should preserve visible content", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning"], "normalized runtime responses should strip provider reasoning", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning_content"], "normalized runtime responses should strip provider reasoning_content", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia runtime outcome fails with generic 502 when no response materializes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm5",
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+
+                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: nil,
+                        response: nil,
+                        error: nil,
+                        deadlineExceeded: false
+                    )
+                )
+
+                guard case .sendError(let statusCode, let message) = outcome else {
+                    recorder.recordFailure("expected missing response material to fail as a generic bad gateway")
+                    return
+                }
+                expectEqual(statusCode, 502, "missing response material should surface as 502", recorder: recorder)
+                expectEqual(message, "Bad Gateway", "missing response material should keep the generic bad-gateway message", recorder: recorder)
             }
         }
 
