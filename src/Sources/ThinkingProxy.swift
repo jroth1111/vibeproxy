@@ -91,10 +91,25 @@ enum OpenAICompatTemporaryShim {
         let canonicalModelID: String
     }
 
+    struct RouteCircuitState: Equatable {
+        let consecutiveFailures: Int
+        let openUntil: Date?
+
+        func isOpen(at now: Date) -> Bool {
+            guard let openUntil else { return false }
+            return now < openUntil
+        }
+    }
+
     private struct CachedNVIDIARouteMap {
         let configPath: String?
         let modificationDate: Date?
         let routesByRequestModel: [String: NVIDIARouteIdentity]
+    }
+
+    private struct RouteCircuitBreakerPolicy {
+        let failureThreshold: Int
+        let cooldown: TimeInterval
     }
 
     private enum ClientStreamingMode {
@@ -251,6 +266,12 @@ enum OpenAICompatTemporaryShim {
     ]
     private static let nvidiaAliasCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-alias-cache")
     private static var cachedNVIDIARouteMap: CachedNVIDIARouteMap?
+    private static let nvidiaRouteHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-route-health")
+    private static var routeCircuitStatesByCanonicalModelID: [String: RouteCircuitState] = [:]
+    private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
+        failureThreshold: 2,
+        cooldown: 300
+    )
 
     private enum ToolCallValidation {
         case none
@@ -371,6 +392,13 @@ enum OpenAICompatTemporaryShim {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
                 message: "NVIDIA hosted inference does not reliably support /v1/responses via this proxy; use /v1/chat/completions."
+            )
+        }
+
+        if isNVIDIAHostedRouteOpen(forRequestModel: model) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 503,
+                message: "This NVIDIA route is temporarily quarantined by the proxy due to repeated upstream failures. Retry later or use another model."
             )
         }
 
@@ -666,6 +694,89 @@ enum OpenAICompatTemporaryShim {
         return model
     }
 
+    static func filteredModelListBodyRemovingOpenNVIDIARoutes(_ bodyData: Data, now: Date = Date()) -> Data? {
+        guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let data = json["data"] as? [[String: Any]] else {
+            return nil
+        }
+
+        let unavailableModelIDs = unavailableRequestModelIDs(at: now)
+        guard !unavailableModelIDs.isEmpty else {
+            return nil
+        }
+
+        let filteredData = data.filter { entry in
+            guard let id = entry["id"] as? String else {
+                return true
+            }
+            return !unavailableModelIDs.contains(id)
+        }
+
+        guard filteredData.count != data.count else {
+            return nil
+        }
+
+        var filteredJSON = json
+        filteredJSON["data"] = filteredData
+        guard let filteredBody = try? JSONSerialization.data(withJSONObject: filteredJSON) else {
+            return nil
+        }
+        return filteredBody
+    }
+
+    static func isNVIDIAHostedRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return false
+        }
+        return nvidiaRouteHealthQueue.sync {
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.isOpen(at: now) ?? false
+        }
+    }
+
+    static func recordNVIDIAHostedRouteFailure(forRequestModel requestModel: String, at now: Date = Date()) {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return
+        }
+        nvidiaRouteHealthQueue.sync {
+            let current = routeCircuitStatesByCanonicalModelID[route.canonicalModelID]
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextRouteCircuitState(
+                current: current,
+                afterFailureAt: now,
+                policy: routeCircuitBreakerPolicy
+            )
+        }
+    }
+
+    static func recordNVIDIAHostedRouteSuccess(forRequestModel requestModel: String) {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return
+        }
+        nvidiaRouteHealthQueue.sync {
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
+                consecutiveFailures: 0,
+                openUntil: nil
+            )
+        }
+    }
+
+    static func clearNVIDIAHostedRouteHealthForTesting() {
+        nvidiaRouteHealthQueue.sync {
+            routeCircuitStatesByCanonicalModelID = [:]
+        }
+    }
+
+    static func forceOpenNVIDIAHostedRouteForTesting(requestModel: String, until: Date) {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return
+        }
+        nvidiaRouteHealthQueue.sync {
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
+                consecutiveFailures: routeCircuitBreakerPolicy.failureThreshold,
+                openUntil: until
+            )
+        }
+    }
+
     static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
         guard let policy = policy(forModel: model) else {
             return NvidiaReasoningEvaluation(failureClass: nil, repairedBodyData: nil, normalizedBodyData: nil)
@@ -791,6 +902,25 @@ enum OpenAICompatTemporaryShim {
         default:
             return nil
         }
+    }
+
+    private static func nextRouteCircuitState(
+        current: RouteCircuitState?,
+        afterFailureAt now: Date,
+        policy: RouteCircuitBreakerPolicy? = nil
+    ) -> RouteCircuitState {
+        let effectivePolicy = policy ?? routeCircuitBreakerPolicy
+        let currentFailures = current?.consecutiveFailures ?? 0
+        let nextFailures = currentFailures + 1
+        let shouldOpen = nextFailures >= effectivePolicy.failureThreshold
+        return RouteCircuitState(
+            consecutiveFailures: nextFailures,
+            openUntil: shouldOpen ? now.addingTimeInterval(effectivePolicy.cooldown) : nil
+        )
+    }
+
+    static func nextRouteCircuitStateAfterSuccess() -> RouteCircuitState {
+        RouteCircuitState(consecutiveFailures: 0, openUntil: nil)
     }
 
     private static func normalizedResponseBody(
@@ -967,6 +1097,21 @@ enum OpenAICompatTemporaryShim {
 
     private static func resolveNVIDIAHostedRoute(forRequestModel model: String) -> NVIDIARouteIdentity? {
         configuredNVIDIARoutesByRequestModel()[model]
+    }
+
+    private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
+        let routes = configuredNVIDIARoutesByRequestModel()
+        let openCanonicalModelIDs = nvidiaRouteHealthQueue.sync {
+            Set(routeCircuitStatesByCanonicalModelID.compactMap { key, value in
+                value.isOpen(at: now) ? key : nil
+            })
+        }
+        guard !openCanonicalModelIDs.isEmpty else {
+            return []
+        }
+        return Set(routes.compactMap { requestModel, route in
+            openCanonicalModelIDs.contains(route.canonicalModelID) ? requestModel : nil
+        })
     }
 
     private static func configuredNVIDIARoutesByRequestModel() -> [String: NVIDIARouteIdentity] {
@@ -1558,6 +1703,16 @@ class ThinkingProxy {
             forwardToAmp(method: method, path: ampPath, version: httpVersion, headers: headers, body: bodyString, originalConnection: connection)
             return
         }
+
+        if method == "GET" && (rewrittenPath == "/v1/models" || rewrittenPath == "/api/v1/models") {
+            forwardModelListRequest(
+                method: method,
+                path: rewrittenPath,
+                headers: headers,
+                originalConnection: connection
+            )
+            return
+        }
         
         // Try to parse and modify JSON body for POST requests
         var modifiedBody = bodyString
@@ -1908,6 +2063,9 @@ class ThinkingProxy {
                     state: nextState
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
+                if statusCode >= 200 && statusCode < 300 {
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model)
+                }
                 self.sendHTTPResponse(
                     to: originalConnection,
                     statusCode: statusCode,
@@ -1915,6 +2073,9 @@ class ThinkingProxy {
                     body: bodyData
                 )
             case .sendError(let statusCode, let message):
+                if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model)
+                }
                 self.sendError(
                     to: originalConnection,
                     statusCode: statusCode,
@@ -1928,6 +2089,52 @@ class ThinkingProxy {
             for: task
         )
         task.resume()
+    }
+
+    private func forwardModelListRequest(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        originalConnection: NWConnection
+    ) {
+        guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
+            sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 10
+
+        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+        for (name, value) in headers where !excludedHeaders.contains(name.lowercased()) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue("close", forHTTPHeaderField: "Connection")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+
+            if let error {
+                NSLog("[ThinkingProxy] Model-list request failed: \(error)")
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  let bodyData = data else {
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
+                return
+            }
+
+            let filteredBody = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(bodyData) ?? bodyData
+            self.sendHTTPResponse(
+                to: originalConnection,
+                statusCode: httpResponse.statusCode,
+                headers: httpResponse.allHeaderFields,
+                body: filteredBody
+            )
+        }.resume()
     }
 
     private func scheduleNvidiaReasoningRetry(

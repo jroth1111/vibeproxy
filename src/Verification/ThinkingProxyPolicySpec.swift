@@ -279,6 +279,86 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia route circuit opens after repeated failures and resets after success", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "glm5 should start healthy", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one failure should not open the circuit yet", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "two failures should quarantine the route", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "a later success should clear the quarantine state", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia preflight rejects quarantined hosted routes before spending timeout budget", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                    requestModel: "kimi-k2.5",
+                    until: Date().addingTimeInterval(60)
+                )
+                let request = """
+                {
+                  "model": "kimi-k2.5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                expectEqual(preflightError?.statusCode ?? 0, 503, "quarantined NVIDIA routes should fail immediately instead of consuming the full timeout budget", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia model list filtering hides quarantined aliases", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                    requestModel: "glm5",
+                    until: Date().addingTimeInterval(60)
+                )
+                let body = """
+                {
+                  "object": "list",
+                  "data": [
+                    {"id": "glm5", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"},
+                    {"id": "gpt-5", "object": "model", "owned_by": "openai"}
+                  ]
+                }
+                """
+
+                guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
+                    recorder.recordFailure("expected quarantined route to be removed from /v1/models response")
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    return
+                }
+
+                let json = parseDataJSONObject(filtered, recorder: recorder)
+                let data = json["data"] as? [[String: Any]]
+                let ids = (data ?? []).compactMap { $0["id"] as? String }
+                expectEqual(ids.contains("glm5"), false, "quarantined glm5 alias should be removed from /v1/models", recorder: recorder)
+                expectEqual(ids.contains("kimi-k2.5"), true, "healthy NVIDIA aliases should remain visible", recorder: recorder)
+                expectEqual(ids.contains("gpt-5"), true, "non-NVIDIA models should remain visible", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
         run("temporary nvidia deadline tracker fires first-byte timeout before payload and buffered timeout after payload", recorder: recorder) {
             var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
 
