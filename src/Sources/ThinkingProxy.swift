@@ -2473,17 +2473,6 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
-            if indent == 0,
-               trimmed.hasSuffix(":"),
-               trimmed != "smart-aliases:",
-               trimmed != "openai-compatibility:",
-               trimmed != "claude-api-key:" {
-                finalizeCurrentSmartAlias()
-                finalizeCurrentProvider(section: currentSection)
-                currentSection = .none
-                continue
-            }
-
             if currentSection == .none {
                 continue
             }
@@ -2524,6 +2513,17 @@ enum OpenAICompatTemporaryShim {
                    let value = scalarValue(from: trimmed) {
                     currentProvider?.name = value
                 }
+                continue
+            }
+
+            if indent == 0,
+               trimmed.hasSuffix(":"),
+               trimmed != "smart-aliases:",
+               trimmed != "openai-compatibility:",
+               trimmed != "claude-api-key:" {
+                finalizeCurrentSmartAlias()
+                finalizeCurrentProvider(section: currentSection)
+                currentSection = .none
                 continue
             }
 
