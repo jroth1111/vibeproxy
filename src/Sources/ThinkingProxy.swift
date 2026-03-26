@@ -64,6 +64,28 @@ enum OpenAICompatTemporaryShim {
         case returnGatewayError(statusCode: Int, message: String)
     }
 
+    struct NVIDIARetryState: Equatable {
+        let model: String
+        var transportRetriesRemaining: Int
+        var semanticRetriesRemaining: Int
+        let retryBackoffMilliseconds: Int
+        let salvagesBestEffortRepair: Bool
+        var bestEffortRepairedBodyData: Data?
+    }
+
+    struct NVIDIAAttemptResult {
+        let data: Data?
+        let response: HTTPURLResponse?
+        let error: Error?
+        let deadlineExceeded: Bool
+    }
+
+    enum NVIDIARuntimeOutcome {
+        case retry(NVIDIARetryState)
+        case sendResponse(statusCode: Int, headers: [AnyHashable: Any], body: Data)
+        case sendError(statusCode: Int, message: String)
+    }
+
     struct NVIDIARouteIdentity: Equatable {
         let providerID: String
         let canonicalModelID: String
@@ -539,6 +561,99 @@ enum OpenAICompatTemporaryShim {
         return .returnGatewayError(
             statusCode: statusCode,
             message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
+        )
+    }
+
+    static func resolveNVIDIARuntimeOutcome(
+        path: String,
+        state: NVIDIARetryState,
+        attempt: NVIDIAAttemptResult
+    ) -> NVIDIARuntimeOutcome {
+        if let error = attempt.error {
+            let effectiveError: Error
+            if attempt.deadlineExceeded {
+                effectiveError = URLError(.timedOut)
+            } else {
+                effectiveError = error
+            }
+            switch transportFailureDisposition(
+                error: effectiveError,
+                transportRetriesRemaining: state.transportRetriesRemaining,
+                salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                preservedBestEffortRepair: state.bestEffortRepairedBodyData
+            ) {
+            case .retry(let nextTransportRetriesRemaining):
+                var nextState = state
+                nextState.transportRetriesRemaining = nextTransportRetriesRemaining
+                return .retry(nextState)
+            case .returnRepaired(let repairedBodyData):
+                return .sendResponse(
+                    statusCode: 200,
+                    headers: ["Content-Type": "application/json; charset=utf-8"],
+                    body: repairedBodyData
+                )
+            case .returnGatewayError(let statusCode, let message):
+                return .sendError(statusCode: statusCode, message: message)
+            }
+        }
+
+        guard let httpResponse = attempt.response,
+              let bodyData = attempt.data else {
+            return .sendError(statusCode: 502, message: "Bad Gateway")
+        }
+
+        if let classifiedFailure = classifyUpstreamFailure(
+            model: state.model,
+            path: path,
+            statusCode: httpResponse.statusCode,
+            bodyData: bodyData
+        ) {
+            return .sendError(statusCode: classifiedFailure.statusCode, message: classifiedFailure.message)
+        }
+
+        if state.transportRetriesRemaining > 0,
+           shouldRetryNvidiaReasoningTransport(statusCode: httpResponse.statusCode) {
+            var nextState = state
+            nextState.transportRetriesRemaining -= 1
+            return .retry(nextState)
+        }
+
+        let evaluation = evaluateNvidiaReasoningResponse(
+            model: state.model,
+            statusCode: httpResponse.statusCode,
+            bodyData: bodyData
+        )
+
+        if evaluation.shouldRetry {
+            switch semanticFailureDisposition(
+                evaluation: evaluation,
+                semanticRetriesRemaining: state.semanticRetriesRemaining,
+                preservedBestEffortRepair: state.bestEffortRepairedBodyData,
+                salvagesBestEffortRepair: state.salvagesBestEffortRepair
+            ) {
+            case .retry(let nextSemanticRetriesRemaining, let preservedBestEffortRepair):
+                var nextState = state
+                nextState.semanticRetriesRemaining = nextSemanticRetriesRemaining
+                nextState.bestEffortRepairedBodyData = preservedBestEffortRepair
+                return .retry(nextState)
+            case .returnRepaired(let repairedBodyData):
+                return .sendResponse(
+                    statusCode: 200,
+                    headers: httpResponse.allHeaderFields,
+                    body: repairedBodyData
+                )
+            case .returnGatewayError:
+                return .sendError(
+                    statusCode: 502,
+                    message: "Bad Gateway - Upstream provider returned an unusable response"
+                )
+            }
+        }
+
+        return .sendResponse(
+            statusCode: httpResponse.statusCode,
+            headers: httpResponse.allHeaderFields,
+            body: evaluation.normalizedBodyData ?? bodyData
         )
     }
 
@@ -1142,15 +1257,6 @@ class ThinkingProxy {
         static let defaultMitigatedAttemptTimeout: TimeInterval = 30
     }
 
-    private struct NvidiaReasoningRetryState {
-        let model: String
-        var transportRetriesRemaining: Int
-        var semanticRetriesRemaining: Int
-        let retryBackoffMilliseconds: Int
-        let salvagesBestEffortRepair: Bool
-        var bestEffortRepairedBodyData: Data?
-    }
-
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
         private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
@@ -1497,7 +1603,7 @@ class ThinkingProxy {
                 headers: headers,
                 body: modifiedBody,
                 originalConnection: connection,
-                state: NvidiaReasoningRetryState(
+                state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: model,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
@@ -1754,7 +1860,7 @@ class ThinkingProxy {
         headers: [(String, String)],
         body: String,
         originalConnection: NWConnection,
-        state: NvidiaReasoningRetryState
+        state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
             sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
@@ -1780,179 +1886,41 @@ class ThinkingProxy {
                 responseProgress.finish()
                 session.finishTasksAndInvalidate()
             }
-
-            if let error {
-                let effectiveError: Error
-                if responseProgress.didExceedDeadline() {
-                    effectiveError = URLError(.timedOut)
-                } else {
-                    effectiveError = error
-                }
-                switch OpenAICompatTemporaryShim.transportFailureDisposition(
-                    error: effectiveError,
-                    transportRetriesRemaining: state.transportRetriesRemaining,
-                    salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                    preservedBestEffortRepair: state.bestEffortRepairedBodyData
-                ) {
-                case .retry(let nextTransportRetriesRemaining):
-                    NSLog(
-                        "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to transport error %@ (%d retries left)",
-                        effectiveError.localizedDescription,
-                        state.transportRetriesRemaining
-                    )
-                    self.scheduleNvidiaReasoningRetry(
-                        method: method,
-                        path: path,
-                        headers: headers,
-                        body: body,
-                        originalConnection: originalConnection,
-                        state: NvidiaReasoningRetryState(
-                            model: state.model,
-                            transportRetriesRemaining: nextTransportRetriesRemaining,
-                            semanticRetriesRemaining: state.semanticRetriesRemaining,
-                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
-                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                            bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
-                        )
-                    )
-                    return
-                case .returnRepaired(let repairedBodyData):
-                    NSLog("[ThinkingProxy] Returning preserved best-effort repaired response after transport exhaustion")
-                    self.sendHTTPResponse(
-                        to: originalConnection,
-                        statusCode: 200,
-                        headers: ["Content-Type": "application/json; charset=utf-8"],
-                        body: repairedBodyData
-                    )
-                    return
-                case .returnGatewayError(let statusCode, let message):
-                    NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(effectiveError)")
-                    self.sendError(
-                        to: originalConnection,
-                        statusCode: statusCode,
-                        message: message
-                    )
-                    return
-                }
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  let bodyData = data else {
-                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
-                return
-            }
-
-            if let classifiedFailure = OpenAICompatTemporaryShim.classifyUpstreamFailure(
-                model: state.model,
+            let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
-                statusCode: httpResponse.statusCode,
-                bodyData: bodyData
-            ) {
-                NSLog(
-                    "[ThinkingProxy] Classified NVIDIA upstream failure for %@ on %@ as HTTP %d: %@",
-                    state.model,
-                    path,
-                    httpResponse.statusCode,
-                    classifiedFailure.message
+                state: state,
+                attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                    data: data,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    deadlineExceeded: responseProgress.didExceedDeadline()
                 )
+            )
+
+            switch outcome {
+            case .retry(let nextState):
+                self.scheduleNvidiaReasoningRetry(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    originalConnection: originalConnection,
+                    state: nextState
+                )
+            case .sendResponse(let statusCode, let headers, let bodyData):
+                self.sendHTTPResponse(
+                    to: originalConnection,
+                    statusCode: statusCode,
+                    headers: headers,
+                    body: bodyData
+                )
+            case .sendError(let statusCode, let message):
                 self.sendError(
                     to: originalConnection,
-                    statusCode: classifiedFailure.statusCode,
-                    message: classifiedFailure.message
+                    statusCode: statusCode,
+                    message: message
                 )
-                return
             }
-
-            if state.transportRetriesRemaining > 0,
-               OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(statusCode: httpResponse.statusCode) {
-                NSLog(
-                    "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to HTTP %d (%d retries left)",
-                    httpResponse.statusCode,
-                    state.transportRetriesRemaining
-                )
-                    self.scheduleNvidiaReasoningRetry(
-                        method: method,
-                        path: path,
-                        headers: headers,
-                        body: body,
-                        originalConnection: originalConnection,
-                        state: NvidiaReasoningRetryState(
-                            model: state.model,
-                            transportRetriesRemaining: state.transportRetriesRemaining - 1,
-                            semanticRetriesRemaining: state.semanticRetriesRemaining,
-                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
-                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                            bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
-                    )
-                )
-                return
-            }
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: state.model,
-                statusCode: httpResponse.statusCode,
-                bodyData: bodyData
-            )
-
-            if evaluation.shouldRetry {
-                switch OpenAICompatTemporaryShim.semanticFailureDisposition(
-                    evaluation: evaluation,
-                    semanticRetriesRemaining: state.semanticRetriesRemaining,
-                    preservedBestEffortRepair: state.bestEffortRepairedBodyData,
-                    salvagesBestEffortRepair: state.salvagesBestEffortRepair
-                ) {
-                case .retry(let nextSemanticRetriesRemaining, let preservedBestEffortRepair):
-                    NSLog(
-                        "[ThinkingProxy] Retrying temporary provider mitigation request due to %@ (%d retries left)",
-                        evaluation.retryReason ?? "unknown",
-                        state.semanticRetriesRemaining
-                    )
-                    self.scheduleNvidiaReasoningRetry(
-                        method: method,
-                        path: path,
-                        headers: headers,
-                        body: body,
-                        originalConnection: originalConnection,
-                        state: NvidiaReasoningRetryState(
-                            model: state.model,
-                            transportRetriesRemaining: state.transportRetriesRemaining,
-                            semanticRetriesRemaining: nextSemanticRetriesRemaining,
-                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
-                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                            bestEffortRepairedBodyData: preservedBestEffortRepair
-                        )
-                    )
-                    return
-                case .returnRepaired(let repairedBodyData):
-                    NSLog("[ThinkingProxy] Applied response repair for temporary provider mitigation shim")
-                    self.sendHTTPResponse(
-                        to: originalConnection,
-                        statusCode: 200,
-                        headers: httpResponse.allHeaderFields,
-                        body: repairedBodyData
-                    )
-                    return
-                case .returnGatewayError:
-                    NSLog(
-                        "[ThinkingProxy] Exhausted temporary provider mitigation retries after %@; returning gateway error instead of invalid upstream success",
-                        evaluation.retryReason ?? "unknown"
-                    )
-                    self.sendError(
-                        to: originalConnection,
-                        statusCode: 502,
-                        message: "Bad Gateway - Upstream provider returned an unusable response"
-                    )
-                    return
-                }
-            }
-
-            let responseBodyData = evaluation.normalizedBodyData ?? bodyData
-            self.sendHTTPResponse(
-                to: originalConnection,
-                statusCode: httpResponse.statusCode,
-                headers: httpResponse.allHeaderFields,
-                body: responseBodyData
-            )
         }
         responseProgress.installDeadlines(
             firstResponseSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
@@ -1968,7 +1936,7 @@ class ThinkingProxy {
         headers: [(String, String)],
         body: String,
         originalConnection: NWConnection,
-        state: NvidiaReasoningRetryState
+        state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
         let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
