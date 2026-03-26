@@ -466,7 +466,7 @@ struct ThinkingProxyPolicySpec {
         run("temporary nvidia rolling metrics tune hedge delay and canary cadence for flaky routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let now = Date()
                 let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
                     requestModel: "glm5",
@@ -1228,6 +1228,236 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias fails over when the primary returns a malformed success-shaped 200", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-zai-invalid",
+                                  "object": "chat.completion",
+                                  "model": "glm-5-turbo"
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-fallback-valid",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "MINIMAX OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5":
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-kimi-slower",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "KIMI OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should fail over after a malformed primary 200 response")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should treat malformed primary 200 bodies as retryable candidate failures and race the NVIDIA fallbacks", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should still return a successful fallback response after a malformed primary 200", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "MINIMAX OK", "worker should return the first valid fallback after rejecting malformed primary success bodies", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "malformed primary 200 bodies should penalize route health for the primary", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias keeps trying deferred backends after raced fallback terminals", recorder: recorder) {
+            withMergedConfig(workerMergedConfigWithLastResortYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"bad request\"}".utf8),
+                                response: httpURLResponse(statusCode: 400),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unauthorized\"}".utf8),
+                                response: httpURLResponse(statusCode: 401),
+                                error: nil
+                            )
+                        )
+                    case "gpt-5.4-medium":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-last-resort",
+                                  "object": "chat.completion",
+                                  "model": "gpt-5.4-medium",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "LAST RESORT OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should continue to deferred backends after the raced fallback set only returns terminal failures")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should still succeed once the deferred last-resort backend returns a valid response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "LAST RESORT OK", "worker should surface the deferred last-resort backend once the raced fallbacks fail terminally", recorder: recorder)
+            }
+        }
+
         run("temporary worker smart alias caps total failover latency for the whole request", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
@@ -1463,6 +1693,40 @@ struct ThinkingProxyPolicySpec {
                 let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
                 let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
                 expectEqual(filteredIDs.contains("worker"), false, "worker should disappear from /v1/models when every candidate is unavailable", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary expired route cooldowns restore worker candidate availability", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let body = """
+                {
+                  "object": "list",
+                  "data": [
+                    {"id": "glm-5-turbo", "object": "model", "owned_by": "zai"},
+                    {"id": "minimax-m2.5", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"}
+                  ]
+                }
+                """
+                let expired = Date().addingTimeInterval(-60)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5-turbo", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5", until: expired)
+
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5-turbo"), false, "expired cooldown windows should make worker primaries eligible for live traffic again", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "minimax-m2.5"), false, "expired cooldown windows should make raced fallbacks eligible again", recorder: recorder)
+
+                guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
+                    recorder.recordFailure("filtered /v1/models should still materialize after cooldown expiry")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
+                let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
+                expectEqual(filteredIDs.contains("worker"), true, "worker should become discoverable again once every candidate cooldown has expired", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -2850,6 +3114,50 @@ private func workerMergedConfigYAML() -> String {
         "    - glm-5-turbo",
         "    - minimax-m2.5",
         "    - kimi-k2.5"
+    ].joined(separator: "\n")
+}
+
+private func workerMergedConfigWithLastResortYAML() -> String {
+    [
+        "openai-compatibility:",
+        "- api-key-entries:",
+        "  - api-key: test-zai-key",
+        "  name: zai",
+        "  base-url: https://api.z.ai/api/anthropic",
+        "  models:",
+        "  - alias: glm-5-turbo",
+        "    name: glm-5-turbo",
+        "- name: nvidia",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: kimi-k2.5",
+        "    name: moonshotai/kimi-k2.5",
+        "- api-key-entries:",
+        "  - api-key: test-nvidia-minimax-key",
+        "  name: nvidia-minimax",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.5",
+        "    name: minimaxai/minimax-m2.5",
+        "- api-key-entries:",
+        "  - api-key: test-openai-key",
+        "  name: openai",
+        "  base-url: https://api.openai.com/v1",
+        "  models:",
+        "  - alias: gpt-5.4-medium",
+        "    name: gpt-5.4-medium",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5-turbo",
+        "    - minimax-m2.5",
+        "    - kimi-k2.5",
+        "    - gpt-5.4-medium"
     ].joined(separator: "\n")
 }
 

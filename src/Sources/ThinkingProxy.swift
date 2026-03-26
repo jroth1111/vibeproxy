@@ -266,7 +266,12 @@ enum OpenAICompatTemporaryShim {
             switch status {
             case .closed, .suspect:
                 return false
-            case .open, .halfOpen:
+            case .open:
+                if let openUntil {
+                    return now < openUntil
+                }
+                return true
+            case .halfOpen:
                 return true
             }
         }
@@ -1887,6 +1892,7 @@ enum OpenAICompatTemporaryShim {
         let route = resolveConfiguredRoute(forRequestModel: requestModel)
         let state = route.flatMap { routeCircuitStatesByRouteHealthKey[$0.routeHealthKey] }
         let metrics = state?.rollingMetrics ?? .empty
+        let now = Date()
         let healthPriority: Int
         switch state?.status ?? .closed {
         case .closed:
@@ -1896,7 +1902,7 @@ enum OpenAICompatTemporaryShim {
         case .halfOpen:
             healthPriority = 2
         case .open:
-            healthPriority = 3
+            healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
         }
         return (
             healthPriority: healthPriority,
@@ -3477,7 +3483,8 @@ class ThinkingProxy {
             failoverDepth: 0,
             deadlineAt: Date().addingTimeInterval(smartAliasTotalTimeout(forRequestJSON: body)),
             originalConnection: originalConnection,
-            coalescingKey: coalescingKey
+            coalescingKey: coalescingKey,
+            terminalFallbackOutcome: nil
         )
     }
 
@@ -3491,7 +3498,8 @@ class ThinkingProxy {
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
-        coalescingKey: String?
+        coalescingKey: String?,
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
@@ -3540,7 +3548,8 @@ class ThinkingProxy {
                     failoverDepth: failoverDepth,
                     deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalFallbackOutcome
                 )
                 return
             }
@@ -3552,6 +3561,14 @@ class ThinkingProxy {
             currentBody: currentBody,
             candidateModelsRemaining: rankedCandidateModels
         ) else {
+            if let terminalFallbackOutcome {
+                deliverSmartAliasTerminalOutcome(
+                    terminalFallbackOutcome,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
             deliverBufferedError(
                 defaultConnection: originalConnection,
                 statusCode: 503,
@@ -3579,7 +3596,8 @@ class ThinkingProxy {
                     failoverDepth: failoverDepth + 1,
                     deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalFallbackOutcome
                 )
                 return
             }
@@ -3617,7 +3635,8 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: terminalFallbackOutcome
             )
         }
     }
@@ -3633,7 +3652,8 @@ class ThinkingProxy {
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
-        coalescingKey: String?
+        coalescingKey: String?,
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
     ) {
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
@@ -3654,7 +3674,8 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: terminalFallbackOutcome
             )
             return
         }
@@ -3750,15 +3771,6 @@ class ThinkingProxy {
                     guard remainingAttempts == 0, !coordinator.isFinished() else { return }
                     _ = coordinator.tryFinish(attemptLane: 0)
 
-                    if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first {
-                        self.deliverSmartAliasTerminalOutcome(
-                            terminalOutcome,
-                            originalConnection: originalConnection,
-                            coalescingKey: coalescingKey
-                        )
-                        return
-                    }
-
                     if !deferredCandidateModels.isEmpty {
                         self.attemptSmartAliasCandidate(
                             method: method,
@@ -3769,6 +3781,16 @@ class ThinkingProxy {
                             remainingCandidateModels: deferredCandidateModels,
                             failoverDepth: failoverDepth + raceTransitions.count,
                             deadlineAt: deadlineAt,
+                            originalConnection: originalConnection,
+                            coalescingKey: coalescingKey,
+                            terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome
+                        )
+                        return
+                    }
+
+                    if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
+                        self.deliverSmartAliasTerminalOutcome(
+                            terminalOutcome,
                             originalConnection: originalConnection,
                             coalescingKey: coalescingKey
                         )
@@ -3801,7 +3823,8 @@ class ThinkingProxy {
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
-        coalescingKey: String?
+        coalescingKey: String?,
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
     ) {
         switch outcome {
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -3841,7 +3864,8 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth + 1,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: terminalFallbackOutcome
             )
         case .terminalResponse(_, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
             OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
@@ -4095,7 +4119,8 @@ class ThinkingProxy {
             case .sendResponse(let statusCode, let responseHeaders, let responseBody):
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
-                    bodyData: responseBody
+                    bodyData: responseBody,
+                    path: path
                 ).shouldFailover {
                     completion(
                         .retryableFailure(
@@ -4131,7 +4156,8 @@ class ThinkingProxy {
             case .sendError(let statusCode, let message):
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
-                    bodyData: nil
+                    bodyData: nil,
+                    path: path
                 ).shouldFailover {
                     completion(
                         .retryableFailure(
@@ -4232,7 +4258,8 @@ class ThinkingProxy {
         let statusCode = response.statusCode
         let failureClassification = classifySmartAliasCandidateFailure(
             statusCode: statusCode,
-            bodyData: responseData
+            bodyData: responseData,
+            path: path
         )
         let shouldFailover = failureClassification.shouldFailover
         let failureClass = failureClassification.failureClass
@@ -4295,9 +4322,14 @@ class ThinkingProxy {
 
     private func classifySmartAliasCandidateFailure(
         statusCode: Int,
-        bodyData: Data?
+        bodyData: Data?,
+        path: String
     ) -> (shouldFailover: Bool, failureClass: String?) {
-        _ = bodyData
+        if statusCode >= 200 && statusCode < 300,
+           let bodyData,
+           let failureClass = classifySmartAliasSuccessBodyFailure(path: path, bodyData: bodyData) {
+            return (true, failureClass)
+        }
         switch statusCode {
         case 429, 403, 404:
             return (true, "classified_\(statusCode)")
@@ -4306,6 +4338,32 @@ class ThinkingProxy {
         default:
             return (false, nil)
         }
+    }
+
+    private func classifySmartAliasSuccessBodyFailure(path: String, bodyData: Data) -> String? {
+        if bodyData.isEmpty {
+            return "empty_body"
+        }
+
+        guard path == "/v1/chat/completions" || path == "/api/v1/chat/completions" else {
+            return nil
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+            return "invalid_json"
+        }
+        guard let choices = json["choices"] as? [[String: Any]], !choices.isEmpty else {
+            return "missing_choices"
+        }
+        let message = choices[0]["message"] as? [String: Any] ?? [:]
+        let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if content.isEmpty {
+            return "empty_content"
+        }
+        if content.hasPrefix("<think>") {
+            return "reasoning_leak_content"
+        }
+        return nil
     }
 
     private func transportFailureClass(_ error: Error) -> String {
