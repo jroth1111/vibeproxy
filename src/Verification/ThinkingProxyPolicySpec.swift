@@ -279,6 +279,126 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia deadline tracker fires first-byte timeout before payload and buffered timeout after payload", recorder: recorder) {
+            var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
+
+            expectEqual(tracker.firstResponseDeadlineDidFire(), true, "first-response deadline should fire before any payload arrives", recorder: recorder)
+            expectEqual(tracker.deadlineExceeded, true, "first-response deadline should mark the tracker as exceeded", recorder: recorder)
+
+            tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
+            tracker.payloadReceived()
+            expectEqual(tracker.firstResponseDeadlineDidFire(), false, "first-response deadline should be suppressed after payload arrives", recorder: recorder)
+            expectEqual(tracker.bufferedResponseDeadlineDidFire(), true, "buffered deadline should still fire until the response finishes", recorder: recorder)
+        }
+
+        run("temporary nvidia deadline tracker finish suppresses later cancellations", recorder: recorder) {
+            var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
+            tracker.finish()
+
+            expectEqual(tracker.firstResponseDeadlineDidFire(), false, "finished responses should not be cancelled by the first-response deadline", recorder: recorder)
+            expectEqual(tracker.bufferedResponseDeadlineDidFire(), false, "finished responses should not be cancelled by the buffered deadline", recorder: recorder)
+            expectEqual(tracker.deadlineExceeded, false, "finishing before deadlines fire should keep the tracker clean", recorder: recorder)
+        }
+
+        run("temporary nvidia semantic retry disposition preserves repaired bodies and returns them after retry exhaustion", recorder: recorder) {
+            let repaired = Data("{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}".utf8)
+            let evaluation = OpenAICompatTemporaryShim.NvidiaReasoningEvaluation(
+                failureClass: .reasoningLeakLength,
+                repairedBodyData: repaired,
+                normalizedBodyData: repaired
+            )
+
+            let retryDisposition = OpenAICompatTemporaryShim.semanticFailureDisposition(
+                evaluation: evaluation,
+                semanticRetriesRemaining: 1,
+                preservedBestEffortRepair: nil,
+                salvagesBestEffortRepair: true
+            )
+
+            switch retryDisposition {
+            case .retry(let nextRemaining, let preserved):
+                expectEqual(nextRemaining, 0, "semantic retries should decrement exactly once", recorder: recorder)
+                expectEqual(preserved, repaired, "semantic retries should preserve repaired bodies for later fallback", recorder: recorder)
+            default:
+                recorder.recordFailure("expected semantic failure disposition to retry while retries remain")
+            }
+
+            let fallbackEvaluation = OpenAICompatTemporaryShim.NvidiaReasoningEvaluation(
+                failureClass: .reasoningLeakLength,
+                repairedBodyData: nil,
+                normalizedBodyData: nil
+            )
+            let fallbackDisposition = OpenAICompatTemporaryShim.semanticFailureDisposition(
+                evaluation: fallbackEvaluation,
+                semanticRetriesRemaining: 0,
+                preservedBestEffortRepair: repaired,
+                salvagesBestEffortRepair: true
+            )
+
+            switch fallbackDisposition {
+            case .returnRepaired(let body):
+                expectEqual(body, repaired, "exhausted semantic retries should return the preserved repaired body", recorder: recorder)
+            default:
+                recorder.recordFailure("expected exhausted semantic retries to return the preserved repaired body")
+            }
+        }
+
+        run("temporary nvidia semantic retry disposition fails closed when no repaired body exists", recorder: recorder) {
+            let evaluation = OpenAICompatTemporaryShim.NvidiaReasoningEvaluation(
+                failureClass: .emptyContent,
+                repairedBodyData: nil,
+                normalizedBodyData: nil
+            )
+
+            let disposition = OpenAICompatTemporaryShim.semanticFailureDisposition(
+                evaluation: evaluation,
+                semanticRetriesRemaining: 0,
+                preservedBestEffortRepair: nil,
+                salvagesBestEffortRepair: true
+            )
+
+            switch disposition {
+            case .returnGatewayError:
+                break
+            default:
+                recorder.recordFailure("expected exhausted semantic failures without repaired output to fail closed")
+            }
+        }
+
+        run("temporary nvidia transport retry disposition returns preserved repaired bodies after retry exhaustion", recorder: recorder) {
+            let repaired = Data("{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}".utf8)
+            let disposition = OpenAICompatTemporaryShim.transportFailureDisposition(
+                error: URLError(.timedOut),
+                transportRetriesRemaining: 0,
+                salvagesBestEffortRepair: true,
+                preservedBestEffortRepair: repaired
+            )
+
+            switch disposition {
+            case .returnRepaired(let body):
+                expectEqual(body, repaired, "transport exhaustion should return preserved repaired output when available", recorder: recorder)
+            default:
+                recorder.recordFailure("expected transport exhaustion with preserved repair to return the repaired body")
+            }
+        }
+
+        run("temporary nvidia transport retry disposition fails with 504 for deadline-driven timeouts", recorder: recorder) {
+            let disposition = OpenAICompatTemporaryShim.transportFailureDisposition(
+                error: URLError(.timedOut),
+                transportRetriesRemaining: 0,
+                salvagesBestEffortRepair: false,
+                preservedBestEffortRepair: nil
+            )
+
+            switch disposition {
+            case .returnGatewayError(let statusCode, let message):
+                expectEqual(statusCode, 504, "timed-out NVIDIA transport failures should surface as 504", recorder: recorder)
+                expectEqual(message, "Gateway Timeout", "timed-out NVIDIA transport failures should keep the gateway-timeout message", recorder: recorder)
+            default:
+                recorder.recordFailure("expected timed-out transport exhaustion to return a gateway-timeout error")
+            }
+        }
+
         run("temporary nvidia failure classification normalizes function-not-found outages", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let problem = """

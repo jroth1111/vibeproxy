@@ -21,6 +21,49 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    struct ResponseDeadlineTracker {
+        private(set) var hasReceivedPayload = false
+        private(set) var deadlineExceeded = false
+        private(set) var isFinished = false
+
+        mutating func firstResponseDeadlineDidFire() -> Bool {
+            guard !hasReceivedPayload, !isFinished else {
+                return false
+            }
+            deadlineExceeded = true
+            return true
+        }
+
+        mutating func bufferedResponseDeadlineDidFire() -> Bool {
+            guard !isFinished else {
+                return false
+            }
+            deadlineExceeded = true
+            return true
+        }
+
+        mutating func payloadReceived() {
+            hasReceivedPayload = true
+        }
+
+        mutating func finish() {
+            isFinished = true
+            hasReceivedPayload = true
+        }
+    }
+
+    enum SemanticFailureDisposition {
+        case retry(nextSemanticRetriesRemaining: Int, preservedBestEffortRepair: Data?)
+        case returnRepaired(Data)
+        case returnGatewayError
+    }
+
+    enum TransportFailureDisposition {
+        case retry(nextTransportRetriesRemaining: Int)
+        case returnRepaired(Data)
+        case returnGatewayError(statusCode: Int, message: String)
+    }
+
     struct NVIDIARouteIdentity: Equatable {
         let providerID: String
         let canonicalModelID: String
@@ -445,6 +488,57 @@ enum OpenAICompatTemporaryShim {
             semantic: policy.semanticRetries,
             backoffMilliseconds: policy.retryBackoffMilliseconds,
             salvagesBestEffortRepair: policy.salvagesBestEffortRepair
+        )
+    }
+
+    static func semanticFailureDisposition(
+        evaluation: NvidiaReasoningEvaluation,
+        semanticRetriesRemaining: Int,
+        preservedBestEffortRepair: Data?,
+        salvagesBestEffortRepair: Bool
+    ) -> SemanticFailureDisposition {
+        let bestEffortRepairedBodyData = evaluation.repairedBodyData ?? preservedBestEffortRepair
+        if evaluation.shouldRetry, semanticRetriesRemaining > 0 {
+            return .retry(
+                nextSemanticRetriesRemaining: semanticRetriesRemaining - 1,
+                preservedBestEffortRepair: bestEffortRepairedBodyData
+            )
+        }
+
+        if evaluation.shouldRetry,
+           salvagesBestEffortRepair,
+           let repairedBodyData = bestEffortRepairedBodyData {
+            return .returnRepaired(repairedBodyData)
+        }
+
+        return evaluation.shouldRetry ? .returnGatewayError : .retry(
+            nextSemanticRetriesRemaining: semanticRetriesRemaining,
+            preservedBestEffortRepair: bestEffortRepairedBodyData
+        )
+    }
+
+    static func transportFailureDisposition(
+        error: Error,
+        transportRetriesRemaining: Int,
+        salvagesBestEffortRepair: Bool,
+        preservedBestEffortRepair: Data?
+    ) -> TransportFailureDisposition {
+        if transportRetriesRemaining > 0,
+           shouldRetryNvidiaReasoningTransport(error: error) {
+            return .retry(nextTransportRetriesRemaining: transportRetriesRemaining - 1)
+        }
+
+        if salvagesBestEffortRepair,
+           let repairedBodyData = preservedBestEffortRepair {
+            return .returnRepaired(repairedBodyData)
+        }
+
+        let nsError = error as NSError
+        let statusCode = nsError.domain == NSURLErrorDomain &&
+            nsError.code == URLError.Code.timedOut.rawValue ? 504 : 502
+        return .returnGatewayError(
+            statusCode: statusCode,
+            message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
         )
     }
 
@@ -1059,9 +1153,7 @@ class ThinkingProxy {
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
-        private var hasReceivedPayload = false
-        private var deadlineExceeded = false
-        private var isFinished = false
+        private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
         private var firstResponseDeadlineWorkItem: DispatchWorkItem?
         private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
 
@@ -1074,11 +1166,7 @@ class ThinkingProxy {
                 let workItem = DispatchWorkItem { [weak self, weak task] in
                     guard let self else { return }
                     let shouldCancel = self.stateQueue.sync { () -> Bool in
-                        guard !self.hasReceivedPayload, !self.isFinished else {
-                            return false
-                        }
-                        self.deadlineExceeded = true
-                        return true
+                        self.tracker.firstResponseDeadlineDidFire()
                     }
                     if shouldCancel {
                         task?.cancel()
@@ -1095,11 +1183,7 @@ class ThinkingProxy {
                 let workItem = DispatchWorkItem { [weak self, weak task] in
                     guard let self else { return }
                     let shouldCancel = self.stateQueue.sync { () -> Bool in
-                        guard !self.isFinished else {
-                            return false
-                        }
-                        self.deadlineExceeded = true
-                        return true
+                        self.tracker.bufferedResponseDeadlineDidFire()
                     }
                     if shouldCancel {
                         task?.cancel()
@@ -1115,8 +1199,7 @@ class ThinkingProxy {
 
         func finish() {
             stateQueue.sync {
-                isFinished = true
-                hasReceivedPayload = true
+                tracker.finish()
                 firstResponseDeadlineWorkItem?.cancel()
                 bufferedResponseDeadlineWorkItem?.cancel()
                 firstResponseDeadlineWorkItem = nil
@@ -1125,12 +1208,12 @@ class ThinkingProxy {
         }
 
         func didExceedDeadline() -> Bool {
-            stateQueue.sync { deadlineExceeded }
+            stateQueue.sync { tracker.deadlineExceeded }
         }
 
         private func markPayloadReceived() {
             stateQueue.sync {
-                hasReceivedPayload = true
+                tracker.payloadReceived()
                 firstResponseDeadlineWorkItem?.cancel()
                 firstResponseDeadlineWorkItem = nil
             }
@@ -1705,8 +1788,13 @@ class ThinkingProxy {
                 } else {
                     effectiveError = error
                 }
-                if state.transportRetriesRemaining > 0,
-                   OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: effectiveError) {
+                switch OpenAICompatTemporaryShim.transportFailureDisposition(
+                    error: effectiveError,
+                    transportRetriesRemaining: state.transportRetriesRemaining,
+                    salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                    preservedBestEffortRepair: state.bestEffortRepairedBodyData
+                ) {
+                case .retry(let nextTransportRetriesRemaining):
                     NSLog(
                         "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to transport error %@ (%d retries left)",
                         effectiveError.localizedDescription,
@@ -1720,7 +1808,7 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
-                            transportRetriesRemaining: state.transportRetriesRemaining - 1,
+                            transportRetriesRemaining: nextTransportRetriesRemaining,
                             semanticRetriesRemaining: state.semanticRetriesRemaining,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
                             salvagesBestEffortRepair: state.salvagesBestEffortRepair,
@@ -1728,10 +1816,7 @@ class ThinkingProxy {
                         )
                     )
                     return
-                }
-
-                if state.salvagesBestEffortRepair,
-                   let repairedBodyData = state.bestEffortRepairedBodyData {
+                case .returnRepaired(let repairedBodyData):
                     NSLog("[ThinkingProxy] Returning preserved best-effort repaired response after transport exhaustion")
                     self.sendHTTPResponse(
                         to: originalConnection,
@@ -1740,18 +1825,15 @@ class ThinkingProxy {
                         body: repairedBodyData
                     )
                     return
+                case .returnGatewayError(let statusCode, let message):
+                    NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(effectiveError)")
+                    self.sendError(
+                        to: originalConnection,
+                        statusCode: statusCode,
+                        message: message
+                    )
+                    return
                 }
-
-                NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(effectiveError)")
-                let nsError = effectiveError as NSError
-                let statusCode = nsError.domain == NSURLErrorDomain &&
-                    nsError.code == URLError.Code.timedOut.rawValue ? 504 : 502
-                self.sendError(
-                    to: originalConnection,
-                    statusCode: statusCode,
-                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
-                )
-                return
             }
 
             guard let httpResponse = response as? HTTPURLResponse,
@@ -1813,8 +1895,13 @@ class ThinkingProxy {
             )
 
             if evaluation.shouldRetry {
-                let bestEffortRepairedBodyData = evaluation.repairedBodyData ?? state.bestEffortRepairedBodyData
-                if state.semanticRetriesRemaining > 0 {
+                switch OpenAICompatTemporaryShim.semanticFailureDisposition(
+                    evaluation: evaluation,
+                    semanticRetriesRemaining: state.semanticRetriesRemaining,
+                    preservedBestEffortRepair: state.bestEffortRepairedBodyData,
+                    salvagesBestEffortRepair: state.salvagesBestEffortRepair
+                ) {
+                case .retry(let nextSemanticRetriesRemaining, let preservedBestEffortRepair):
                     NSLog(
                         "[ThinkingProxy] Retrying temporary provider mitigation request due to %@ (%d retries left)",
                         evaluation.retryReason ?? "unknown",
@@ -1829,16 +1916,14 @@ class ThinkingProxy {
                         state: NvidiaReasoningRetryState(
                             model: state.model,
                             transportRetriesRemaining: state.transportRetriesRemaining,
-                            semanticRetriesRemaining: state.semanticRetriesRemaining - 1,
+                            semanticRetriesRemaining: nextSemanticRetriesRemaining,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
                             salvagesBestEffortRepair: state.salvagesBestEffortRepair,
-                            bestEffortRepairedBodyData: bestEffortRepairedBodyData
+                            bestEffortRepairedBodyData: preservedBestEffortRepair
                         )
                     )
                     return
-                }
-
-                if let repairedBodyData = bestEffortRepairedBodyData {
+                case .returnRepaired(let repairedBodyData):
                     NSLog("[ThinkingProxy] Applied response repair for temporary provider mitigation shim")
                     self.sendHTTPResponse(
                         to: originalConnection,
@@ -1847,18 +1932,18 @@ class ThinkingProxy {
                         body: repairedBodyData
                     )
                     return
+                case .returnGatewayError:
+                    NSLog(
+                        "[ThinkingProxy] Exhausted temporary provider mitigation retries after %@; returning gateway error instead of invalid upstream success",
+                        evaluation.retryReason ?? "unknown"
+                    )
+                    self.sendError(
+                        to: originalConnection,
+                        statusCode: 502,
+                        message: "Bad Gateway - Upstream provider returned an unusable response"
+                    )
+                    return
                 }
-
-                NSLog(
-                    "[ThinkingProxy] Exhausted temporary provider mitigation retries after %@; returning gateway error instead of invalid upstream success",
-                    evaluation.retryReason ?? "unknown"
-                )
-                self.sendError(
-                    to: originalConnection,
-                    statusCode: 502,
-                    message: "Bad Gateway - Upstream provider returned an unusable response"
-                )
-                return
             }
 
             let responseBodyData = evaluation.normalizedBodyData ?? bodyData
