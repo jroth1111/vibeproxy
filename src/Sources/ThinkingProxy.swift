@@ -79,6 +79,8 @@ enum OpenAICompatTemporaryShim {
         let canonicalModelID: String
         let transportOutcome: String
         let healthTransition: String?
+        let attemptLane: Int
+        let winnerAttemptLane: Int?
         let failureClass: String?
         let timeoutStage: DeadlineStage
         let upstreamHTTPStatus: Int?
@@ -93,6 +95,8 @@ enum OpenAICompatTemporaryShim {
             canonicalModelID: String,
             transportOutcome: String,
             healthTransition: String? = nil,
+            attemptLane: Int = 1,
+            winnerAttemptLane: Int? = nil,
             failureClass: String?,
             timeoutStage: DeadlineStage,
             upstreamHTTPStatus: Int?,
@@ -106,6 +110,8 @@ enum OpenAICompatTemporaryShim {
             self.canonicalModelID = canonicalModelID
             self.transportOutcome = transportOutcome
             self.healthTransition = healthTransition
+            self.attemptLane = attemptLane
+            self.winnerAttemptLane = winnerAttemptLane
             self.failureClass = failureClass
             self.timeoutStage = timeoutStage
             self.upstreamHTTPStatus = upstreamHTTPStatus
@@ -209,6 +215,7 @@ enum OpenAICompatTemporaryShim {
         let failureScore: Int
         let recoverySuccesses: Int
         let openUntil: Date?
+        let lastScoreUpdatedAt: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
         let rollingMetrics: RouteRollingMetrics
 
@@ -243,6 +250,7 @@ enum OpenAICompatTemporaryShim {
         let failureScore: Int
         let recoverySuccesses: Int
         let openUntil: Date?
+        let lastScoreUpdatedAt: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
         let rollingMetrics: RouteRollingMetrics
     }
@@ -413,6 +421,8 @@ enum OpenAICompatTemporaryShim {
     private static let fastCanaryInterval: TimeInterval = 30
     private static let defaultCanaryInterval: TimeInterval = 60
     private static let defaultSuspectHedgeDelay: TimeInterval = 6
+    private static let suspectFirstResponseDeadline: TimeInterval = 8
+    private static let routeFailureScoreDecayInterval: TimeInterval = 180
 
     private enum ToolCallValidation {
         case none
@@ -697,6 +707,18 @@ enum OpenAICompatTemporaryShim {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
+    static func effectiveFirstResponseDeadline(
+        forRequestJSON jsonString: String,
+        routeHealthStatus: RouteHealthStatus?
+    ) -> TimeInterval? {
+        let baseline = firstResponseDeadline(forRequestJSON: jsonString)
+        guard routeHealthStatus == .suspect,
+              let baseline else {
+            return baseline
+        }
+        return min(baseline, suspectFirstResponseDeadline)
+    }
+
     static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
         policy(forRequestJSON: jsonString)?.bufferedResponseDeadline
     }
@@ -862,7 +884,8 @@ enum OpenAICompatTemporaryShim {
         state: NVIDIARetryState,
         attempt: NVIDIAAttemptResult,
         outcome: NVIDIARuntimeOutcome,
-        source: String
+        source: String,
+        attemptLane: Int = 1
     ) -> RouteTelemetryEvent {
         let canonicalModelID = resolveNVIDIAHostedRoute(forRequestModel: state.model)?.canonicalModelID ?? state.model
         let retryCount = max(0, state.initialTransportRetries - state.transportRetriesRemaining) +
@@ -883,6 +906,7 @@ enum OpenAICompatTemporaryShim {
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
                 transportOutcome: outcomeTelemetryLabel(outcome),
+                attemptLane: attemptLane,
                 failureClass: failureClass,
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: upstreamHTTPStatus,
@@ -906,6 +930,7 @@ enum OpenAICompatTemporaryShim {
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
                 transportOutcome: outcomeTelemetryLabel(outcome),
+                attemptLane: attemptLane,
                 failureClass: "classified_\(classifiedFailure.statusCode)",
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: response.statusCode,
@@ -928,6 +953,7 @@ enum OpenAICompatTemporaryShim {
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
                 transportOutcome: outcomeTelemetryLabel(outcome),
+                attemptLane: attemptLane,
                 failureClass: evaluation.retryReason,
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: response.statusCode,
@@ -943,6 +969,7 @@ enum OpenAICompatTemporaryShim {
             requestModel: state.model,
             canonicalModelID: canonicalModelID,
             transportOutcome: outcomeTelemetryLabel(outcome),
+            attemptLane: attemptLane,
             failureClass: "missing_response_material",
             timeoutStage: attempt.deadlineStage,
             upstreamHTTPStatus: upstreamHTTPStatus,
@@ -1088,7 +1115,8 @@ enum OpenAICompatTemporaryShim {
 
     static func recordNVIDIAHostedRouteSuccess(
         forRequestModel requestModel: String,
-        telemetryEvent: RouteTelemetryEvent? = nil
+        telemetryEvent: RouteTelemetryEvent? = nil,
+        at now: Date = Date()
     ) {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return
@@ -1099,6 +1127,7 @@ enum OpenAICompatTemporaryShim {
             var nextState = nextRouteCircuitStateAfterSuccess(
                 current: current,
                 telemetryEvent: telemetryEvent,
+                at: now,
                 policy: routeCircuitBreakerPolicy
             )
             let enrichedTelemetryEvent = telemetryEvent.map {
@@ -1135,6 +1164,7 @@ enum OpenAICompatTemporaryShim {
                 failureScore: routeCircuitBreakerPolicy.failureThreshold,
                 recoverySuccesses: 0,
                 openUntil: until,
+                lastScoreUpdatedAt: until,
                 lastTelemetryEvent: nil,
                 rollingMetrics: .empty
             )
@@ -1297,19 +1327,29 @@ enum OpenAICompatTemporaryShim {
             current: current?.rollingMetrics,
             telemetryEvent: telemetryEvent
         )
+        let decayedFailureScore = decayedFailureScore(
+            current?.failureScore ?? 0,
+            lastUpdatedAt: current?.lastScoreUpdatedAt,
+            now: now
+        )
+        let failureThreshold = effectiveFailureThreshold(
+            policy: effectivePolicy,
+            metrics: nextRollingMetrics
+        )
 
         switch current?.status ?? .closed {
         case .closed, .suspect:
             let nextFailureScore = min(
-                effectivePolicy.failureThreshold,
-                (current?.failureScore ?? 0) + failurePenalty
+                failureThreshold,
+                decayedFailureScore + failurePenalty
             )
-            if nextFailureScore >= effectivePolicy.failureThreshold {
+            if nextFailureScore >= failureThreshold {
                 return RouteCircuitState(
                     status: .open,
-                    failureScore: effectivePolicy.failureThreshold,
+                    failureScore: failureThreshold,
                     recoverySuccesses: 0,
                     openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
+                    lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics
                 )
@@ -1319,15 +1359,17 @@ enum OpenAICompatTemporaryShim {
                 failureScore: nextFailureScore,
                 recoverySuccesses: 0,
                 openUntil: nil,
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
         case .open, .halfOpen:
             return RouteCircuitState(
                 status: .open,
-                failureScore: effectivePolicy.failureThreshold,
+                failureScore: failureThreshold,
                 recoverySuccesses: 0,
                 openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
@@ -1337,6 +1379,7 @@ enum OpenAICompatTemporaryShim {
     private static func nextRouteCircuitStateAfterSuccess(
         current: RouteCircuitState?,
         telemetryEvent: RouteTelemetryEvent?,
+        at now: Date,
         policy: RouteCircuitBreakerPolicy? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
@@ -1345,6 +1388,12 @@ enum OpenAICompatTemporaryShim {
             current: current?.rollingMetrics,
             telemetryEvent: telemetryEvent
         )
+        let decayedScore = decayedFailureScore(
+            current?.failureScore ?? 0,
+            lastUpdatedAt: current?.lastScoreUpdatedAt,
+            now: now
+        )
+        let reducedScore = max(0, decayedScore - 1)
 
         switch current?.status ?? .closed {
         case .closed:
@@ -1353,16 +1402,18 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: 0,
                 openUntil: nil,
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
         case .suspect:
-            if shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
+            if reducedScore > 0 || shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
                 return RouteCircuitState(
                     status: .suspect,
-                    failureScore: 0,
+                    failureScore: reducedScore,
                     recoverySuccesses: 0,
                     openUntil: nil,
+                    lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics
                 )
@@ -1372,6 +1423,7 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: 0,
                 openUntil: nil,
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
@@ -1381,6 +1433,7 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: 1,
                 openUntil: nil,
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
@@ -1392,6 +1445,7 @@ enum OpenAICompatTemporaryShim {
                     failureScore: 0,
                     recoverySuccesses: 0,
                     openUntil: nil,
+                    lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics
                 )
@@ -1401,6 +1455,7 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: nextRecoverySuccesses,
                 openUntil: nil,
+                lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics
             )
@@ -1416,6 +1471,7 @@ enum OpenAICompatTemporaryShim {
             failureScore: state.failureScore,
             recoverySuccesses: state.recoverySuccesses,
             openUntil: state.openUntil,
+            lastScoreUpdatedAt: state.lastScoreUpdatedAt,
             lastTelemetryEvent: telemetryEvent,
             rollingMetrics: state.rollingMetrics
         )
@@ -1424,7 +1480,8 @@ enum OpenAICompatTemporaryShim {
     private static func enrichTelemetryEvent(
         _ event: RouteTelemetryEvent,
         from previousStatus: RouteHealthStatus,
-        to nextStatus: RouteHealthStatus
+        to nextStatus: RouteHealthStatus,
+        winnerAttemptLane: Int? = nil
     ) -> RouteTelemetryEvent {
         RouteTelemetryEvent(
             timestamp: event.timestamp,
@@ -1432,6 +1489,8 @@ enum OpenAICompatTemporaryShim {
             canonicalModelID: event.canonicalModelID,
             transportOutcome: event.transportOutcome,
             healthTransition: healthTransitionLabel(from: previousStatus, to: nextStatus),
+            attemptLane: event.attemptLane,
+            winnerAttemptLane: winnerAttemptLane ?? event.winnerAttemptLane,
             failureClass: event.failureClass,
             timeoutStage: event.timeoutStage,
             upstreamHTTPStatus: event.upstreamHTTPStatus,
@@ -1459,6 +1518,36 @@ enum OpenAICompatTemporaryShim {
         }
 
         return 1
+    }
+
+    private static func decayedFailureScore(
+        _ failureScore: Int,
+        lastUpdatedAt: Date?,
+        now: Date
+    ) -> Int {
+        guard failureScore > 0,
+              let lastUpdatedAt else {
+            return failureScore
+        }
+        let elapsed = max(0, now.timeIntervalSince(lastUpdatedAt))
+        guard elapsed >= routeFailureScoreDecayInterval else {
+            return failureScore
+        }
+        let decaySteps = Int(elapsed / routeFailureScoreDecayInterval)
+        return max(0, failureScore - decaySteps)
+    }
+
+    private static func effectiveFailureThreshold(
+        policy: RouteCircuitBreakerPolicy,
+        metrics: RouteRollingMetrics
+    ) -> Int {
+        guard metrics.requestCount >= 3 else {
+            return policy.failureThreshold
+        }
+        if metrics.timeoutRate >= 0.5 || metrics.invalidSuccessRate >= 0.5 {
+            return max(1, policy.failureThreshold - 1)
+        }
+        return policy.failureThreshold
     }
 
     private static func updatedRollingMetrics(
@@ -1559,6 +1648,7 @@ enum OpenAICompatTemporaryShim {
             let failureScore = entry["failure_score"] as? Int ?? entry["consecutive_failures"] as? Int ?? 0
             let recoverySuccesses = entry["recovery_successes"] as? Int ?? 0
             let openUntil = parseISO8601Date(entry["open_until"])
+            let lastScoreUpdatedAt = parseISO8601Date(entry["last_score_updated_at"])
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
             let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
             loaded[canonicalModelID] = RouteCircuitState(
@@ -1566,6 +1656,7 @@ enum OpenAICompatTemporaryShim {
                 failureScore: failureScore,
                 recoverySuccesses: recoverySuccesses,
                 openUntil: openUntil,
+                lastScoreUpdatedAt: lastScoreUpdatedAt,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: rollingMetrics
             )
@@ -1587,6 +1678,9 @@ enum OpenAICompatTemporaryShim {
             ]
             if let openUntil = state.openUntil {
                 entry["open_until"] = iso8601String(from: openUntil)
+            }
+            if let lastScoreUpdatedAt = state.lastScoreUpdatedAt {
+                entry["last_score_updated_at"] = iso8601String(from: lastScoreUpdatedAt)
             }
             if let lastTelemetryEvent = state.lastTelemetryEvent {
                 entry["last_event"] = telemetryEventDictionary(lastTelemetryEvent)
@@ -1619,12 +1713,16 @@ enum OpenAICompatTemporaryShim {
             "request_model": event.requestModel,
             "canonical_model_id": event.canonicalModelID,
             "transport_outcome": event.transportOutcome,
+            "attempt_lane": event.attemptLane,
             "timeout_stage": event.timeoutStage.rawValue,
             "retry_count": event.retryCount,
             "source": event.source
         ]
         if let healthTransition = event.healthTransition {
             dict["health_transition"] = healthTransition
+        }
+        if let winnerAttemptLane = event.winnerAttemptLane {
+            dict["winner_attempt_lane"] = winnerAttemptLane
         }
         if let failureClass = event.failureClass {
             dict["failure_class"] = failureClass
@@ -1653,12 +1751,15 @@ enum OpenAICompatTemporaryShim {
               let source = dict["source"] as? String else {
             return nil
         }
+        let attemptLane = integerValue(dict["attempt_lane"]) ?? 1
         return RouteTelemetryEvent(
             timestamp: timestamp,
             requestModel: requestModel,
             canonicalModelID: canonicalModelID,
             transportOutcome: transportOutcome,
             healthTransition: dict["health_transition"] as? String,
+            attemptLane: attemptLane,
+            winnerAttemptLane: integerValue(dict["winner_attempt_lane"]),
             failureClass: dict["failure_class"] as? String,
             timeoutStage: timeoutStage,
             upstreamHTTPStatus: dict["upstream_http_status"] as? Int,
@@ -1710,6 +1811,28 @@ enum OpenAICompatTemporaryShim {
             return
         }
         NSLog("[ThinkingProxy] NVIDIA route telemetry %@", jsonString)
+    }
+
+    static func telemetryEventWithWinnerAttemptLane(
+        _ event: RouteTelemetryEvent,
+        winnerAttemptLane: Int
+    ) -> RouteTelemetryEvent {
+        RouteTelemetryEvent(
+            timestamp: event.timestamp,
+            requestModel: event.requestModel,
+            canonicalModelID: event.canonicalModelID,
+            transportOutcome: event.transportOutcome,
+            healthTransition: event.healthTransition,
+            attemptLane: event.attemptLane,
+            winnerAttemptLane: winnerAttemptLane,
+            failureClass: event.failureClass,
+            timeoutStage: event.timeoutStage,
+            upstreamHTTPStatus: event.upstreamHTTPStatus,
+            retryCount: event.retryCount,
+            source: event.source,
+            firstByteLatencyMilliseconds: event.firstByteLatencyMilliseconds,
+            totalLatencyMilliseconds: event.totalLatencyMilliseconds
+        )
     }
 
     private static func normalizedResponseBody(
@@ -2201,6 +2324,8 @@ class ThinkingProxy {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-hedge-coordinator")
         private var finished = false
         private var hedgeStarted = false
+        private var winnerAttemptLane: Int?
+        private var cancelersByAttemptLane: [Int: () -> Void] = [:]
 
         func shouldStartHedge() -> Bool {
             stateQueue.sync {
@@ -2210,16 +2335,44 @@ class ThinkingProxy {
             }
         }
 
-        func tryFinish() -> Bool {
-            stateQueue.sync {
-                guard !finished else { return false }
-                finished = true
-                return true
+        func registerAttempt(attemptLane: Int, cancel: @escaping () -> Void) {
+            let cancelImmediately: (() -> Void)? = stateQueue.sync {
+                if finished {
+                    return cancel
+                }
+                cancelersByAttemptLane[attemptLane] = cancel
+                return nil
             }
+            cancelImmediately?()
+        }
+
+        func tryFinish(attemptLane: Int) -> Bool {
+            let losersToCancel: [() -> Void]? = stateQueue.sync {
+                guard !finished else { return nil }
+                finished = true
+                winnerAttemptLane = attemptLane
+                let losers = cancelersByAttemptLane.compactMap { lane, canceler in
+                    lane == attemptLane ? nil : canceler
+                }
+                cancelersByAttemptLane.removeAll()
+                return losers
+            }
+            losersToCancel?.forEach { $0() }
+            return losersToCancel != nil
         }
 
         func isFinished() -> Bool {
             stateQueue.sync { finished }
+        }
+
+        func finishAttemptWithoutWinning(attemptLane: Int) {
+            _ = stateQueue.sync {
+                cancelersByAttemptLane.removeValue(forKey: attemptLane)
+            }
+        }
+
+        func winnerAttemptLaneValue() -> Int? {
+            stateQueue.sync { winnerAttemptLane }
         }
     }
 
@@ -2287,6 +2440,10 @@ class ThinkingProxy {
 
         func currentDeadlineStage() -> OpenAICompatTemporaryShim.DeadlineStage {
             stateQueue.sync { tracker.deadlineStage }
+        }
+
+        func hasReceivedPayload() -> Bool {
+            stateQueue.sync { firstPayloadAt != nil }
         }
 
         func firstByteLatencyMilliseconds() -> Int? {
@@ -2865,6 +3022,13 @@ class ThinkingProxy {
         state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
         let coordinator = NVIDIAAttemptCoordinator()
+        let routeHealthStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
+        let hedgeEligible = OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
+            method: method,
+            path: path,
+            jsonString: body,
+            routeHealthStatus: routeHealthStatus
+        )
         forwardNvidiaReasoningRequestWithRetry(
             method: method,
             path: path,
@@ -2872,33 +3036,10 @@ class ThinkingProxy {
             body: body,
             originalConnection: originalConnection,
             state: state,
-            coordinator: coordinator
+            coordinator: coordinator,
+            attemptLane: 1,
+            hedgeEligible: hedgeEligible
         )
-
-        let routeHealthStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
-        guard OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
-            method: method,
-            path: path,
-            jsonString: body,
-            routeHealthStatus: routeHealthStatus
-        ) else {
-            return
-        }
-
-        let hedgeDelay = OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: state.model)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self] in
-            guard let self, coordinator.shouldStartHedge() else { return }
-            NSLog("[ThinkingProxy] Starting hedged NVIDIA attempt for suspect route %@ after %.2fs", state.model, hedgeDelay)
-            self.forwardNvidiaReasoningRequestWithRetry(
-                method: method,
-                path: path,
-                headers: headers,
-                body: body,
-                originalConnection: originalConnection,
-                state: state,
-                coordinator: coordinator
-            )
-        }
     }
 
     private func forwardNvidiaReasoningRequestWithRetry(
@@ -2908,11 +3049,13 @@ class ThinkingProxy {
         body: String,
         originalConnection: NWConnection,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
-        coordinator: NVIDIAAttemptCoordinator
+        coordinator: NVIDIAAttemptCoordinator,
+        attemptLane: Int,
+        hedgeEligible: Bool
     ) {
         guard !coordinator.isFinished() else { return }
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
-            if coordinator.tryFinish() {
+            if coordinator.tryFinish(attemptLane: attemptLane) {
                 sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
             }
             return
@@ -2934,6 +3077,7 @@ class ThinkingProxy {
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             defer {
+                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                 responseProgress.finish()
                 session.finishTasksAndInvalidate()
             }
@@ -2955,12 +3099,30 @@ class ThinkingProxy {
                 state: state,
                 attempt: attempt,
                 outcome: outcome,
-                source: "live_request"
+                source: "live_request",
+                attemptLane: attemptLane
             )
 
             switch outcome {
             case .retry(let nextState):
                 guard !coordinator.isFinished() else { return }
+                if attemptLane == 1,
+                   hedgeEligible,
+                   coordinator.shouldStartHedge() {
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    self.forwardNvidiaReasoningRequestWithRetry(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: nextState,
+                        coordinator: coordinator,
+                        attemptLane: 2,
+                        hedgeEligible: false
+                    )
+                    return
+                }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
                 self.scheduleNvidiaReasoningRetry(
                     method: method,
@@ -2969,16 +3131,22 @@ class ThinkingProxy {
                     body: body,
                     originalConnection: originalConnection,
                     state: nextState,
-                    coordinator: coordinator
+                    coordinator: coordinator,
+                    attemptLane: attemptLane,
+                    hedgeEligible: hedgeEligible
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
-                guard coordinator.tryFinish() else { return }
+                guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                    telemetryEvent,
+                    winnerAttemptLane: attemptLane
+                )
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
-                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
                 self.sendHTTPResponse(
                     to: originalConnection,
@@ -2987,11 +3155,15 @@ class ThinkingProxy {
                     body: bodyData
                 )
             case .sendError(let statusCode, let message):
-                guard coordinator.tryFinish() else { return }
+                guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                    telemetryEvent,
+                    winnerAttemptLane: attemptLane
+                )
                 if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
-                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
                 self.sendError(
                     to: originalConnection,
@@ -3000,8 +3172,36 @@ class ThinkingProxy {
                 )
             }
         }
+        coordinator.registerAttempt(attemptLane: attemptLane) {
+            task.cancel()
+        }
+        if attemptLane == 1, hedgeEligible {
+            let hedgeDelay = OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: state.model)
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self, weak responseProgress] in
+                guard let self,
+                      let responseProgress,
+                      !coordinator.isFinished(),
+                      !responseProgress.hasReceivedPayload(),
+                      coordinator.shouldStartHedge() else { return }
+                NSLog("[ThinkingProxy] Starting hedged NVIDIA attempt for suspect route %@ after %.2fs without first byte", state.model, hedgeDelay)
+                self.forwardNvidiaReasoningRequestWithRetry(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    originalConnection: originalConnection,
+                    state: state,
+                    coordinator: coordinator,
+                    attemptLane: 2,
+                    hedgeEligible: false
+                )
+            }
+        }
         responseProgress.installDeadlines(
-            firstResponseSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                forRequestJSON: body,
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
+            ),
             bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body),
             for: task
         )
@@ -3226,7 +3426,9 @@ class ThinkingProxy {
         body: String,
         originalConnection: NWConnection,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
-        coordinator: NVIDIAAttemptCoordinator
+        coordinator: NVIDIAAttemptCoordinator,
+        attemptLane: Int,
+        hedgeEligible: Bool
     ) {
         let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -3238,7 +3440,9 @@ class ThinkingProxy {
                 body: body,
                 originalConnection: originalConnection,
                 state: state,
-                coordinator: coordinator
+                coordinator: coordinator,
+                attemptLane: attemptLane,
+                hedgeEligible: hedgeEligible
             )
         }
     }

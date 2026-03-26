@@ -279,6 +279,36 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia suspect routes use shorter first-byte deadlines than healthy routes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let glm5Request = """
+                {
+                  "model": "glm5",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                        forRequestJSON: glm5Request,
+                        routeHealthStatus: .closed
+                    ),
+                    25,
+                    "healthy routes should keep the baseline first-byte deadline",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                        forRequestJSON: glm5Request,
+                        routeHealthStatus: .suspect
+                    ),
+                    8,
+                    "suspect routes should fail first-byte stalls faster than healthy routes",
+                    recorder: recorder
+                )
+            }
+        }
+
         run("temporary nvidia route circuit degrades to suspect before quarantine, then enters half-open on recovery", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
@@ -467,14 +497,110 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia hedge coordination starts once and only lets one attempt finish", recorder: recorder) {
+        run("temporary nvidia hedge coordination starts once, cancels losers, and only lets one attempt finish", recorder: recorder) {
             let coordinator = ThinkingProxy.NVIDIAAttemptCoordinator()
+            var canceledAttempts: [Int] = []
+
+            coordinator.registerAttempt(attemptLane: 1) {
+                canceledAttempts.append(1)
+            }
+            coordinator.registerAttempt(attemptLane: 2) {
+                canceledAttempts.append(2)
+            }
 
             expectEqual(coordinator.shouldStartHedge(), true, "the first hedge request should start the secondary attempt", recorder: recorder)
             expectEqual(coordinator.shouldStartHedge(), false, "duplicate hedge launches should be suppressed", recorder: recorder)
-            expectEqual(coordinator.tryFinish(), true, "the first completed attempt should win delivery", recorder: recorder)
-            expectEqual(coordinator.tryFinish(), false, "later attempts should be prevented from sending duplicate responses", recorder: recorder)
+            expectEqual(coordinator.tryFinish(attemptLane: 1), true, "the first completed attempt should win delivery", recorder: recorder)
+            expectEqual(canceledAttempts, [2], "winning attempts should actively cancel the losing hedge lane", recorder: recorder)
+            expectEqual(coordinator.tryFinish(attemptLane: 2), false, "later attempts should be prevented from sending duplicate responses", recorder: recorder)
             expectEqual(coordinator.isFinished(), true, "coordinator should stay finished once a winner is recorded", recorder: recorder)
+            expectEqual(coordinator.winnerAttemptLaneValue(), 1, "coordinator should record the winning attempt lane", recorder: recorder)
+        }
+
+        run("temporary nvidia failure score decays over time instead of opening on stale failures", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(400))
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "stale failure score should decay before the next failure is applied", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "decayed stale failures should not force an immediate open transition", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia rolling metrics can lower the quarantine threshold for repeatedly bad routes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm5",
+                    canonicalModelID: "z-ai/glm5",
+                    transportOutcome: "send_error",
+                    failureClass: "transport_timeout",
+                    timeoutStage: .firstResponse,
+                    upstreamHTTPStatus: nil,
+                    retryCount: 0,
+                    source: "live_request"
+                )
+                let successEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now.addingTimeInterval(1),
+                    requestModel: "glm5",
+                    canonicalModelID: "z-ai/glm5",
+                    transportOutcome: "send_response",
+                    failureClass: nil,
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 200,
+                    retryCount: 0,
+                    source: "live_request"
+                )
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now
+                )
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                    forRequestModel: "glm5",
+                    telemetryEvent: successEvent,
+                    at: now.addingTimeInterval(1)
+                )
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now.addingTimeInterval(2)
+                )
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "routes with repeated recent badness should quarantine after a lower adaptive threshold", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia telemetry can record hedge and winner attempt lanes", recorder: recorder) {
+            let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+                requestModel: "glm5",
+                canonicalModelID: "z-ai/glm5",
+                transportOutcome: "send_response",
+                attemptLane: 2,
+                failureClass: nil,
+                timeoutStage: .none,
+                upstreamHTTPStatus: 200,
+                retryCount: 0,
+                source: "live_request"
+            )
+            let winningEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                event,
+                winnerAttemptLane: 2
+            )
+
+            expectEqual(winningEvent.attemptLane, 2, "telemetry should preserve the attempt lane that produced the response", recorder: recorder)
+            expectEqual(winningEvent.winnerAttemptLane, 2, "telemetry should record which hedge lane ultimately won", recorder: recorder)
         }
 
         run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
