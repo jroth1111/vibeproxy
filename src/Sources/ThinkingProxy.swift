@@ -114,14 +114,30 @@ enum OpenAICompatTemporaryShim {
         let canonicalModelID: String
     }
 
+    enum RouteHealthStatus: String {
+        case closed = "closed"
+        case open = "open"
+        case halfOpen = "half_open"
+    }
+
     struct RouteCircuitState: Equatable {
-        let consecutiveFailures: Int
+        let status: RouteHealthStatus
+        let failureScore: Int
+        let recoverySuccesses: Int
         let openUntil: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
 
+        func isUnavailable(at now: Date) -> Bool {
+            switch status {
+            case .closed:
+                return false
+            case .open, .halfOpen:
+                return true
+            }
+        }
+
         func isOpen(at now: Date) -> Bool {
-            guard let openUntil else { return false }
-            return now < openUntil
+            isUnavailable(at: now)
         }
     }
 
@@ -134,10 +150,13 @@ enum OpenAICompatTemporaryShim {
     private struct RouteCircuitBreakerPolicy {
         let failureThreshold: Int
         let cooldown: TimeInterval
+        let recoverySuccessThreshold: Int
     }
 
     private struct PersistentRouteHealthEntry {
-        let consecutiveFailures: Int
+        let status: RouteHealthStatus
+        let failureScore: Int
+        let recoverySuccesses: Int
         let openUntil: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
     }
@@ -301,7 +320,8 @@ enum OpenAICompatTemporaryShim {
     private static var hasLoadedPersistedRouteHealth = false
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
         failureThreshold: 2,
-        cooldown: 300
+        cooldown: 300,
+        recoverySuccessThreshold: 2
     )
 
     private enum ToolCallValidation {
@@ -858,7 +878,7 @@ enum OpenAICompatTemporaryShim {
         return nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByCanonicalModelID.compactMap { canonicalModelID, state in
-                state.isOpen(at: now) ? canonicalModelID : nil
+                state.isUnavailable(at: now) ? canonicalModelID : nil
             }.sorted()
         }
     }
@@ -869,7 +889,7 @@ enum OpenAICompatTemporaryShim {
         }
         return nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            return routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.isOpen(at: now) ?? false
+            return routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.isUnavailable(at: now) ?? false
         }
     }
 
@@ -906,10 +926,10 @@ enum OpenAICompatTemporaryShim {
         }
         nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
-                consecutiveFailures: 0,
-                openUntil: nil,
-                lastTelemetryEvent: telemetryEvent ?? routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.lastTelemetryEvent
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextRouteCircuitStateAfterSuccess(
+                current: routeCircuitStatesByCanonicalModelID[route.canonicalModelID],
+                telemetryEvent: telemetryEvent,
+                policy: routeCircuitBreakerPolicy
             )
             persistRouteHealthLocked()
             if let telemetryEvent {
@@ -933,7 +953,9 @@ enum OpenAICompatTemporaryShim {
         nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
-                consecutiveFailures: routeCircuitBreakerPolicy.failureThreshold,
+                status: .open,
+                failureScore: routeCircuitBreakerPolicy.failureThreshold,
+                recoverySuccesses: 0,
                 openUntil: until,
                 lastTelemetryEvent: nil
             )
@@ -1090,18 +1112,101 @@ enum OpenAICompatTemporaryShim {
         policy: RouteCircuitBreakerPolicy? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
-        let currentFailures = current?.consecutiveFailures ?? 0
-        let nextFailures = currentFailures + 1
-        let shouldOpen = nextFailures >= effectivePolicy.failureThreshold
-        return RouteCircuitState(
-            consecutiveFailures: nextFailures,
-            openUntil: shouldOpen ? now.addingTimeInterval(effectivePolicy.cooldown) : nil,
-            lastTelemetryEvent: telemetryEvent ?? current?.lastTelemetryEvent
-        )
+        let failurePenalty = failurePenalty(for: telemetryEvent)
+        let lastTelemetryEvent = telemetryEvent ?? current?.lastTelemetryEvent
+
+        switch current?.status ?? .closed {
+        case .closed:
+            let nextFailureScore = min(
+                effectivePolicy.failureThreshold,
+                (current?.failureScore ?? 0) + failurePenalty
+            )
+            if nextFailureScore >= effectivePolicy.failureThreshold {
+                return RouteCircuitState(
+                    status: .open,
+                    failureScore: effectivePolicy.failureThreshold,
+                    recoverySuccesses: 0,
+                    openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
+                    lastTelemetryEvent: lastTelemetryEvent
+                )
+            }
+            return RouteCircuitState(
+                status: .closed,
+                failureScore: nextFailureScore,
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        case .open, .halfOpen:
+            return RouteCircuitState(
+                status: .open,
+                failureScore: effectivePolicy.failureThreshold,
+                recoverySuccesses: 0,
+                openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        }
     }
 
-    static func nextRouteCircuitStateAfterSuccess() -> RouteCircuitState {
-        RouteCircuitState(consecutiveFailures: 0, openUntil: nil, lastTelemetryEvent: nil)
+    private static func nextRouteCircuitStateAfterSuccess(
+        current: RouteCircuitState?,
+        telemetryEvent: RouteTelemetryEvent?,
+        policy: RouteCircuitBreakerPolicy? = nil
+    ) -> RouteCircuitState {
+        let effectivePolicy = policy ?? routeCircuitBreakerPolicy
+        let lastTelemetryEvent = telemetryEvent ?? current?.lastTelemetryEvent
+
+        switch current?.status ?? .closed {
+        case .closed:
+            return RouteCircuitState(
+                status: .closed,
+                failureScore: 0,
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        case .open:
+            return RouteCircuitState(
+                status: .halfOpen,
+                failureScore: 0,
+                recoverySuccesses: 1,
+                openUntil: nil,
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        case .halfOpen:
+            let nextRecoverySuccesses = (current?.recoverySuccesses ?? 0) + 1
+            if nextRecoverySuccesses >= effectivePolicy.recoverySuccessThreshold {
+                return RouteCircuitState(
+                    status: .closed,
+                    failureScore: 0,
+                    recoverySuccesses: 0,
+                    openUntil: nil,
+                    lastTelemetryEvent: lastTelemetryEvent
+                )
+            }
+            return RouteCircuitState(
+                status: .halfOpen,
+                failureScore: 0,
+                recoverySuccesses: nextRecoverySuccesses,
+                openUntil: nil,
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        }
+    }
+
+    private static func failurePenalty(for telemetryEvent: RouteTelemetryEvent?) -> Int {
+        guard let failureClass = telemetryEvent?.failureClass?.lowercased() else {
+            return 1
+        }
+
+        if failureClass == "transport_timeout" ||
+            failureClass == "transport_error" ||
+            failureClass == "missing_response_material" ||
+            failureClass.hasPrefix("classified_5") {
+            return 2
+        }
+
+        return 1
     }
 
     private static func loadPersistedRouteHealthIfNeededLocked() {
@@ -1118,11 +1223,17 @@ enum OpenAICompatTemporaryShim {
 
         var loaded: [String: RouteCircuitState] = [:]
         for (canonicalModelID, entry) in routes {
-            let consecutiveFailures = entry["consecutive_failures"] as? Int ?? 0
+            let status = (entry["status"] as? String)
+                .flatMap(RouteHealthStatus.init(rawValue:))
+                ?? ((parseISO8601Date(entry["open_until"]) != nil) ? .open : .closed)
+            let failureScore = entry["failure_score"] as? Int ?? entry["consecutive_failures"] as? Int ?? 0
+            let recoverySuccesses = entry["recovery_successes"] as? Int ?? 0
             let openUntil = parseISO8601Date(entry["open_until"])
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
             loaded[canonicalModelID] = RouteCircuitState(
-                consecutiveFailures: consecutiveFailures,
+                status: status,
+                failureScore: failureScore,
+                recoverySuccesses: recoverySuccesses,
                 openUntil: openUntil,
                 lastTelemetryEvent: lastTelemetryEvent
             )
@@ -1138,7 +1249,9 @@ enum OpenAICompatTemporaryShim {
         var routes: [String: [String: Any]] = [:]
         for (canonicalModelID, state) in routeCircuitStatesByCanonicalModelID {
             var entry: [String: Any] = [
-                "consecutive_failures": state.consecutiveFailures
+                "status": state.status.rawValue,
+                "failure_score": state.failureScore,
+                "recovery_successes": state.recoverySuccesses
             ]
             if let openUntil = state.openUntil {
                 entry["open_until"] = iso8601String(from: openUntil)
@@ -1407,9 +1520,10 @@ enum OpenAICompatTemporaryShim {
 
     private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
         let routes = configuredNVIDIARoutesByRequestModel()
-        let openCanonicalModelIDs = nvidiaRouteHealthQueue.sync {
-            Set(routeCircuitStatesByCanonicalModelID.compactMap { key, value in
-                value.isOpen(at: now) ? key : nil
+        let openCanonicalModelIDs: Set<String> = nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return Set(routeCircuitStatesByCanonicalModelID.compactMap { key, value in
+                value.isUnavailable(at: now) ? key : nil
             })
         }
         guard !openCanonicalModelIDs.isEmpty else {

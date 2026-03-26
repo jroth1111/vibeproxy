@@ -279,7 +279,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia route circuit opens after repeated failures and resets after success", recorder: recorder) {
+        run("temporary nvidia route circuit opens after repeated failures, enters half-open on first success, and closes after recovery threshold", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -293,7 +293,34 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "two failures should quarantine the route", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "a later success should clear the quarantine state", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "one success should only move the route into half-open recovery", recorder: recorder)
+
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first recovery success should transition to half-open", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open state should track recovery successes", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "recovery threshold successes should close the route again", recorder: recorder)
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "second recovery success should restore the healthy state", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(10))
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "a half-open failure should immediately reopen quarantine", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 0, "reopening should reset the recovery counter", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "half-open failure should keep the route unavailable", recorder: recorder)
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
             }
         }
@@ -396,8 +423,9 @@ struct ThinkingProxyPolicySpec {
 
                     let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     let persisted = snapshot["z-ai/glm5"]
-                    expectEqual(persisted?.consecutiveFailures ?? 0, 2, "persisted route health should retain consecutive failure count", recorder: recorder)
-                    expectEqual(persisted?.isOpen(at: now), true, "persisted route health should retain open-circuit state", recorder: recorder)
+                    expectEqual(persisted?.status, .open, "persisted route health should retain open-circuit state", recorder: recorder)
+                    expectEqual(persisted?.failureScore ?? 0, 2, "persisted route health should retain the failure score", recorder: recorder)
+                    expectEqual(persisted?.isUnavailable(at: now), true, "persisted route health should remain unavailable after reload", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent, event, "persisted route health should retain the last telemetry event", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
@@ -407,7 +435,8 @@ struct ThinkingProxyPolicySpec {
                     let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
                     let routes = rawJSON["routes"] as? [String: Any]
                     let glm5 = routes?["z-ai/glm5"] as? [String: Any]
-                    expectEqual(glm5?["consecutive_failures"] as? Int, 2, "persisted route-health file should store consecutive failures", recorder: recorder)
+                    expectEqual(glm5?["status"] as? String, "open", "persisted route-health file should store route status", recorder: recorder)
+                    expectEqual(glm5?["failure_score"] as? Int, 2, "persisted route-health file should store the failure score", recorder: recorder)
                 }
             }
         }
@@ -495,7 +524,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia canary success reopens quarantined routes and records canary telemetry", recorder: recorder) {
+        run("temporary nvidia canary success moves quarantined routes into half-open recovery before reopening", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
                     OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
@@ -539,17 +568,31 @@ struct ThinkingProxyPolicySpec {
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
                     expectEqual(seenRequestModel, "z-ai/glm5", "canary sweep should probe the quarantined canonical route exactly once", recorder: recorder)
-                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "successful canaries should reopen quarantined routes", recorder: recorder)
-                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                    let lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "one successful canary should keep the route unavailable while it is half-open", recorder: recorder)
+                    var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first successful canary should move the route into half-open recovery", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open recovery should count successful canaries", recorder: recorder)
+                    var lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "successful canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.outcome, "send_response", "successful canaries should record a successful runtime outcome", recorder: recorder)
+
+                    let secondSemaphore = DispatchSemaphore(value: 0)
+                    proxy.performNVIDIACanariesOnce {
+                        secondSemaphore.signal()
+                    }
+                    let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)
+                    expectEqual(secondWaitResult, .success, "second canary sweep should also complete promptly", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "recovery threshold successful canaries should reopen the route", recorder: recorder)
+                    snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "route should close after enough successful canaries", recorder: recorder)
+                    lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
+                    expectEqual(lastEvent?.source, "canary", "successful reopening should preserve the last canary telemetry event", recorder: recorder)
                     OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
                 }
             }
         }
 
-        run("temporary nvidia canary failures keep quarantined routes open and record canary telemetry", recorder: recorder) {
+        run("temporary nvidia canary failures reopen half-open routes and record canary telemetry", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
                     OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
@@ -560,8 +603,32 @@ struct ThinkingProxyPolicySpec {
                     )
 
                     let proxy = ThinkingProxy()
+                    var invocation = 0
                     proxy.nvidiaCanaryTransportForTesting = { _, _, completion in
-                        completion(nil, nil, URLError(.timedOut))
+                        invocation += 1
+                        if invocation == 1 {
+                            let body = Data("""
+                            {
+                              "choices": [
+                                {
+                                  "finish_reason": "stop",
+                                  "message": {
+                                    "content": "OK"
+                                  }
+                                }
+                              ]
+                            }
+                            """.utf8)
+                            let response = HTTPURLResponse(
+                                url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                                statusCode: 200,
+                                httpVersion: nil,
+                                headerFields: ["Content-Type": "application/json"]
+                            )
+                            completion(body, response, nil)
+                        } else {
+                            completion(nil, nil, URLError(.timedOut))
+                        }
                     }
 
                     let semaphore = DispatchSemaphore(value: 0)
@@ -569,12 +636,21 @@ struct ThinkingProxyPolicySpec {
                         semaphore.signal()
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
-                    expectEqual(waitResult, .success, "failing canary sweep should still complete promptly", recorder: recorder)
+                    expectEqual(waitResult, .success, "first canary sweep should complete promptly", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "first successful canary should still leave the route unavailable", recorder: recorder)
+
+                    let secondSemaphore = DispatchSemaphore(value: 0)
+                    proxy.performNVIDIACanariesOnce {
+                        secondSemaphore.signal()
+                    }
+                    let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)
+                    expectEqual(secondWaitResult, .success, "second failing canary sweep should still complete promptly", recorder: recorder)
                     expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "failed canaries should keep the route quarantined", recorder: recorder)
                     let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     let lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "failed canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.failureClass, "transport_error_retryable", "failed canaries should preserve the route failure class", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .open, "failed canaries after half-open recovery should reopen quarantine", recorder: recorder)
                     OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
                 }
             }
@@ -1484,20 +1560,31 @@ private func parseDataJSONObject(_ data: Data, recorder: FailureRecorder) -> [St
 }
 
 private func withMergedConfig(_ yaml: String, body: () -> Void) {
-    let key = "VIBEPROXY_MERGED_CONFIG_PATH"
+    let configKey = "VIBEPROXY_MERGED_CONFIG_PATH"
+    let routeHealthKey = "VIBEPROXY_NVIDIA_ROUTE_HEALTH_PATH"
     let fileManager = FileManager.default
     let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     let configPath = temporaryDirectory.appendingPathComponent("merged-config.yaml")
-    let previousValue = ProcessInfo.processInfo.environment[key]
+    let routeHealthPath = temporaryDirectory.appendingPathComponent("nvidia-route-health.json")
+    let previousConfigValue = ProcessInfo.processInfo.environment[configKey]
+    let previousRouteHealthValue = ProcessInfo.processInfo.environment[routeHealthKey]
 
     try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
     try? yaml.write(to: configPath, atomically: true, encoding: .utf8)
-    setenv(key, configPath.path, 1)
+    setenv(configKey, configPath.path, 1)
+    setenv(routeHealthKey, routeHealthPath.path, 1)
+    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
     defer {
-        if let previousValue {
-            setenv(key, previousValue, 1)
+        OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+        if let previousConfigValue {
+            setenv(configKey, previousConfigValue, 1)
         } else {
-            unsetenv(key)
+            unsetenv(configKey)
+        }
+        if let previousRouteHealthValue {
+            setenv(routeHealthKey, previousRouteHealthValue, 1)
+        } else {
+            unsetenv(routeHealthKey)
         }
         try? fileManager.removeItem(at: temporaryDirectory)
     }
