@@ -50,10 +50,14 @@ struct ConfigComposerSpec {
 
         run("applyManagedProviderPatches injects temporary NVIDIA providers without runtime policy shims", recorder: recorder) {
             let patched = ConfigComposer.applyManagedProviderPatches(to: [:])
+            let smartAliases = dictionary(patched["smart-aliases"])
+            let worker = dictionary(smartAliases["worker"])
 
             expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5", recorder: recorder)
+            expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "managed worker alias should prefer z.ai first and then the most reliable NVIDIA fallbacks", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 

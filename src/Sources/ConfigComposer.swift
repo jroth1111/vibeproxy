@@ -40,6 +40,14 @@ enum ConfigComposer {
             patchedRoot["openai-compatibility"] = patchedProviders
         }
 
+        let patchedSmartAliases = mergeManagedSmartAliasEntries(
+            base: stringKeyedDictionary(patchedRoot["smart-aliases"] as Any) ?? [:],
+            managed: defaultManagedSmartAliases()
+        )
+        if !patchedSmartAliases.isEmpty {
+            patchedRoot["smart-aliases"] = patchedSmartAliases
+        }
+
         return patchedRoot
     }
     
@@ -483,6 +491,21 @@ enum ConfigComposer {
         return mergedEntries
     }
 
+    private static func mergeManagedSmartAliasEntries(base: [String: Any], managed: [String: Any]) -> [String: Any] {
+        var merged = managed
+        for (key, value) in base {
+            let mergedValue: Any
+            if let baseEntry = stringKeyedDictionary(value),
+               let managedEntry = stringKeyedDictionary(merged[key] as Any) {
+                mergedValue = mergeDictionary(managedEntry, overlaidWith: baseEntry)
+            } else {
+                mergedValue = value
+            }
+            merged[key] = mergedValue
+        }
+        return merged
+    }
+
     private static func apiKeyEntries(from entry: [String: Any]) -> [[String: String]] {
         stringKeyedDictionaryArray(entry["api-key-entries"]).compactMap { keyEntry in
             guard let apiKey = normalizedString(keyEntry["api-key"]) else {
@@ -607,6 +630,16 @@ enum ConfigComposer {
                 "models": [
                     ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
                 ]
+            ]
+        ]
+    }
+
+    private static func defaultManagedSmartAliases() -> [String: Any] {
+        [
+            "worker": [
+                "request-class": "plain-chat",
+                "failover": "silent",
+                "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
             ]
         ]
     }
