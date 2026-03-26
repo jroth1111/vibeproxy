@@ -359,6 +359,227 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia route health persists quarantine state and telemetry across reload", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withRouteHealthPath { path in
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    let now = Date(timeIntervalSince1970: 1_700_000_000)
+                    let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm5",
+                        canonicalModelID: "z-ai/glm5",
+                        outcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .bufferedResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 1,
+                        source: "live_request"
+                    )
+
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                        forRequestModel: "glm5",
+                        telemetryEvent: event,
+                        at: now
+                    )
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                        forRequestModel: "glm5",
+                        telemetryEvent: event,
+                        at: now
+                    )
+
+                    guard FileManager.default.fileExists(atPath: path) else {
+                        recorder.recordFailure("expected persistent NVIDIA route-health cache file to be written")
+                        return
+                    }
+
+                    OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    let persisted = snapshot["z-ai/glm5"]
+                    expectEqual(persisted?.consecutiveFailures ?? 0, 2, "persisted route health should retain consecutive failure count", recorder: recorder)
+                    expectEqual(persisted?.isOpen(at: now), true, "persisted route health should retain open-circuit state", recorder: recorder)
+                    expectEqual(persisted?.lastTelemetryEvent, event, "persisted route health should retain the last telemetry event", recorder: recorder)
+
+                    guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                        recorder.recordFailure("expected to read persisted route-health cache file")
+                        return
+                    }
+                    let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
+                    let routes = rawJSON["routes"] as? [String: Any]
+                    let glm5 = routes?["z-ai/glm5"] as? [String: Any]
+                    expectEqual(glm5?["consecutive_failures"] as? Int, 2, "persisted route-health file should store consecutive failures", recorder: recorder)
+                }
+            }
+        }
+
+        run("temporary nvidia telemetry derives timeout-stage context from deadline-driven failures", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm5",
+                    initialTransportRetries: 1,
+                    initialSemanticRetries: 0,
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+
+                let event = OpenAICompatTemporaryShim.telemetryEvent(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: nil,
+                        response: nil,
+                        error: URLError(.timedOut),
+                        deadlineStage: .bufferedResponse
+                    ),
+                    outcome: .sendError(statusCode: 504, message: "Gateway Timeout"),
+                    source: "live_request"
+                )
+
+                expectEqual(event.requestModel, "glm5", "telemetry should preserve the request model alias", recorder: recorder)
+                expectEqual(event.canonicalModelID, "z-ai/glm5", "telemetry should resolve canonical NVIDIA model identity", recorder: recorder)
+                expectEqual(event.outcome, "send_error", "telemetry should encode the runtime outcome label", recorder: recorder)
+                expectEqual(event.failureClass, "transport_timeout", "deadline-driven transport failures should be labeled explicitly", recorder: recorder)
+                expectEqual(event.timeoutStage, .bufferedResponse, "telemetry should capture the deadline stage", recorder: recorder)
+                expectEqual(event.retryCount, 1, "telemetry should include retries already spent before the outcome", recorder: recorder)
+                expectNil(event.upstreamHTTPStatus, "transport-level failures should not claim an upstream HTTP status", recorder: recorder)
+                expectEqual(event.source, "live_request", "telemetry should preserve the event source", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia telemetry derives upstream status and retry counts from classified failures", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = Data("""
+                {
+                  "error": {
+                    "message": "Too Many Requests"
+                  }
+                }
+                """.utf8)
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                    statusCode: 429,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "kimi-k2.5",
+                    initialTransportRetries: 2,
+                    initialSemanticRetries: 1,
+                    transportRetriesRemaining: 1,
+                    semanticRetriesRemaining: 1,
+                    retryBackoffMilliseconds: 250,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+                let outcome = OpenAICompatTemporaryShim.NVIDIARuntimeOutcome.sendError(statusCode: 429, message: "Too Many Requests")
+                let event = OpenAICompatTemporaryShim.telemetryEvent(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: body,
+                        response: response,
+                        error: nil,
+                        deadlineStage: .none
+                    ),
+                    outcome: outcome,
+                    source: "live_request"
+                )
+
+                expectEqual(event.canonicalModelID, "moonshotai/kimi-k2.5", "telemetry should resolve the canonical Kimi model ID", recorder: recorder)
+                expectEqual(event.failureClass, "classified_429", "classified upstream failures should carry their normalized class", recorder: recorder)
+                expectEqual(event.upstreamHTTPStatus, 429, "telemetry should preserve the upstream HTTP status when available", recorder: recorder)
+                expectEqual(event.retryCount, 1, "telemetry should count prior transport retries", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia canary success reopens quarantined routes and records canary telemetry", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withRouteHealthPath { _ in
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                        requestModel: "glm5",
+                        until: Date().addingTimeInterval(60)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    var seenRequestModel: String?
+                    proxy.nvidiaCanaryTransportForTesting = { requestModel, requestJSON, completion in
+                        seenRequestModel = requestModel
+                        if !requestJSON.contains("\"model\": \"z-ai/glm5\"") {
+                            recorder.recordFailure("expected canary request JSON to target the quarantined canonical route")
+                        }
+                        let body = Data("""
+                        {
+                          "choices": [
+                            {
+                              "finish_reason": "stop",
+                              "message": {
+                                "content": "OK"
+                              }
+                            }
+                          ]
+                        }
+                        """.utf8)
+                        let response = HTTPURLResponse(
+                            url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                            statusCode: 200,
+                            httpVersion: nil,
+                            headerFields: ["Content-Type": "application/json"]
+                        )
+                        completion(body, response, nil)
+                    }
+
+                    let semaphore = DispatchSemaphore(value: 0)
+                    proxy.performNVIDIACanariesOnce {
+                        semaphore.signal()
+                    }
+                    let waitResult = semaphore.wait(timeout: .now() + 2)
+                    expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
+                    expectEqual(seenRequestModel, "z-ai/glm5", "canary sweep should probe the quarantined canonical route exactly once", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "successful canaries should reopen quarantined routes", recorder: recorder)
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    let lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
+                    expectEqual(lastEvent?.source, "canary", "successful canaries should record canary telemetry", recorder: recorder)
+                    expectEqual(lastEvent?.outcome, "send_response", "successful canaries should record a successful runtime outcome", recorder: recorder)
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("temporary nvidia canary failures keep quarantined routes open and record canary telemetry", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withRouteHealthPath { _ in
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(60)
+                    OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                        requestModel: "glm5",
+                        until: until
+                    )
+
+                    let proxy = ThinkingProxy()
+                    proxy.nvidiaCanaryTransportForTesting = { _, _, completion in
+                        completion(nil, nil, URLError(.timedOut))
+                    }
+
+                    let semaphore = DispatchSemaphore(value: 0)
+                    proxy.performNVIDIACanariesOnce {
+                        semaphore.signal()
+                    }
+                    let waitResult = semaphore.wait(timeout: .now() + 2)
+                    expectEqual(waitResult, .success, "failing canary sweep should still complete promptly", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "failed canaries should keep the route quarantined", recorder: recorder)
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    let lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
+                    expectEqual(lastEvent?.source, "canary", "failed canaries should record canary telemetry", recorder: recorder)
+                    expectEqual(lastEvent?.failureClass, "transport_error_retryable", "failed canaries should preserve the route failure class", recorder: recorder)
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                }
+            }
+        }
+
         run("temporary nvidia deadline tracker fires first-byte timeout before payload and buffered timeout after payload", recorder: recorder) {
             var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
 
@@ -501,6 +722,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 let initialState = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "minimax-m2.5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 1,
                     transportRetriesRemaining: 0,
                     semanticRetriesRemaining: 1,
                     retryBackoffMilliseconds: 250,
@@ -515,7 +738,7 @@ struct ThinkingProxyPolicySpec {
                         data: firstBody,
                         response: firstResponse,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -536,7 +759,7 @@ struct ThinkingProxyPolicySpec {
                         data: nil,
                         response: nil,
                         error: URLError(.timedOut),
-                        deadlineExceeded: true
+                        deadlineStage: .bufferedResponse
                     )
                 )
 
@@ -553,6 +776,8 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "glm5",
+                    initialTransportRetries: 1,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 1,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -567,7 +792,7 @@ struct ThinkingProxyPolicySpec {
                         data: nil,
                         response: nil,
                         error: URLError(.timedOut),
-                        deadlineExceeded: true
+                        deadlineStage: .bufferedResponse
                     )
                 )
 
@@ -601,6 +826,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "glm5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 0,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -615,7 +842,7 @@ struct ThinkingProxyPolicySpec {
                         data: body,
                         response: response,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -645,6 +872,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "glm5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 0,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -659,7 +888,7 @@ struct ThinkingProxyPolicySpec {
                         data: body,
                         response: response,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -683,6 +912,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "glm5",
+                    initialTransportRetries: 1,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 1,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -697,7 +928,7 @@ struct ThinkingProxyPolicySpec {
                         data: body,
                         response: response,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -733,6 +964,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "kimi-k2.5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 0,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -747,7 +980,7 @@ struct ThinkingProxyPolicySpec {
                         data: body,
                         response: response,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -769,6 +1002,8 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: "glm5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
                     transportRetriesRemaining: 0,
                     semanticRetriesRemaining: 0,
                     retryBackoffMilliseconds: 250,
@@ -783,7 +1018,7 @@ struct ThinkingProxyPolicySpec {
                         data: nil,
                         response: nil,
                         error: nil,
-                        deadlineExceeded: false
+                        deadlineStage: .none
                     )
                 )
 
@@ -1268,6 +1503,27 @@ private func withMergedConfig(_ yaml: String, body: () -> Void) {
     }
 
     body()
+}
+
+private func withRouteHealthPath(body: (String) -> Void) {
+    let key = "VIBEPROXY_NVIDIA_ROUTE_HEALTH_PATH"
+    let fileManager = FileManager.default
+    let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let statePath = temporaryDirectory.appendingPathComponent("nvidia-route-health.json")
+    let previousValue = ProcessInfo.processInfo.environment[key]
+
+    try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+    setenv(key, statePath.path, 1)
+    defer {
+        if let previousValue {
+            setenv(key, previousValue, 1)
+        } else {
+            unsetenv(key)
+        }
+        try? fileManager.removeItem(at: temporaryDirectory)
+    }
+
+    body(statePath.path)
 }
 
 private func defaultMergedConfigYAML() -> String {

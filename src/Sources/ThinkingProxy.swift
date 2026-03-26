@@ -25,12 +25,14 @@ enum OpenAICompatTemporaryShim {
         private(set) var hasReceivedPayload = false
         private(set) var deadlineExceeded = false
         private(set) var isFinished = false
+        private(set) var deadlineStage: DeadlineStage = .none
 
         mutating func firstResponseDeadlineDidFire() -> Bool {
             guard !hasReceivedPayload, !isFinished else {
                 return false
             }
             deadlineExceeded = true
+            deadlineStage = .firstResponse
             return true
         }
 
@@ -39,6 +41,7 @@ enum OpenAICompatTemporaryShim {
                 return false
             }
             deadlineExceeded = true
+            deadlineStage = .bufferedResponse
             return true
         }
 
@@ -64,8 +67,28 @@ enum OpenAICompatTemporaryShim {
         case returnGatewayError(statusCode: Int, message: String)
     }
 
+    enum DeadlineStage: String {
+        case none = "none"
+        case firstResponse = "first_response"
+        case bufferedResponse = "buffered_response"
+    }
+
+    struct RouteTelemetryEvent: Equatable {
+        let timestamp: Date
+        let requestModel: String
+        let canonicalModelID: String
+        let outcome: String
+        let failureClass: String?
+        let timeoutStage: DeadlineStage
+        let upstreamHTTPStatus: Int?
+        let retryCount: Int
+        let source: String
+    }
+
     struct NVIDIARetryState: Equatable {
         let model: String
+        let initialTransportRetries: Int
+        let initialSemanticRetries: Int
         var transportRetriesRemaining: Int
         var semanticRetriesRemaining: Int
         let retryBackoffMilliseconds: Int
@@ -77,7 +100,7 @@ enum OpenAICompatTemporaryShim {
         let data: Data?
         let response: HTTPURLResponse?
         let error: Error?
-        let deadlineExceeded: Bool
+        let deadlineStage: DeadlineStage
     }
 
     enum NVIDIARuntimeOutcome {
@@ -94,6 +117,7 @@ enum OpenAICompatTemporaryShim {
     struct RouteCircuitState: Equatable {
         let consecutiveFailures: Int
         let openUntil: Date?
+        let lastTelemetryEvent: RouteTelemetryEvent?
 
         func isOpen(at now: Date) -> Bool {
             guard let openUntil else { return false }
@@ -110,6 +134,12 @@ enum OpenAICompatTemporaryShim {
     private struct RouteCircuitBreakerPolicy {
         let failureThreshold: Int
         let cooldown: TimeInterval
+    }
+
+    private struct PersistentRouteHealthEntry {
+        let consecutiveFailures: Int
+        let openUntil: Date?
+        let lastTelemetryEvent: RouteTelemetryEvent?
     }
 
     private enum ClientStreamingMode {
@@ -268,6 +298,7 @@ enum OpenAICompatTemporaryShim {
     private static var cachedNVIDIARouteMap: CachedNVIDIARouteMap?
     private static let nvidiaRouteHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-route-health")
     private static var routeCircuitStatesByCanonicalModelID: [String: RouteCircuitState] = [:]
+    private static var hasLoadedPersistedRouteHealth = false
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
         failureThreshold: 2,
         cooldown: 300
@@ -599,7 +630,7 @@ enum OpenAICompatTemporaryShim {
     ) -> NVIDIARuntimeOutcome {
         if let error = attempt.error {
             let effectiveError: Error
-            if attempt.deadlineExceeded {
+            if attempt.deadlineStage != .none {
                 effectiveError = URLError(.timedOut)
             } else {
                 effectiveError = error
@@ -685,6 +716,105 @@ enum OpenAICompatTemporaryShim {
         )
     }
 
+    static func telemetryEvent(
+        path: String,
+        state: NVIDIARetryState,
+        attempt: NVIDIAAttemptResult,
+        outcome: NVIDIARuntimeOutcome,
+        source: String
+    ) -> RouteTelemetryEvent {
+        let canonicalModelID = resolveNVIDIAHostedRoute(forRequestModel: state.model)?.canonicalModelID ?? state.model
+        let retryCount = max(0, state.initialTransportRetries - state.transportRetriesRemaining) +
+            max(0, state.initialSemanticRetries - state.semanticRetriesRemaining)
+        let upstreamHTTPStatus = attempt.response?.statusCode
+
+        if let error = attempt.error {
+            let failureClass: String
+            if attempt.deadlineStage != .none {
+                failureClass = "transport_timeout"
+            } else if shouldRetryNvidiaReasoningTransport(error: error) {
+                failureClass = "transport_error_retryable"
+            } else {
+                failureClass = "transport_error"
+            }
+            return RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: state.model,
+                canonicalModelID: canonicalModelID,
+                outcome: outcomeTelemetryLabel(outcome),
+                failureClass: failureClass,
+                timeoutStage: attempt.deadlineStage,
+                upstreamHTTPStatus: upstreamHTTPStatus,
+                retryCount: retryCount,
+                source: source
+            )
+        }
+
+        if let response = attempt.response,
+           let bodyData = attempt.data,
+           let classifiedFailure = classifyUpstreamFailure(
+                model: state.model,
+                path: path,
+                statusCode: response.statusCode,
+                bodyData: bodyData
+           ) {
+            return RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: state.model,
+                canonicalModelID: canonicalModelID,
+                outcome: outcomeTelemetryLabel(outcome),
+                failureClass: "classified_\(classifiedFailure.statusCode)",
+                timeoutStage: attempt.deadlineStage,
+                upstreamHTTPStatus: response.statusCode,
+                retryCount: retryCount,
+                source: source
+            )
+        }
+
+        if let response = attempt.response,
+           let bodyData = attempt.data {
+            let evaluation = evaluateNvidiaReasoningResponse(
+                model: state.model,
+                statusCode: response.statusCode,
+                bodyData: bodyData
+            )
+            return RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: state.model,
+                canonicalModelID: canonicalModelID,
+                outcome: outcomeTelemetryLabel(outcome),
+                failureClass: evaluation.retryReason,
+                timeoutStage: attempt.deadlineStage,
+                upstreamHTTPStatus: response.statusCode,
+                retryCount: retryCount,
+                source: source
+            )
+        }
+
+        return RouteTelemetryEvent(
+            timestamp: Date(),
+            requestModel: state.model,
+            canonicalModelID: canonicalModelID,
+            outcome: outcomeTelemetryLabel(outcome),
+            failureClass: "missing_response_material",
+            timeoutStage: attempt.deadlineStage,
+            upstreamHTTPStatus: upstreamHTTPStatus,
+            retryCount: retryCount,
+            source: source
+        )
+    }
+
+    private static func outcomeTelemetryLabel(_ outcome: NVIDIARuntimeOutcome) -> String {
+        switch outcome {
+        case .retry:
+            return "retry"
+        case .sendResponse:
+            return "send_response"
+        case .sendError:
+            return "send_error"
+        }
+    }
+
     static func modelName(forRequestJSON jsonString: String) -> String? {
         guard let jsonData = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
@@ -724,44 +854,75 @@ enum OpenAICompatTemporaryShim {
         return filteredBody
     }
 
+    static func quarantinedNVIDIAHostedRequestModels(at now: Date = Date()) -> [String] {
+        return nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByCanonicalModelID.compactMap { canonicalModelID, state in
+                state.isOpen(at: now) ? canonicalModelID : nil
+            }.sorted()
+        }
+    }
+
     static func isNVIDIAHostedRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return false
         }
         return nvidiaRouteHealthQueue.sync {
-            routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.isOpen(at: now) ?? false
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.isOpen(at: now) ?? false
         }
     }
 
-    static func recordNVIDIAHostedRouteFailure(forRequestModel requestModel: String, at now: Date = Date()) {
+    static func recordNVIDIAHostedRouteFailure(
+        forRequestModel requestModel: String,
+        telemetryEvent: RouteTelemetryEvent? = nil,
+        at now: Date = Date()
+    ) {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return
         }
         nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByCanonicalModelID[route.canonicalModelID]
             routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextRouteCircuitState(
                 current: current,
                 afterFailureAt: now,
+                telemetryEvent: telemetryEvent,
                 policy: routeCircuitBreakerPolicy
             )
+            persistRouteHealthLocked()
+            if let telemetryEvent {
+                logNVIDIARouteTelemetry(telemetryEvent)
+            }
         }
     }
 
-    static func recordNVIDIAHostedRouteSuccess(forRequestModel requestModel: String) {
+    static func recordNVIDIAHostedRouteSuccess(
+        forRequestModel requestModel: String,
+        telemetryEvent: RouteTelemetryEvent? = nil
+    ) {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return
         }
         nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
             routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
                 consecutiveFailures: 0,
-                openUntil: nil
+                openUntil: nil,
+                lastTelemetryEvent: telemetryEvent ?? routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.lastTelemetryEvent
             )
+            persistRouteHealthLocked()
+            if let telemetryEvent {
+                logNVIDIARouteTelemetry(telemetryEvent)
+            }
         }
     }
 
     static func clearNVIDIAHostedRouteHealthForTesting() {
         nvidiaRouteHealthQueue.sync {
             routeCircuitStatesByCanonicalModelID = [:]
+            hasLoadedPersistedRouteHealth = true
+            persistRouteHealthLocked()
         }
     }
 
@@ -770,10 +931,28 @@ enum OpenAICompatTemporaryShim {
             return
         }
         nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
             routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = RouteCircuitState(
                 consecutiveFailures: routeCircuitBreakerPolicy.failureThreshold,
-                openUntil: until
+                openUntil: until,
+                lastTelemetryEvent: nil
             )
+            persistRouteHealthLocked()
+        }
+    }
+
+    static func routeHealthSnapshotForTesting() -> [String: RouteCircuitState] {
+        nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByCanonicalModelID
+        }
+    }
+
+    static func reloadPersistedRouteHealthForTesting() {
+        nvidiaRouteHealthQueue.sync {
+            hasLoadedPersistedRouteHealth = false
+            routeCircuitStatesByCanonicalModelID = [:]
+            loadPersistedRouteHealthIfNeededLocked()
         }
     }
 
@@ -907,6 +1086,7 @@ enum OpenAICompatTemporaryShim {
     private static func nextRouteCircuitState(
         current: RouteCircuitState?,
         afterFailureAt now: Date,
+        telemetryEvent: RouteTelemetryEvent?,
         policy: RouteCircuitBreakerPolicy? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
@@ -915,12 +1095,138 @@ enum OpenAICompatTemporaryShim {
         let shouldOpen = nextFailures >= effectivePolicy.failureThreshold
         return RouteCircuitState(
             consecutiveFailures: nextFailures,
-            openUntil: shouldOpen ? now.addingTimeInterval(effectivePolicy.cooldown) : nil
+            openUntil: shouldOpen ? now.addingTimeInterval(effectivePolicy.cooldown) : nil,
+            lastTelemetryEvent: telemetryEvent ?? current?.lastTelemetryEvent
         )
     }
 
     static func nextRouteCircuitStateAfterSuccess() -> RouteCircuitState {
-        RouteCircuitState(consecutiveFailures: 0, openUntil: nil)
+        RouteCircuitState(consecutiveFailures: 0, openUntil: nil, lastTelemetryEvent: nil)
+    }
+
+    private static func loadPersistedRouteHealthIfNeededLocked() {
+        guard !hasLoadedPersistedRouteHealth else { return }
+        hasLoadedPersistedRouteHealth = true
+        guard let path = routeHealthStatePath(),
+              FileManager.default.fileExists(atPath: path),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let routes = json["routes"] as? [String: [String: Any]] else {
+            routeCircuitStatesByCanonicalModelID = [:]
+            return
+        }
+
+        var loaded: [String: RouteCircuitState] = [:]
+        for (canonicalModelID, entry) in routes {
+            let consecutiveFailures = entry["consecutive_failures"] as? Int ?? 0
+            let openUntil = parseISO8601Date(entry["open_until"])
+            let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
+            loaded[canonicalModelID] = RouteCircuitState(
+                consecutiveFailures: consecutiveFailures,
+                openUntil: openUntil,
+                lastTelemetryEvent: lastTelemetryEvent
+            )
+        }
+        routeCircuitStatesByCanonicalModelID = loaded
+    }
+
+    private static func persistRouteHealthLocked() {
+        guard let path = routeHealthStatePath() else { return }
+        let directory = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+
+        var routes: [String: [String: Any]] = [:]
+        for (canonicalModelID, state) in routeCircuitStatesByCanonicalModelID {
+            var entry: [String: Any] = [
+                "consecutive_failures": state.consecutiveFailures
+            ]
+            if let openUntil = state.openUntil {
+                entry["open_until"] = iso8601String(from: openUntil)
+            }
+            if let lastTelemetryEvent = state.lastTelemetryEvent {
+                entry["last_event"] = telemetryEventDictionary(lastTelemetryEvent)
+            }
+            routes[canonicalModelID] = entry
+        }
+
+        let payload: [String: Any] = [
+            "version": 1,
+            "routes": routes
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    private static func routeHealthStatePath() -> String? {
+        if let overridePath = ProcessInfo.processInfo.environment["VIBEPROXY_NVIDIA_ROUTE_HEALTH_PATH"],
+           !overridePath.isEmpty {
+            return overridePath
+        }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(".cli-proxy-api/nvidia-route-health.json")
+    }
+
+    private static func telemetryEventDictionary(_ event: RouteTelemetryEvent) -> [String: Any] {
+        var dict: [String: Any] = [
+            "timestamp": iso8601String(from: event.timestamp),
+            "request_model": event.requestModel,
+            "canonical_model_id": event.canonicalModelID,
+            "outcome": event.outcome,
+            "timeout_stage": event.timeoutStage.rawValue,
+            "retry_count": event.retryCount,
+            "source": event.source
+        ]
+        if let failureClass = event.failureClass {
+            dict["failure_class"] = failureClass
+        }
+        if let upstreamHTTPStatus = event.upstreamHTTPStatus {
+            dict["upstream_http_status"] = upstreamHTTPStatus
+        }
+        return dict
+    }
+
+    private static func parseTelemetryEvent(_ rawValue: Any?) -> RouteTelemetryEvent? {
+        guard let dict = rawValue as? [String: Any],
+              let timestamp = parseISO8601Date(dict["timestamp"]),
+              let requestModel = dict["request_model"] as? String,
+              let canonicalModelID = dict["canonical_model_id"] as? String,
+              let outcome = dict["outcome"] as? String,
+              let timeoutStageRaw = dict["timeout_stage"] as? String,
+              let timeoutStage = DeadlineStage(rawValue: timeoutStageRaw),
+              let retryCount = dict["retry_count"] as? Int,
+              let source = dict["source"] as? String else {
+            return nil
+        }
+        return RouteTelemetryEvent(
+            timestamp: timestamp,
+            requestModel: requestModel,
+            canonicalModelID: canonicalModelID,
+            outcome: outcome,
+            failureClass: dict["failure_class"] as? String,
+            timeoutStage: timeoutStage,
+            upstreamHTTPStatus: dict["upstream_http_status"] as? Int,
+            retryCount: retryCount,
+            source: source
+        )
+    }
+
+    private static func parseISO8601Date(_ rawValue: Any?) -> Date? {
+        guard let string = rawValue as? String else { return nil }
+        return ISO8601DateFormatter().date(from: string)
+    }
+
+    private static func iso8601String(from date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
+
+    static func logNVIDIARouteTelemetry(_ event: RouteTelemetryEvent) {
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: telemetryEventDictionary(event), options: [.sortedKeys]),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            NSLog("[ThinkingProxy] NVIDIA route telemetry encode failed for %@", event.requestModel)
+            return
+        }
+        NSLog("[ThinkingProxy] NVIDIA route telemetry %@", jsonString)
     }
 
     private static func normalizedResponseBody(
@@ -1389,6 +1695,10 @@ class ThinkingProxy {
     private let targetHost = "127.0.0.1"
     private(set) var isRunning = false
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
+    private var nvidiaCanaryTimer: DispatchSourceTimer?
+    private let nvidiaCanaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-canary")
+    private var nvidiaCanarySweepInFlight = false
+    var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
     
@@ -1400,6 +1710,8 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let defaultMitigatedAttemptTimeout: TimeInterval = 30
+        static let nvidiaCanaryInterval: TimeInterval = 60
+        static let nvidiaCanaryTimeout: TimeInterval = 20
     }
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
@@ -1460,6 +1772,10 @@ class ThinkingProxy {
 
         func didExceedDeadline() -> Bool {
             stateQueue.sync { tracker.deadlineExceeded }
+        }
+
+        func currentDeadlineStage() -> OpenAICompatTemporaryShim.DeadlineStage {
+            stateQueue.sync { tracker.deadlineStage }
         }
 
         private func markPayloadReceived() {
@@ -1531,6 +1847,7 @@ class ThinkingProxy {
             }
             
             listener?.start(queue: .global(qos: .userInitiated))
+            startNVIDIACanaryLoop()
             
         } catch {
             NSLog("[ThinkingProxy] Failed to start: \(error)")
@@ -1546,6 +1863,7 @@ class ThinkingProxy {
             
             listener?.cancel()
             listener = nil
+            stopNVIDIACanaryLoop()
             DispatchQueue.main.async { [weak self] in
                 self?.isRunning = false
             }
@@ -1760,6 +2078,8 @@ class ThinkingProxy {
                 originalConnection: connection,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: model,
+                    initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
@@ -2048,12 +2368,25 @@ class ThinkingProxy {
                     data: data,
                     response: response as? HTTPURLResponse,
                     error: error,
-                    deadlineExceeded: responseProgress.didExceedDeadline()
+                    deadlineStage: responseProgress.currentDeadlineStage()
                 )
+            )
+            let telemetryEvent = OpenAICompatTemporaryShim.telemetryEvent(
+                path: path,
+                state: state,
+                attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                    data: data,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    deadlineStage: responseProgress.currentDeadlineStage()
+                ),
+                outcome: outcome,
+                source: "live_request"
             )
 
             switch outcome {
             case .retry(let nextState):
+                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
                 self.scheduleNvidiaReasoningRetry(
                     method: method,
                     path: path,
@@ -2064,7 +2397,7 @@ class ThinkingProxy {
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model)
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model, telemetryEvent: telemetryEvent)
                 }
                 self.sendHTTPResponse(
                     to: originalConnection,
@@ -2074,7 +2407,9 @@ class ThinkingProxy {
                 )
             case .sendError(let statusCode, let message):
                 if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model)
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                } else {
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
                 }
                 self.sendError(
                     to: originalConnection,
@@ -2135,6 +2470,160 @@ class ThinkingProxy {
                 body: filteredBody
             )
         }.resume()
+    }
+
+    private func startNVIDIACanaryLoop() {
+        stateQueue.sync {
+            guard nvidiaCanaryTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: nvidiaCanaryQueue)
+            timer.schedule(deadline: .now() + Config.nvidiaCanaryInterval, repeating: Config.nvidiaCanaryInterval)
+            timer.setEventHandler { [weak self] in
+                self?.performNVIDIACanariesOnce()
+            }
+            nvidiaCanaryTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func stopNVIDIACanaryLoop() {
+        stateQueue.sync {
+            nvidiaCanaryTimer?.cancel()
+            nvidiaCanaryTimer = nil
+            nvidiaCanarySweepInFlight = false
+        }
+    }
+
+    func performNVIDIACanariesOnce(completion: (() -> Void)? = nil) {
+        let shouldStart = stateQueue.sync { () -> Bool in
+            guard !nvidiaCanarySweepInFlight else { return false }
+            nvidiaCanarySweepInFlight = true
+            return true
+        }
+        guard shouldStart else {
+            completion?()
+            return
+        }
+
+        let requestModels = OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
+        guard !requestModels.isEmpty else {
+            stateQueue.sync { nvidiaCanarySweepInFlight = false }
+            completion?()
+            return
+        }
+
+        runNVIDIACanary(at: 0, requestModels: requestModels) { [weak self] in
+            self?.stateQueue.sync { self?.nvidiaCanarySweepInFlight = false }
+            completion?()
+        }
+    }
+
+    private func runNVIDIACanary(at index: Int, requestModels: [String], completion: @escaping () -> Void) {
+        guard index < requestModels.count else {
+            completion()
+            return
+        }
+
+        let requestModel = requestModels[index]
+        let requestJSON = nvidiaCanaryRequestJSON(forRequestModel: requestModel)
+        let transformedJSON = OpenAICompatTemporaryShim.transformRequest(
+            method: "POST",
+            path: "/v1/chat/completions",
+            jsonString: requestJSON
+        ) ?? requestJSON
+
+        sendNVIDIACanaryRequest(requestModel: requestModel, requestJSON: transformedJSON) { [weak self] data, response, error in
+            guard let self else { return }
+            let canaryState = OpenAICompatTemporaryShim.NVIDIARetryState(
+                model: requestModel,
+                initialTransportRetries: 0,
+                initialSemanticRetries: 0,
+                transportRetriesRemaining: 0,
+                semanticRetriesRemaining: 0,
+                retryBackoffMilliseconds: 0,
+                salvagesBestEffortRepair: false,
+                bestEffortRepairedBodyData: nil
+            )
+            let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                data: data,
+                response: response,
+                error: error,
+                deadlineStage: .none
+            )
+            let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                path: "/v1/chat/completions",
+                state: canaryState,
+                attempt: attempt
+            )
+            let telemetryEvent = OpenAICompatTemporaryShim.telemetryEvent(
+                path: "/v1/chat/completions",
+                state: canaryState,
+                attempt: attempt,
+                outcome: outcome,
+                source: "canary"
+            )
+
+            switch outcome {
+            case .sendResponse(let statusCode, _, _):
+                if statusCode >= 200 && statusCode < 300 {
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                        forRequestModel: requestModel,
+                        telemetryEvent: telemetryEvent
+                    )
+                } else {
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                        forRequestModel: requestModel,
+                        telemetryEvent: telemetryEvent
+                    )
+                }
+            case .retry, .sendError:
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: requestModel,
+                    telemetryEvent: telemetryEvent
+                )
+            }
+
+            self.runNVIDIACanary(at: index + 1, requestModels: requestModels, completion: completion)
+        }
+    }
+
+    private func sendNVIDIACanaryRequest(
+        requestModel: String,
+        requestJSON: String,
+        completion: @escaping (Data?, HTTPURLResponse?, Error?) -> Void
+    ) {
+        if let nvidiaCanaryTransportForTesting {
+            nvidiaCanaryTransportForTesting(requestModel, requestJSON, completion)
+            return
+        }
+
+        guard let url = URL(string: "http://\(targetHost):\(targetPort)/v1/chat/completions") else {
+            completion(nil, nil, URLError(.badURL))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = Data(requestJSON.utf8)
+        request.timeoutInterval = Config.nvidiaCanaryTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("close", forHTTPHeaderField: "Connection")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            completion(data, response as? HTTPURLResponse, error)
+        }.resume()
+    }
+
+    private func nvidiaCanaryRequestJSON(forRequestModel requestModel: String) -> String {
+        """
+        {
+          "model": "\(requestModel)",
+          "messages": [
+            {"role": "user", "content": "Return exactly: OK"}
+          ],
+          "max_tokens": 32,
+          "stream": false
+        }
+        """
     }
 
     private func scheduleNvidiaReasoningRetry(
