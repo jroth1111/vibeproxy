@@ -623,8 +623,8 @@ struct ThinkingProxyPolicySpec {
             expectEqual(proxy.inflightNVIDIAWaiterCount(for: key), 0, "taking the slot should clear the coalescing registry", recorder: recorder)
         }
 
-        run("temporary nvidia fallback chains are config-driven and skip quarantined fallback models", recorder: recorder) {
-            withMergedConfig(fallbackMergedConfigYAML()) {
+        run("temporary worker smart alias is config-driven and skips quarantined fallback models", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
                 OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
                     requestModel: "kimi-k2.5",
@@ -632,29 +632,348 @@ struct ThinkingProxyPolicySpec {
                 )
                 let request = """
                 {
-                  "model": "glm5",
+                  "model": "worker",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}],
                   "stream": false
                 }
                 """
 
-                expectEqual(
-                    OpenAICompatTemporaryShim.fallbackChain(forRequestModel: "glm5"),
-                    ["kimi-k2.5", "minimax-m2.5"],
-                    "fallback chains should load from merged config instead of being hardcoded",
-                    recorder: recorder
-                )
+                let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
+                expectEqual(smartAlias?.candidates, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should load its candidate order from merged config", recorder: recorder)
 
-                let transition = OpenAICompatTemporaryShim.nextFallbackRequestTransition(
+                let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                    publicAlias: "worker",
                     method: "POST",
                     path: "/v1/chat/completions",
                     currentBody: request,
-                    fallbackModelsRemaining: ["kimi-k2.5", "minimax-m2.5"]
+                    candidateModelsRemaining: ["kimi-k2.5", "minimax-m2.5"]
                 )
 
                 expectEqual(transition?.model, "minimax-m2.5", "fallback planning should skip quarantined fallback routes and pick the next viable alias", recorder: recorder)
                 let rewritten = parseJSONObject(transition?.body, recorder: recorder)
                 expectEqual(rewritten["model"] as? String, "minimax-m2.5", "fallback planning should rewrite the request model to the chosen fallback alias", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary worker smart alias rejects streaming, tools, and structured output requests", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "stream": true,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker preflight should return an error response")
+                    return
+                }
+                expectEqual(deliveredStatus, 501, "worker should fail closed for unsupported request classes", recorder: recorder)
+                expectEqual(
+                    deliveredMessage?.contains("only supports non-streaming plain chat"),
+                    true,
+                    "worker rejection should explain the supported request class",
+                    recorder: recorder
+                )
+            }
+        }
+
+        run("temporary worker smart alias silently fails over from z.ai to nvidia and preserves the outward alias", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+                var seenModels: [String] = []
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer { OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil }
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-test",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker failover should eventually return a successful response")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5"], "worker should try z.ai first and then fail over to the next configured candidate", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should return the fallback candidate's success response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker responses should preserve the outward alias instead of leaking the winner model", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "route health should track non-NVIDIA worker candidates so the pool can quarantine flaky primaries", recorder: recorder)
+
+                let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5-turbo" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "minimax-m2.5" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "minimax-m2.5" }), true, "worker telemetry should record the winning fallback candidate and final winner", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias coalesces duplicate safe requests behind one upstream sequence", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let secondConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var transportInvocationCount = 0
+                var deliveredResponseCount = 0
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, completion in
+                    lock.lock()
+                    transportInvocationCount += 1
+                    lock.unlock()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-coalesced",
+                                  "object": "chat.completion",
+                                  "model": "glm-5-turbo",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    lock.lock()
+                    deliveredResponseCount += 1
+                    let shouldSignal = deliveredResponseCount == 2
+                    lock.unlock()
+                    if shouldSignal {
+                        delivered.signal()
+                    }
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+                let rawRequest = rawHTTPRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    body: requestJSON
+                )
+
+                proxy.processRequestForTesting(rawRequest, connection: firstConnection)
+                proxy.processRequestForTesting(rawRequest, connection: secondConnection)
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("coalesced worker requests should deliver one upstream winner to both waiters")
+                    return
+                }
+
+                expectEqual(transportInvocationCount, 1, "duplicate worker requests should share one upstream request sequence", recorder: recorder)
+                expectEqual(deliveredResponseCount, 2, "coalesced worker requests should fan out the winner to both waiting callers", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias returns one clean 503 when every candidate fails", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should return a final error when all candidates fail")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(deliveredStatus, 503, "worker should return one clean 503 when no configured candidate is usable", recorder: recorder)
+                expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "worker should emit a stable final failure message after exhausting the pool", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias is injected into /v1/models only while at least one candidate is healthy", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let body = """
+                {
+                  "object": "list",
+                  "data": [
+                    {"id": "glm-5-turbo", "object": "model", "owned_by": "zai"},
+                    {"id": "minimax-m2.5", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"}
+                  ]
+                }
+                """
+
+                guard let injected = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
+                    recorder.recordFailure("worker should be injected into /v1/models when at least one candidate is healthy")
+                    return
+                }
+                let injectedJSON = parseDataJSONObject(injected, recorder: recorder)
+                let injectedIDs = ((injectedJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
+                expectEqual(injectedIDs.contains("worker"), true, "worker should appear in /v1/models when any candidate is available", recorder: recorder)
+
+                let until = Date().addingTimeInterval(60)
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "glm-5-turbo", until: until)
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "minimax-m2.5", until: until)
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "kimi-k2.5", until: until)
+
+                guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
+                    recorder.recordFailure("filtered /v1/models should still be materialized after every worker candidate is quarantined")
+                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    return
+                }
+                let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
+                let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
+                expectEqual(filteredIDs.contains("worker"), false, "worker should disappear from /v1/models when every candidate is unavailable", recorder: recorder)
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
             }
         }
@@ -789,7 +1108,7 @@ struct ThinkingProxyPolicySpec {
                     }
                     let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
                     let routes = rawJSON["routes"] as? [String: Any]
-                    let glm5 = routes?["z-ai/glm5"] as? [String: Any]
+                    let glm5 = routes?["nvidia::z-ai/glm5"] as? [String: Any]
                     expectEqual(glm5?["status"] as? String, "open", "persisted route-health file should store route status", recorder: recorder)
                     expectEqual(glm5?["failure_score"] as? Int, 2, "persisted route-health file should store the failure score", recorder: recorder)
                     let lastEvent = glm5?["last_event"] as? [String: Any]
@@ -1921,11 +2240,11 @@ private func parseDataJSONObject(_ data: Data, recorder: FailureRecorder) -> [St
 
 private func withMergedConfig(_ yaml: String, body: () -> Void) {
     let configKey = "VIBEPROXY_MERGED_CONFIG_PATH"
-    let routeHealthKey = "VIBEPROXY_NVIDIA_ROUTE_HEALTH_PATH"
+    let routeHealthKey = "VIBEPROXY_ROUTE_HEALTH_PATH"
     let fileManager = FileManager.default
     let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     let configPath = temporaryDirectory.appendingPathComponent("merged-config.yaml")
-    let routeHealthPath = temporaryDirectory.appendingPathComponent("nvidia-route-health.json")
+    let routeHealthPath = temporaryDirectory.appendingPathComponent("route-health.json")
     let previousConfigValue = ProcessInfo.processInfo.environment[configKey]
     let previousRouteHealthValue = ProcessInfo.processInfo.environment[routeHealthKey]
 
@@ -1953,10 +2272,10 @@ private func withMergedConfig(_ yaml: String, body: () -> Void) {
 }
 
 private func withRouteHealthPath(body: (String) -> Void) {
-    let key = "VIBEPROXY_NVIDIA_ROUTE_HEALTH_PATH"
+    let key = "VIBEPROXY_ROUTE_HEALTH_PATH"
     let fileManager = FileManager.default
     let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let statePath = temporaryDirectory.appendingPathComponent("nvidia-route-health.json")
+    let statePath = temporaryDirectory.appendingPathComponent("route-health.json")
     let previousValue = ProcessInfo.processInfo.environment[key]
 
     try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
@@ -2009,18 +2328,25 @@ private func renamedAliasMergedConfigYAML() -> String {
     ].joined(separator: "\n")
 }
 
-private func fallbackMergedConfigYAML() -> String {
+private func workerMergedConfigYAML() -> String {
     [
-        "nvidia-fallback-chains:",
-        "  glm5:",
-        "    - kimi-k2.5",
-        "    - minimax-m2.5",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "      - glm-5-turbo",
+        "      - minimax-m2.5",
+        "      - kimi-k2.5",
         "openai-compatibility:",
+        "- name: zai",
+        "  base-url: https://api.z.ai/api/coding/paas/v4",
+        "  models:",
+        "  - alias: glm-5-turbo",
+        "    name: glm-5-turbo",
         "- name: nvidia",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: glm5",
-        "    name: z-ai/glm5",
         "  - alias: kimi-k2.5",
         "    name: moonshotai/kimi-k2.5",
         "- name: nvidia-minimax",
@@ -2029,4 +2355,25 @@ private func fallbackMergedConfigYAML() -> String {
         "  - alias: minimax-m2.5",
         "    name: minimaxai/minimax-m2.5"
     ].joined(separator: "\n")
+}
+
+private func rawHTTPRequest(method: String, path: String, body: String) -> String {
+    let bodyData = Data(body.utf8)
+    return [
+        "\(method) \(path) HTTP/1.1",
+        "Host: 127.0.0.1:8317",
+        "Content-Type: application/json",
+        "Content-Length: \(bodyData.count)",
+        "",
+        body
+    ].joined(separator: "\r\n")
+}
+
+private func httpURLResponse(statusCode: Int) -> HTTPURLResponse {
+    HTTPURLResponse(
+        url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+        statusCode: statusCode,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "application/json"]
+    )!
 }
