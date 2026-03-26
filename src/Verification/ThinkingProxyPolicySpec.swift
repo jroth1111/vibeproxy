@@ -265,6 +265,8 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 200, "minimax should keep the long per-attempt timeout", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 25, "glm5 should fail closed on first-byte stalls", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 25, "minimax should also guard first-byte stalls", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 28, "glm5 should bound the full buffered response time", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 28, "minimax should also bound the full buffered response time", recorder: recorder)
 
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
                 let minimaxBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: minimaxRequest)
@@ -295,6 +297,32 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(classification?.statusCode ?? 0, 503, "function-not-found outages should surface as provider unavailability", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia glm5 shim retries empty-content successes instead of forwarding them", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": null
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectEqual(evaluation.retryReason, "empty_content", "glm5 should fail closed on blank 200 responses instead of forwarding them", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "blank glm5 successes should not be auto-repaired", recorder: recorder)
             }
         }
 

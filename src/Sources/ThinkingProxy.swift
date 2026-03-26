@@ -56,9 +56,10 @@ enum OpenAICompatTemporaryShim {
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
+            bufferedResponseDeadline: 28,
             transportRetries: 0,
             semanticRetries: 1,
-            retryableFailureClasses: [.malformedToolArguments],
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
             allowsThinkLeakRepair: false,
@@ -72,9 +73,10 @@ enum OpenAICompatTemporaryShim {
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
+            bufferedResponseDeadline: 28,
             transportRetries: 0,
             semanticRetries: 2,
-            retryableFailureClasses: [.emptyContent, .reasoningOnlyContentMissing, .malformedToolArguments],
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
             allowsThinkLeakRepair: false,
@@ -88,9 +90,10 @@ enum OpenAICompatTemporaryShim {
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
+            bufferedResponseDeadline: 28,
             transportRetries: 0,
             semanticRetries: 2,
-            retryableFailureClasses: [.emptyContent, .reasoningLeakLength, .malformedToolArguments],
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
             allowsThinkLeakRepair: true,
@@ -106,6 +109,7 @@ enum OpenAICompatTemporaryShim {
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -122,6 +126,7 @@ enum OpenAICompatTemporaryShim {
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -138,6 +143,7 @@ enum OpenAICompatTemporaryShim {
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -156,6 +162,7 @@ enum OpenAICompatTemporaryShim {
         let strippedFields: Set<String>
         let attemptTimeout: TimeInterval?
         let firstResponseDeadline: TimeInterval?
+        let bufferedResponseDeadline: TimeInterval?
         let transportRetries: Int
         let semanticRetries: Int
         let retryableFailureClasses: Set<FailureClass>
@@ -423,6 +430,10 @@ enum OpenAICompatTemporaryShim {
 
     static func firstResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
+    }
+
+    static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
+        policy(forRequestJSON: jsonString)?.bufferedResponseDeadline
     }
 
     static func retryBudget(forRequestJSON jsonString: String) -> (transport: Int, semantic: Int, backoffMilliseconds: Int, salvagesBestEffortRepair: Bool)? {
@@ -1050,41 +1061,66 @@ class ThinkingProxy {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
         private var hasReceivedPayload = false
         private var deadlineExceeded = false
-        private var deadlineWorkItem: DispatchWorkItem?
+        private var isFinished = false
+        private var firstResponseDeadlineWorkItem: DispatchWorkItem?
+        private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
 
-        func installFirstResponseDeadline(
-            seconds: TimeInterval?,
+        func installDeadlines(
+            firstResponseSeconds: TimeInterval?,
+            bufferedResponseSeconds: TimeInterval?,
             for task: URLSessionTask
         ) {
-            guard let seconds, seconds > 0 else {
-                return
-            }
-
-            let workItem = DispatchWorkItem { [weak self, weak task] in
-                guard let self else { return }
-                let shouldCancel = self.stateQueue.sync { () -> Bool in
-                    guard !self.hasReceivedPayload else {
-                        return false
+            if let firstResponseSeconds, firstResponseSeconds > 0 {
+                let workItem = DispatchWorkItem { [weak self, weak task] in
+                    guard let self else { return }
+                    let shouldCancel = self.stateQueue.sync { () -> Bool in
+                        guard !self.hasReceivedPayload, !self.isFinished else {
+                            return false
+                        }
+                        self.deadlineExceeded = true
+                        return true
                     }
-                    self.deadlineExceeded = true
-                    return true
+                    if shouldCancel {
+                        task?.cancel()
+                    }
                 }
-                if shouldCancel {
-                    task?.cancel()
+
+                stateQueue.sync {
+                    firstResponseDeadlineWorkItem = workItem
                 }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + firstResponseSeconds, execute: workItem)
             }
 
-            stateQueue.sync {
-                deadlineWorkItem = workItem
+            if let bufferedResponseSeconds, bufferedResponseSeconds > 0 {
+                let workItem = DispatchWorkItem { [weak self, weak task] in
+                    guard let self else { return }
+                    let shouldCancel = self.stateQueue.sync { () -> Bool in
+                        guard !self.isFinished else {
+                            return false
+                        }
+                        self.deadlineExceeded = true
+                        return true
+                    }
+                    if shouldCancel {
+                        task?.cancel()
+                    }
+                }
+
+                stateQueue.sync {
+                    bufferedResponseDeadlineWorkItem = workItem
+                }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + bufferedResponseSeconds, execute: workItem)
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: workItem)
         }
 
         func finish() {
             stateQueue.sync {
+                isFinished = true
                 hasReceivedPayload = true
-                deadlineWorkItem?.cancel()
-                deadlineWorkItem = nil
+                firstResponseDeadlineWorkItem?.cancel()
+                bufferedResponseDeadlineWorkItem?.cancel()
+                firstResponseDeadlineWorkItem = nil
+                bufferedResponseDeadlineWorkItem = nil
             }
         }
 
@@ -1095,8 +1131,8 @@ class ThinkingProxy {
         private func markPayloadReceived() {
             stateQueue.sync {
                 hasReceivedPayload = true
-                deadlineWorkItem?.cancel()
-                deadlineWorkItem = nil
+                firstResponseDeadlineWorkItem?.cancel()
+                firstResponseDeadlineWorkItem = nil
             }
         }
 
@@ -1833,8 +1869,9 @@ class ThinkingProxy {
                 body: responseBodyData
             )
         }
-        responseProgress.installFirstResponseDeadline(
-            seconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+        responseProgress.installDeadlines(
+            firstResponseSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body),
             for: task
         )
         task.resume()
