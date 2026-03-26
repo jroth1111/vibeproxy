@@ -7,117 +7,165 @@ enum OpenAICompatTemporaryShim {
         let message: String
     }
 
-    private struct CachedNVIDIAAliasMap {
-        let configPath: String?
-        let modificationDate: Date?
-        let aliasesByModel: [String: String]
+    struct NvidiaReasoningEvaluation {
+        let failureClass: FailureClass?
+        let repairedBodyData: Data?
+        let normalizedBodyData: Data?
+
+        var retryReason: String? {
+            failureClass?.rawValue
+        }
+
+        var shouldRetry: Bool {
+            failureClass != nil
+        }
     }
 
-    private static let genericNvidiaFallbackPolicy = RequestPolicy(
-        responseProfile: .genericSanity,
-        minimumMaxTokens: nil,
-        strippedFields: ["reasoning_effort", "frequency_penalty", "presence_penalty", "ignore_eos"],
-        attemptTimeout: 200,
-        firstResponseDeadline: 25,
-        transportRetries: 0,
-        semanticRetries: 2,
-        retryBackoffMilliseconds: 250,
-        stripsReasoningFieldFromSuccess: true,
-        salvagesBestEffortRepair: true
-    )
-    private static let nvidiaReasoningModelPolicies: [String: RequestPolicy] = [
-        "glm5": RequestPolicy(
-            responseProfile: .transportOnly,
+    struct NVIDIARouteIdentity: Equatable {
+        let providerID: String
+        let canonicalModelID: String
+    }
+
+    private struct CachedNVIDIARouteMap {
+        let configPath: String?
+        let modificationDate: Date?
+        let routesByRequestModel: [String: NVIDIARouteIdentity]
+    }
+
+    private enum ClientStreamingMode {
+        case preserve
+        case rejectBufferedMitigation
+    }
+
+    private enum ToolChoiceMode {
+        case preserve
+        case rejectRequiredOrFunctionChoice
+    }
+
+    enum FailureClass: String, Hashable {
+        case emptyBody = "empty_body"
+        case emptyContent = "empty_content"
+        case reasoningOnlyContentMissing = "reasoning_only_content_missing"
+        case reasoningLeakLength = "reasoning_leak_length"
+        case malformedToolArguments = "malformed_tool_arguments"
+    }
+
+    private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = [
+        "z-ai/glm5": RequestPolicy(
             minimumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
             transportRetries: 0,
-            semanticRetries: 0,
+            semanticRetries: 1,
+            retryableFailureClasses: [.malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
-            salvagesBestEffortRepair: false
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .rejectBufferedMitigation,
+            toolChoiceMode: .rejectRequiredOrFunctionChoice,
+            forcesKimiInstantMode: false
         ),
-        "kimi-k2.5": RequestPolicy(
-            responseProfile: .kimiReasoningOnly,
+        "moonshotai/kimi-k2.5": RequestPolicy(
             minimumMaxTokens: 384,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
             transportRetries: 0,
             semanticRetries: 2,
+            retryableFailureClasses: [.emptyContent, .reasoningOnlyContentMissing, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
-            salvagesBestEffortRepair: false
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .rejectBufferedMitigation,
+            toolChoiceMode: .rejectRequiredOrFunctionChoice,
+            forcesKimiInstantMode: true
         ),
-        "minimax-m2.5": RequestPolicy(
-            responseProfile: .minimaxThinkLeak,
+        "minimaxai/minimax-m2.5": RequestPolicy(
             minimumMaxTokens: 128,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
             firstResponseDeadline: 25,
             transportRetries: 0,
             semanticRetries: 2,
+            retryableFailureClasses: [.emptyContent, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
-            salvagesBestEffortRepair: true
-        ),
+            allowsThinkLeakRepair: true,
+            salvagesBestEffortRepair: true,
+            clientStreamingMode: .rejectBufferedMitigation,
+            toolChoiceMode: .rejectRequiredOrFunctionChoice,
+            forcesKimiInstantMode: false
+        )
+    ]
+    private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
-            responseProfile: .genericSanity,
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: false,
-            salvagesBestEffortRepair: false
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
         ),
         "glm-5": RequestPolicy(
-            responseProfile: .genericSanity,
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: false,
-            salvagesBestEffortRepair: false
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
         ),
         "glm-5-turbo": RequestPolicy(
-            responseProfile: .genericSanity,
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: false,
-            salvagesBestEffortRepair: false
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
         )
     ]
 
-    private enum ResponseProfile {
-        case transportOnly
-        case kimiReasoningOnly
-        case minimaxThinkLeak
-        case genericSanity
-    }
-
     private struct RequestPolicy {
-        let responseProfile: ResponseProfile
         let minimumMaxTokens: Int?
         let strippedFields: Set<String>
         let attemptTimeout: TimeInterval?
         let firstResponseDeadline: TimeInterval?
         let transportRetries: Int
         let semanticRetries: Int
+        let retryableFailureClasses: Set<FailureClass>
         let retryBackoffMilliseconds: Int
         let stripsReasoningFieldFromSuccess: Bool
+        let allowsThinkLeakRepair: Bool
         let salvagesBestEffortRepair: Bool
+        let clientStreamingMode: ClientStreamingMode
+        let toolChoiceMode: ToolChoiceMode
+        let forcesKimiInstantMode: Bool
     }
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
     private static let retryableTransportErrorCodes: Set<Int> = [
@@ -130,22 +178,12 @@ enum OpenAICompatTemporaryShim {
         URLError.Code.resourceUnavailable.rawValue
     ]
     private static let nvidiaAliasCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-alias-cache")
-    private static var cachedNVIDIAAliasMap: CachedNVIDIAAliasMap?
-
-    struct NvidiaReasoningEvaluation {
-        let retryReason: String?
-        let repairedBodyData: Data?
-        let normalizedBodyData: Data?
-
-        var shouldRetry: Bool {
-            retryReason != nil
-        }
-    }
+    private static var cachedNVIDIARouteMap: CachedNVIDIARouteMap?
 
     private enum ToolCallValidation {
         case none
         case valid
-        case invalid(reason: String)
+        case invalid
     }
 
     private enum ContentNormalizationResult {
@@ -185,15 +223,6 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
-        if (json["stream"] as? Bool) == true {
-            json["stream"] = false
-            modified = true
-        }
-        if json["stream_options"] != nil {
-            json.removeValue(forKey: "stream_options")
-            modified = true
-        }
-
         if let minimumMaxTokens = policy.minimumMaxTokens {
             if let currentMaxTokens = integerValue(json["max_tokens"]) {
                 if currentMaxTokens < minimumMaxTokens {
@@ -216,18 +245,9 @@ enum OpenAICompatTemporaryShim {
                 json.removeValue(forKey: "response_format")
                 modified = true
             }
-            if let toolChoice = json["tool_choice"] as? String, ["function", "required"].contains(toolChoice) {
-                json["tool_choice"] = "auto"
-                modified = true
-            } else if let toolChoice = json["tool_choice"] as? [String: Any],
-                      let type = toolChoice["type"] as? String,
-                      ["function", "required"].contains(type) {
-                json["tool_choice"] = "auto"
-                modified = true
-            }
         }
 
-        if model == "kimi-k2.5" {
+        if policy.forcesKimiInstantMode {
             var chatTemplate = json["chat_template_kwargs"] as? [String: Any] ?? [:]
             var chatTemplateModified = false
             if (chatTemplate["thinking"] as? Bool) != false {
@@ -242,8 +262,7 @@ enum OpenAICompatTemporaryShim {
                 json["chat_template_kwargs"] = chatTemplate
                 modified = true
             }
-            if (json["stream"] as? Bool) != true,
-               (json["include_reasoning"] as? Bool) != false {
+            if (json["include_reasoning"] as? Bool) != false {
                 json["include_reasoning"] = false
                 modified = true
             }
@@ -272,7 +291,7 @@ enum OpenAICompatTemporaryShim {
               let jsonData = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
               let model = json["model"] as? String,
-              isNVIDIAHostedModel(model) else {
+              let route = resolveNVIDIAHostedRoute(forRequestModel: model) else {
             return nil
         }
 
@@ -291,6 +310,37 @@ enum OpenAICompatTemporaryShim {
             )
         }
 
+        guard isChatCompletionsPath(path),
+              let policy = policy(forModel: model) else {
+            return nil
+        }
+
+        if policy.clientStreamingMode == .rejectBufferedMitigation,
+           requestedStream(forRequestJSON: jsonString) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "Streaming is temporarily disabled for this NVIDIA route in the proxy because full-response normalization is required; use non-streaming chat completions."
+            )
+        }
+
+        if let tools = json["tools"] as? [Any],
+           !tools.isEmpty,
+           requestedStream(forRequestJSON: jsonString) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "Streaming NVIDIA tool calls are not reliably supported through this proxy; use non-streaming chat completions."
+            )
+        }
+
+        if policy.toolChoiceMode == .rejectRequiredOrFunctionChoice,
+           hasStrictToolChoice(in: json) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "This NVIDIA route does not reliably preserve required/function tool-choice semantics through the proxy; use tool_choice=auto or another provider."
+            )
+        }
+
+        _ = route
         return nil
     }
 
@@ -303,7 +353,10 @@ enum OpenAICompatTemporaryShim {
             return false
         }
 
-        return policy(forModel: model) != nil
+        guard let policy = policy(forModel: model) else {
+            return false
+        }
+        return policy.clientStreamingMode == .rejectBufferedMitigation || !policy.retryableFailureClasses.isEmpty
     }
 
     static func classifyUpstreamFailure(
@@ -364,62 +417,6 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
-    static func synthesizeEventStreamBody(fromChatCompletionBody bodyData: Data) -> Data? {
-        guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let choice = choices.first else {
-            return nil
-        }
-
-        let message = choice["message"] as? [String: Any] ?? [:]
-        let role = (message["role"] as? String) ?? "assistant"
-        let content = message["content"] as? String
-        let toolCalls = message["tool_calls"] as? [[String: Any]]
-        let finishReason = (choice["finish_reason"] as? String) ?? "stop"
-        let identifier = (json["id"] as? String) ?? UUID().uuidString
-
-        var events: [String] = []
-
-        if let roleChunk = encodeStreamChunk(
-            id: identifier,
-            delta: ["role": role],
-            finishReason: nil
-        ) {
-            events.append(roleChunk)
-        }
-
-        if let content,
-           !content.isEmpty,
-           let contentChunk = encodeStreamChunk(
-            id: identifier,
-            delta: ["content": content],
-            finishReason: nil
-           ) {
-            events.append(contentChunk)
-        }
-
-        if let toolCalls,
-           !toolCalls.isEmpty,
-           let toolCallChunk = encodeStreamChunk(
-            id: identifier,
-            delta: ["tool_calls": toolCalls],
-            finishReason: nil
-           ) {
-            events.append(toolCallChunk)
-        }
-
-        if let finalChunk = encodeStreamChunk(
-            id: identifier,
-            delta: [:],
-            finishReason: finishReason
-        ) {
-            events.append(finalChunk)
-        }
-
-        events.append("data: [DONE]\n\n")
-        return events.joined().data(using: .utf8)
-    }
-
     static func attemptTimeout(forRequestJSON jsonString: String) -> TimeInterval? {
         policy(forRequestJSON: jsonString)?.attemptTimeout
     }
@@ -451,18 +448,23 @@ enum OpenAICompatTemporaryShim {
 
     static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
         guard let policy = policy(forModel: model) else {
-            return NvidiaReasoningEvaluation(retryReason: nil, repairedBodyData: nil, normalizedBodyData: nil)
+            return NvidiaReasoningEvaluation(failureClass: nil, repairedBodyData: nil, normalizedBodyData: nil)
         }
 
         if statusCode == 200, bodyData.isEmpty {
-            return NvidiaReasoningEvaluation(retryReason: "empty_content", repairedBodyData: nil, normalizedBodyData: nil)
+            return retryEvaluation(
+                for: .emptyBody,
+                policy: policy,
+                repairedBodyData: nil,
+                normalizedBodyData: nil
+            )
         }
 
         guard statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
               let choices = json["choices"] as? [[String: Any]],
               !choices.isEmpty else {
-            return NvidiaReasoningEvaluation(retryReason: nil, repairedBodyData: nil, normalizedBodyData: nil)
+            return NvidiaReasoningEvaluation(failureClass: nil, repairedBodyData: nil, normalizedBodyData: nil)
         }
 
         let choice = choices[0]
@@ -477,15 +479,16 @@ enum OpenAICompatTemporaryShim {
             stripsReasoningField: policy.stripsReasoningFieldFromSuccess
         )
         switch validateToolCalls(in: message) {
-        case .invalid(let reason):
-            return NvidiaReasoningEvaluation(
-                retryReason: reason,
+        case .invalid:
+            return retryEvaluation(
+                for: .malformedToolArguments,
+                policy: policy,
                 repairedBodyData: nil,
                 normalizedBodyData: nil
             )
         case .valid:
             return NvidiaReasoningEvaluation(
-                retryReason: nil,
+                failureClass: nil,
                 repairedBodyData: nil,
                 normalizedBodyData: normalizedBodyData
             )
@@ -493,95 +496,48 @@ enum OpenAICompatTemporaryShim {
             break
         }
 
-        switch policy.responseProfile {
-        case .transportOnly:
-            return NvidiaReasoningEvaluation(
-                retryReason: nil,
-                repairedBodyData: nil,
-                normalizedBodyData: normalizedBodyData
-            )
-        case .kimiReasoningOnly:
-            if trimmedContent.isEmpty,
-               !reasoning.isEmpty,
-               finishReason == "length" {
-                return NvidiaReasoningEvaluation(
-                    retryReason: "reasoning_only_content_missing",
-                    repairedBodyData: nil,
-                    normalizedBodyData: nil
-                )
-            }
-            if trimmedContent.isEmpty {
-                return NvidiaReasoningEvaluation(
-                    retryReason: "empty_content",
-                    repairedBodyData: nil,
-                    normalizedBodyData: nil
-                )
-            }
-            return NvidiaReasoningEvaluation(
-                retryReason: nil,
-                repairedBodyData: nil,
-                normalizedBodyData: normalizedBodyData
-            )
-        case .minimaxThinkLeak:
-            if trimmedContent.isEmpty {
-                return NvidiaReasoningEvaluation(
-                    retryReason: "empty_content",
-                    repairedBodyData: nil,
-                    normalizedBodyData: nil
-                )
-            }
-            guard startsWithThinkTag(trimmedContent) else {
-                return NvidiaReasoningEvaluation(
-                    retryReason: nil,
-                    repairedBodyData: nil,
-                    normalizedBodyData: normalizedBodyData
-                )
-            }
-            let repairedBodyData = normalizedResponseBody(
-                json: json,
-                contentOverride: stripLeadingThinkBlock(from: content),
-                stripsReasoningField: policy.stripsReasoningFieldFromSuccess
-            )
-            return NvidiaReasoningEvaluation(
-                retryReason: "reasoning_leak_length",
-                repairedBodyData: repairedBodyData,
-                normalizedBodyData: nil
-            )
-        case .genericSanity:
-            if trimmedContent.isEmpty,
-               !reasoning.isEmpty,
-               finishReason == "length" {
-                return NvidiaReasoningEvaluation(
-                    retryReason: "reasoning_only_content_missing",
-                    repairedBodyData: nil,
-                    normalizedBodyData: nil
-                )
-            }
-            if trimmedContent.isEmpty {
-                return NvidiaReasoningEvaluation(
-                    retryReason: "empty_content",
-                    repairedBodyData: nil,
-                    normalizedBodyData: nil
-                )
-            }
-            if startsWithThinkTag(trimmedContent) {
-                let repairedBodyData = normalizedResponseBody(
-                    json: json,
-                    contentOverride: stripLeadingThinkBlock(from: content),
-                    stripsReasoningField: policy.stripsReasoningFieldFromSuccess
-                )
-                return NvidiaReasoningEvaluation(
-                    retryReason: "reasoning_leak_length",
-                    repairedBodyData: repairedBodyData,
-                    normalizedBodyData: nil
-                )
-            }
-            return NvidiaReasoningEvaluation(
-                retryReason: nil,
+        if trimmedContent.isEmpty,
+           !reasoning.isEmpty,
+           finishReason == "length" {
+            return retryEvaluation(
+                for: .reasoningOnlyContentMissing,
+                policy: policy,
                 repairedBodyData: nil,
                 normalizedBodyData: normalizedBodyData
             )
         }
+
+        if trimmedContent.isEmpty {
+            return retryEvaluation(
+                for: .emptyContent,
+                policy: policy,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        }
+
+        guard startsWithThinkTag(trimmedContent) else {
+            return NvidiaReasoningEvaluation(
+                failureClass: nil,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        }
+
+        let repairedBodyData = policy.allowsThinkLeakRepair
+            ? normalizedResponseBody(
+                json: json,
+                contentOverride: stripLeadingThinkBlock(from: content),
+                stripsReasoningField: policy.stripsReasoningFieldFromSuccess
+            )
+            : nil
+
+        return retryEvaluation(
+            for: .reasoningLeakLength,
+            policy: policy,
+            repairedBodyData: repairedBodyData,
+            normalizedBodyData: repairedBodyData ?? normalizedBodyData
+        )
     }
 
     static func shouldRetryNvidiaReasoningTransport(statusCode: Int? = nil, error: Error? = nil) -> Bool {
@@ -661,28 +617,6 @@ enum OpenAICompatTemporaryShim {
         value.lowercased().hasPrefix("<think>")
     }
 
-    private static func encodeStreamChunk(
-        id: String,
-        delta: [String: Any],
-        finishReason: String?
-    ) -> String? {
-        let encodedFinishReason: Any = finishReason ?? NSNull()
-        let chunk: [String: Any] = [
-            "id": id,
-            "choices": [[
-                "index": 0,
-                "delta": delta,
-                "finish_reason": encodedFinishReason
-            ]]
-        ]
-
-        guard let data = try? JSONSerialization.data(withJSONObject: chunk),
-              let string = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return "data: \(string)\n\n"
-    }
-
     private static func containsUnsupportedTypedMessageContent(in json: [String: Any]) -> Bool {
         guard let messages = json["messages"] as? [[String: Any]] else {
             return false
@@ -743,17 +677,17 @@ enum OpenAICompatTemporaryShim {
         for toolCall in toolCalls {
             guard let function = toolCall["function"] as? [String: Any],
                   let arguments = function["arguments"] as? String else {
-                return .invalid(reason: "malformed_tool_arguments")
+                return .invalid
             }
 
             let trimmedArguments = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedArguments.isEmpty else {
-                return .invalid(reason: "malformed_tool_arguments")
+                return .invalid
             }
             guard let argumentsData = trimmedArguments.data(using: .utf8),
                   let jsonObject = try? JSONSerialization.jsonObject(with: argumentsData),
                   jsonObject is [String: Any] else {
-                return .invalid(reason: "malformed_tool_arguments")
+                return .invalid
             }
         }
 
@@ -786,20 +720,17 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func policy(forModel model: String) -> RequestPolicy? {
-        if let policy = nvidiaReasoningModelPolicies[model] {
+        if let policy = nonNVIDIAMitigationPoliciesByRequestModel[model] {
             return policy
         }
-        if configuredNVIDIAProviderIDsByModelAlias()[model] != nil {
-            return genericNvidiaFallbackPolicy
+        if let route = resolveNVIDIAHostedRoute(forRequestModel: model) {
+            return knownNVIDIARoutePoliciesByCanonicalModelID[route.canonicalModelID]
         }
         return nil
     }
 
     private static func isNVIDIAHostedModel(_ model: String) -> Bool {
-        if ["glm5", "kimi-k2.5", "minimax-m2.5"].contains(model) {
-            return true
-        }
-        return configuredNVIDIAProviderIDsByModelAlias()[model] != nil
+        resolveNVIDIAHostedRoute(forRequestModel: model) != nil
     }
 
     private static func reasoningString(from message: [String: Any]) -> String {
@@ -814,46 +745,55 @@ enum OpenAICompatTemporaryShim {
         return ""
     }
 
-    private static func configuredNVIDIAProviderIDsByModelAlias() -> [String: String] {
+    private static func resolveNVIDIAHostedRoute(forRequestModel model: String) -> NVIDIARouteIdentity? {
+        configuredNVIDIARoutesByRequestModel()[model]
+    }
+
+    private static func configuredNVIDIARoutesByRequestModel() -> [String: NVIDIARouteIdentity] {
         let path = mergedConfigPath()
         let modificationDate = path.flatMap { configPath in
             (try? FileManager.default.attributesOfItem(atPath: configPath)[.modificationDate]) as? Date
         }
 
         return nvidiaAliasCacheQueue.sync {
-            if let cachedNVIDIAAliasMap,
-               cachedNVIDIAAliasMap.configPath == path,
-               cachedNVIDIAAliasMap.modificationDate == modificationDate {
-                return cachedNVIDIAAliasMap.aliasesByModel
+            if let cachedNVIDIARouteMap,
+               cachedNVIDIARouteMap.configPath == path,
+               cachedNVIDIARouteMap.modificationDate == modificationDate {
+                return cachedNVIDIARouteMap.routesByRequestModel
             }
 
-            let aliasesByModel = loadConfiguredNVIDIAProviderIDsByModelAlias(from: path)
-            cachedNVIDIAAliasMap = CachedNVIDIAAliasMap(
+            let routesByRequestModel = loadConfiguredNVIDIARoutesByRequestModel(from: path)
+            cachedNVIDIARouteMap = CachedNVIDIARouteMap(
                 configPath: path,
                 modificationDate: modificationDate,
-                aliasesByModel: aliasesByModel
+                routesByRequestModel: routesByRequestModel
             )
-            return aliasesByModel
+            return routesByRequestModel
         }
     }
 
-    private static func loadConfiguredNVIDIAProviderIDsByModelAlias(from path: String?) -> [String: String] {
+    private static func loadConfiguredNVIDIARoutesByRequestModel(from path: String?) -> [String: NVIDIARouteIdentity] {
         guard let path,
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             return [:]
         }
 
+        struct ParsedModel {
+            var alias: String?
+            var name: String?
+        }
+
         struct ParsedProvider {
             var name = ""
             var baseURL = ""
-            var modelAliases: [String] = []
+            var models: [ParsedModel] = []
         }
 
-        var aliasesByModel: [String: String] = [:]
+        var routesByRequestModel: [String: NVIDIARouteIdentity] = [:]
         var insideOpenAICompatibility = false
         var currentProvider: ParsedProvider?
         var insideModels = false
-        var currentModelAlias: String?
+        var currentModel = ParsedModel()
 
         func indentation(of line: String) -> Int {
             line.prefix { $0 == " " }.count
@@ -871,16 +811,22 @@ enum OpenAICompatTemporaryShim {
         }
 
         func finalizeCurrentModel() {
-            guard let providerValue = currentProvider,
-                  let aliasValue = currentModelAlias?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !aliasValue.isEmpty else {
-                currentModelAlias = nil
+            guard currentProvider != nil else {
+                currentModel = ParsedModel()
                 return
             }
-            var provider = providerValue
-            provider.modelAliases.append(aliasValue)
+            let trimmedAlias = currentModel.alias?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedName = currentModel.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let canonicalModelID = [trimmedName, trimmedAlias].compactMap({ $0 }).first,
+                  !canonicalModelID.isEmpty else {
+                currentModel = ParsedModel()
+                return
+            }
+
+            var provider = currentProvider ?? ParsedProvider()
+            provider.models.append(ParsedModel(alias: trimmedAlias, name: canonicalModelID))
             currentProvider = provider
-            currentModelAlias = nil
+            currentModel = ParsedModel()
         }
 
         func finalizeCurrentProvider() {
@@ -893,8 +839,20 @@ enum OpenAICompatTemporaryShim {
             let isNVIDIAProvider = trimmedName.hasPrefix("nvidia") || trimmedBaseURL.contains("integrate.api.nvidia.com")
             if isNVIDIAProvider {
                 let providerID = trimmedName.isEmpty ? "nvidia" : trimmedName
-                for alias in provider.modelAliases {
-                    aliasesByModel[alias] = providerID
+                for model in provider.models {
+                    guard let canonicalModelID = model.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !canonicalModelID.isEmpty else {
+                        continue
+                    }
+                    let routeIdentity = NVIDIARouteIdentity(
+                        providerID: providerID,
+                        canonicalModelID: canonicalModelID
+                    )
+                    if let alias = model.alias?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !alias.isEmpty {
+                        routesByRequestModel[alias] = routeIdentity
+                    }
+                    routesByRequestModel[canonicalModelID] = routeIdentity
                 }
             }
             currentProvider = nil
@@ -964,30 +922,74 @@ enum OpenAICompatTemporaryShim {
 
             if indent == 2 && trimmed.hasPrefix("- ") {
                 finalizeCurrentModel()
-                if trimmed.hasPrefix("- alias: ") || trimmed.hasPrefix("- name: ") {
-                    currentModelAlias = scalarValue(from: trimmed)
+                if trimmed.hasPrefix("- alias: ") {
+                    currentModel.alias = scalarValue(from: trimmed)
+                } else if trimmed.hasPrefix("- name: ") {
+                    currentModel.name = scalarValue(from: trimmed)
                 }
                 continue
             }
 
             if indent >= 4, trimmed.hasPrefix("alias: "), let value = scalarValue(from: trimmed) {
-                currentModelAlias = value
+                currentModel.alias = value
                 continue
             }
 
             if indent >= 4,
                trimmed.hasPrefix("name: "),
-               currentModelAlias == nil,
                let value = scalarValue(from: trimmed) {
-                currentModelAlias = value
+                currentModel.name = value
             }
         }
 
         finalizeCurrentProvider()
-        return aliasesByModel
+        return routesByRequestModel
+    }
+
+    private static func retryEvaluation(
+        for failureClass: FailureClass,
+        policy: RequestPolicy,
+        repairedBodyData: Data?,
+        normalizedBodyData: Data?
+    ) -> NvidiaReasoningEvaluation {
+        if policy.retryableFailureClasses.contains(failureClass) {
+            return NvidiaReasoningEvaluation(
+                failureClass: failureClass,
+                repairedBodyData: repairedBodyData,
+                normalizedBodyData: nil
+            )
+        }
+
+        return NvidiaReasoningEvaluation(
+            failureClass: nil,
+            repairedBodyData: nil,
+            normalizedBodyData: normalizedBodyData
+        )
+    }
+
+    private static func hasStrictToolChoice(in json: [String: Any]) -> Bool {
+        guard let toolChoice = json["tool_choice"] else {
+            return false
+        }
+
+        if let toolChoiceString = toolChoice as? String {
+            let normalized = toolChoiceString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized == "required"
+        }
+
+        guard let toolChoiceDict = toolChoice as? [String: Any],
+              let type = (toolChoiceDict["type"] as? String)?.lowercased() else {
+            return false
+        }
+        return type == "function" || type == "required"
     }
 
     private static func mergedConfigPath() -> String? {
+        if let overridePath = ProcessInfo.processInfo.environment["VIBEPROXY_MERGED_CONFIG_PATH"],
+           !overridePath.isEmpty,
+           FileManager.default.fileExists(atPath: overridePath) {
+            return overridePath
+        }
         let path = (NSHomeDirectory() as NSString).appendingPathComponent(".cli-proxy-api/merged-config.yaml")
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
@@ -1037,7 +1039,6 @@ class ThinkingProxy {
 
     private struct NvidiaReasoningRetryState {
         let model: String
-        let originalStreamRequested: Bool
         var transportRetriesRemaining: Int
         var semanticRetriesRemaining: Int
         let retryBackoffMilliseconds: Int
@@ -1336,7 +1337,6 @@ class ThinkingProxy {
         // Try to parse and modify JSON body for POST requests
         var modifiedBody = bodyString
         var thinkingEnabled = false
-        var nvidiaOriginalStreamRequested = false
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -1347,7 +1347,6 @@ class ThinkingProxy {
             if let stripped = stripCacheControl(from: modifiedBody) {
                 modifiedBody = stripped
             }
-            nvidiaOriginalStreamRequested = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
             if let shimmed = OpenAICompatTemporaryShim.transformRequest(
                 method: method,
                 path: rewrittenPath,
@@ -1381,7 +1380,6 @@ class ThinkingProxy {
                 originalConnection: connection,
                 state: NvidiaReasoningRetryState(
                     model: model,
-                    originalStreamRequested: nvidiaOriginalStreamRequested,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
@@ -1686,7 +1684,6 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
-                            originalStreamRequested: state.originalStreamRequested,
                             transportRetriesRemaining: state.transportRetriesRemaining - 1,
                             semanticRetriesRemaining: state.semanticRetriesRemaining,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
@@ -1700,18 +1697,11 @@ class ThinkingProxy {
                 if state.salvagesBestEffortRepair,
                    let repairedBodyData = state.bestEffortRepairedBodyData {
                     NSLog("[ThinkingProxy] Returning preserved best-effort repaired response after transport exhaustion")
-                    let synthesizedStreamBody = state.originalStreamRequested
-                        ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: repairedBodyData)
-                        : nil
-                    let bodyToSend = synthesizedStreamBody ?? repairedBodyData
                     self.sendHTTPResponse(
                         to: originalConnection,
                         statusCode: 200,
                         headers: ["Content-Type": "application/json; charset=utf-8"],
-                        body: bodyToSend,
-                        overridingHeaders: synthesizedStreamBody != nil
-                            ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
-                            : [:]
+                        body: repairedBodyData
                     )
                     return
                 }
@@ -1770,7 +1760,6 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
-                            originalStreamRequested: state.originalStreamRequested,
                             transportRetriesRemaining: state.transportRetriesRemaining - 1,
                             semanticRetriesRemaining: state.semanticRetriesRemaining,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
@@ -1803,7 +1792,6 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: NvidiaReasoningRetryState(
                             model: state.model,
-                            originalStreamRequested: state.originalStreamRequested,
                             transportRetriesRemaining: state.transportRetriesRemaining,
                             semanticRetriesRemaining: state.semanticRetriesRemaining - 1,
                             retryBackoffMilliseconds: state.retryBackoffMilliseconds,
@@ -1816,18 +1804,11 @@ class ThinkingProxy {
 
                 if let repairedBodyData = bestEffortRepairedBodyData {
                     NSLog("[ThinkingProxy] Applied response repair for temporary provider mitigation shim")
-                    let synthesizedStreamBody = state.originalStreamRequested
-                        ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: repairedBodyData)
-                        : nil
-                    let bodyToSend = synthesizedStreamBody ?? repairedBodyData
                     self.sendHTTPResponse(
                         to: originalConnection,
                         statusCode: 200,
                         headers: httpResponse.allHeaderFields,
-                        body: bodyToSend,
-                        overridingHeaders: synthesizedStreamBody != nil
-                            ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
-                            : [:]
+                        body: repairedBodyData
                     )
                     return
                 }
@@ -1845,18 +1826,11 @@ class ThinkingProxy {
             }
 
             let responseBodyData = evaluation.normalizedBodyData ?? bodyData
-            let synthesizedStreamBody = state.originalStreamRequested && httpResponse.statusCode == 200
-                ? OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: responseBodyData)
-                : nil
-            let bodyToSend = synthesizedStreamBody ?? responseBodyData
             self.sendHTTPResponse(
                 to: originalConnection,
                 statusCode: httpResponse.statusCode,
                 headers: httpResponse.allHeaderFields,
-                body: bodyToSend,
-                overridingHeaders: synthesizedStreamBody != nil
-                    ? ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
-                    : [:]
+                body: responseBodyData
             )
         }
         responseProgress.installFirstResponseDeadline(

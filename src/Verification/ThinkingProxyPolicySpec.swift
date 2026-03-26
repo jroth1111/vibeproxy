@@ -6,240 +6,522 @@ struct ThinkingProxyPolicySpec {
         let recorder = FailureRecorder()
 
         run("temporary nvidia minimax shim floors max_tokens and strips unsupported fields", recorder: recorder) {
-            let request = """
-            {
-              "model": "minimax-m2.5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ],
-              "max_tokens": 32,
-              "reasoning_effort": "high",
-              "response_format": {"type": "json_object"},
-              "stop": ["END"]
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectEqual(json["max_tokens"] as? Int, 128, "minimax requests should be floored to max_tokens 128", recorder: recorder)
-            expectNil(json["reasoning_effort"], "reasoning_effort should be stripped for minimax", recorder: recorder)
-            expectNil(json["response_format"], "response_format should be stripped for minimax", recorder: recorder)
-            expectNil(json["stop"], "stop should be stripped for minimax", recorder: recorder)
-        }
-
-        run("temporary nvidia minimax shim sets max_tokens when absent", recorder: recorder) {
-            let request = """
-            {
-              "model": "minimax-m2.5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/api/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectEqual(json["max_tokens"] as? Int, 128, "minimax requests without max_tokens should default to 128", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim strips unstable fields for glm5", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ],
-              "max_tokens": 32,
-              "reasoning_effort": "high",
-              "response_format": {"type": "json_object"}
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectEqual(json["max_tokens"] as? Int, 32, "glm5 requests should preserve caller max_tokens", recorder: recorder)
-            expectNil(json["reasoning_effort"], "glm5 requests should strip reasoning_effort", recorder: recorder)
-            expectNil(json["response_format"], "glm5 should strip response_format for the temporary mitigation", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim forces buffered upstream mode for streaming NVIDIA requests", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm5",
-              "stream": true,
-              "stream_options": {
-                "include_usage": true
-              },
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectEqual(json["stream"] as? Bool, false, "NVIDIA requests should be forced to non-streaming mode upstream so the proxy can validate the full response", recorder: recorder)
-            expectNil(json["stream_options"], "stream_options should be stripped once the proxy forces buffered mode", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim flattens text-only typed content arrays", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm5",
-              "messages": [
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
                 {
-                  "role": "user",
-                  "content": [
-                    {"type": "text", "text": "Hello "},
-                    {"type": "input_text", "text": "world"}
+                  "model": "minimax-m2.5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "max_tokens": 32,
+                  "reasoning_effort": "high",
+                  "response_format": {"type": "json_object"},
+                  "stop": ["END"]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                expectEqual(json["max_tokens"] as? Int, 128, "minimax requests should be floored to max_tokens 128", recorder: recorder)
+                expectNil(json["reasoning_effort"], "reasoning_effort should be stripped for minimax", recorder: recorder)
+                expectNil(json["response_format"], "response_format should be stripped for minimax", recorder: recorder)
+                expectNil(json["stop"], "stop should be stripped for minimax", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia kimi shim forces instant mode and floors max_tokens", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "kimi-k2.5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "reasoning_effort": "medium",
+                  "stop": ["END"]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let chatTemplate = json["chat_template_kwargs"] as? [String: Bool]
+                expectEqual(json["max_tokens"] as? Int, 384, "kimi should floor max_tokens to 384", recorder: recorder)
+                expectNil(json["reasoning_effort"], "kimi should strip reasoning_effort", recorder: recorder)
+                expectNil(json["stop"], "kimi should strip stop", recorder: recorder)
+                expectEqual(chatTemplate?["thinking"], false, "kimi should force chat_template_kwargs.thinking=false", recorder: recorder)
+                expectEqual(chatTemplate?["enable_thinking"], false, "kimi should force chat_template_kwargs.enable_thinking=false", recorder: recorder)
+                expectEqual(json["include_reasoning"] as? Bool, false, "kimi should request no reasoning field in buffered mode", recorder: recorder)
+            }
+        }
+
+        run("canonical nvidia route identity preserves mitigation when aliases are renamed", recorder: recorder) {
+            withMergedConfig(renamedAliasMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm-five-custom",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "reasoning_effort": "high",
+                  "response_format": {"type": "json_object"}
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let isMitigated = OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: transformed ?? request
+                )
+
+                expectEqual(isMitigated, true, "renamed aliases should still resolve to the canonical NVIDIA mitigation policy", recorder: recorder)
+                expectNil(json["reasoning_effort"], "glm5 mitigation should still strip reasoning_effort after alias renames", recorder: recorder)
+                expectNil(json["response_format"], "glm5 mitigation should still strip response_format after alias renames", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia preflight rejects streaming for buffered mitigation routes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "stream": true,
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
                   ]
                 }
-              ]
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                expectNil(transformed, "stream-only requests should not be silently rewritten just to hide buffering", recorder: recorder)
+                expectEqual(preflightError?.statusCode ?? 0, 501, "buffered NVIDIA mitigations should reject client streaming explicitly", recorder: recorder)
             }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            let messages = json["messages"] as? [[String: Any]]
-            expectEqual(messages?.first?["content"] as? String, "Hello world", "text-only typed content arrays should be flattened into a single string for NVIDIA chat completions", recorder: recorder)
         }
 
-        run("temporary nvidia preflight rejects typed content arrays with unsupported segment types", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm5",
-              "messages": [
+        run("temporary nvidia preflight rejects strict tool choice instead of silently weakening semantics", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
                 {
-                  "role": "user",
-                  "content": [
+                  "model": "kimi-k2.5",
+                  "messages": [
+                    {"role": "user", "content": "Use the tool."}
+                  ],
+                  "tool_choice": {
+                    "type": "required",
+                    "function": {"name": "lookup"}
+                  },
+                  "response_format": {"type": "json_object"},
+                  "tools": [
                     {
-                      "type": "image_url",
-                      "image_url": {"url": "https://example.com/cat.png"}
+                      "type": "function",
+                      "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"}
+                      }
                     }
                   ]
                 }
-              ]
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: transformed ?? request
+                )
+                let toolChoice = json["tool_choice"] as? [String: Any]
+
+                expectEqual(toolChoice?["type"] as? String, "required", "strict tool choice should not be rewritten to auto", recorder: recorder)
+                expectNil(json["response_format"], "response_format should still be stripped for NVIDIA tool requests", recorder: recorder)
+                expectEqual(preflightError?.statusCode ?? 0, 501, "strict NVIDIA tool-choice requests should fail closed", recorder: recorder)
             }
-            """
+        }
 
-            let preflightError = OpenAICompatTemporaryShim.preflightError(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
+        run("temporary nvidia shim flattens text-only typed content arrays", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": [
+                        {"type": "text", "text": "Hello "},
+                        {"type": "input_text", "text": "world"}
+                      ]
+                    }
+                  ]
+                }
+                """
 
-            expectEqual(preflightError?.statusCode ?? 0, 400, "unsupported typed content should be rejected before the NVIDIA backend sees it", recorder: recorder)
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                expectEqual(messages?.first?["content"] as? String, "Hello world", "text-only typed content arrays should be flattened into a single string", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia preflight rejects unsupported typed content arrays", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": [
+                        {
+                          "type": "image_url",
+                          "image_url": {"url": "https://example.com/cat.png"}
+                        }
+                      ]
+                    }
+                  ]
+                }
+                """
+
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                expectEqual(preflightError?.statusCode ?? 0, 400, "unsupported typed content should be rejected before the NVIDIA backend sees it", recorder: recorder)
+            }
         }
 
         run("temporary nvidia preflight rejects /v1/responses for NVIDIA-hosted routes", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-
-            let preflightError = OpenAICompatTemporaryShim.preflightError(
-                method: "POST",
-                path: "/v1/responses",
-                jsonString: request
-            )
-
-            expectEqual(preflightError?.statusCode ?? 0, 501, "NVIDIA-hosted routes should fail fast on the unsupported /v1/responses surface", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim forces kimi-k2.5 instant mode and floors max_tokens", recorder: recorder) {
-            let request = """
-            {
-              "model": "kimi-k2.5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ],
-              "reasoning_effort": "medium",
-              "stop": ["END"]
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectNil(json["reasoning_effort"], "kimi-k2.5 requests should strip reasoning_effort", recorder: recorder)
-            expectNil(json["stop"], "kimi-k2.5 should strip stop for the temporary mitigation", recorder: recorder)
-            expectEqual(json["max_tokens"] as? Int, 384, "kimi-k2.5 should floor max_tokens to 384", recorder: recorder)
-            expectEqual((json["chat_template_kwargs"] as? [String: Bool])?["thinking"], false, "kimi-k2.5 should force instant mode", recorder: recorder)
-            expectEqual((json["chat_template_kwargs"] as? [String: Bool])?["enable_thinking"], false, "kimi-k2.5 should disable backend thinking toggles defensively", recorder: recorder)
-            expectEqual(json["include_reasoning"] as? Bool, false, "kimi-k2.5 should request no reasoning field in non-streaming mode", recorder: recorder)
-        }
-
-        run("temporary nvidia mitigation disables streaming tool calls for NVIDIA models", recorder: recorder) {
-            let request = """
-            {
-              "model": "kimi-k2.5",
-              "messages": [
-                {"role": "user", "content": "Use the tool."}
-              ],
-              "stream": true,
-              "tool_choice": {
-                "type": "required",
-                "function": {"name": "lookup"}
-              },
-              "response_format": {"type": "json_object"},
-              "tools": [
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
                 {
-                  "type": "function",
-                  "function": {
-                    "name": "lookup",
-                    "parameters": {"type": "object"}
-                  }
+                  "model": "glm5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
                 }
-              ]
+                """
+
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/responses",
+                    jsonString: request
+                )
+
+                expectEqual(preflightError?.statusCode ?? 0, 501, "NVIDIA-hosted routes should fail fast on /v1/responses", recorder: recorder)
             }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            let json = parseJSONObject(transformed, recorder: recorder)
-            expectEqual(json["stream"] as? Bool, false, "NVIDIA tool calls should be forced to non-streaming mode", recorder: recorder)
-            expectEqual(json["tool_choice"] as? String, "auto", "function-style or required tool_choice should be rewritten to auto", recorder: recorder)
-            expectNil(json["response_format"], "response_format should be stripped when NVIDIA tool-calling is enabled", recorder: recorder)
         }
 
-        run("temporary nvidia reasoning shim leaves unrelated models untouched", recorder: recorder) {
+        run("temporary nvidia timeout and retry budgets are route-specific", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let glm5Request = """
+                {
+                  "model": "glm5",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+                let minimaxRequest = """
+                {
+                  "model": "minimax-m2.5",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 200, "glm5 should keep the long per-attempt timeout", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 200, "minimax should keep the long per-attempt timeout", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 25, "glm5 should fail closed on first-byte stalls", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 25, "minimax should also guard first-byte stalls", recorder: recorder)
+
+                let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
+                let minimaxBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: minimaxRequest)
+                expectEqual(glm5Budget?.transport, 0, "glm5 should not spend extra proxy transport retries", recorder: recorder)
+                expectEqual(glm5Budget?.semantic, 1, "glm5 should reserve one semantic retry for malformed tool-call payloads", recorder: recorder)
+                expectEqual(minimaxBudget?.transport, 0, "minimax should leave transport failover to the backend manager", recorder: recorder)
+                expectEqual(minimaxBudget?.semantic, 2, "minimax should keep semantic retries", recorder: recorder)
+                expectEqual(minimaxBudget?.backoffMilliseconds, 250, "minimax should use retry backoff", recorder: recorder)
+                expectEqual(minimaxBudget?.salvagesBestEffortRepair, true, "minimax should preserve a best-effort repaired body across retries", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia failure classification normalizes function-not-found outages", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let problem = """
+                {
+                  "status": 404,
+                  "title": "Not Found",
+                  "detail": "Function 'abc': Not found for account 'acct'"
+                }
+                """
+
+                let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                    model: "glm5",
+                    path: "/v1/chat/completions",
+                    statusCode: 404,
+                    bodyData: Data(problem.utf8)
+                )
+
+                expectEqual(classification?.statusCode ?? 0, 503, "function-not-found outages should surface as provider unavailability", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia minimax shim retries leaked reasoning responses", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "length",
+                      "message": {
+                        "content": "<think>The user wants the answer OK."
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "minimax-m2.5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectEqual(evaluation.retryReason, "reasoning_leak_length", "leaked reasoning should be marked retryable", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "unclosed leaked reasoning should not claim a safe repaired body", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia minimax shim can repair closed think blocks with trailing answers", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "<think>draft reasoning</think>\\n\\nOK"
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "minimax-m2.5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectEqual(evaluation.retryReason, "reasoning_leak_length", "closed think blocks should still be retried first", recorder: recorder)
+                guard let repairedBodyData = evaluation.repairedBodyData,
+                      let repairedJSON = try? JSONSerialization.jsonObject(with: repairedBodyData) as? [String: Any],
+                      let repairedChoices = repairedJSON["choices"] as? [[String: Any]],
+                      let repairedMessage = repairedChoices.first?["message"] as? [String: Any] else {
+                    recorder.recordFailure("expected repaired minimax response body to be generated")
+                    return
+                }
+
+                expectEqual(repairedMessage["content"] as? String, "OK", "repaired minimax responses should keep the trailing answer", recorder: recorder)
+                expectNil(repairedMessage["reasoning"], "repaired minimax responses should strip provider reasoning fields", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia kimi shim retries reasoning-only responses with missing content", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "length",
+                      "message": {
+                        "content": null,
+                        "reasoning_content": "The user wants exactly OK."
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "kimi-k2.5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectEqual(evaluation.retryReason, "reasoning_only_content_missing", "reasoning-only kimi responses should be classified as invalid and retryable", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "reasoning-only kimi responses should not be repaired into synthetic output", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim strips provider-specific reasoning from successful kimi responses", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": " OK",
+                        "reasoning": "hidden chain of thought",
+                        "reasoning_content": "duplicate hidden chain of thought"
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "kimi-k2.5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "successful kimi responses should not be retried", recorder: recorder)
+                guard let normalizedBodyData = evaluation.normalizedBodyData else {
+                    recorder.recordFailure("expected normalized kimi response body to be generated")
+                    return
+                }
+
+                let normalizedJSON = parseDataJSONObject(normalizedBodyData, recorder: recorder)
+                let normalizedChoices = normalizedJSON["choices"] as? [[String: Any]]
+                let normalizedMessage = normalizedChoices?.first?["message"] as? [String: Any]
+                expectEqual(normalizedMessage?["content"] as? String, " OK", "normalized kimi responses should preserve visible content", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning"], "normalized kimi responses should strip provider reasoning", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning_content"], "normalized kimi responses should strip provider reasoning_content", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim accepts valid tool-call responses without visible content", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "lookup",
+                              "arguments": "{\\"query\\":\\"OK\\"}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "valid tool-call responses should not be misclassified as empty content", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim retries malformed tool-call argument payloads", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "lookup",
+                              "arguments": "{\\"query\\":\\"OK\\""
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectEqual(evaluation.retryReason, "malformed_tool_arguments", "malformed tool-call payloads should be retried", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "malformed tool-call payloads should not be auto-repaired", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim accepts clean responses unchanged", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "\\n\\nOK"
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "minimax-m2.5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "clean minimax responses should not be retried", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "clean minimax responses should not be rewritten", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim leaves unrelated models untouched", recorder: recorder) {
             let request = """
             {
               "model": "gpt-5",
@@ -256,469 +538,7 @@ struct ThinkingProxyPolicySpec {
                 jsonString: request
             )
 
-            expectNil(transformed, "non-NVIDIA temporary models should not be rewritten", recorder: recorder)
-        }
-
-        run("temporary provider mitigation routes glm-5 through response sanity checks without rewriting the request", recorder: recorder) {
-            let request = """
-            {
-              "model": "glm-5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ],
-              "max_tokens": 32
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-            let isMitigated = OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
-                method: "POST",
-                path: "/v1/chat/completions",
-                jsonString: request
-            )
-
-            expectNil(transformed, "glm-5 should not be rewritten when no request shaping is required", recorder: recorder)
-            expectEqual(isMitigated, true, "glm-5 should still enter the mitigation retry/repair path", recorder: recorder)
-        }
-
-        run("temporary nvidia model timeout overrides are model-specific", recorder: recorder) {
-            let glm5Request = """
-            {
-              "model": "glm5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-            let minimaxRequest = """
-            {
-              "model": "minimax-m2.5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-            let zaiRequest = """
-            {
-              "model": "glm-5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ]
-            }
-            """
-
-            expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 200, "glm5 should use the 200 second timeout override", recorder: recorder)
-            expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 200, "minimax should use the 200 second timeout override", recorder: recorder)
-            expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: zaiRequest), 200, "Z.AI mitigation should keep the long-running timeout override", recorder: recorder)
-            expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 25, "glm5 should fail closed on first-response stalls before the client times out", recorder: recorder)
-            expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 25, "minimax should also guard first-response stalls", recorder: recorder)
-            expectNil(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: zaiRequest), "Z.AI mitigation should not inherit the NVIDIA first-response guard", recorder: recorder)
-
-            let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
-            let minimaxBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: minimaxRequest)
-            expectEqual(glm5Budget?.transport, 0, "glm5 should fail closed on transport stalls instead of spending extra proxy retries", recorder: recorder)
-            expectEqual(glm5Budget?.semantic, 0, "glm5 should not spend semantic retries on transport-only failures", recorder: recorder)
-            expectEqual(minimaxBudget?.transport, 0, "minimax should leave transport failover to the backend manager and reserve proxy retries for semantic repair", recorder: recorder)
-            expectEqual(minimaxBudget?.semantic, 2, "minimax should retain semantic retries", recorder: recorder)
-            expectEqual(minimaxBudget?.backoffMilliseconds, 250, "minimax should use retry backoff", recorder: recorder)
-            expectEqual(minimaxBudget?.salvagesBestEffortRepair, true, "minimax should preserve best-effort repaired responses across retries", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim ignores non-chat endpoints", recorder: recorder) {
-            let request = """
-            {
-              "model": "minimax-m2.5",
-              "messages": [
-                {"role": "user", "content": "Return exactly: OK"}
-              ],
-              "max_tokens": 32
-            }
-            """
-
-            let transformed = OpenAICompatTemporaryShim.transformRequest(
-                method: "POST",
-                path: "/v1/models",
-                jsonString: request
-            )
-
-            expectNil(transformed, "non-chat endpoints should not be rewritten", recorder: recorder)
-        }
-
-        run("temporary nvidia failure classification normalizes function-not-found outages", recorder: recorder) {
-            let problem = """
-            {
-              "status": 404,
-              "title": "Not Found",
-              "detail": "Function 'abc': Not found for account 'acct'"
-            }
-            """
-
-            let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
-                model: "glm5",
-                path: "/v1/chat/completions",
-                statusCode: 404,
-                bodyData: Data(problem.utf8)
-            )
-
-            expectEqual(classification?.statusCode ?? 0, 503, "function-not-found outages should be surfaced as provider unavailability", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim retries leaked reasoning responses", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "length",
-                  "message": {
-                    "content": "<think>The user wants the answer OK."
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "minimax-m2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(evaluation.retryReason, "reasoning_leak_length", "leaked reasoning should be marked retryable", recorder: recorder)
-            expectNil(evaluation.repairedBodyData, "unclosed leaked reasoning should not claim a safe repaired body", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim can repair closed think blocks with trailing answers", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                    "content": "<think>draft reasoning</think>\\n\\nOK"
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "minimax-m2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(evaluation.retryReason, "reasoning_leak_length", "closed think blocks should still be retryable first", recorder: recorder)
-
-            guard let repairedBodyData = evaluation.repairedBodyData,
-                  let repairedJSON = try? JSONSerialization.jsonObject(with: repairedBodyData) as? [String: Any],
-                  let repairedChoices = repairedJSON["choices"] as? [[String: Any]],
-                  let repairedMessage = repairedChoices.first?["message"] as? [String: Any] else {
-                recorder.recordFailure("expected repaired minimax response body to be generated")
-                return
-            }
-
-            expectEqual(repairedMessage["content"] as? String, "OK", "repaired minimax responses should drop the think block and keep the trailing answer", recorder: recorder)
-            expectNil(repairedMessage["reasoning"], "repaired minimax responses should strip provider-specific reasoning fields", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim retries empty content without attempting repair", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                    "content": "   "
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "glm-5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(evaluation.retryReason, "empty_content", "empty content should be retryable", recorder: recorder)
-            expectNil(evaluation.repairedBodyData, "empty content should not generate a repaired body", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim retries kimi reasoning-only responses with missing content", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "length",
-                  "message": {
-                    "content": null,
-                    "reasoning": "The user wants exactly OK."
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "kimi-k2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(
-                evaluation.retryReason,
-                "reasoning_only_content_missing",
-                "reasoning-only kimi responses should be classified as invalid and retryable",
-                recorder: recorder
-            )
-            expectNil(evaluation.repairedBodyData, "reasoning-only kimi responses should not be repaired into synthetic output", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim retries kimi reasoning_content-only responses with missing content", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "length",
-                  "message": {
-                    "content": null,
-                    "reasoning_content": "The user wants exactly OK."
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "kimi-k2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(
-                evaluation.retryReason,
-                "reasoning_only_content_missing",
-                "reasoning_content-only kimi responses should be classified as invalid and retryable",
-                recorder: recorder
-            )
-            expectNil(evaluation.repairedBodyData, "reasoning_content-only kimi responses should not be repaired into synthetic output", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim strips provider-specific reasoning on successful kimi responses", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                        "content": " OK",
-                    "reasoning": "hidden chain of thought",
-                    "reasoning_content": "duplicate hidden chain of thought"
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "kimi-k2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectNil(evaluation.retryReason, "successful kimi responses should not be retried", recorder: recorder)
-            guard let normalizedBodyData = evaluation.normalizedBodyData else {
-                recorder.recordFailure("expected normalized kimi response body to be generated")
-                return
-            }
-            let normalizedJSON = parseDataJSONObject(normalizedBodyData, recorder: recorder)
-            let normalizedChoices = normalizedJSON["choices"] as? [[String: Any]]
-            let normalizedMessage = normalizedChoices?.first?["message"] as? [String: Any]
-            expectEqual(normalizedMessage?["content"] as? String, " OK", "normalized kimi responses should preserve visible content", recorder: recorder)
-            expectNil(normalizedMessage?["reasoning"], "normalized kimi responses should strip provider-specific reasoning", recorder: recorder)
-            expectNil(normalizedMessage?["reasoning_content"], "normalized kimi responses should strip provider-specific reasoning_content", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim accepts valid tool-call responses without visible content", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "tool_calls",
-                  "message": {
-                    "content": null,
-                    "tool_calls": [
-                      {
-                        "id": "call_123",
-                        "type": "function",
-                        "function": {
-                          "name": "lookup",
-                          "arguments": "{\\"query\\":\\"OK\\"}"
-                        }
-                      }
-                    ]
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "glm5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectNil(evaluation.retryReason, "valid NVIDIA tool-call responses should not be misclassified as empty content", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim retries malformed tool-call argument payloads", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "tool_calls",
-                  "message": {
-                    "content": null,
-                    "tool_calls": [
-                      {
-                        "id": "call_123",
-                        "type": "function",
-                        "function": {
-                          "name": "lookup",
-                          "arguments": "{\\"query\\":\\"OK\\""
-                        }
-                      }
-                    ]
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "glm5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(evaluation.retryReason, "malformed_tool_arguments", "malformed NVIDIA tool-call payloads should be retried instead of leaking invalid JSON downstream", recorder: recorder)
-            expectNil(evaluation.repairedBodyData, "malformed tool-call payloads should not be auto-repaired", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim treats retryable transport failures as retryable", recorder: recorder) {
-            let timeoutError = URLError(.timedOut)
-            let retryableStatusCodes = [408, 429, 500, 502, 503, 504]
-
-            expectEqual(
-                OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: timeoutError),
-                true,
-                "timed out NVIDIA transport failures should be retried",
-                recorder: recorder
-            )
-
-            for statusCode in retryableStatusCodes {
-                expectEqual(
-                    OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(statusCode: statusCode),
-                    true,
-                    "HTTP \(statusCode) should be retried for temporary NVIDIA reasoning mitigation",
-                    recorder: recorder
-                )
-            }
-        }
-
-        run("temporary nvidia reasoning shim ignores non-retryable transport states", recorder: recorder) {
-            expectEqual(
-                OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: URLError(.badURL)),
-                false,
-                "non-retryable URL errors should not be retried",
-                recorder: recorder
-            )
-            expectEqual(
-                OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(statusCode: 401),
-                false,
-                "HTTP 401 should not be retried by the temporary NVIDIA mitigation",
-                recorder: recorder
-            )
-        }
-
-        run("temporary nvidia minimax shim does not claim a repair when only think text remains", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                    "content": "<think>draft reasoning</think>"
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "minimax-m2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectEqual(evaluation.retryReason, "reasoning_leak_length", "think-only minimax responses should still be retried", recorder: recorder)
-            expectNil(evaluation.repairedBodyData, "think-only minimax responses should not invent a repaired answer", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim accepts normal responses unchanged", recorder: recorder) {
-            let response = """
-            {
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                    "content": "\\n\\nOK"
-                  }
-                }
-              ]
-            }
-            """
-
-            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                model: "minimax-m2.5",
-                statusCode: 200,
-                bodyData: Data(response.utf8)
-            )
-
-            expectNil(evaluation.retryReason, "clean minimax responses should not be retried", recorder: recorder)
-            expectNil(evaluation.repairedBodyData, "clean minimax responses should not be rewritten", recorder: recorder)
-        }
-
-        run("temporary nvidia reasoning shim can synthesize a final SSE transcript from normalized JSON", recorder: recorder) {
-            let response = """
-            {
-              "id": "chatcmpl-test",
-              "choices": [
-                {
-                  "finish_reason": "stop",
-                  "message": {
-                    "role": "assistant",
-                    "content": "OK"
-                  }
-                }
-              ]
-            }
-            """
-
-            guard let sseData = OpenAICompatTemporaryShim.synthesizeEventStreamBody(fromChatCompletionBody: Data(response.utf8)),
-                  let sse = String(data: sseData, encoding: .utf8) else {
-                recorder.recordFailure("expected synthetic NVIDIA SSE body to be generated")
-                return
-            }
-
-            expectEqual(sse.contains("\"content\":\"OK\""), true, "synthetic SSE should carry the normalized assistant content", recorder: recorder)
-            expectEqual(sse.contains("data: [DONE]"), true, "synthetic SSE should terminate with [DONE]", recorder: recorder)
+            expectNil(transformed, "unrelated models should not be rewritten", recorder: recorder)
         }
 
         if recorder.failures == 0 {
@@ -787,4 +607,62 @@ private func parseDataJSONObject(_ data: Data, recorder: FailureRecorder) -> [St
         return [:]
     }
     return json
+}
+
+private func withMergedConfig(_ yaml: String, body: () -> Void) {
+    let key = "VIBEPROXY_MERGED_CONFIG_PATH"
+    let fileManager = FileManager.default
+    let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let configPath = temporaryDirectory.appendingPathComponent("merged-config.yaml")
+    let previousValue = ProcessInfo.processInfo.environment[key]
+
+    try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+    try? yaml.write(to: configPath, atomically: true, encoding: .utf8)
+    setenv(key, configPath.path, 1)
+    defer {
+        if let previousValue {
+            setenv(key, previousValue, 1)
+        } else {
+            unsetenv(key)
+        }
+        try? fileManager.removeItem(at: temporaryDirectory)
+    }
+
+    body()
+}
+
+private func defaultMergedConfigYAML() -> String {
+    [
+        "openai-compatibility:",
+        "- name: nvidia",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: glm5",
+        "    name: z-ai/glm5",
+        "  - alias: kimi-k2.5",
+        "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.5",
+        "    name: minimaxai/minimax-m2.5"
+    ].joined(separator: "\n")
+}
+
+private func renamedAliasMergedConfigYAML() -> String {
+    [
+        "openai-compatibility:",
+        "- name: nvidia",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: glm-five-custom",
+        "    name: z-ai/glm5",
+        "  - alias: kimi-custom",
+        "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-custom",
+        "    name: minimaxai/minimax-m2.5"
+    ].joined(separator: "\n")
 }

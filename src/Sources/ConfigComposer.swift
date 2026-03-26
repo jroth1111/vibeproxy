@@ -8,12 +8,60 @@ struct ConfigProviderAuthRecord: Equatable {
 
 enum ConfigComposer {
     static let uiMetadataKeys: Set<String> = ["display-name", "help-text", "icon-system"]
+    static let additiveUserConfigRootKeys: Set<String> = [
+        "debug",
+        "logging-to-file",
+        "max-retry-credentials",
+        "oauth-excluded-models",
+        "openai-compatibility",
+        "policies",
+        "passthrough-headers",
+        "proxy-url",
+        "quota-exceeded",
+        "request-retry",
+        "request-timeout",
+        "routing",
+        "usage-statistics-enabled"
+    ]
+
+    static func applyManagedProviderPatches(to root: [String: Any]) -> [String: Any] {
+        var patchedRoot = root
+
+        if patchedRoot["max-retry-credentials"] == nil {
+            patchedRoot["max-retry-credentials"] = 0
+        }
+
+        let patchedProviders = mergeManagedProviderEntries(
+            base: stringKeyedDictionaryArray(patchedRoot["openai-compatibility"]),
+            managed: temporaryNVIDIAProviderEntries()
+        )
+        if !patchedProviders.isEmpty {
+            patchedRoot["openai-compatibility"] = patchedProviders
+        }
+
+        return patchedRoot
+    }
     
     static func composeAdditiveBaseConfig(bundledRoot: [String: Any], userRoot: [String: Any]?) -> [String: Any] {
         guard let userRoot else {
             return bundledRoot
         }
-        return mergeDictionary(bundledRoot, overlaidWith: userRoot)
+        return mergeDictionary(bundledRoot, overlaidWith: sanitizeAdditiveUserConfig(userRoot))
+    }
+
+    static func ignoredAdditiveUserConfigKeys(in root: [String: Any]) -> [String] {
+        root.keys
+            .filter { !isSupportedAdditiveUserConfigKey($0) }
+            .sorted()
+    }
+
+    static func sanitizeAdditiveUserConfig(_ root: [String: Any]) -> [String: Any] {
+        root.reduce(into: [String: Any]()) { sanitized, entry in
+            guard isSupportedAdditiveUserConfigKey(entry.key) else {
+                return
+            }
+            sanitized[entry.key] = entry.value
+        }
     }
     
     static func parseCustomProviders(
@@ -289,6 +337,10 @@ enum ConfigComposer {
         
         return merged
     }
+
+    private static func isSupportedAdditiveUserConfigKey(_ key: String) -> Bool {
+        additiveUserConfigRootKeys.contains(key) || key.hasSuffix("-api-key")
+    }
     
     private static func mergeNamedEntries(base: [[String: Any]], overlay: [[String: Any]]) -> [[String: Any]] {
         var mergedEntries = base
@@ -323,7 +375,32 @@ enum ConfigComposer {
         
         return mergedEntries
     }
-    
+
+    private static func mergeManagedProviderEntries(base: [[String: Any]], managed: [[String: Any]]) -> [[String: Any]] {
+        var mergedEntries = base
+        let indexByName = Dictionary(
+            uniqueKeysWithValues: base.enumerated().compactMap { index, entry in
+                normalizedProviderID(from: entry).map { ($0, index) }
+            }
+        )
+
+        for managedEntry in managed {
+            guard let name = normalizedProviderID(from: managedEntry) else {
+                mergedEntries.append(managedEntry)
+                continue
+            }
+
+            if let existingIndex = indexByName[name] {
+                let existingEntry = mergedEntries[existingIndex]
+                mergedEntries[existingIndex] = mergeDictionary(managedEntry, overlaidWith: existingEntry)
+            } else {
+                mergedEntries.append(managedEntry)
+            }
+        }
+
+        return mergedEntries
+    }
+
     private static func apiKeyEntries(from entry: [String: Any]) -> [[String: String]] {
         stringKeyedDictionaryArray(entry["api-key-entries"]).compactMap { keyEntry in
             guard let apiKey = normalizedString(keyEntry["api-key"]) else {
@@ -409,9 +486,35 @@ enum ConfigComposer {
     private static func defaultZAIModels() -> [[String: String]] {
         [
             ["name": "glm-4.7", "alias": "glm-4.7"],
-            ["name": "glm-4-plus", "alias": "glm-4-plus"],
-            ["name": "glm-4-air", "alias": "glm-4-air"],
-            ["name": "glm-4-flash", "alias": "glm-4-flash"]
+            ["name": "glm-5", "alias": "glm-5"],
+            ["name": "glm-5-turbo", "alias": "glm-5-turbo"]
         ]
     }
+
+    private static func temporaryNVIDIAProviderEntries() -> [[String: Any]] {
+        [
+            [
+                "name": "nvidia",
+                "display-name": "NVIDIA",
+                "help-text": "NVIDIA pool for GLM5 and Kimi K2.5 with automatic request shaping and response cleanup.",
+                "icon-system": "bolt.fill",
+                "base-url": "https://integrate.api.nvidia.com/v1",
+                "models": [
+                    ["name": "z-ai/glm5", "alias": "glm5"],
+                    ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"]
+                ]
+            ],
+            [
+                "name": "nvidia-minimax",
+                "display-name": "NVIDIA MiniMax",
+                "help-text": "NVIDIA pool for minimax-m2.5 with automatic request shaping and response cleanup.",
+                "icon-system": "bolt.fill",
+                "base-url": "https://integrate.api.nvidia.com/v1",
+                "models": [
+                    ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                ]
+            ]
+        ]
+    }
+
 }

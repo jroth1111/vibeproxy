@@ -48,6 +48,74 @@ struct ConfigComposerSpec {
             expectEqual(provider(named: "nvidia", in: merged)?["display-name"] as? String, "NVIDIA", "user provider metadata should be present", recorder: recorder)
         }
 
+        run("applyManagedProviderPatches injects temporary NVIDIA providers without runtime policy shims", recorder: recorder) {
+            let patched = ConfigComposer.applyManagedProviderPatches(to: [:])
+
+            expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5", recorder: recorder)
+            expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
+        }
+
+        run("applyManagedProviderPatches preserves explicit retry settings and merges composed user overlays on top", recorder: recorder) {
+            let bundledRoot: [String: Any] = [
+                "max-retry-credentials": 2
+            ]
+            let userRoot: [String: Any] = [
+                "max-retry-credentials": 1,
+                "openai-compatibility": [
+                    [
+                        "name": "nvidia",
+                        "display-name": "NVIDIA Override",
+                        "api-key-entries": [
+                            ["api-key": "inline-a"]
+                        ]
+                    ]
+                ]
+            ]
+
+            let merged = ConfigComposer.composeAdditiveBaseConfig(
+                bundledRoot: bundledRoot,
+                userRoot: userRoot
+            )
+            let patchedMerged = ConfigComposer.applyManagedProviderPatches(to: merged)
+
+            expectEqual(patchedMerged["max-retry-credentials"] as? Int, 1, "user retry settings should still override the patched bundled default", recorder: recorder)
+            expectEqual(provider(named: "nvidia", in: patchedMerged)?["display-name"] as? String, "NVIDIA Override", "user overlays should still merge onto the hardcoded NVIDIA provider", recorder: recorder)
+            expectEqual(apiKeys(in: provider(named: "nvidia", in: patchedMerged) ?? [:]), ["inline-a"], "user inline keys should still merge onto the hardcoded NVIDIA provider", recorder: recorder)
+        }
+
+        run("applyManagedProviderPatches leaves user policies untouched", recorder: recorder) {
+            let root: [String: Any] = [
+                "policies": [
+                    "scoped": [
+                        [
+                            "match": [
+                                "protocol": "openai",
+                                "provider": "custom-provider",
+                                "models": ["custom-model"],
+                                "endpoint-family": "chat_completions"
+                            ],
+                            "request": [
+                                "min-numeric": [
+                                    "max_tokens": 64
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+
+            let patched = ConfigComposer.applyManagedProviderPatches(to: root)
+
+            expectEqual(
+                dictionary(dictionary(policyScopes(in: patched).first?["request"])["min-numeric"])["max_tokens"] as? Int,
+                64,
+                "managed provider patches should not mutate user policy definitions",
+                recorder: recorder
+            )
+        }
+
         run("composeAdditiveBaseConfig merges provider overrides by name", recorder: recorder) {
             let bundledRoot: [String: Any] = [
                 "openai-compatibility": [
@@ -138,6 +206,35 @@ struct ConfigComposerSpec {
                 "an empty openai-compatibility overlay should be treated as no additive override",
                 recorder: recorder
             )
+        }
+
+        run("composeAdditiveBaseConfig ignores unsupported top-level overrides that would break app topology", recorder: recorder) {
+            let bundledRoot: [String: Any] = [
+                "port": 8318,
+                "host": "127.0.0.1",
+                "request-timeout": "10m",
+                "max-retry-credentials": 2
+            ]
+            let userRoot: [String: Any] = [
+                "port": 9999,
+                "host": "0.0.0.0",
+                "remote-management": [
+                    "allow-remote": true
+                ],
+                "request-timeout": "30m",
+                "max-retry-credentials": 0
+            ]
+
+            let merged = ConfigComposer.composeAdditiveBaseConfig(
+                bundledRoot: bundledRoot,
+                userRoot: userRoot
+            )
+
+            expectEqual(merged["port"] as? Int, 8318, "bundled backend port should remain authoritative", recorder: recorder)
+            expectEqual(merged["host"] as? String, "127.0.0.1", "bundled backend host should remain authoritative", recorder: recorder)
+            expectEqual(merged["request-timeout"] as? String, "30m", "supported additive keys should still overlay", recorder: recorder)
+            expectEqual(merged["max-retry-credentials"] as? Int, 0, "safe additive retry controls should remain user-configurable", recorder: recorder)
+            expectNil(merged["remote-management"], "unsupported remote-management overrides should be ignored", recorder: recorder)
         }
 
         run("parseCustomProviders ignores reserved providers and keeps UI metadata", recorder: recorder) {
@@ -292,6 +389,26 @@ struct ConfigComposerSpec {
             expectNil(
                 zai?["display-name"],
                 "managed zai runtime should strip UI metadata before writing merged config",
+                recorder: recorder
+            )
+        }
+
+        run("composeRuntimeConfig injects modern default zai models when no user-defined models exist", recorder: recorder) {
+            let runtime = ConfigComposer.composeRuntimeConfig(
+                baseRoot: [:],
+                reservedCustomProviderKeys: reservedProviderIDs,
+                disabledCustomProviderIDs: [],
+                disabledOAuthProviderKeys: [],
+                zaiAPIKeys: ["managed-zai"],
+                customProviderAuthRecords: [],
+                includeManagedZAIProvider: true
+            )
+
+            let zai = provider(named: "zai", in: runtime)
+            expectEqual(
+                modelAliases(in: zai ?? [:]),
+                ["glm-4.7", "glm-5", "glm-5-turbo"],
+                "default managed zai models should expose the current GLM aliases on a clean install",
                 recorder: recorder
             )
         }
@@ -485,6 +602,10 @@ private func providerEntries(in root: [String: Any]) -> [[String: Any]] {
 
 private func provider(named name: String, in root: [String: Any]) -> [String: Any]? {
     providerEntries(in: root).first { $0["name"] as? String == name }
+}
+
+private func policyScopes(in root: [String: Any]) -> [[String: Any]] {
+    ConfigComposer.stringKeyedDictionaryArray(dictionary(root["policies"])["scoped"])
 }
 
 private func dictionary(_ value: Any?) -> [String: Any] {
