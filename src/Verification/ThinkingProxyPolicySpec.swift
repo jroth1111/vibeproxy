@@ -808,6 +808,99 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias silently fails over when z.ai returns 404 route unavailable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5-turbo":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"model not found for account\"}".utf8),
+                                response: httpURLResponse(statusCode: 404),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-zai-404-fallback",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should fail over after a z.ai route-unavailable 404")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5"], "worker should treat a route-unavailable z.ai 404 as candidate failure and fall through to the next backend", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should still succeed after failing over from a z.ai 404", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias after a z.ai 404 fallback", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "route health should penalize z.ai route-unavailable 404 failures", recorder: recorder)
+            }
+        }
+
         run("temporary worker smart alias coalesces duplicate safe requests behind one upstream sequence", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
@@ -2330,8 +2423,10 @@ private func renamedAliasMergedConfigYAML() -> String {
 
 private func workerMergedConfigYAML() -> String {
     [
-        "claude-api-key:",
-        "- api-key: test-zai-key",
+        "openai-compatibility:",
+        "- api-key-entries:",
+        "  - api-key: test-zai-key",
+        "  name: zai",
         "  base-url: https://api.z.ai/api/anthropic",
         "  models:",
         "  - alias: glm-5-turbo",

@@ -3442,7 +3442,10 @@ class ThinkingProxy {
                     failoverDepth: failoverDepth,
                     finalWinnerRequestModel: statusCode >= 200 && statusCode < 300 ? currentCandidateModel : nil
                 )
-                if self.shouldFailoverSmartAliasCandidate(onHTTPStatus: statusCode) {
+                if self.classifySmartAliasCandidateFailure(
+                    statusCode: statusCode,
+                    bodyData: responseBody
+                ).shouldFailover {
                     OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
@@ -3495,7 +3498,10 @@ class ThinkingProxy {
                     failoverDepth: failoverDepth,
                     finalWinnerRequestModel: nil
                 )
-                if self.shouldFailoverSmartAliasCandidate(onHTTPStatus: statusCode) {
+                if self.classifySmartAliasCandidateFailure(
+                    statusCode: statusCode,
+                    bodyData: nil
+                ).shouldFailover {
                     OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
@@ -3623,8 +3629,12 @@ class ThinkingProxy {
         }
 
         let statusCode = response.statusCode
-        let shouldFailover = shouldFailoverSmartAliasCandidate(onHTTPStatus: statusCode)
-        let failureClass = shouldFailover ? "classified_\(statusCode)" : nil
+        let failureClassification = classifySmartAliasCandidateFailure(
+            statusCode: statusCode,
+            bodyData: responseData
+        )
+        let shouldFailover = failureClassification.shouldFailover
+        let failureClass = failureClassification.failureClass
         let telemetryEvent = annotatedSmartAliasTelemetryEvent(
             OpenAICompatTemporaryShim.RouteTelemetryEvent(
                 timestamp: Date(),
@@ -3690,8 +3700,19 @@ class ThinkingProxy {
         )
     }
 
-    private func shouldFailoverSmartAliasCandidate(onHTTPStatus statusCode: Int) -> Bool {
-        statusCode == 429 || statusCode >= 500
+    private func classifySmartAliasCandidateFailure(
+        statusCode: Int,
+        bodyData: Data?
+    ) -> (shouldFailover: Bool, failureClass: String?) {
+        _ = bodyData
+        switch statusCode {
+        case 429, 403, 404:
+            return (true, "classified_\(statusCode)")
+        case 500...599:
+            return (true, "classified_\(statusCode)")
+        default:
+            return (false, nil)
+        }
     }
 
     private func transportFailureClass(_ error: Error) -> String {
