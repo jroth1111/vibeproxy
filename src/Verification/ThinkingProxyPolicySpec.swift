@@ -300,6 +300,100 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia failure classification normalizes responses endpoint 404s", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = "404 page not found"
+
+                let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                    model: "glm5",
+                    path: "/v1/responses",
+                    statusCode: 404,
+                    bodyData: Data(body.utf8)
+                )
+
+                expectEqual(classification?.statusCode ?? 0, 501, "responses 404s should surface as unsupported NVIDIA hosted behavior", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia failure classification preserves upstream overload as 429", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = """
+                {
+                  "error": {
+                    "message": "Too Many Requests"
+                  }
+                }
+                """
+
+                let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                    model: "kimi-k2.5",
+                    path: "/v1/chat/completions",
+                    statusCode: 429,
+                    bodyData: Data(body.utf8)
+                )
+
+                expectEqual(classification?.statusCode ?? 0, 429, "NVIDIA overload/rate-limit responses should remain explicit 429s", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia failure classification normalizes typed-content schema mismatch", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = """
+                {
+                  "detail": [
+                    {
+                      "loc": ["body", "messages", 0, "content"],
+                      "msg": "Input should be a valid string"
+                    }
+                  ]
+                }
+                """
+
+                let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                    model: "glm5",
+                    path: "/v1/chat/completions",
+                    statusCode: 400,
+                    bodyData: Data(body.utf8)
+                )
+
+                expectEqual(classification?.statusCode ?? 0, 400, "typed-content schema mismatches should surface as explicit 400s", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia failure classification normalizes EngineCore upstream faults", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let body = """
+                {
+                  "error": {
+                    "message": "EngineCore encountered an issue"
+                  }
+                }
+                """
+
+                let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
+                    model: "glm5",
+                    path: "/v1/chat/completions",
+                    statusCode: 500,
+                    bodyData: Data(body.utf8)
+                )
+
+                expectEqual(classification?.statusCode ?? 0, 502, "EngineCore faults should be normalized into upstream bad-gateway failures", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim retries empty-body successes instead of forwarding them", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "kimi-k2.5",
+                    statusCode: 200,
+                    bodyData: Data()
+                )
+
+                expectEqual(evaluation.retryReason, "empty_body", "empty 200 bodies should be treated as retryable invalid-success responses", recorder: recorder)
+                expectNil(evaluation.repairedBodyData, "empty-body successes should not be auto-repaired", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia glm5 shim retries empty-content successes instead of forwarding them", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let response = """
