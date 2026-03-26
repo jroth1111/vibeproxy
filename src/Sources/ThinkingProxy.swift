@@ -1,6 +1,653 @@
 import Foundation
 import Network
 
+enum OpenAICompatTemporaryShim {
+    private struct CachedNVIDIAAliasMap {
+        let configPath: String?
+        let modificationDate: Date?
+        let aliasesByModel: [String: String]
+    }
+
+    private static let genericNvidiaFallbackPolicy = RequestPolicy(
+        responseProfile: .genericSanity,
+        minimumMaxTokens: nil,
+        strippedFields: ["reasoning_effort", "frequency_penalty", "presence_penalty", "ignore_eos"],
+        attemptTimeout: 200,
+        transportRetries: 2,
+        semanticRetries: 2,
+        retryBackoffMilliseconds: 250,
+        stripsReasoningFieldFromSuccess: true,
+        salvagesBestEffortRepair: true
+    )
+    private static let nvidiaReasoningModelPolicies: [String: RequestPolicy] = [
+        "glm5": RequestPolicy(
+            responseProfile: .transportOnly,
+            minimumMaxTokens: nil,
+            strippedFields: ["reasoning_effort", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 0,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            salvagesBestEffortRepair: false
+        ),
+        "kimi-k2.5": RequestPolicy(
+            responseProfile: .kimiReasoningOnly,
+            minimumMaxTokens: 384,
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            salvagesBestEffortRepair: false
+        ),
+        "minimax-m2.5": RequestPolicy(
+            responseProfile: .minimaxThinkLeak,
+            minimumMaxTokens: 128,
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            salvagesBestEffortRepair: true
+        ),
+        "glm-4.7": RequestPolicy(
+            responseProfile: .genericSanity,
+            minimumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: false,
+            salvagesBestEffortRepair: false
+        ),
+        "glm-5": RequestPolicy(
+            responseProfile: .genericSanity,
+            minimumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: false,
+            salvagesBestEffortRepair: false
+        ),
+        "glm-5-turbo": RequestPolicy(
+            responseProfile: .genericSanity,
+            minimumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: false,
+            salvagesBestEffortRepair: false
+        )
+    ]
+
+    private enum ResponseProfile {
+        case transportOnly
+        case kimiReasoningOnly
+        case minimaxThinkLeak
+        case genericSanity
+    }
+
+    private struct RequestPolicy {
+        let responseProfile: ResponseProfile
+        let minimumMaxTokens: Int?
+        let strippedFields: Set<String>
+        let attemptTimeout: TimeInterval?
+        let transportRetries: Int
+        let semanticRetries: Int
+        let retryBackoffMilliseconds: Int
+        let stripsReasoningFieldFromSuccess: Bool
+        let salvagesBestEffortRepair: Bool
+    }
+    private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
+    private static let retryableTransportErrorCodes: Set<Int> = [
+        URLError.Code.timedOut.rawValue,
+        URLError.Code.cannotFindHost.rawValue,
+        URLError.Code.cannotConnectToHost.rawValue,
+        URLError.Code.networkConnectionLost.rawValue,
+        URLError.Code.dnsLookupFailed.rawValue,
+        URLError.Code.notConnectedToInternet.rawValue,
+        URLError.Code.resourceUnavailable.rawValue
+    ]
+    private static let nvidiaAliasCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-alias-cache")
+    private static var cachedNVIDIAAliasMap: CachedNVIDIAAliasMap?
+
+    struct NvidiaReasoningEvaluation {
+        let retryReason: String?
+        let repairedBodyData: Data?
+        let normalizedBodyData: Data?
+
+        var shouldRetry: Bool {
+            retryReason != nil
+        }
+    }
+
+    static func transformRequest(method: String, path: String, jsonString: String) -> String? {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              let policy = policy(forModel: model) else {
+            return nil
+        }
+        var modified = false
+
+        if let minimumMaxTokens = policy.minimumMaxTokens {
+            if let currentMaxTokens = integerValue(json["max_tokens"]) {
+                if currentMaxTokens < minimumMaxTokens {
+                    json["max_tokens"] = minimumMaxTokens
+                    modified = true
+                }
+            } else {
+                json["max_tokens"] = minimumMaxTokens
+                modified = true
+            }
+        }
+
+        for field in policy.strippedFields where json[field] != nil {
+            json.removeValue(forKey: field)
+            modified = true
+        }
+
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            if let stream = json["stream"] as? Bool, stream {
+                json["stream"] = false
+                modified = true
+            }
+            if let toolChoice = json["tool_choice"] as? String, toolChoice == "function" {
+                json["tool_choice"] = "auto"
+                modified = true
+            } else if let toolChoice = json["tool_choice"] as? [String: Any],
+                      (toolChoice["type"] as? String) == "function" {
+                json["tool_choice"] = "auto"
+                modified = true
+            }
+        }
+
+        if model == "kimi-k2.5" {
+            var chatTemplate = json["chat_template_kwargs"] as? [String: Any] ?? [:]
+            if (chatTemplate["thinking"] as? Bool) != false {
+                chatTemplate["thinking"] = false
+                json["chat_template_kwargs"] = chatTemplate
+                modified = true
+            }
+            if (json["stream"] as? Bool) != true,
+               (json["include_reasoning"] as? Bool) != false {
+                json["include_reasoning"] = false
+                modified = true
+            }
+        }
+
+        guard modified,
+              let modifiedData = try? JSONSerialization.data(withJSONObject: json),
+              let modifiedString = String(data: modifiedData, encoding: .utf8) else {
+            return nil
+        }
+
+        NSLog("[ThinkingProxy] Applied temporary provider mitigation request shim for %@", model)
+        return modifiedString
+    }
+
+    static func isNvidiaReasoningChatRequest(method: String, path: String, jsonString: String) -> Bool {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String else {
+            return false
+        }
+
+        return policy(forModel: model) != nil
+    }
+
+    static func attemptTimeout(forRequestJSON jsonString: String) -> TimeInterval? {
+        policy(forRequestJSON: jsonString)?.attemptTimeout
+    }
+
+    static func retryBudget(forRequestJSON jsonString: String) -> (transport: Int, semantic: Int, backoffMilliseconds: Int, salvagesBestEffortRepair: Bool)? {
+        guard let policy = policy(forRequestJSON: jsonString) else {
+            return nil
+        }
+        return (
+            transport: policy.transportRetries,
+            semantic: policy.semanticRetries,
+            backoffMilliseconds: policy.retryBackoffMilliseconds,
+            salvagesBestEffortRepair: policy.salvagesBestEffortRepair
+        )
+    }
+
+    static func modelName(forRequestJSON jsonString: String) -> String? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String else {
+            return nil
+        }
+        return model
+    }
+
+    static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
+        guard let policy = policy(forModel: model) else {
+            return NvidiaReasoningEvaluation(retryReason: nil, repairedBodyData: nil, normalizedBodyData: nil)
+        }
+
+        guard statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let choices = json["choices"] as? [[String: Any]],
+              !choices.isEmpty else {
+            return NvidiaReasoningEvaluation(retryReason: nil, repairedBodyData: nil, normalizedBodyData: nil)
+        }
+
+        let choice = choices[0]
+        let message = choice["message"] as? [String: Any] ?? [:]
+        let content = (message["content"] as? String) ?? ""
+        let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reasoning = reasoningString(from: message)
+        let finishReason = (choice["finish_reason"] as? String)?.lowercased()
+        let normalizedBodyData = normalizedResponseBody(
+            json: json,
+            contentOverride: nil,
+            stripsReasoningField: policy.stripsReasoningFieldFromSuccess
+        )
+
+        switch policy.responseProfile {
+        case .transportOnly:
+            return NvidiaReasoningEvaluation(
+                retryReason: nil,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        case .kimiReasoningOnly:
+            if trimmedContent.isEmpty,
+               !reasoning.isEmpty,
+               finishReason == "length" {
+                return NvidiaReasoningEvaluation(
+                    retryReason: "reasoning_only_content_missing",
+                    repairedBodyData: nil,
+                    normalizedBodyData: nil
+                )
+            }
+            if trimmedContent.isEmpty {
+                return NvidiaReasoningEvaluation(
+                    retryReason: "empty_content",
+                    repairedBodyData: nil,
+                    normalizedBodyData: nil
+                )
+            }
+            return NvidiaReasoningEvaluation(
+                retryReason: nil,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        case .minimaxThinkLeak:
+            if trimmedContent.isEmpty {
+                return NvidiaReasoningEvaluation(
+                    retryReason: "empty_content",
+                    repairedBodyData: nil,
+                    normalizedBodyData: nil
+                )
+            }
+            guard startsWithThinkTag(trimmedContent) else {
+                return NvidiaReasoningEvaluation(
+                    retryReason: nil,
+                    repairedBodyData: nil,
+                    normalizedBodyData: normalizedBodyData
+                )
+            }
+            let repairedBodyData = normalizedResponseBody(
+                json: json,
+                contentOverride: stripLeadingThinkBlock(from: content),
+                stripsReasoningField: policy.stripsReasoningFieldFromSuccess
+            )
+            return NvidiaReasoningEvaluation(
+                retryReason: "reasoning_leak_length",
+                repairedBodyData: repairedBodyData,
+                normalizedBodyData: nil
+            )
+        case .genericSanity:
+            if trimmedContent.isEmpty,
+               !reasoning.isEmpty,
+               finishReason == "length" {
+                return NvidiaReasoningEvaluation(
+                    retryReason: "reasoning_only_content_missing",
+                    repairedBodyData: nil,
+                    normalizedBodyData: nil
+                )
+            }
+            if trimmedContent.isEmpty {
+                return NvidiaReasoningEvaluation(
+                    retryReason: "empty_content",
+                    repairedBodyData: nil,
+                    normalizedBodyData: nil
+                )
+            }
+            if startsWithThinkTag(trimmedContent) {
+                let repairedBodyData = normalizedResponseBody(
+                    json: json,
+                    contentOverride: stripLeadingThinkBlock(from: content),
+                    stripsReasoningField: policy.stripsReasoningFieldFromSuccess
+                )
+                return NvidiaReasoningEvaluation(
+                    retryReason: "reasoning_leak_length",
+                    repairedBodyData: repairedBodyData,
+                    normalizedBodyData: nil
+                )
+            }
+            return NvidiaReasoningEvaluation(
+                retryReason: nil,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        }
+    }
+
+    static func shouldRetryNvidiaReasoningTransport(statusCode: Int? = nil, error: Error? = nil) -> Bool {
+        if let statusCode {
+            return retryableHTTPStatusCodes.contains(statusCode)
+        }
+
+        guard let nsError = error as NSError? else {
+            return false
+        }
+        guard nsError.domain == NSURLErrorDomain else {
+            return false
+        }
+        return retryableTransportErrorCodes.contains(nsError.code)
+    }
+
+    private static func isChatCompletionsPath(_ path: String) -> Bool {
+        path == "/v1/chat/completions" || path == "/api/v1/chat/completions"
+    }
+
+    private static func integerValue(_ value: Any?) -> Int? {
+        switch value {
+        case let intValue as Int:
+            return intValue
+        case let number as NSNumber:
+            return number.intValue
+        default:
+            return nil
+        }
+    }
+
+    private static func normalizedResponseBody(
+        json: [String: Any],
+        contentOverride: String?,
+        stripsReasoningField: Bool
+    ) -> Data? {
+        var repairedJSON = json
+        guard var choices = repairedJSON["choices"] as? [[String: Any]],
+              !choices.isEmpty else {
+            return nil
+        }
+
+        var firstChoice = choices[0]
+        var message = firstChoice["message"] as? [String: Any] ?? [:]
+        var modified = false
+
+        if let contentOverride {
+            message["content"] = contentOverride
+            modified = true
+        }
+        if stripsReasoningField {
+            if message["reasoning"] != nil {
+                message.removeValue(forKey: "reasoning")
+                modified = true
+            }
+            if message["reasoning_content"] != nil {
+                message.removeValue(forKey: "reasoning_content")
+                modified = true
+            }
+        }
+        guard modified else {
+            return nil
+        }
+
+        firstChoice["message"] = message
+        choices[0] = firstChoice
+        repairedJSON["choices"] = choices
+
+        return try? JSONSerialization.data(withJSONObject: repairedJSON)
+    }
+
+    private static func startsWithThinkTag(_ value: String) -> Bool {
+        value.lowercased().hasPrefix("<think>")
+    }
+
+    private static func stripLeadingThinkBlock(from content: String) -> String? {
+        let pattern = #"(?is)^\s*<think>.*?</think>\s*"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return nil
+        }
+
+        let range = NSRange(content.startIndex..<content.endIndex, in: content)
+        guard let match = regex.firstMatch(in: content, options: [], range: range),
+              match.range.location != NSNotFound,
+              match.range.location == 0 else {
+            return nil
+        }
+
+        let stripped = regex.stringByReplacingMatches(in: content, options: [], range: range, withTemplate: "")
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func policy(forRequestJSON jsonString: String) -> RequestPolicy? {
+        guard let model = modelName(forRequestJSON: jsonString) else {
+            return nil
+        }
+        return policy(forModel: model)
+    }
+
+    private static func policy(forModel model: String) -> RequestPolicy? {
+        if let policy = nvidiaReasoningModelPolicies[model] {
+            return policy
+        }
+        if configuredNVIDIAProviderIDsByModelAlias()[model] != nil {
+            return genericNvidiaFallbackPolicy
+        }
+        return nil
+    }
+
+    private static func reasoningString(from message: [String: Any]) -> String {
+        if let reasoning = (message["reasoning"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !reasoning.isEmpty {
+            return reasoning
+        }
+        if let reasoningContent = (message["reasoning_content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !reasoningContent.isEmpty {
+            return reasoningContent
+        }
+        return ""
+    }
+
+    private static func configuredNVIDIAProviderIDsByModelAlias() -> [String: String] {
+        let path = mergedConfigPath()
+        let modificationDate = path.flatMap { configPath in
+            (try? FileManager.default.attributesOfItem(atPath: configPath)[.modificationDate]) as? Date
+        }
+
+        return nvidiaAliasCacheQueue.sync {
+            if let cachedNVIDIAAliasMap,
+               cachedNVIDIAAliasMap.configPath == path,
+               cachedNVIDIAAliasMap.modificationDate == modificationDate {
+                return cachedNVIDIAAliasMap.aliasesByModel
+            }
+
+            let aliasesByModel = loadConfiguredNVIDIAProviderIDsByModelAlias(from: path)
+            cachedNVIDIAAliasMap = CachedNVIDIAAliasMap(
+                configPath: path,
+                modificationDate: modificationDate,
+                aliasesByModel: aliasesByModel
+            )
+            return aliasesByModel
+        }
+    }
+
+    private static func loadConfiguredNVIDIAProviderIDsByModelAlias(from path: String?) -> [String: String] {
+        guard let path,
+              let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return [:]
+        }
+
+        struct ParsedProvider {
+            var name = ""
+            var baseURL = ""
+            var modelAliases: [String] = []
+        }
+
+        var aliasesByModel: [String: String] = [:]
+        var insideOpenAICompatibility = false
+        var currentProvider: ParsedProvider?
+        var insideModels = false
+        var currentModelAlias: String?
+
+        func indentation(of line: String) -> Int {
+            line.prefix { $0 == " " }.count
+        }
+
+        func scalarValue(from line: String) -> String? {
+            guard let separatorIndex = line.firstIndex(of: ":") else {
+                return nil
+            }
+            let rawValue = line[line.index(after: separatorIndex)...].trimmingCharacters(in: .whitespaces)
+            guard !rawValue.isEmpty else {
+                return nil
+            }
+            return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        }
+
+        func finalizeCurrentModel() {
+            guard let providerValue = currentProvider,
+                  let aliasValue = currentModelAlias?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !aliasValue.isEmpty else {
+                currentModelAlias = nil
+                return
+            }
+            var provider = providerValue
+            provider.modelAliases.append(aliasValue)
+            currentProvider = provider
+            currentModelAlias = nil
+        }
+
+        func finalizeCurrentProvider() {
+            finalizeCurrentModel()
+            guard let provider = currentProvider else {
+                return
+            }
+            let trimmedName = provider.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedBaseURL = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let isNVIDIAProvider = trimmedName.hasPrefix("nvidia") || trimmedBaseURL.contains("integrate.api.nvidia.com")
+            if isNVIDIAProvider {
+                let providerID = trimmedName.isEmpty ? "nvidia" : trimmedName
+                for alias in provider.modelAliases {
+                    aliasesByModel[alias] = providerID
+                }
+            }
+            currentProvider = nil
+            insideModels = false
+        }
+
+        for rawLine in content.components(separatedBy: .newlines) {
+            let line = rawLine.replacingOccurrences(of: "\t", with: "    ")
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") {
+                continue
+            }
+
+            if !insideOpenAICompatibility {
+                if trimmed == "openai-compatibility:" {
+                    insideOpenAICompatibility = true
+                }
+                continue
+            }
+
+            let indent = indentation(of: line)
+            if indent == 0 && !trimmed.hasPrefix("- ") {
+                finalizeCurrentProvider()
+                break
+            }
+
+            if indent == 0 && trimmed.hasPrefix("- ") {
+                finalizeCurrentProvider()
+                currentProvider = ParsedProvider()
+                if trimmed.hasPrefix("- name: "),
+                   let value = scalarValue(from: trimmed) {
+                    currentProvider?.name = value
+                }
+                continue
+            }
+
+            guard currentProvider != nil else {
+                continue
+            }
+
+            if indent == 2 && trimmed == "models:" {
+                finalizeCurrentModel()
+                insideModels = true
+                continue
+            }
+
+            if indent == 2 && trimmed.hasSuffix(":") && trimmed != "models:" {
+                if insideModels {
+                    finalizeCurrentModel()
+                }
+                insideModels = false
+            }
+
+            if indent == 2, trimmed.hasPrefix("name: "), let value = scalarValue(from: trimmed) {
+                currentProvider?.name = value
+                continue
+            }
+
+            if indent == 2, trimmed.hasPrefix("base-url: "), let value = scalarValue(from: trimmed) {
+                currentProvider?.baseURL = value
+                continue
+            }
+
+            guard insideModels else {
+                continue
+            }
+
+            if indent == 2 && trimmed.hasPrefix("- ") {
+                finalizeCurrentModel()
+                if trimmed.hasPrefix("- alias: ") || trimmed.hasPrefix("- name: ") {
+                    currentModelAlias = scalarValue(from: trimmed)
+                }
+                continue
+            }
+
+            if indent >= 4, trimmed.hasPrefix("alias: "), let value = scalarValue(from: trimmed) {
+                currentModelAlias = value
+                continue
+            }
+
+            if indent >= 4,
+               trimmed.hasPrefix("name: "),
+               currentModelAlias == nil,
+               let value = scalarValue(from: trimmed) {
+                currentModelAlias = value
+            }
+        }
+
+        finalizeCurrentProvider()
+        return aliasesByModel
+    }
+
+    private static func mergedConfigPath() -> String? {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".cli-proxy-api/merged-config.yaml")
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+}
+
 /**
  A lightweight HTTP proxy that intercepts requests to add extended thinking parameters
  for Claude models based on model name suffixes.
@@ -38,6 +685,17 @@ class ThinkingProxy {
         static let headroomRatio = 0.1
         static let vercelGatewayHost = "ai-gateway.vercel.sh"
         static let anthropicVersion = "2023-06-01"
+        static let nvidiaReasoningSemanticRetries = 2
+        static let defaultMitigatedAttemptTimeout: TimeInterval = 30
+    }
+
+    private struct NvidiaReasoningRetryState {
+        let model: String
+        var transportRetriesRemaining: Int
+        var semanticRetriesRemaining: Int
+        let retryBackoffMilliseconds: Int
+        let salvagesBestEffortRepair: Bool
+        var bestEffortRepairedBodyData: Data?
     }
     
     /**
@@ -272,6 +930,38 @@ class ThinkingProxy {
             if let stripped = stripCacheControl(from: modifiedBody) {
                 modifiedBody = stripped
             }
+            if let shimmed = OpenAICompatTemporaryShim.transformRequest(
+                method: method,
+                path: rewrittenPath,
+                jsonString: modifiedBody
+            ) {
+                modifiedBody = shimmed
+            }
+        }
+
+        if OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+            method: method,
+            path: rewrittenPath,
+            jsonString: modifiedBody
+        ) {
+            let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: modifiedBody)
+            let model = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody) ?? "unknown"
+            forwardNvidiaReasoningRequestWithRetry(
+                method: method,
+                path: rewrittenPath,
+                headers: headers,
+                body: modifiedBody,
+                originalConnection: connection,
+                state: NvidiaReasoningRetryState(
+                    model: model,
+                    transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
+                    retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
+                    salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
+                    bestEffortRepairedBodyData: nil
+                )
+            )
+            return
         }
         
         // Route Claude requests through Vercel AI Gateway when configured
@@ -511,6 +1201,200 @@ class ThinkingProxy {
         }
         
         targetConnection.start(queue: .global(qos: .userInitiated))
+    }
+
+    private func forwardNvidiaReasoningRequestWithRetry(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        originalConnection: NWConnection,
+        state: NvidiaReasoningRetryState
+    ) {
+        guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
+            sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
+
+        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+        for (name, value) in headers where !excludedHeaders.contains(name.lowercased()) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue("close", forHTTPHeaderField: "Connection")
+
+        let session = URLSession(configuration: .ephemeral)
+        session.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            defer { session.finishTasksAndInvalidate() }
+
+            if let error {
+                if state.transportRetriesRemaining > 0,
+                   OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: error) {
+                    NSLog(
+                        "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to transport error %@ (%d retries left)",
+                        error.localizedDescription,
+                        state.transportRetriesRemaining
+                    )
+                    self.scheduleNvidiaReasoningRetry(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: NvidiaReasoningRetryState(
+                            model: state.model,
+                            transportRetriesRemaining: state.transportRetriesRemaining - 1,
+                            semanticRetriesRemaining: state.semanticRetriesRemaining,
+                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
+                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                            bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
+                        )
+                    )
+                    return
+                }
+
+                if state.salvagesBestEffortRepair,
+                   let repairedBodyData = state.bestEffortRepairedBodyData {
+                    NSLog("[ThinkingProxy] Returning preserved best-effort repaired response after transport exhaustion")
+                    self.sendHTTPResponse(
+                        to: originalConnection,
+                        statusCode: 200,
+                        headers: ["Content-Type": "application/json; charset=utf-8"],
+                        body: repairedBodyData
+                    )
+                    return
+                }
+
+                NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(error)")
+                let statusCode = (error as NSError).domain == NSURLErrorDomain &&
+                    (error as NSError).code == URLError.Code.timedOut.rawValue ? 504 : 502
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: statusCode,
+                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
+                )
+                return
+            }
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  let bodyData = data else {
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
+                return
+            }
+
+            if state.transportRetriesRemaining > 0,
+               OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(statusCode: httpResponse.statusCode) {
+                NSLog(
+                    "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to HTTP %d (%d retries left)",
+                    httpResponse.statusCode,
+                    state.transportRetriesRemaining
+                )
+                self.scheduleNvidiaReasoningRetry(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    originalConnection: originalConnection,
+                    state: NvidiaReasoningRetryState(
+                        model: state.model,
+                        transportRetriesRemaining: state.transportRetriesRemaining - 1,
+                        semanticRetriesRemaining: state.semanticRetriesRemaining,
+                        retryBackoffMilliseconds: state.retryBackoffMilliseconds,
+                        salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                        bestEffortRepairedBodyData: state.bestEffortRepairedBodyData
+                    )
+                )
+                return
+            }
+
+            let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                model: state.model,
+                statusCode: httpResponse.statusCode,
+                bodyData: bodyData
+            )
+
+            if evaluation.shouldRetry {
+                let bestEffortRepairedBodyData = evaluation.repairedBodyData ?? state.bestEffortRepairedBodyData
+                if state.semanticRetriesRemaining > 0 {
+                    NSLog(
+                        "[ThinkingProxy] Retrying temporary provider mitigation request due to %@ (%d retries left)",
+                        evaluation.retryReason ?? "unknown",
+                        state.semanticRetriesRemaining
+                    )
+                    self.scheduleNvidiaReasoningRetry(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: NvidiaReasoningRetryState(
+                            model: state.model,
+                            transportRetriesRemaining: state.transportRetriesRemaining,
+                            semanticRetriesRemaining: state.semanticRetriesRemaining - 1,
+                            retryBackoffMilliseconds: state.retryBackoffMilliseconds,
+                            salvagesBestEffortRepair: state.salvagesBestEffortRepair,
+                            bestEffortRepairedBodyData: bestEffortRepairedBodyData
+                        )
+                    )
+                    return
+                }
+
+                if let repairedBodyData = bestEffortRepairedBodyData {
+                    NSLog("[ThinkingProxy] Applied response repair for temporary provider mitigation shim")
+                    self.sendHTTPResponse(
+                        to: originalConnection,
+                        statusCode: 200,
+                        headers: httpResponse.allHeaderFields,
+                        body: repairedBodyData
+                    )
+                    return
+                }
+
+                NSLog(
+                    "[ThinkingProxy] Exhausted temporary provider mitigation retries after %@; returning gateway error instead of invalid upstream success",
+                    evaluation.retryReason ?? "unknown"
+                )
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: 502,
+                    message: "Bad Gateway - Upstream provider returned an unusable response"
+                )
+                return
+            }
+
+            self.sendHTTPResponse(
+                to: originalConnection,
+                statusCode: httpResponse.statusCode,
+                headers: httpResponse.allHeaderFields,
+                body: evaluation.normalizedBodyData ?? bodyData
+            )
+        }.resume()
+    }
+
+    private func scheduleNvidiaReasoningRetry(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        originalConnection: NWConnection,
+        state: NvidiaReasoningRetryState
+    ) {
+        let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.forwardNvidiaReasoningRequestWithRetry(
+                method: method,
+                path: path,
+                headers: headers,
+                body: body,
+                originalConnection: originalConnection,
+                state: state
+            )
+        }
     }
     
     /**
@@ -949,6 +1833,41 @@ class ThinkingProxy {
         }
 
         connection.send(content: headerData, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+    }
+
+    private func sendHTTPResponse(
+        to connection: NWConnection,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        body: Data
+    ) {
+        var response = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n"
+        let excludedHeaders: Set<String> = ["content-length", "connection", "transfer-encoding"]
+
+        for (rawName, rawValue) in headers {
+            guard let name = rawName as? String,
+                  !excludedHeaders.contains(name.lowercased()) else {
+                continue
+            }
+            response += "\(name): \(String(describing: rawValue))\r\n"
+        }
+
+        response += "Content-Length: \(body.count)\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+
+        guard let headerData = response.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+
+        var responseData = Data()
+        responseData.append(headerData)
+        responseData.append(body)
+
+        connection.send(content: responseData, completion: .contentProcessed({ _ in
             connection.cancel()
         }))
     }
