@@ -312,38 +312,38 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary nvidia route circuit degrades to suspect before quarantine, then enters half-open on recovery", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
 
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "glm5 should start healthy", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one failure should not quarantine the route yet", recorder: recorder)
                 var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "one failure should degrade the route to suspect", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "suspect state should retain the current failure score", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "two failures should quarantine the route", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "one success should only move the route into half-open recovery", recorder: recorder)
 
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first recovery success should transition to half-open", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open state should track recovery successes", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "recovery threshold successes should close the route again", recorder: recorder)
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "second recovery success should restore the healthy state", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia rolling metrics keep flaky suspect routes degraded until they prove stability", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
                 let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
@@ -372,12 +372,12 @@ struct ThinkingProxyPolicySpec {
                     totalLatencyMilliseconds: 400
                 )
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now
                 )
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
                     telemetryEvent: successEvent
                 )
@@ -386,13 +386,13 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky suspect route", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.timeoutCount, 1, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
                     telemetryEvent: successEvent
                 )
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "enough clean successes should still restore the healthy state", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -465,7 +465,7 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary nvidia rolling metrics tune hedge delay and canary cadence for flaky routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
                 let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
@@ -481,20 +481,20 @@ struct ThinkingProxyPolicySpec {
                     totalLatencyMilliseconds: 25_000
                 )
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now
                 )
                 expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 3, "high recent timeout rates should shorten suspect hedge delay", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now.addingTimeInterval(1)
                 )
                 expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval(), 30, "quarantined routes with severe timeout history should be canaried more aggressively", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -520,22 +520,22 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary nvidia failure score decays over time instead of opening on stale failures", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(400))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(400))
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "stale failure score should decay before the next failure is applied", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "decayed stale failures should not force an immediate open transition", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia rolling metrics can lower the quarantine threshold for repeatedly bad routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
                 let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
@@ -560,17 +560,17 @@ struct ThinkingProxyPolicySpec {
                     source: "live_request"
                 )
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now
                 )
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
                     telemetryEvent: successEvent,
                     at: now.addingTimeInterval(1)
                 )
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now.addingTimeInterval(2)
@@ -578,7 +578,7 @@ struct ThinkingProxyPolicySpec {
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .open, "routes with repeated recent badness should quarantine after a lower adaptive threshold", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -616,17 +616,17 @@ struct ThinkingProxyPolicySpec {
                 using: .tcp
             )
 
-            expectEqual(proxy.registerOrJoinNVIDIAInflightRequestForTesting(key: key, connection: firstConnection), true, "the first request should own the in-flight slot", recorder: recorder)
-            expectEqual(proxy.registerOrJoinNVIDIAInflightRequestForTesting(key: key, connection: secondConnection), false, "duplicate requests should join the existing in-flight slot", recorder: recorder)
-            expectEqual(proxy.inflightNVIDIAWaiterCount(for: key), 2, "joined duplicate requests should share the same waiter list", recorder: recorder)
-            expectEqual(proxy.takeInflightNVIDIAConnectionsForTesting(for: key)?.count, 2, "finishing the in-flight slot should return all coalesced waiters", recorder: recorder)
-            expectEqual(proxy.inflightNVIDIAWaiterCount(for: key), 0, "taking the slot should clear the coalescing registry", recorder: recorder)
+            expectEqual(proxy.registerOrJoinInflightRequestForTesting(key: key, connection: firstConnection), true, "the first request should own the in-flight slot", recorder: recorder)
+            expectEqual(proxy.registerOrJoinInflightRequestForTesting(key: key, connection: secondConnection), false, "duplicate requests should join the existing in-flight slot", recorder: recorder)
+            expectEqual(proxy.inflightRequestWaiterCount(for: key), 2, "joined duplicate requests should share the same waiter list", recorder: recorder)
+            expectEqual(proxy.takeInflightRequestConnectionsForTesting(for: key)?.count, 2, "finishing the in-flight slot should return all coalesced waiters", recorder: recorder)
+            expectEqual(proxy.inflightRequestWaiterCount(for: key), 0, "taking the slot should clear the coalescing registry", recorder: recorder)
         }
 
         run("temporary worker smart alias is config-driven and skips quarantined fallback models", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "kimi-k2.5",
                     until: Date().addingTimeInterval(60)
                 )
@@ -642,7 +642,6 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(smartAlias?.candidates, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
-                    publicAlias: "worker",
                     method: "POST",
                     path: "/v1/chat/completions",
                     currentBody: request,
@@ -652,7 +651,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(transition?.model, "minimax-m2.5", "fallback planning should skip quarantined fallback routes and pick the next viable alias", recorder: recorder)
                 let rewritten = parseJSONObject(transition?.body, recorder: recorder)
                 expectEqual(rewritten["model"] as? String, "minimax-m2.5", "fallback planning should rewrite the request model to the chosen fallback alias", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -1034,7 +1033,7 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary worker smart alias is injected into /v1/models only while at least one candidate is healthy", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let body = """
                 {
                   "object": "list",
@@ -1055,44 +1054,44 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(injectedIDs.contains("worker"), true, "worker should appear in /v1/models when any candidate is available", recorder: recorder)
 
                 let until = Date().addingTimeInterval(60)
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "glm-5-turbo", until: until)
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "minimax-m2.5", until: until)
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(requestModel: "kimi-k2.5", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5-turbo", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5", until: until)
 
                 guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
                     recorder.recordFailure("filtered /v1/models should still be materialized after every worker candidate is quarantined")
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     return
                 }
                 let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
                 let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
                 expectEqual(filteredIDs.contains("worker"), false, "worker should disappear from /v1/models when every candidate is unavailable", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
 
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(10))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(10))
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .open, "a half-open failure should immediately reopen quarantine", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 0, "reopening should reset the recovery counter", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "half-open failure should keep the route unavailable", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia preflight rejects quarantined hosted routes before spending timeout budget", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "kimi-k2.5",
                     until: Date().addingTimeInterval(60)
                 )
@@ -1112,14 +1111,14 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(preflightError?.statusCode ?? 0, 503, "quarantined NVIDIA routes should fail immediately instead of consuming the full timeout budget", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia model list filtering hides quarantined aliases", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
-                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "glm5",
                     until: Date().addingTimeInterval(60)
                 )
@@ -1136,7 +1135,7 @@ struct ThinkingProxyPolicySpec {
 
                 guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
                     recorder.recordFailure("expected quarantined route to be removed from /v1/models response")
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     return
                 }
 
@@ -1146,14 +1145,14 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(ids.contains("glm5"), false, "quarantined glm5 alias should be removed from /v1/models", recorder: recorder)
                 expectEqual(ids.contains("kimi-k2.5"), true, "healthy NVIDIA aliases should remain visible", recorder: recorder)
                 expectEqual(ids.contains("gpt-5"), true, "non-NVIDIA models should remain visible", recorder: recorder)
-                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary nvidia route health persists quarantine state and telemetry across reload", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { path in
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let now = Date(timeIntervalSince1970: 1_700_000_000)
                     let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: now,
@@ -1167,12 +1166,12 @@ struct ThinkingProxyPolicySpec {
                         source: "live_request"
                     )
 
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: "glm5",
                         telemetryEvent: event,
                         at: now
                     )
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: "glm5",
                         telemetryEvent: event,
                         at: now
@@ -1298,8 +1297,8 @@ struct ThinkingProxyPolicySpec {
         run("temporary nvidia canary success moves quarantined routes into half-open recovery before reopening", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
-                    OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                         requestModel: "glm5",
                         until: Date().addingTimeInterval(60)
                     )
@@ -1359,7 +1358,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "route should close after enough successful canaries", recorder: recorder)
                     lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "successful reopening should preserve the last canary telemetry event", recorder: recorder)
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
         }
@@ -1367,9 +1366,9 @@ struct ThinkingProxyPolicySpec {
         run("temporary nvidia canary failures reopen half-open routes and record canary telemetry", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let until = Date().addingTimeInterval(60)
-                    OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                         requestModel: "glm5",
                         until: until
                     )
@@ -1423,7 +1422,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(lastEvent?.source, "canary", "failed canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.failureClass, "transport_error_retryable", "failed canaries should preserve the route failure class", recorder: recorder)
                     expectEqual(snapshot["z-ai/glm5"]?.status, .open, "failed canaries after half-open recovery should reopen quarantine", recorder: recorder)
-                    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
         }
@@ -2345,9 +2344,9 @@ private func withMergedConfig(_ yaml: String, body: () -> Void) {
     try? yaml.write(to: configPath, atomically: true, encoding: .utf8)
     setenv(configKey, configPath.path, 1)
     setenv(routeHealthKey, routeHealthPath.path, 1)
-    OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
     defer {
-        OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
         if let previousConfigValue {
             setenv(configKey, previousConfigValue, 1)
         } else {

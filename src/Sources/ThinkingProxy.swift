@@ -454,7 +454,7 @@ enum OpenAICompatTemporaryShim {
     ]
     private static let routeConfigCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-config-cache")
     private static var cachedRouteConfiguration: CachedRouteConfiguration?
-    private static let nvidiaRouteHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-route-health")
+    private static let routeHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-health")
     private static var routeCircuitStatesByRouteHealthKey: [String: RouteCircuitState] = [:]
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
@@ -686,7 +686,6 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func nextSmartAliasCandidateTransition(
-        publicAlias: String,
         method: String,
         path: String,
         currentBody: String,
@@ -711,7 +710,6 @@ enum OpenAICompatTemporaryShim {
             }
             return (candidateBody, nextCandidateModel, remainingCandidateModels)
         }
-        _ = publicAlias
         return nil
     }
 
@@ -1203,7 +1201,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func quarantinedNVIDIAHostedRequestModels(at now: Date = Date()) -> [String] {
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let routesByHealthKey = configuredRouteConfiguration().routesByRequestModel.values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
                 routesByHealthKey[route.routeHealthKey] = route
@@ -1223,7 +1221,7 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return nil
         }
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.status
         }
@@ -1233,7 +1231,7 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return defaultSuspectHedgeDelay
         }
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return recommendedNVIDIAHedgeDelay(
                 metrics: routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.rollingMetrics
@@ -1242,7 +1240,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func recommendedNVIDIACanaryInterval() -> TimeInterval {
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let metrics = routeCircuitStatesByRouteHealthKey.values
                 .filter { $0.isUnavailable(at: Date()) }
@@ -1255,7 +1253,7 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return false
         }
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.isUnavailable(at: now) ?? false
         }
@@ -1265,13 +1263,13 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return false
         }
-        return nvidiaRouteHealthQueue.sync {
+        return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.isUnavailable(at: now) ?? false
         }
     }
 
-    static func recordNVIDIAHostedRouteFailure(
+    static func recordRouteFailure(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
         at now: Date = Date()
@@ -1279,7 +1277,7 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return
         }
-        nvidiaRouteHealthQueue.sync {
+        routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
             var nextState = nextRouteCircuitState(
@@ -1303,7 +1301,7 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func recordNVIDIAHostedRouteSuccess(
+    static func recordRouteSuccess(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
         at now: Date = Date()
@@ -1311,7 +1309,7 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return
         }
-        nvidiaRouteHealthQueue.sync {
+        routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
             var nextState = nextRouteCircuitStateAfterSuccess(
@@ -1335,19 +1333,19 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func clearNVIDIAHostedRouteHealthForTesting() {
-        nvidiaRouteHealthQueue.sync {
+    static func clearRouteHealthForTesting() {
+        routeHealthQueue.sync {
             routeCircuitStatesByRouteHealthKey = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
         }
     }
 
-    static func forceOpenNVIDIAHostedRouteForTesting(requestModel: String, until: Date) {
+    static func forceOpenRouteForTesting(requestModel: String, until: Date) {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return
         }
-        nvidiaRouteHealthQueue.sync {
+        routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = RouteCircuitState(
                 status: .open,
@@ -1363,7 +1361,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func routeHealthSnapshotForTesting() -> [String: RouteCircuitState] {
-        nvidiaRouteHealthQueue.sync {
+        routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let routesByHealthKey = configuredRouteConfiguration().routesByRequestModel.values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
                 routesByHealthKey[route.routeHealthKey] = route
@@ -1376,7 +1374,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func reloadPersistedRouteHealthForTesting() {
-        nvidiaRouteHealthQueue.sync {
+        routeHealthQueue.sync {
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
             loadPersistedRouteHealthIfNeededLocked()
@@ -2240,7 +2238,7 @@ enum OpenAICompatTemporaryShim {
 
     private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
         let routes = configuredRouteConfiguration().routesByRequestModel
-        let openRouteHealthKeys: Set<String> = nvidiaRouteHealthQueue.sync {
+        let openRouteHealthKeys: Set<String> = routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return Set(routeCircuitStatesByRouteHealthKey.compactMap { key, value in
                 value.isUnavailable(at: now) ? key : nil
@@ -2677,7 +2675,7 @@ class ThinkingProxy {
     private var nvidiaCanaryTimer: DispatchSourceTimer?
     private let nvidiaCanaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-canary")
     private var nvidiaCanarySweepInFlight = false
-    private var inflightNVIDIARequests: [String: [NWConnection]] = [:]
+    private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
@@ -3136,7 +3134,7 @@ class ThinkingProxy {
                     )
                     return
                 }
-                let coalescingKey = nvidiaCoalescingKey(
+                let coalescingKey = coalescingKeyForSafeRequest(
                     method: method,
                     path: rewrittenPath,
                     body: modifiedBody,
@@ -3144,7 +3142,7 @@ class ThinkingProxy {
                     requestedModelAlias: requestModel
                 )
                 if let coalescingKey,
-                   !registerOrJoinNVIDIAInflightRequest(key: coalescingKey, connection: connection) {
+                   !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
                     NSLog("[ThinkingProxy] Joined coalesced smart-alias request for %@", requestModel)
                     return
                 }
@@ -3179,7 +3177,7 @@ class ThinkingProxy {
         ) {
             let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: modifiedBody)
             let model = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody) ?? "unknown"
-            let coalescingKey = nvidiaCoalescingKey(
+            let coalescingKey = coalescingKeyForSafeRequest(
                 method: method,
                 path: rewrittenPath,
                 body: modifiedBody,
@@ -3187,7 +3185,7 @@ class ThinkingProxy {
                 requestedModelAlias: nil
             )
             if let coalescingKey,
-               !registerOrJoinNVIDIAInflightRequest(key: coalescingKey, connection: connection) {
+               !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
                 NSLog("[ThinkingProxy] Joined coalesced NVIDIA request for %@", model)
                 return
             }
@@ -3264,7 +3262,6 @@ class ThinkingProxy {
         coalescingKey: String?
     ) {
         guard let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
-            publicAlias: publicAlias,
             method: method,
             path: path,
             currentBody: currentBody,
@@ -3446,7 +3443,7 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     bodyData: responseBody
                 ).shouldFailover {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
                     )
@@ -3465,7 +3462,7 @@ class ThinkingProxy {
                 }
 
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
                     )
@@ -3502,7 +3499,7 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     bodyData: nil
                 ).shouldFailover {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
                     )
@@ -3521,7 +3518,7 @@ class ThinkingProxy {
                 }
 
                 if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: currentCandidateModel,
                         telemetryEvent: winningTelemetry
                     )
@@ -3572,7 +3569,7 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: nil
             )
-            OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+            OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: candidateModel,
                 telemetryEvent: telemetryEvent
             )
@@ -3610,7 +3607,7 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: nil
             )
-            OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+            OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: candidateModel,
                 telemetryEvent: telemetryEvent
             )
@@ -3656,7 +3653,7 @@ class ThinkingProxy {
         )
 
         if shouldFailover {
-            OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+            OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: candidateModel,
                 telemetryEvent: telemetryEvent
             )
@@ -3675,7 +3672,7 @@ class ThinkingProxy {
         }
 
         if statusCode >= 200 && statusCode < 300 {
-            OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+            OpenAICompatTemporaryShim.recordRouteSuccess(
                 forRequestModel: candidateModel,
                 telemetryEvent: telemetryEvent
             )
@@ -3800,7 +3797,7 @@ class ThinkingProxy {
         )
     }
 
-    private func nvidiaCoalescingKey(
+    private func coalescingKeyForSafeRequest(
         method: String,
         path: String,
         body: String,
@@ -3829,38 +3826,38 @@ class ThinkingProxy {
         return "\(method) \(path)\n\(body)"
     }
 
-    private func registerOrJoinNVIDIAInflightRequest(
+    private func registerOrJoinInflightRequest(
         key: String,
         connection: NWConnection
     ) -> Bool {
         nvidiaInflightQueue.sync {
-            if inflightNVIDIARequests[key] != nil {
-                inflightNVIDIARequests[key, default: []].append(connection)
+            if inflightCoalescedRequests[key] != nil {
+                inflightCoalescedRequests[key, default: []].append(connection)
                 return false
             }
-            inflightNVIDIARequests[key] = [connection]
+            inflightCoalescedRequests[key] = [connection]
             return true
         }
     }
 
-    func registerOrJoinNVIDIAInflightRequestForTesting(key: String, connection: NWConnection) -> Bool {
-        registerOrJoinNVIDIAInflightRequest(key: key, connection: connection)
+    func registerOrJoinInflightRequestForTesting(key: String, connection: NWConnection) -> Bool {
+        registerOrJoinInflightRequest(key: key, connection: connection)
     }
 
-    func inflightNVIDIAWaiterCount(for key: String) -> Int {
+    func inflightRequestWaiterCount(for key: String) -> Int {
         nvidiaInflightQueue.sync {
-            inflightNVIDIARequests[key]?.count ?? 0
+            inflightCoalescedRequests[key]?.count ?? 0
         }
     }
 
-    func takeInflightNVIDIAConnectionsForTesting(for key: String) -> [NWConnection]? {
-        takeInflightNVIDIAConnections(for: key)
+    func takeInflightRequestConnectionsForTesting(for key: String) -> [NWConnection]? {
+        takeInflightRequestConnections(for: key)
     }
 
-    private func takeInflightNVIDIAConnections(for key: String?) -> [NWConnection]? {
+    private func takeInflightRequestConnections(for key: String?) -> [NWConnection]? {
         guard let key else { return nil }
         return nvidiaInflightQueue.sync {
-            let connections = inflightNVIDIARequests.removeValue(forKey: key)
+            let connections = inflightCoalescedRequests.removeValue(forKey: key)
             return connections
         }
     }
@@ -3878,7 +3875,7 @@ class ThinkingProxy {
             overridingModelWith: overridingModel,
             statusCode: statusCode
         ) ?? body
-        let connections = takeInflightNVIDIAConnections(for: coalescingKey) ?? [defaultConnection]
+        let connections = takeInflightRequestConnections(for: coalescingKey) ?? [defaultConnection]
         for connection in connections {
             sendHTTPResponse(
                 to: connection,
@@ -3895,7 +3892,7 @@ class ThinkingProxy {
         message: String,
         coalescingKey: String?
     ) {
-        let connections = takeInflightNVIDIAConnections(for: coalescingKey) ?? [defaultConnection]
+        let connections = takeInflightRequestConnections(for: coalescingKey) ?? [defaultConnection]
         for connection in connections {
             sendError(
                 to: connection,
@@ -4278,9 +4275,9 @@ class ThinkingProxy {
                     winnerAttemptLane: attemptLane
                 )
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
+                    OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
+                    OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
@@ -4298,7 +4295,7 @@ class ThinkingProxy {
                     winnerAttemptLane: attemptLane
                 )
                 if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
+                    OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
@@ -4496,18 +4493,18 @@ class ThinkingProxy {
             switch outcome {
             case .sendResponse(let statusCode, _, _):
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
                         forRequestModel: requestModel,
                         telemetryEvent: telemetryEvent
                     )
                 } else {
-                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: requestModel,
                         telemetryEvent: telemetryEvent
                     )
                 }
             case .retry, .sendError:
-                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: requestModel,
                     telemetryEvent: telemetryEvent
                 )
