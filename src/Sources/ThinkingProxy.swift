@@ -77,12 +77,43 @@ enum OpenAICompatTemporaryShim {
         let timestamp: Date
         let requestModel: String
         let canonicalModelID: String
-        let outcome: String
+        let transportOutcome: String
+        let healthTransition: String?
         let failureClass: String?
         let timeoutStage: DeadlineStage
         let upstreamHTTPStatus: Int?
         let retryCount: Int
         let source: String
+        let firstByteLatencyMilliseconds: Int?
+        let totalLatencyMilliseconds: Int?
+
+        init(
+            timestamp: Date,
+            requestModel: String,
+            canonicalModelID: String,
+            transportOutcome: String,
+            healthTransition: String? = nil,
+            failureClass: String?,
+            timeoutStage: DeadlineStage,
+            upstreamHTTPStatus: Int?,
+            retryCount: Int,
+            source: String,
+            firstByteLatencyMilliseconds: Int? = nil,
+            totalLatencyMilliseconds: Int? = nil
+        ) {
+            self.timestamp = timestamp
+            self.requestModel = requestModel
+            self.canonicalModelID = canonicalModelID
+            self.transportOutcome = transportOutcome
+            self.healthTransition = healthTransition
+            self.failureClass = failureClass
+            self.timeoutStage = timeoutStage
+            self.upstreamHTTPStatus = upstreamHTTPStatus
+            self.retryCount = retryCount
+            self.source = source
+            self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
+            self.totalLatencyMilliseconds = totalLatencyMilliseconds
+        }
     }
 
     struct NVIDIARetryState: Equatable {
@@ -101,6 +132,24 @@ enum OpenAICompatTemporaryShim {
         let response: HTTPURLResponse?
         let error: Error?
         let deadlineStage: DeadlineStage
+        let firstByteLatencyMilliseconds: Int?
+        let totalLatencyMilliseconds: Int?
+
+        init(
+            data: Data?,
+            response: HTTPURLResponse?,
+            error: Error?,
+            deadlineStage: DeadlineStage,
+            firstByteLatencyMilliseconds: Int? = nil,
+            totalLatencyMilliseconds: Int? = nil
+        ) {
+            self.data = data
+            self.response = response
+            self.error = error
+            self.deadlineStage = deadlineStage
+            self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
+            self.totalLatencyMilliseconds = totalLatencyMilliseconds
+        }
     }
 
     enum NVIDIARuntimeOutcome {
@@ -116,8 +165,43 @@ enum OpenAICompatTemporaryShim {
 
     enum RouteHealthStatus: String {
         case closed = "closed"
+        case suspect = "suspect"
         case open = "open"
         case halfOpen = "half_open"
+    }
+
+    struct RouteRollingMetrics: Equatable {
+        let requestCount: Int
+        let successCount: Int
+        let timeoutCount: Int
+        let invalidSuccessCount: Int
+        let recentOutcomes: [String]
+        let recentFirstByteLatencyMilliseconds: [Int]
+
+        static let empty = RouteRollingMetrics(
+            requestCount: 0,
+            successCount: 0,
+            timeoutCount: 0,
+            invalidSuccessCount: 0,
+            recentOutcomes: [],
+            recentFirstByteLatencyMilliseconds: []
+        )
+
+        var timeoutRate: Double {
+            guard requestCount > 0 else { return 0 }
+            return Double(timeoutCount) / Double(requestCount)
+        }
+
+        var invalidSuccessRate: Double {
+            guard requestCount > 0 else { return 0 }
+            return Double(invalidSuccessCount) / Double(requestCount)
+        }
+
+        var averageFirstByteLatencyMilliseconds: Int? {
+            guard !recentFirstByteLatencyMilliseconds.isEmpty else { return nil }
+            let total = recentFirstByteLatencyMilliseconds.reduce(0, +)
+            return total / recentFirstByteLatencyMilliseconds.count
+        }
     }
 
     struct RouteCircuitState: Equatable {
@@ -126,10 +210,11 @@ enum OpenAICompatTemporaryShim {
         let recoverySuccesses: Int
         let openUntil: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
+        let rollingMetrics: RouteRollingMetrics
 
         func isUnavailable(at now: Date) -> Bool {
             switch status {
-            case .closed:
+            case .closed, .suspect:
                 return false
             case .open, .halfOpen:
                 return true
@@ -159,6 +244,7 @@ enum OpenAICompatTemporaryShim {
         let recoverySuccesses: Int
         let openUntil: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
+        let rollingMetrics: RouteRollingMetrics
     }
 
     private enum ClientStreamingMode {
@@ -323,6 +409,10 @@ enum OpenAICompatTemporaryShim {
         cooldown: 300,
         recoverySuccessThreshold: 2
     )
+    private static let routeRollingWindow = 8
+    private static let fastCanaryInterval: TimeInterval = 30
+    private static let defaultCanaryInterval: TimeInterval = 60
+    private static let defaultSuspectHedgeDelay: TimeInterval = 6
 
     private enum ToolCallValidation {
         case none
@@ -428,6 +518,37 @@ enum OpenAICompatTemporaryShim {
             return false
         }
         return (json["stream"] as? Bool) == true
+    }
+
+    static func allowsHedgedNVIDIARequest(
+        method: String,
+        path: String,
+        jsonString: String,
+        routeHealthStatus: RouteHealthStatus?
+    ) -> Bool {
+        guard routeHealthStatus == .suspect,
+              method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              policy(forModel: model) != nil else {
+            return false
+        }
+
+        if requestedStream(forRequestJSON: jsonString) {
+            return false
+        }
+
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            return false
+        }
+
+        if json["response_format"] != nil {
+            return false
+        }
+
+        return true
     }
 
     static func preflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
@@ -761,12 +882,14 @@ enum OpenAICompatTemporaryShim {
                 timestamp: Date(),
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
-                outcome: outcomeTelemetryLabel(outcome),
+                transportOutcome: outcomeTelemetryLabel(outcome),
                 failureClass: failureClass,
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: upstreamHTTPStatus,
                 retryCount: retryCount,
-                source: source
+                source: source,
+                firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
             )
         }
 
@@ -782,12 +905,14 @@ enum OpenAICompatTemporaryShim {
                 timestamp: Date(),
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
-                outcome: outcomeTelemetryLabel(outcome),
+                transportOutcome: outcomeTelemetryLabel(outcome),
                 failureClass: "classified_\(classifiedFailure.statusCode)",
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: response.statusCode,
                 retryCount: retryCount,
-                source: source
+                source: source,
+                firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
             )
         }
 
@@ -802,12 +927,14 @@ enum OpenAICompatTemporaryShim {
                 timestamp: Date(),
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
-                outcome: outcomeTelemetryLabel(outcome),
+                transportOutcome: outcomeTelemetryLabel(outcome),
                 failureClass: evaluation.retryReason,
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: response.statusCode,
                 retryCount: retryCount,
-                source: source
+                source: source,
+                firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
             )
         }
 
@@ -815,12 +942,14 @@ enum OpenAICompatTemporaryShim {
             timestamp: Date(),
             requestModel: state.model,
             canonicalModelID: canonicalModelID,
-            outcome: outcomeTelemetryLabel(outcome),
+            transportOutcome: outcomeTelemetryLabel(outcome),
             failureClass: "missing_response_material",
             timeoutStage: attempt.deadlineStage,
             upstreamHTTPStatus: upstreamHTTPStatus,
             retryCount: retryCount,
-            source: source
+            source: source,
+            firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
+            totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
         )
     }
 
@@ -883,6 +1012,38 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func routeHealthStatus(forRequestModel requestModel: String, at now: Date = Date()) -> RouteHealthStatus? {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return nil
+        }
+        return nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.status
+        }
+    }
+
+    static func recommendedNVIDIAHedgeDelay(forRequestModel requestModel: String) -> TimeInterval {
+        guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
+            return defaultSuspectHedgeDelay
+        }
+        return nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return recommendedNVIDIAHedgeDelay(
+                metrics: routeCircuitStatesByCanonicalModelID[route.canonicalModelID]?.rollingMetrics
+            )
+        }
+    }
+
+    static func recommendedNVIDIACanaryInterval() -> TimeInterval {
+        return nvidiaRouteHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let metrics = routeCircuitStatesByCanonicalModelID.values
+                .filter { $0.isUnavailable(at: Date()) }
+                .map(\.rollingMetrics)
+            return recommendedNVIDIACanaryInterval(metrics: metrics)
+        }
+    }
+
     static func isNVIDIAHostedRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return false
@@ -904,15 +1065,23 @@ enum OpenAICompatTemporaryShim {
         nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByCanonicalModelID[route.canonicalModelID]
-            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextRouteCircuitState(
+            var nextState = nextRouteCircuitState(
                 current: current,
                 afterFailureAt: now,
                 telemetryEvent: telemetryEvent,
                 policy: routeCircuitBreakerPolicy
             )
+            let enrichedTelemetryEvent = telemetryEvent.map {
+                enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
+            }
+            nextState = routeCircuitState(
+                nextState,
+                replacingLastTelemetryEvent: enrichedTelemetryEvent
+            )
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextState
             persistRouteHealthLocked()
-            if let telemetryEvent {
-                logNVIDIARouteTelemetry(telemetryEvent)
+            if let enrichedTelemetryEvent {
+                logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
         }
     }
@@ -926,14 +1095,23 @@ enum OpenAICompatTemporaryShim {
         }
         nvidiaRouteHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextRouteCircuitStateAfterSuccess(
-                current: routeCircuitStatesByCanonicalModelID[route.canonicalModelID],
+            let current = routeCircuitStatesByCanonicalModelID[route.canonicalModelID]
+            var nextState = nextRouteCircuitStateAfterSuccess(
+                current: current,
                 telemetryEvent: telemetryEvent,
                 policy: routeCircuitBreakerPolicy
             )
+            let enrichedTelemetryEvent = telemetryEvent.map {
+                enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
+            }
+            nextState = routeCircuitState(
+                nextState,
+                replacingLastTelemetryEvent: enrichedTelemetryEvent
+            )
+            routeCircuitStatesByCanonicalModelID[route.canonicalModelID] = nextState
             persistRouteHealthLocked()
-            if let telemetryEvent {
-                logNVIDIARouteTelemetry(telemetryEvent)
+            if let enrichedTelemetryEvent {
+                logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
         }
     }
@@ -957,7 +1135,8 @@ enum OpenAICompatTemporaryShim {
                 failureScore: routeCircuitBreakerPolicy.failureThreshold,
                 recoverySuccesses: 0,
                 openUntil: until,
-                lastTelemetryEvent: nil
+                lastTelemetryEvent: nil,
+                rollingMetrics: .empty
             )
             persistRouteHealthLocked()
         }
@@ -1114,9 +1293,13 @@ enum OpenAICompatTemporaryShim {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
         let failurePenalty = failurePenalty(for: telemetryEvent)
         let lastTelemetryEvent = telemetryEvent ?? current?.lastTelemetryEvent
+        let nextRollingMetrics = updatedRollingMetrics(
+            current: current?.rollingMetrics,
+            telemetryEvent: telemetryEvent
+        )
 
         switch current?.status ?? .closed {
-        case .closed:
+        case .closed, .suspect:
             let nextFailureScore = min(
                 effectivePolicy.failureThreshold,
                 (current?.failureScore ?? 0) + failurePenalty
@@ -1127,15 +1310,17 @@ enum OpenAICompatTemporaryShim {
                     failureScore: effectivePolicy.failureThreshold,
                     recoverySuccesses: 0,
                     openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
-                    lastTelemetryEvent: lastTelemetryEvent
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics
                 )
             }
             return RouteCircuitState(
-                status: .closed,
+                status: .suspect,
                 failureScore: nextFailureScore,
                 recoverySuccesses: 0,
                 openUntil: nil,
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
             )
         case .open, .halfOpen:
             return RouteCircuitState(
@@ -1143,7 +1328,8 @@ enum OpenAICompatTemporaryShim {
                 failureScore: effectivePolicy.failureThreshold,
                 recoverySuccesses: 0,
                 openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
             )
         }
     }
@@ -1155,6 +1341,10 @@ enum OpenAICompatTemporaryShim {
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
         let lastTelemetryEvent = telemetryEvent ?? current?.lastTelemetryEvent
+        let nextRollingMetrics = updatedRollingMetrics(
+            current: current?.rollingMetrics,
+            telemetryEvent: telemetryEvent
+        )
 
         switch current?.status ?? .closed {
         case .closed:
@@ -1163,7 +1353,27 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: 0,
                 openUntil: nil,
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
+            )
+        case .suspect:
+            if shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
+                return RouteCircuitState(
+                    status: .suspect,
+                    failureScore: 0,
+                    recoverySuccesses: 0,
+                    openUntil: nil,
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics
+                )
+            }
+            return RouteCircuitState(
+                status: .closed,
+                failureScore: 0,
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
             )
         case .open:
             return RouteCircuitState(
@@ -1171,7 +1381,8 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: 1,
                 openUntil: nil,
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
             )
         case .halfOpen:
             let nextRecoverySuccesses = (current?.recoverySuccesses ?? 0) + 1
@@ -1181,7 +1392,8 @@ enum OpenAICompatTemporaryShim {
                     failureScore: 0,
                     recoverySuccesses: 0,
                     openUntil: nil,
-                    lastTelemetryEvent: lastTelemetryEvent
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics
                 )
             }
             return RouteCircuitState(
@@ -1189,9 +1401,50 @@ enum OpenAICompatTemporaryShim {
                 failureScore: 0,
                 recoverySuccesses: nextRecoverySuccesses,
                 openUntil: nil,
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
             )
         }
+    }
+
+    private static func routeCircuitState(
+        _ state: RouteCircuitState,
+        replacingLastTelemetryEvent telemetryEvent: RouteTelemetryEvent?
+    ) -> RouteCircuitState {
+        RouteCircuitState(
+            status: state.status,
+            failureScore: state.failureScore,
+            recoverySuccesses: state.recoverySuccesses,
+            openUntil: state.openUntil,
+            lastTelemetryEvent: telemetryEvent,
+            rollingMetrics: state.rollingMetrics
+        )
+    }
+
+    private static func enrichTelemetryEvent(
+        _ event: RouteTelemetryEvent,
+        from previousStatus: RouteHealthStatus,
+        to nextStatus: RouteHealthStatus
+    ) -> RouteTelemetryEvent {
+        RouteTelemetryEvent(
+            timestamp: event.timestamp,
+            requestModel: event.requestModel,
+            canonicalModelID: event.canonicalModelID,
+            transportOutcome: event.transportOutcome,
+            healthTransition: healthTransitionLabel(from: previousStatus, to: nextStatus),
+            failureClass: event.failureClass,
+            timeoutStage: event.timeoutStage,
+            upstreamHTTPStatus: event.upstreamHTTPStatus,
+            retryCount: event.retryCount,
+            source: event.source,
+            firstByteLatencyMilliseconds: event.firstByteLatencyMilliseconds,
+            totalLatencyMilliseconds: event.totalLatencyMilliseconds
+        )
+    }
+
+    private static func healthTransitionLabel(from previousStatus: RouteHealthStatus, to nextStatus: RouteHealthStatus) -> String? {
+        guard previousStatus != nextStatus else { return nil }
+        return "\(previousStatus.rawValue)->\(nextStatus.rawValue)"
     }
 
     private static func failurePenalty(for telemetryEvent: RouteTelemetryEvent?) -> Int {
@@ -1199,14 +1452,91 @@ enum OpenAICompatTemporaryShim {
             return 1
         }
 
-        if failureClass == "transport_timeout" ||
-            failureClass == "transport_error" ||
+        if failureClass == "transport_error" ||
             failureClass == "missing_response_material" ||
             failureClass.hasPrefix("classified_5") {
             return 2
         }
 
         return 1
+    }
+
+    private static func updatedRollingMetrics(
+        current: RouteRollingMetrics?,
+        telemetryEvent: RouteTelemetryEvent?
+    ) -> RouteRollingMetrics {
+        guard let telemetryEvent else {
+            return current ?? .empty
+        }
+
+        let prior = current ?? .empty
+        var recentOutcomes = prior.recentOutcomes
+        recentOutcomes.append(rollingOutcomeLabel(for: telemetryEvent))
+        if recentOutcomes.count > routeRollingWindow {
+            recentOutcomes.removeFirst(recentOutcomes.count - routeRollingWindow)
+        }
+
+        var recentFirstByteLatencyMilliseconds = prior.recentFirstByteLatencyMilliseconds
+        if let firstByteLatencyMilliseconds = telemetryEvent.firstByteLatencyMilliseconds {
+            recentFirstByteLatencyMilliseconds.append(firstByteLatencyMilliseconds)
+            if recentFirstByteLatencyMilliseconds.count > routeRollingWindow {
+                recentFirstByteLatencyMilliseconds.removeFirst(recentFirstByteLatencyMilliseconds.count - routeRollingWindow)
+            }
+        }
+
+        return RouteRollingMetrics(
+            requestCount: prior.requestCount + 1,
+            successCount: prior.successCount + (telemetryEvent.failureClass == nil ? 1 : 0),
+            timeoutCount: prior.timeoutCount + (telemetryEvent.failureClass == "transport_timeout" ? 1 : 0),
+            invalidSuccessCount: prior.invalidSuccessCount + (isInvalidSuccessFailureClass(telemetryEvent.failureClass) ? 1 : 0),
+            recentOutcomes: recentOutcomes,
+            recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds
+        )
+    }
+
+    private static func rollingOutcomeLabel(for telemetryEvent: RouteTelemetryEvent) -> String {
+        if let failureClass = telemetryEvent.failureClass, !failureClass.isEmpty {
+            return "\(telemetryEvent.transportOutcome):\(failureClass)"
+        }
+        return telemetryEvent.transportOutcome
+    }
+
+    private static func isInvalidSuccessFailureClass(_ failureClass: String?) -> Bool {
+        guard let failureClass else { return false }
+        return FailureClass(rawValue: failureClass) != nil
+    }
+
+    private static func shouldRemainSuspectAfterSuccess(metrics: RouteRollingMetrics) -> Bool {
+        metrics.timeoutRate >= 0.5 || metrics.invalidSuccessRate >= 0.5
+    }
+
+    private static func recommendedNVIDIAHedgeDelay(metrics: RouteRollingMetrics?) -> TimeInterval {
+        guard let metrics else { return defaultSuspectHedgeDelay }
+        if metrics.timeoutRate >= 0.5 {
+            return 3
+        }
+        if metrics.invalidSuccessRate >= 0.5 {
+            return 2
+        }
+        if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
+           averageFirstByteLatencyMilliseconds >= 4_000 {
+            return 4
+        }
+        return defaultSuspectHedgeDelay
+    }
+
+    private static func recommendedNVIDIACanaryInterval(metrics: [RouteRollingMetrics]) -> TimeInterval {
+        guard !metrics.isEmpty else { return defaultCanaryInterval }
+        if metrics.contains(where: { $0.timeoutRate >= 0.5 }) {
+            return fastCanaryInterval
+        }
+        if metrics.contains(where: { $0.invalidSuccessRate >= 0.5 }) {
+            return 45
+        }
+        if metrics.contains(where: { ($0.averageFirstByteLatencyMilliseconds ?? 0) >= 4_000 }) {
+            return fastCanaryInterval
+        }
+        return defaultCanaryInterval
     }
 
     private static func loadPersistedRouteHealthIfNeededLocked() {
@@ -1230,12 +1560,14 @@ enum OpenAICompatTemporaryShim {
             let recoverySuccesses = entry["recovery_successes"] as? Int ?? 0
             let openUntil = parseISO8601Date(entry["open_until"])
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
+            let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
             loaded[canonicalModelID] = RouteCircuitState(
                 status: status,
                 failureScore: failureScore,
                 recoverySuccesses: recoverySuccesses,
                 openUntil: openUntil,
-                lastTelemetryEvent: lastTelemetryEvent
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: rollingMetrics
             )
         }
         routeCircuitStatesByCanonicalModelID = loaded
@@ -1259,6 +1591,7 @@ enum OpenAICompatTemporaryShim {
             if let lastTelemetryEvent = state.lastTelemetryEvent {
                 entry["last_event"] = telemetryEventDictionary(lastTelemetryEvent)
             }
+            entry["rolling_metrics"] = rollingMetricsDictionary(state.rollingMetrics)
             routes[canonicalModelID] = entry
         }
 
@@ -1285,16 +1618,25 @@ enum OpenAICompatTemporaryShim {
             "timestamp": iso8601String(from: event.timestamp),
             "request_model": event.requestModel,
             "canonical_model_id": event.canonicalModelID,
-            "outcome": event.outcome,
+            "transport_outcome": event.transportOutcome,
             "timeout_stage": event.timeoutStage.rawValue,
             "retry_count": event.retryCount,
             "source": event.source
         ]
+        if let healthTransition = event.healthTransition {
+            dict["health_transition"] = healthTransition
+        }
         if let failureClass = event.failureClass {
             dict["failure_class"] = failureClass
         }
         if let upstreamHTTPStatus = event.upstreamHTTPStatus {
             dict["upstream_http_status"] = upstreamHTTPStatus
+        }
+        if let firstByteLatencyMilliseconds = event.firstByteLatencyMilliseconds {
+            dict["first_byte_latency_ms"] = firstByteLatencyMilliseconds
+        }
+        if let totalLatencyMilliseconds = event.totalLatencyMilliseconds {
+            dict["total_latency_ms"] = totalLatencyMilliseconds
         }
         return dict
     }
@@ -1304,7 +1646,7 @@ enum OpenAICompatTemporaryShim {
               let timestamp = parseISO8601Date(dict["timestamp"]),
               let requestModel = dict["request_model"] as? String,
               let canonicalModelID = dict["canonical_model_id"] as? String,
-              let outcome = dict["outcome"] as? String,
+              let transportOutcome = (dict["transport_outcome"] as? String) ?? (dict["outcome"] as? String),
               let timeoutStageRaw = dict["timeout_stage"] as? String,
               let timeoutStage = DeadlineStage(rawValue: timeoutStageRaw),
               let retryCount = dict["retry_count"] as? Int,
@@ -1315,12 +1657,40 @@ enum OpenAICompatTemporaryShim {
             timestamp: timestamp,
             requestModel: requestModel,
             canonicalModelID: canonicalModelID,
-            outcome: outcome,
+            transportOutcome: transportOutcome,
+            healthTransition: dict["health_transition"] as? String,
             failureClass: dict["failure_class"] as? String,
             timeoutStage: timeoutStage,
             upstreamHTTPStatus: dict["upstream_http_status"] as? Int,
             retryCount: retryCount,
-            source: source
+            source: source,
+            firstByteLatencyMilliseconds: integerValue(dict["first_byte_latency_ms"]),
+            totalLatencyMilliseconds: integerValue(dict["total_latency_ms"])
+        )
+    }
+
+    private static func rollingMetricsDictionary(_ metrics: RouteRollingMetrics) -> [String: Any] {
+        [
+            "request_count": metrics.requestCount,
+            "success_count": metrics.successCount,
+            "timeout_count": metrics.timeoutCount,
+            "invalid_success_count": metrics.invalidSuccessCount,
+            "recent_outcomes": metrics.recentOutcomes,
+            "recent_first_byte_latency_ms": metrics.recentFirstByteLatencyMilliseconds
+        ]
+    }
+
+    private static func parseRollingMetrics(_ rawValue: Any?) -> RouteRollingMetrics {
+        guard let dict = rawValue as? [String: Any] else {
+            return .empty
+        }
+        return RouteRollingMetrics(
+            requestCount: integerValue(dict["request_count"]) ?? 0,
+            successCount: integerValue(dict["success_count"]) ?? 0,
+            timeoutCount: integerValue(dict["timeout_count"]) ?? 0,
+            invalidSuccessCount: integerValue(dict["invalid_success_count"]) ?? 0,
+            recentOutcomes: dict["recent_outcomes"] as? [String] ?? [],
+            recentFirstByteLatencyMilliseconds: dict["recent_first_byte_latency_ms"] as? [Int] ?? []
         )
     }
 
@@ -1824,8 +2194,33 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let defaultMitigatedAttemptTimeout: TimeInterval = 30
-        static let nvidiaCanaryInterval: TimeInterval = 60
         static let nvidiaCanaryTimeout: TimeInterval = 20
+    }
+
+    final class NVIDIAAttemptCoordinator {
+        private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-hedge-coordinator")
+        private var finished = false
+        private var hedgeStarted = false
+
+        func shouldStartHedge() -> Bool {
+            stateQueue.sync {
+                guard !finished, !hedgeStarted else { return false }
+                hedgeStarted = true
+                return true
+            }
+        }
+
+        func tryFinish() -> Bool {
+            stateQueue.sync {
+                guard !finished else { return false }
+                finished = true
+                return true
+            }
+        }
+
+        func isFinished() -> Bool {
+            stateQueue.sync { finished }
+        }
     }
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
@@ -1833,6 +2228,8 @@ class ThinkingProxy {
         private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
         private var firstResponseDeadlineWorkItem: DispatchWorkItem?
         private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
+        private let startedAt = Date()
+        private var firstPayloadAt: Date?
 
         func installDeadlines(
             firstResponseSeconds: TimeInterval?,
@@ -1892,8 +2289,24 @@ class ThinkingProxy {
             stateQueue.sync { tracker.deadlineStage }
         }
 
+        func firstByteLatencyMilliseconds() -> Int? {
+            stateQueue.sync {
+                guard let firstPayloadAt else { return nil }
+                return Int(firstPayloadAt.timeIntervalSince(startedAt) * 1000)
+            }
+        }
+
+        func totalLatencyMilliseconds() -> Int {
+            stateQueue.sync {
+                Int(Date().timeIntervalSince(startedAt) * 1000)
+            }
+        }
+
         private func markPayloadReceived() {
             stateQueue.sync {
+                if firstPayloadAt == nil {
+                    firstPayloadAt = Date()
+                }
                 tracker.payloadReceived()
                 firstResponseDeadlineWorkItem?.cancel()
                 firstResponseDeadlineWorkItem = nil
@@ -2184,7 +2597,7 @@ class ThinkingProxy {
         ) {
             let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: modifiedBody)
             let model = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody) ?? "unknown"
-            forwardNvidiaReasoningRequestWithRetry(
+            forwardNvidiaReasoningRequest(
                 method: method,
                 path: rewrittenPath,
                 headers: headers,
@@ -2443,7 +2856,7 @@ class ThinkingProxy {
         targetConnection.start(queue: .global(qos: .userInitiated))
     }
 
-    private func forwardNvidiaReasoningRequestWithRetry(
+    private func forwardNvidiaReasoningRequest(
         method: String,
         path: String,
         headers: [(String, String)],
@@ -2451,8 +2864,57 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
+        let coordinator = NVIDIAAttemptCoordinator()
+        forwardNvidiaReasoningRequestWithRetry(
+            method: method,
+            path: path,
+            headers: headers,
+            body: body,
+            originalConnection: originalConnection,
+            state: state,
+            coordinator: coordinator
+        )
+
+        let routeHealthStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
+        guard OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
+            method: method,
+            path: path,
+            jsonString: body,
+            routeHealthStatus: routeHealthStatus
+        ) else {
+            return
+        }
+
+        let hedgeDelay = OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: state.model)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self] in
+            guard let self, coordinator.shouldStartHedge() else { return }
+            NSLog("[ThinkingProxy] Starting hedged NVIDIA attempt for suspect route %@ after %.2fs", state.model, hedgeDelay)
+            self.forwardNvidiaReasoningRequestWithRetry(
+                method: method,
+                path: path,
+                headers: headers,
+                body: body,
+                originalConnection: originalConnection,
+                state: state,
+                coordinator: coordinator
+            )
+        }
+    }
+
+    private func forwardNvidiaReasoningRequestWithRetry(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        originalConnection: NWConnection,
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        coordinator: NVIDIAAttemptCoordinator
+    ) {
+        guard !coordinator.isFinished() else { return }
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
-            sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+            if coordinator.tryFinish() {
+                sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+            }
             return
         }
 
@@ -2475,31 +2937,30 @@ class ThinkingProxy {
                 responseProgress.finish()
                 session.finishTasksAndInvalidate()
             }
+            let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                data: data,
+                response: response as? HTTPURLResponse,
+                error: error,
+                deadlineStage: responseProgress.currentDeadlineStage(),
+                firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
+            )
             let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
                 state: state,
-                attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
-                    data: data,
-                    response: response as? HTTPURLResponse,
-                    error: error,
-                    deadlineStage: responseProgress.currentDeadlineStage()
-                )
+                attempt: attempt
             )
             let telemetryEvent = OpenAICompatTemporaryShim.telemetryEvent(
                 path: path,
                 state: state,
-                attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
-                    data: data,
-                    response: response as? HTTPURLResponse,
-                    error: error,
-                    deadlineStage: responseProgress.currentDeadlineStage()
-                ),
+                attempt: attempt,
                 outcome: outcome,
                 source: "live_request"
             )
 
             switch outcome {
             case .retry(let nextState):
+                guard !coordinator.isFinished() else { return }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
                 self.scheduleNvidiaReasoningRetry(
                     method: method,
@@ -2507,11 +2968,17 @@ class ThinkingProxy {
                     headers: headers,
                     body: body,
                     originalConnection: originalConnection,
-                    state: nextState
+                    state: nextState,
+                    coordinator: coordinator
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
+                guard coordinator.tryFinish() else { return }
                 if statusCode >= 200 && statusCode < 300 {
                     OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                } else if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
+                    OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                } else {
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
                 }
                 self.sendHTTPResponse(
                     to: originalConnection,
@@ -2520,6 +2987,7 @@ class ThinkingProxy {
                     body: bodyData
                 )
             case .sendError(let statusCode, let message):
+                guard coordinator.tryFinish() else { return }
                 if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
                     OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
                 } else {
@@ -2589,14 +3057,25 @@ class ThinkingProxy {
     private func startNVIDIACanaryLoop() {
         stateQueue.sync {
             guard nvidiaCanaryTimer == nil else { return }
-            let timer = DispatchSource.makeTimerSource(queue: nvidiaCanaryQueue)
-            timer.schedule(deadline: .now() + Config.nvidiaCanaryInterval, repeating: Config.nvidiaCanaryInterval)
-            timer.setEventHandler { [weak self] in
-                self?.performNVIDIACanariesOnce()
-            }
-            nvidiaCanaryTimer = timer
-            timer.resume()
+            scheduleNextNVIDIACanaryLocked(after: OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval())
         }
+    }
+
+    private func scheduleNextNVIDIACanaryLocked(after interval: TimeInterval) {
+        nvidiaCanaryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: nvidiaCanaryQueue)
+        timer.schedule(deadline: .now() + interval)
+        timer.setEventHandler { [weak self] in
+            self?.performNVIDIACanariesOnce { [weak self] in
+                guard let self else { return }
+                self.stateQueue.sync {
+                    guard self.isRunning else { return }
+                    self.scheduleNextNVIDIACanaryLocked(after: OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval())
+                }
+            }
+        }
+        nvidiaCanaryTimer = timer
+        timer.resume()
     }
 
     private func stopNVIDIACanaryLoop() {
@@ -2746,17 +3225,20 @@ class ThinkingProxy {
         headers: [(String, String)],
         body: String,
         originalConnection: NWConnection,
-        state: OpenAICompatTemporaryShim.NVIDIARetryState
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        coordinator: NVIDIAAttemptCoordinator
     ) {
         let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.forwardNvidiaReasoningRequestWithRetry(
+            guard let self, !coordinator.isFinished() else { return }
+            self.forwardNvidiaReasoningRequestWithRetry(
                 method: method,
                 path: path,
                 headers: headers,
                 body: body,
                 originalConnection: originalConnection,
-                state: state
+                state: state,
+                coordinator: coordinator
             )
         }
     }

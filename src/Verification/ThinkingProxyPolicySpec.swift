@@ -279,7 +279,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia route circuit opens after repeated failures, enters half-open on first success, and closes after recovery threshold", recorder: recorder) {
+        run("temporary nvidia route circuit degrades to suspect before quarantine, then enters half-open on recovery", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -287,7 +287,10 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "glm5 should start healthy", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one failure should not open the circuit yet", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one failure should not quarantine the route yet", recorder: recorder)
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "one failure should degrade the route to suspect", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "suspect state should retain the current failure score", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(forRequestModel: "glm5", at: now)
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "two failures should quarantine the route", recorder: recorder)
@@ -295,7 +298,7 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(forRequestModel: "glm5")
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "one success should only move the route into half-open recovery", recorder: recorder)
 
-                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first recovery success should transition to half-open", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open state should track recovery successes", recorder: recorder)
 
@@ -305,6 +308,173 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "second recovery success should restore the healthy state", recorder: recorder)
                 OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
             }
+        }
+
+        run("temporary nvidia rolling metrics keep flaky suspect routes degraded until they prove stability", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm5",
+                    canonicalModelID: "z-ai/glm5",
+                    transportOutcome: "send_error",
+                    failureClass: "transport_timeout",
+                    timeoutStage: .firstResponse,
+                    upstreamHTTPStatus: nil,
+                    retryCount: 0,
+                    source: "live_request",
+                    firstByteLatencyMilliseconds: 6_000,
+                    totalLatencyMilliseconds: 25_000
+                )
+                let successEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now.addingTimeInterval(1),
+                    requestModel: "glm5",
+                    canonicalModelID: "z-ai/glm5",
+                    transportOutcome: "send_response",
+                    failureClass: nil,
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 200,
+                    retryCount: 0,
+                    source: "live_request",
+                    firstByteLatencyMilliseconds: 150,
+                    totalLatencyMilliseconds: 400
+                )
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now
+                )
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                    forRequestModel: "glm5",
+                    telemetryEvent: successEvent
+                )
+
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky suspect route", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.timeoutCount, 1, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteSuccess(
+                    forRequestModel: "glm5",
+                    telemetryEvent: successEvent
+                )
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "enough clean successes should still restore the healthy state", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia hedging is enabled only for suspect plain-chat requests", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let plainRequest = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "max_tokens": 32,
+                  "stream": false
+                }
+                """
+                let toolRequest = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {"role": "user", "content": "Use the tool"}
+                  ],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"}
+                      }
+                    }
+                  ],
+                  "stream": false
+                }
+                """
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: plainRequest,
+                        routeHealthStatus: .suspect
+                    ),
+                    true,
+                    "suspect plain-chat requests should be hedge-eligible",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: plainRequest,
+                        routeHealthStatus: .closed
+                    ),
+                    false,
+                    "healthy routes should not hedge by default",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: toolRequest,
+                        routeHealthStatus: .suspect
+                    ),
+                    false,
+                    "tool-calling requests should not be hedge-eligible",
+                    recorder: recorder
+                )
+            }
+        }
+
+        run("temporary nvidia rolling metrics tune hedge delay and canary cadence for flaky routes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm5",
+                    canonicalModelID: "z-ai/glm5",
+                    transportOutcome: "send_error",
+                    failureClass: "transport_timeout",
+                    timeoutStage: .firstResponse,
+                    upstreamHTTPStatus: nil,
+                    retryCount: 0,
+                    source: "live_request",
+                    firstByteLatencyMilliseconds: 5_500,
+                    totalLatencyMilliseconds: 25_000
+                )
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now
+                )
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 3, "high recent timeout rates should shorten suspect hedge delay", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordNVIDIAHostedRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now.addingTimeInterval(1)
+                )
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval(), 30, "quarantined routes with severe timeout history should be canaried more aggressively", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia hedge coordination starts once and only lets one attempt finish", recorder: recorder) {
+            let coordinator = ThinkingProxy.NVIDIAAttemptCoordinator()
+
+            expectEqual(coordinator.shouldStartHedge(), true, "the first hedge request should start the secondary attempt", recorder: recorder)
+            expectEqual(coordinator.shouldStartHedge(), false, "duplicate hedge launches should be suppressed", recorder: recorder)
+            expectEqual(coordinator.tryFinish(), true, "the first completed attempt should win delivery", recorder: recorder)
+            expectEqual(coordinator.tryFinish(), false, "later attempts should be prevented from sending duplicate responses", recorder: recorder)
+            expectEqual(coordinator.isFinished(), true, "coordinator should stay finished once a winner is recorded", recorder: recorder)
         }
 
         run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
@@ -395,7 +565,7 @@ struct ThinkingProxyPolicySpec {
                         timestamp: now,
                         requestModel: "glm5",
                         canonicalModelID: "z-ai/glm5",
-                        outcome: "send_error",
+                        transportOutcome: "send_error",
                         failureClass: "transport_timeout",
                         timeoutStage: .bufferedResponse,
                         upstreamHTTPStatus: nil,
@@ -426,7 +596,10 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(persisted?.status, .open, "persisted route health should retain open-circuit state", recorder: recorder)
                     expectEqual(persisted?.failureScore ?? 0, 2, "persisted route health should retain the failure score", recorder: recorder)
                     expectEqual(persisted?.isUnavailable(at: now), true, "persisted route health should remain unavailable after reload", recorder: recorder)
-                    expectEqual(persisted?.lastTelemetryEvent, event, "persisted route health should retain the last telemetry event", recorder: recorder)
+                    expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "persisted route health should retain the transport outcome", recorder: recorder)
+                    expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "persisted route health should retain the health transition", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.timeoutCount, 2, "persisted route health should retain rolling timeout counts", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 2, "persisted route health should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                         recorder.recordFailure("expected to read persisted route-health cache file")
@@ -437,6 +610,10 @@ struct ThinkingProxyPolicySpec {
                     let glm5 = routes?["z-ai/glm5"] as? [String: Any]
                     expectEqual(glm5?["status"] as? String, "open", "persisted route-health file should store route status", recorder: recorder)
                     expectEqual(glm5?["failure_score"] as? Int, 2, "persisted route-health file should store the failure score", recorder: recorder)
+                    let lastEvent = glm5?["last_event"] as? [String: Any]
+                    expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "persisted route-health file should store the health transition", recorder: recorder)
+                    let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
+                    expectEqual(rollingMetrics?["timeout_count"] as? Int, 2, "persisted route-health file should store rolling timeout counts", recorder: recorder)
                 }
             }
         }
@@ -469,7 +646,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(event.requestModel, "glm5", "telemetry should preserve the request model alias", recorder: recorder)
                 expectEqual(event.canonicalModelID, "z-ai/glm5", "telemetry should resolve canonical NVIDIA model identity", recorder: recorder)
-                expectEqual(event.outcome, "send_error", "telemetry should encode the runtime outcome label", recorder: recorder)
+                expectEqual(event.transportOutcome, "send_error", "telemetry should encode the runtime outcome label", recorder: recorder)
                 expectEqual(event.failureClass, "transport_timeout", "deadline-driven transport failures should be labeled explicitly", recorder: recorder)
                 expectEqual(event.timeoutStage, .bufferedResponse, "telemetry should capture the deadline stage", recorder: recorder)
                 expectEqual(event.retryCount, 1, "telemetry should include retries already spent before the outcome", recorder: recorder)
@@ -574,7 +751,8 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open recovery should count successful canaries", recorder: recorder)
                     var lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "successful canaries should record canary telemetry", recorder: recorder)
-                    expectEqual(lastEvent?.outcome, "send_response", "successful canaries should record a successful runtime outcome", recorder: recorder)
+                    expectEqual(lastEvent?.transportOutcome, "send_response", "successful canaries should record a successful runtime outcome", recorder: recorder)
+                    expectEqual(lastEvent?.healthTransition, "open->half_open", "successful canaries should record the route-health transition", recorder: recorder)
 
                     let secondSemaphore = DispatchSemaphore(value: 0)
                     proxy.performNVIDIACanariesOnce {
