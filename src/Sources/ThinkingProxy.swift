@@ -828,6 +828,27 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    static func configuredRoutePreflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
+        guard method == "POST",
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              let route = resolveConfiguredRoute(forRequestModel: model) else {
+            return nil
+        }
+
+        if route.providerID == "zai",
+           route.canonicalModelID == "glm-5-turbo",
+           isResponsesPath(path) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 501,
+                message: "Z.AI glm-5-turbo does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions."
+            )
+        }
+
+        return preflightError(method: method, path: path, jsonString: jsonString)
+    }
+
     static func isNvidiaReasoningChatRequest(method: String, path: String, jsonString: String) -> Bool {
         guard method == "POST",
               isChatCompletionsPath(path),
@@ -3395,7 +3416,7 @@ class ThinkingProxy {
                 return
             }
 
-            if let preflightError = OpenAICompatTemporaryShim.preflightError(
+            if let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
                 method: method,
                 path: rewrittenPath,
                 jsonString: modifiedBody

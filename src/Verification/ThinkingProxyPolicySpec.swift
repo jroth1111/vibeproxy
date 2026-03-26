@@ -247,6 +247,28 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary zai glm-5-turbo preflight rejects /v1/responses", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm-5-turbo",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
+                    method: "POST",
+                    path: "/v1/responses",
+                    jsonString: request
+                )
+
+                expectEqual(preflightError?.statusCode ?? 0, 501, "glm-5-turbo should fail fast on /v1/responses instead of surfacing a useless success-shaped response", recorder: recorder)
+                expectEqual(preflightError?.message, "Z.AI glm-5-turbo does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions.", "glm-5-turbo /v1/responses rejections should steer callers to the supported surfaces", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia timeout and retry budgets are route-specific", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let glm5Request = """
