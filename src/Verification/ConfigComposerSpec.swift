@@ -237,6 +237,31 @@ struct ConfigComposerSpec {
             expectNil(merged["remote-management"], "unsupported remote-management overrides should be ignored", recorder: recorder)
         }
 
+        run("composeAdditiveBaseConfig preserves smart-aliases overlays", recorder: recorder) {
+            let bundledRoot: [String: Any] = [
+                "routing": ["strategy": "round-robin"]
+            ]
+            let userRoot: [String: Any] = [
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
+                    ]
+                ]
+            ]
+
+            let merged = ConfigComposer.composeAdditiveBaseConfig(
+                bundledRoot: bundledRoot,
+                userRoot: userRoot
+            )
+
+            let smartAliases = dictionary(merged["smart-aliases"])
+            let worker = dictionary(smartAliases["worker"])
+            expectEqual(worker["request-class"] as? String, "plain-chat", "smart alias request class should survive additive config composition", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "smart alias candidate order should be preserved", recorder: recorder)
+        }
+
         run("parseCustomProviders ignores reserved providers and keeps UI metadata", recorder: recorder) {
             let root: [String: Any] = [
                 "openai-compatibility": [
@@ -441,6 +466,33 @@ struct ConfigComposerSpec {
             expectNil(provider(named: "nvidia", in: runtime), "disabled custom providers should be omitted from runtime config", recorder: recorder)
         }
 
+        run("composeRuntimeConfig preserves smart-aliases untouched", recorder: recorder) {
+            let baseRoot: [String: Any] = [
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5-turbo", "minimax-m2.5"]
+                    ]
+                ]
+            ]
+
+            let runtime = ConfigComposer.composeRuntimeConfig(
+                baseRoot: baseRoot,
+                reservedCustomProviderKeys: reservedProviderIDs,
+                disabledCustomProviderIDs: [],
+                disabledOAuthProviderKeys: [],
+                zaiAPIKeys: [],
+                customProviderAuthRecords: [],
+                includeManagedZAIProvider: false
+            )
+
+            let smartAliases = dictionary(runtime["smart-aliases"])
+            let worker = dictionary(smartAliases["worker"])
+            expectEqual(worker["failover"] as? String, "silent", "runtime config should preserve smart alias failover mode", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5"], "runtime config should preserve smart alias candidate order", recorder: recorder)
+        }
+
         run("wildcard oauth exclusions are detectable", recorder: recorder) {
             let root: [String: Any] = [
                 "oauth-excluded-models": [
@@ -549,6 +601,73 @@ struct ConfigComposerSpec {
                     "Provider 'gemini-cli' is reserved and cannot be declared under openai-compatibility."
                 ],
                 "whitespace-padded and reserved provider ids should be rejected",
+                recorder: recorder
+            )
+        }
+
+        run("validateSmartAliases rejects malformed or unknown smart-alias configurations", recorder: recorder) {
+            let root: [String: Any] = [
+                "openai-compatibility": [
+                    [
+                        "name": "nvidia",
+                        "base-url": "https://integrate.api.nvidia.com/v1",
+                        "models": [
+                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                        ]
+                    ]
+                ],
+                "smart-aliases": [
+                    " worker ": [
+                        "request-class": "streaming",
+                        "failover": "visible",
+                        "candidates": ["glm-5-turbo", " unknown ", "minimax-m2.5", "minimax-m2.5"]
+                    ],
+                    "fanout": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["worker"]
+                    ]
+                ]
+            ]
+
+            let errors = ConfigComposer.validateSmartAliases(in: root)
+
+            expectEqual(
+                errors,
+                [
+                    "Smart alias name ' worker ' must not include leading or trailing whitespace.",
+                    "smart-aliases.fanout.candidates contains unknown model alias 'worker'."
+                ],
+                "smart alias validation should reject malformed names and smart-alias chaining",
+                recorder: recorder
+            )
+        }
+
+        run("validateSmartAliases accepts worker pools that target known model aliases", recorder: recorder) {
+            let root: [String: Any] = [
+                "openai-compatibility": [
+                    [
+                        "name": "nvidia",
+                        "base-url": "https://integrate.api.nvidia.com/v1",
+                        "models": [
+                            ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"],
+                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                        ]
+                    ]
+                ],
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
+                    ]
+                ]
+            ]
+
+            expectEqual(
+                ConfigComposer.validateSmartAliases(in: root),
+                [],
+                "smart alias validation should accept known Z.AI defaults plus configured provider aliases",
                 recorder: recorder
             )
         }

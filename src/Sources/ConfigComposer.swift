@@ -21,6 +21,7 @@ enum ConfigComposer {
         "request-retry",
         "request-timeout",
         "routing",
+        "smart-aliases",
         "usage-statistics-enabled"
     ]
 
@@ -169,6 +170,87 @@ enum ConfigComposer {
             guard normalizedString(entry["base-url"]) != nil else {
                 errors.append("Custom provider '\(providerID)' must define a non-empty base-url.")
                 continue
+            }
+        }
+
+        return errors
+    }
+
+    static func validateSmartAliases(in root: [String: Any]) -> [String] {
+        guard let rawSmartAliases = root["smart-aliases"] else {
+            return []
+        }
+        guard let entries = rawSmartAliases as? [String: Any] else {
+            return ["smart-aliases must be a mapping of alias name to configuration."]
+        }
+
+        let knownRequestModelAliases = knownSmartAliasCandidateModels(in: root)
+        var errors: [String] = []
+
+        for aliasName in entries.keys.sorted() {
+            let path = "smart-aliases.\(aliasName)"
+            guard let rawEntry = entries[aliasName] else {
+                errors.append("\(path) must be a mapping.")
+                continue
+            }
+            guard let entry = stringKeyedDictionary(rawEntry) else {
+                errors.append("\(path) must be a mapping.")
+                continue
+            }
+
+            guard normalizedString(aliasName) == aliasName else {
+                errors.append("Smart alias name '\(aliasName)' must not include leading or trailing whitespace.")
+                continue
+            }
+
+            let requestClass = normalizedString(entry["request-class"])
+            if requestClass != "plain-chat" {
+                errors.append("\(path).request-class must be 'plain-chat'.")
+            }
+
+            let failover = normalizedString(entry["failover"])
+            if failover != "silent" {
+                errors.append("\(path).failover must be 'silent'.")
+            }
+
+            guard let candidates = entry["candidates"] as? [Any] else {
+                errors.append("\(path).candidates must be an array of model aliases.")
+                continue
+            }
+
+            var normalizedCandidates: [String] = []
+            for (candidateIndex, rawCandidate) in candidates.enumerated() {
+                guard let rawCandidateString = rawCandidate as? String else {
+                    errors.append("\(path).candidates[\(candidateIndex)] must be a string.")
+                    continue
+                }
+                guard let candidate = normalizedString(rawCandidateString) else {
+                    errors.append("\(path).candidates[\(candidateIndex)] must be a non-empty string.")
+                    continue
+                }
+                if candidate != rawCandidateString {
+                    errors.append("\(path).candidates[\(candidateIndex)] must not include leading or trailing whitespace.")
+                    continue
+                }
+                normalizedCandidates.append(candidate)
+            }
+
+            if normalizedCandidates.isEmpty {
+                errors.append("\(path).candidates must contain at least one model alias.")
+            }
+
+            if Set(normalizedCandidates).count != normalizedCandidates.count {
+                errors.append("\(path).candidates must not contain duplicates.")
+            }
+
+            for candidate in normalizedCandidates {
+                if entries[candidate] != nil {
+                    errors.append("\(path).candidates must not reference another smart alias ('\(candidate)').")
+                    continue
+                }
+                if !knownRequestModelAliases.contains(candidate) {
+                    errors.append("\(path).candidates contains unknown model alias '\(candidate)'.")
+                }
             }
         }
 
@@ -481,6 +563,18 @@ enum ConfigComposer {
             errors.append("\(path)[\(index)] must be a mapping.")
         }
         return errors
+    }
+
+    private static func knownSmartAliasCandidateModels(in root: [String: Any]) -> Set<String> {
+        var aliases = Set(defaultZAIModels().compactMap { $0["alias"] })
+        for entry in stringKeyedDictionaryArray(root["openai-compatibility"]) {
+            for modelEntry in stringKeyedDictionaryArray(entry["models"]) {
+                if let alias = normalizedString(modelEntry["alias"]) ?? normalizedString(modelEntry["name"]) {
+                    aliases.insert(alias)
+                }
+            }
+        }
+        return aliases
     }
 
     private static func defaultZAIModels() -> [[String: String]] {

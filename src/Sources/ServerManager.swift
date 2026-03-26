@@ -118,6 +118,7 @@ class ServerManager: ObservableObject {
     private struct LoadedBaseConfig {
         let root: [String: Any]
         let isUserConfig: Bool
+        let requiresGeneratedConfig: Bool
     }
 
     private struct ConfigResolutionFailure: Error {
@@ -559,9 +560,15 @@ class ServerManager: ObservableObject {
     func saveZaiApiKey(_ apiKey: String, completion: @escaping (Bool, String) -> Void) {
         credentialMutationQueue.async { [weak self] in
             guard let self else { return }
+            guard let normalizedAPIKey = ConfigComposer.normalizedString(apiKey) else {
+                DispatchQueue.main.async {
+                    completion(false, "API key must not be empty.")
+                }
+                return
+            }
 
             do {
-                let filePath = try self.zaiAPIKeyStore.save(apiKey: apiKey)
+                let filePath = try self.zaiAPIKeyStore.save(apiKey: normalizedAPIKey)
                 self.addLog("✓ Z.AI API key saved to \(filePath.lastPathComponent)")
                 self.refreshAuthBackedConfiguration()
                 DispatchQueue.main.async {
@@ -578,6 +585,12 @@ class ServerManager: ObservableObject {
     func saveCustomProviderAPIKey(providerID: String, apiKey: String, completion: @escaping (Bool, String) -> Void) {
         credentialMutationQueue.async { [weak self] in
             guard let self else { return }
+            guard let normalizedAPIKey = ConfigComposer.normalizedString(apiKey) else {
+                DispatchQueue.main.async {
+                    completion(false, "API key must not be empty.")
+                }
+                return
+            }
 
             do {
                 let baseConfig: LoadedBaseConfig
@@ -602,7 +615,7 @@ class ServerManager: ObservableObject {
                     return
                 }
 
-                if provider.inlineAPIKeys.contains(apiKey) {
+                if provider.inlineAPIKeys.contains(normalizedAPIKey) {
                     self.addLog("✓ API key for custom provider \(providerID) already exists in config")
                     DispatchQueue.main.async {
                         completion(true, "API key already exists in config")
@@ -610,7 +623,10 @@ class ServerManager: ObservableObject {
                     return
                 }
 
-                let saveResult = try self.customProviderCredentialStore.save(providerID: providerID, apiKey: apiKey)
+                let saveResult = try self.customProviderCredentialStore.save(
+                    providerID: providerID,
+                    apiKey: normalizedAPIKey
+                )
                 switch saveResult {
                 case .created(let record):
                     self.addLog("✓ Saved API key for custom provider: \(record.providerID)")
@@ -772,6 +788,7 @@ class ServerManager: ObservableObject {
             )
         }
         let needsMergedConfig =
+            baseConfig.requiresGeneratedConfig ||
             baseConfig.isUserConfig ||
             !zaiApiKeys.isEmpty ||
             !disabledProviders.isEmpty ||
@@ -888,12 +905,15 @@ class ServerManager: ObservableObject {
             }
             return .failure(ConfigResolutionFailure(message: "Could not load the bundled config at \(bundledConfigPath)."))
         }
-        
         let userConfigPath = authDirectoryURL()
             .appendingPathComponent(CustomProviderConstants.userConfigFilename)
             .path
         guard FileManager.default.fileExists(atPath: userConfigPath) else {
-            return validatedLoadedBaseConfig(root: bundledRoot, isUserConfig: false)
+            return validatedLoadedBaseConfig(
+                root: ConfigComposer.applyManagedProviderPatches(to: bundledRoot),
+                isUserConfig: false,
+                requiresGeneratedConfig: true
+            )
         }
         
         let userRootResult = loadYAMLDictionary(atPath: userConfigPath)
@@ -903,13 +923,27 @@ class ServerManager: ObservableObject {
             }
             return .failure(ConfigResolutionFailure(message: "Could not load the user config at \(userConfigPath)."))
         }
+
+        let ignoredKeys = ConfigComposer.ignoredAdditiveUserConfigKeys(in: userRoot)
+        if !ignoredKeys.isEmpty {
+            NSLog(
+                "[ServerManager] Ignoring unsupported additive user config keys in %@: %@",
+                userConfigPath,
+                ignoredKeys.joined(separator: ", ")
+            )
+        }
         
         let mergedRoot = ConfigComposer.composeAdditiveBaseConfig(
             bundledRoot: bundledRoot,
             userRoot: userRoot
         )
+        let patchedRoot = ConfigComposer.applyManagedProviderPatches(to: mergedRoot)
         
-        return validatedLoadedBaseConfig(root: mergedRoot, isUserConfig: true)
+        return validatedLoadedBaseConfig(
+            root: patchedRoot,
+            isUserConfig: true,
+            requiresGeneratedConfig: true
+        )
     }
     
     private func loadYAMLDictionary(atPath path: String) -> Result<[String: Any], ConfigResolutionFailure> {
@@ -929,12 +963,15 @@ class ServerManager: ObservableObject {
 
     private func validatedLoadedBaseConfig(
         root: [String: Any],
-        isUserConfig: Bool
+        isUserConfig: Bool,
+        requiresGeneratedConfig: Bool
     ) -> Result<LoadedBaseConfig, ConfigResolutionFailure> {
-        let validationErrors = ConfigComposer.validateCustomProviders(
+        let providerValidationErrors = ConfigComposer.validateCustomProviders(
             in: root,
             reservedProviderIDs: ProviderCatalog.reservedCustomProviderKeys
         )
+        let smartAliasValidationErrors = ConfigComposer.validateSmartAliases(in: root)
+        let validationErrors = providerValidationErrors + smartAliasValidationErrors
         guard validationErrors.isEmpty else {
             return .failure(
                 ConfigResolutionFailure(
@@ -942,7 +979,13 @@ class ServerManager: ObservableObject {
                 )
             )
         }
-        return .success(LoadedBaseConfig(root: root, isUserConfig: isUserConfig))
+        return .success(
+            LoadedBaseConfig(
+                root: root,
+                isUserConfig: isUserConfig,
+                requiresGeneratedConfig: requiresGeneratedConfig
+            )
+        )
     }
 
     private func currentObservedConfigInputsFingerprint() -> String {
@@ -1003,7 +1046,7 @@ class ServerManager: ObservableObject {
                 return nil
             }
 
-            let preferredRecord = groupedRecords.sorted { lhs, rhs in
+            guard let preferredRecord = groupedRecords.sorted(by: { lhs, rhs in
                 if lhs.isDisabled != rhs.isDisabled {
                     return !lhs.isDisabled
                 }
@@ -1014,7 +1057,13 @@ class ServerManager: ObservableObject {
                 }
 
                 return lhs.filePath.lastPathComponent < rhs.filePath.lastPathComponent
-            }.first!
+            }).first else {
+                NSLog(
+                    "[ServerManager] Skipping logical credential projection for provider %@ because no preferred record could be selected.",
+                    sampleRecord.providerID
+                )
+                return nil
+            }
 
             return CustomProviderCredential(
                 providerID: sampleRecord.providerID,
