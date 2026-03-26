@@ -13,7 +13,8 @@ enum OpenAICompatTemporaryShim {
         minimumMaxTokens: nil,
         strippedFields: ["reasoning_effort", "frequency_penalty", "presence_penalty", "ignore_eos"],
         attemptTimeout: 200,
-        transportRetries: 2,
+        firstResponseDeadline: 25,
+        transportRetries: 0,
         semanticRetries: 2,
         retryBackoffMilliseconds: 250,
         stripsReasoningFieldFromSuccess: true,
@@ -23,9 +24,10 @@ enum OpenAICompatTemporaryShim {
         "glm5": RequestPolicy(
             responseProfile: .transportOnly,
             minimumMaxTokens: nil,
-            strippedFields: ["reasoning_effort", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
-            transportRetries: 2,
+            firstResponseDeadline: 25,
+            transportRetries: 0,
             semanticRetries: 0,
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
@@ -36,7 +38,8 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 384,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
-            transportRetries: 2,
+            firstResponseDeadline: 25,
+            transportRetries: 0,
             semanticRetries: 2,
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
@@ -47,7 +50,8 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 128,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
             attemptTimeout: 200,
-            transportRetries: 2,
+            firstResponseDeadline: 25,
+            transportRetries: 0,
             semanticRetries: 2,
             retryBackoffMilliseconds: 250,
             stripsReasoningFieldFromSuccess: true,
@@ -58,6 +62,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
+            firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryBackoffMilliseconds: 250,
@@ -69,6 +74,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
+            firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryBackoffMilliseconds: 250,
@@ -80,6 +86,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
+            firstResponseDeadline: nil,
             transportRetries: 2,
             semanticRetries: 2,
             retryBackoffMilliseconds: 250,
@@ -100,6 +107,7 @@ enum OpenAICompatTemporaryShim {
         let minimumMaxTokens: Int?
         let strippedFields: Set<String>
         let attemptTimeout: TimeInterval?
+        let firstResponseDeadline: TimeInterval?
         let transportRetries: Int
         let semanticRetries: Int
         let retryBackoffMilliseconds: Int
@@ -127,6 +135,12 @@ enum OpenAICompatTemporaryShim {
         var shouldRetry: Bool {
             retryReason != nil
         }
+    }
+
+    private enum ToolCallValidation {
+        case none
+        case valid
+        case invalid(reason: String)
     }
 
     static func transformRequest(method: String, path: String, jsonString: String) -> String? {
@@ -162,11 +176,16 @@ enum OpenAICompatTemporaryShim {
                 json["stream"] = false
                 modified = true
             }
-            if let toolChoice = json["tool_choice"] as? String, toolChoice == "function" {
+            if json["response_format"] != nil {
+                json.removeValue(forKey: "response_format")
+                modified = true
+            }
+            if let toolChoice = json["tool_choice"] as? String, ["function", "required"].contains(toolChoice) {
                 json["tool_choice"] = "auto"
                 modified = true
             } else if let toolChoice = json["tool_choice"] as? [String: Any],
-                      (toolChoice["type"] as? String) == "function" {
+                      let type = toolChoice["type"] as? String,
+                      ["function", "required"].contains(type) {
                 json["tool_choice"] = "auto"
                 modified = true
             }
@@ -174,8 +193,16 @@ enum OpenAICompatTemporaryShim {
 
         if model == "kimi-k2.5" {
             var chatTemplate = json["chat_template_kwargs"] as? [String: Any] ?? [:]
+            var chatTemplateModified = false
             if (chatTemplate["thinking"] as? Bool) != false {
                 chatTemplate["thinking"] = false
+                chatTemplateModified = true
+            }
+            if (chatTemplate["enable_thinking"] as? Bool) != false {
+                chatTemplate["enable_thinking"] = false
+                chatTemplateModified = true
+            }
+            if chatTemplateModified {
                 json["chat_template_kwargs"] = chatTemplate
                 modified = true
             }
@@ -210,6 +237,10 @@ enum OpenAICompatTemporaryShim {
 
     static func attemptTimeout(forRequestJSON jsonString: String) -> TimeInterval? {
         policy(forRequestJSON: jsonString)?.attemptTimeout
+    }
+
+    static func firstResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
+        policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
     static func retryBudget(forRequestJSON jsonString: String) -> (transport: Int, semantic: Int, backoffMilliseconds: Int, salvagesBestEffortRepair: Bool)? {
@@ -256,6 +287,22 @@ enum OpenAICompatTemporaryShim {
             contentOverride: nil,
             stripsReasoningField: policy.stripsReasoningFieldFromSuccess
         )
+        switch validateToolCalls(in: message) {
+        case .invalid(let reason):
+            return NvidiaReasoningEvaluation(
+                retryReason: reason,
+                repairedBodyData: nil,
+                normalizedBodyData: nil
+            )
+        case .valid:
+            return NvidiaReasoningEvaluation(
+                retryReason: nil,
+                repairedBodyData: nil,
+                normalizedBodyData: normalizedBodyData
+            )
+        case .none:
+            break
+        }
 
         switch policy.responseProfile {
         case .transportOnly:
@@ -419,6 +466,32 @@ enum OpenAICompatTemporaryShim {
 
     private static func startsWithThinkTag(_ value: String) -> Bool {
         value.lowercased().hasPrefix("<think>")
+    }
+
+    private static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
+        guard let toolCalls = message["tool_calls"] as? [[String: Any]],
+              !toolCalls.isEmpty else {
+            return .none
+        }
+
+        for toolCall in toolCalls {
+            guard let function = toolCall["function"] as? [String: Any],
+                  let arguments = function["arguments"] as? String else {
+                return .invalid(reason: "malformed_tool_arguments")
+            }
+
+            let trimmedArguments = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedArguments.isEmpty else {
+                return .invalid(reason: "malformed_tool_arguments")
+            }
+            guard let argumentsData = trimmedArguments.data(using: .utf8),
+                  let jsonObject = try? JSONSerialization.jsonObject(with: argumentsData),
+                  jsonObject is [String: Any] else {
+                return .invalid(reason: "malformed_tool_arguments")
+            }
+        }
+
+        return .valid
     }
 
     private static func stripLeadingThinkBlock(from content: String) -> String? {
@@ -696,6 +769,75 @@ class ThinkingProxy {
         let retryBackoffMilliseconds: Int
         let salvagesBestEffortRepair: Bool
         var bestEffortRepairedBodyData: Data?
+    }
+
+    private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
+        private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
+        private var hasReceivedResponse = false
+        private var deadlineExceeded = false
+        private var deadlineWorkItem: DispatchWorkItem?
+
+        func installFirstResponseDeadline(
+            seconds: TimeInterval?,
+            for task: URLSessionTask
+        ) {
+            guard let seconds, seconds > 0 else {
+                return
+            }
+
+            let workItem = DispatchWorkItem { [weak self, weak task] in
+                guard let self else { return }
+                let shouldCancel = self.stateQueue.sync { () -> Bool in
+                    guard !self.hasReceivedResponse else {
+                        return false
+                    }
+                    self.deadlineExceeded = true
+                    return true
+                }
+                if shouldCancel {
+                    task?.cancel()
+                }
+            }
+
+            stateQueue.sync {
+                deadlineWorkItem = workItem
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: workItem)
+        }
+
+        func finish() {
+            stateQueue.sync {
+                hasReceivedResponse = true
+                deadlineWorkItem?.cancel()
+                deadlineWorkItem = nil
+            }
+        }
+
+        func didExceedDeadline() -> Bool {
+            stateQueue.sync { deadlineExceeded }
+        }
+
+        private func markResponseReceived() {
+            stateQueue.sync {
+                hasReceivedResponse = true
+                deadlineWorkItem?.cancel()
+                deadlineWorkItem = nil
+            }
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            markResponseReceived()
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            markResponseReceived()
+        }
     }
     
     /**
@@ -1227,17 +1369,27 @@ class ThinkingProxy {
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        let session = URLSession(configuration: .ephemeral)
-        session.dataTask(with: request) { [weak self] data, response, error in
+        let responseProgress = ResponseProgressDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
-            defer { session.finishTasksAndInvalidate() }
+            defer {
+                responseProgress.finish()
+                session.finishTasksAndInvalidate()
+            }
 
             if let error {
+                let effectiveError: Error
+                if responseProgress.didExceedDeadline() {
+                    effectiveError = URLError(.timedOut)
+                } else {
+                    effectiveError = error
+                }
                 if state.transportRetriesRemaining > 0,
-                   OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: error) {
+                   OpenAICompatTemporaryShim.shouldRetryNvidiaReasoningTransport(error: effectiveError) {
                     NSLog(
                         "[ThinkingProxy] Retrying temporary NVIDIA reasoning-model shim request due to transport error %@ (%d retries left)",
-                        error.localizedDescription,
+                        effectiveError.localizedDescription,
                         state.transportRetriesRemaining
                     )
                     self.scheduleNvidiaReasoningRetry(
@@ -1270,9 +1422,10 @@ class ThinkingProxy {
                     return
                 }
 
-                NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(error)")
-                let statusCode = (error as NSError).domain == NSURLErrorDomain &&
-                    (error as NSError).code == URLError.Code.timedOut.rawValue ? 504 : 502
+                NSLog("[ThinkingProxy] NVIDIA reasoning-model shim backend request failed: \(effectiveError)")
+                let nsError = effectiveError as NSError
+                let statusCode = nsError.domain == NSURLErrorDomain &&
+                    nsError.code == URLError.Code.timedOut.rawValue ? 504 : 502
                 self.sendError(
                     to: originalConnection,
                     statusCode: statusCode,
@@ -1373,7 +1526,12 @@ class ThinkingProxy {
                 headers: httpResponse.allHeaderFields,
                 body: evaluation.normalizedBodyData ?? bodyData
             )
-        }.resume()
+        }
+        responseProgress.installFirstResponseDeadline(
+            seconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            for: task
+        )
+        task.resume()
     }
 
     private func scheduleNvidiaReasoningRetry(
