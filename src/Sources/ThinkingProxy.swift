@@ -131,6 +131,32 @@ enum OpenAICompatTemporaryShim {
         let retryBackoffMilliseconds: Int
         let salvagesBestEffortRepair: Bool
         var bestEffortRepairedBodyData: Data?
+        var fallbackModelsRemaining: [String]
+        let coalescingKey: String?
+
+        init(
+            model: String,
+            initialTransportRetries: Int,
+            initialSemanticRetries: Int,
+            transportRetriesRemaining: Int,
+            semanticRetriesRemaining: Int,
+            retryBackoffMilliseconds: Int,
+            salvagesBestEffortRepair: Bool,
+            bestEffortRepairedBodyData: Data?,
+            fallbackModelsRemaining: [String] = [],
+            coalescingKey: String? = nil
+        ) {
+            self.model = model
+            self.initialTransportRetries = initialTransportRetries
+            self.initialSemanticRetries = initialSemanticRetries
+            self.transportRetriesRemaining = transportRetriesRemaining
+            self.semanticRetriesRemaining = semanticRetriesRemaining
+            self.retryBackoffMilliseconds = retryBackoffMilliseconds
+            self.salvagesBestEffortRepair = salvagesBestEffortRepair
+            self.bestEffortRepairedBodyData = bestEffortRepairedBodyData
+            self.fallbackModelsRemaining = fallbackModelsRemaining
+            self.coalescingKey = coalescingKey
+        }
     }
 
     struct NVIDIAAttemptResult {
@@ -237,6 +263,7 @@ enum OpenAICompatTemporaryShim {
         let configPath: String?
         let modificationDate: Date?
         let routesByRequestModel: [String: NVIDIARouteIdentity]
+        let fallbackChainsByRequestModel: [String: [String]]
     }
 
     private struct RouteCircuitBreakerPolicy {
@@ -559,6 +586,87 @@ enum OpenAICompatTemporaryShim {
         }
 
         return true
+    }
+
+    static func allowsPlainSafeNVIDIARequest(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> Bool {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              policy(forModel: model) != nil else {
+            return false
+        }
+
+        if requestedStream(forRequestJSON: jsonString) {
+            return false
+        }
+
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            return false
+        }
+
+        if json["response_format"] != nil {
+            return false
+        }
+
+        return true
+    }
+
+    static func fallbackChain(forRequestModel requestModel: String) -> [String] {
+        configuredNVIDIAFallbackChainsByRequestModel()[requestModel] ?? []
+    }
+
+    static func rewrittenRequestJSON(
+        method: String,
+        path: String,
+        replacingRequestModelIn jsonString: String,
+        with requestModel: String
+    ) -> String? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return nil
+        }
+        json["model"] = requestModel
+        guard let rewrittenJSONData = try? JSONSerialization.data(withJSONObject: json),
+              let rewrittenJSONString = String(data: rewrittenJSONData, encoding: .utf8) else {
+            return nil
+        }
+        return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
+    }
+
+    static func nextFallbackRequestTransition(
+        method: String,
+        path: String,
+        currentBody: String,
+        fallbackModelsRemaining: [String]
+    ) -> (body: String, model: String, remainingFallbackModels: [String])? {
+        var remainingFallbackModels = fallbackModelsRemaining
+        while !remainingFallbackModels.isEmpty {
+            let nextFallbackModel = remainingFallbackModels.removeFirst()
+            guard let fallbackBody = rewrittenRequestJSON(
+                method: method,
+                path: path,
+                replacingRequestModelIn: currentBody,
+                with: nextFallbackModel
+            ) else {
+                continue
+            }
+            if let preflightError = preflightError(
+                method: method,
+                path: path,
+                jsonString: fallbackBody
+            ),
+               preflightError.statusCode == 503 {
+                continue
+            }
+            return (fallbackBody, nextFallbackModel, remainingFallbackModels)
+        }
+        return nil
     }
 
     static func preflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
@@ -2028,6 +2136,14 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func configuredNVIDIARoutesByRequestModel() -> [String: NVIDIARouteIdentity] {
+        configuredNVIDIAConfiguration().routesByRequestModel
+    }
+
+    private static func configuredNVIDIAFallbackChainsByRequestModel() -> [String: [String]] {
+        configuredNVIDIAConfiguration().fallbackChainsByRequestModel
+    }
+
+    private static func configuredNVIDIAConfiguration() -> CachedNVIDIARouteMap {
         let path = mergedConfigPath()
         let modificationDate = path.flatMap { configPath in
             (try? FileManager.default.attributesOfItem(atPath: configPath)[.modificationDate]) as? Date
@@ -2037,23 +2153,25 @@ enum OpenAICompatTemporaryShim {
             if let cachedNVIDIARouteMap,
                cachedNVIDIARouteMap.configPath == path,
                cachedNVIDIARouteMap.modificationDate == modificationDate {
-                return cachedNVIDIARouteMap.routesByRequestModel
+                return cachedNVIDIARouteMap
             }
 
-            let routesByRequestModel = loadConfiguredNVIDIARoutesByRequestModel(from: path)
-            cachedNVIDIARouteMap = CachedNVIDIARouteMap(
+            let loadedConfiguration = loadConfiguredNVIDIAConfiguration(from: path)
+            let cachedMap = CachedNVIDIARouteMap(
                 configPath: path,
                 modificationDate: modificationDate,
-                routesByRequestModel: routesByRequestModel
+                routesByRequestModel: loadedConfiguration.routesByRequestModel,
+                fallbackChainsByRequestModel: loadedConfiguration.fallbackChainsByRequestModel
             )
-            return routesByRequestModel
+            cachedNVIDIARouteMap = cachedMap
+            return cachedMap
         }
     }
 
-    private static func loadConfiguredNVIDIARoutesByRequestModel(from path: String?) -> [String: NVIDIARouteIdentity] {
+    private static func loadConfiguredNVIDIAConfiguration(from path: String?) -> (routesByRequestModel: [String: NVIDIARouteIdentity], fallbackChainsByRequestModel: [String: [String]]) {
         guard let path,
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return [:]
+            return ([:], [:])
         }
 
         struct ParsedModel {
@@ -2068,10 +2186,13 @@ enum OpenAICompatTemporaryShim {
         }
 
         var routesByRequestModel: [String: NVIDIARouteIdentity] = [:]
+        var fallbackChainsByRequestModel: [String: [String]] = [:]
         var insideOpenAICompatibility = false
+        var insideFallbackChains = false
         var currentProvider: ParsedProvider?
         var insideModels = false
         var currentModel = ParsedModel()
+        var currentFallbackAlias: String?
 
         func indentation(of line: String) -> Int {
             line.prefix { $0 == " " }.count
@@ -2144,14 +2265,53 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
+            let indent = indentation(of: line)
+
+            if indent == 0 && trimmed == "nvidia-fallback-chains:" {
+                finalizeCurrentProvider()
+                insideOpenAICompatibility = false
+                insideFallbackChains = true
+                currentFallbackAlias = nil
+                continue
+            }
+
+            if indent == 0 && trimmed == "openai-compatibility:" {
+                insideFallbackChains = false
+                insideOpenAICompatibility = true
+                continue
+            }
+
             if !insideOpenAICompatibility {
-                if trimmed == "openai-compatibility:" {
-                    insideOpenAICompatibility = true
+                if !insideFallbackChains {
+                    continue
+                }
+            }
+
+            if insideFallbackChains && !insideOpenAICompatibility {
+                if indent == 0 && trimmed != "nvidia-fallback-chains:" {
+                    insideFallbackChains = false
+                    continue
+                }
+                if trimmed == "nvidia-fallback-chains:" {
+                    currentFallbackAlias = nil
+                    continue
+                }
+                if indent == 2, trimmed.hasSuffix(":") {
+                    currentFallbackAlias = String(trimmed.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                    fallbackChainsByRequestModel[currentFallbackAlias ?? ""] = []
+                    continue
+                }
+                if indent == 4,
+                   trimmed.hasPrefix("- "),
+                   let currentFallbackAlias {
+                    let fallbackModel = String(trimmed.dropFirst(2)).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'")))
+                    if !fallbackModel.isEmpty {
+                        fallbackChainsByRequestModel[currentFallbackAlias, default: []].append(fallbackModel)
+                    }
                 }
                 continue
             }
 
-            let indent = indentation(of: line)
             if indent == 0 && !trimmed.hasPrefix("- ") {
                 finalizeCurrentProvider()
                 break
@@ -2221,7 +2381,7 @@ enum OpenAICompatTemporaryShim {
         }
 
         finalizeCurrentProvider()
-        return routesByRequestModel
+        return (routesByRequestModel, fallbackChainsByRequestModel.filter { !$0.key.isEmpty && !$0.value.isEmpty })
     }
 
     private static func retryEvaluation(
@@ -2302,9 +2462,11 @@ class ThinkingProxy {
     private let targetHost = "127.0.0.1"
     private(set) var isRunning = false
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
+    private let nvidiaInflightQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-inflight")
     private var nvidiaCanaryTimer: DispatchSourceTimer?
     private let nvidiaCanaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-canary")
     private var nvidiaCanarySweepInFlight = false
+    private var inflightNVIDIARequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
@@ -2719,6 +2881,7 @@ class ThinkingProxy {
         // Try to parse and modify JSON body for POST requests
         var modifiedBody = bodyString
         var thinkingEnabled = false
+        var fallbackModelsRemaining: [String] = []
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -2736,11 +2899,38 @@ class ThinkingProxy {
             ) {
                 modifiedBody = shimmed
             }
-            if let preflightError = OpenAICompatTemporaryShim.preflightError(
+
+            if let requestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody),
+               OpenAICompatTemporaryShim.allowsPlainSafeNVIDIARequest(
+                    method: method,
+                    path: rewrittenPath,
+                    jsonString: modifiedBody
+               ) {
+                fallbackModelsRemaining = OpenAICompatTemporaryShim.fallbackChain(forRequestModel: requestModel)
+            }
+
+            while let preflightError = OpenAICompatTemporaryShim.preflightError(
                 method: method,
                 path: rewrittenPath,
                 jsonString: modifiedBody
             ) {
+                if preflightError.statusCode == 503,
+                   !fallbackModelsRemaining.isEmpty {
+                    let fallbackModel = fallbackModelsRemaining.removeFirst()
+                    guard let fallbackBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
+                        method: method,
+                        path: rewrittenPath,
+                        replacingRequestModelIn: modifiedBody,
+                        with: fallbackModel
+                    ) else {
+                        NSLog("[ThinkingProxy] NVIDIA preflight fallback rewrite failed for %@", fallbackModel)
+                        sendError(to: connection, statusCode: preflightError.statusCode, message: preflightError.message)
+                        return
+                    }
+                    NSLog("[ThinkingProxy] NVIDIA preflight rerouted request from quarantined model to fallback %@", fallbackModel)
+                    modifiedBody = fallbackBody
+                    continue
+                }
                 NSLog("[ThinkingProxy] NVIDIA preflight mitigation blocked request for \(rewrittenPath): \(preflightError.message)")
                 sendError(to: connection, statusCode: preflightError.statusCode, message: preflightError.message)
                 return
@@ -2754,6 +2944,16 @@ class ThinkingProxy {
         ) {
             let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: modifiedBody)
             let model = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody) ?? "unknown"
+            let coalescingKey = nvidiaCoalescingKey(
+                method: method,
+                path: rewrittenPath,
+                body: modifiedBody
+            )
+            if let coalescingKey,
+               !registerOrJoinNVIDIAInflightRequest(key: coalescingKey, connection: connection) {
+                NSLog("[ThinkingProxy] Joined coalesced NVIDIA request for %@", model)
+                return
+            }
             forwardNvidiaReasoningRequest(
                 method: method,
                 path: rewrittenPath,
@@ -2768,7 +2968,9 @@ class ThinkingProxy {
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
                     salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
-                    bestEffortRepairedBodyData: nil
+                    bestEffortRepairedBodyData: nil,
+                    fallbackModelsRemaining: fallbackModelsRemaining,
+                    coalescingKey: coalescingKey
                 )
             )
             return
@@ -2789,6 +2991,140 @@ class ThinkingProxy {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let model = json["model"] as? String else { return false }
         return model.starts(with: "claude-") || model.starts(with: "gemini-claude-")
+    }
+
+    private func nvidiaCoalescingKey(
+        method: String,
+        path: String,
+        body: String
+    ) -> String? {
+        guard OpenAICompatTemporaryShim.allowsPlainSafeNVIDIARequest(
+            method: method,
+            path: path,
+            jsonString: body
+        ),
+        let model = OpenAICompatTemporaryShim.modelName(forRequestJSON: body),
+        OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: model) == .suspect else {
+            return nil
+        }
+        return "\(method) \(path)\n\(body)"
+    }
+
+    private func registerOrJoinNVIDIAInflightRequest(
+        key: String,
+        connection: NWConnection
+    ) -> Bool {
+        nvidiaInflightQueue.sync {
+            if inflightNVIDIARequests[key] != nil {
+                inflightNVIDIARequests[key, default: []].append(connection)
+                return false
+            }
+            inflightNVIDIARequests[key] = [connection]
+            return true
+        }
+    }
+
+    func registerOrJoinNVIDIAInflightRequestForTesting(key: String, connection: NWConnection) -> Bool {
+        registerOrJoinNVIDIAInflightRequest(key: key, connection: connection)
+    }
+
+    func inflightNVIDIAWaiterCount(for key: String) -> Int {
+        nvidiaInflightQueue.sync {
+            inflightNVIDIARequests[key]?.count ?? 0
+        }
+    }
+
+    func takeInflightNVIDIAConnectionsForTesting(for key: String) -> [NWConnection]? {
+        takeInflightNVIDIAConnections(for: key)
+    }
+
+    private func takeInflightNVIDIAConnections(for key: String?) -> [NWConnection]? {
+        guard let key else { return nil }
+        return nvidiaInflightQueue.sync {
+            let connections = inflightNVIDIARequests.removeValue(forKey: key)
+            return connections
+        }
+    }
+
+    private func deliverNVIDIAHTTPResponse(
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        defaultConnection: NWConnection,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        body: Data
+    ) {
+        let connections = takeInflightNVIDIAConnections(for: state.coalescingKey) ?? [defaultConnection]
+        for connection in connections {
+            sendHTTPResponse(
+                to: connection,
+                statusCode: statusCode,
+                headers: headers,
+                body: body
+            )
+        }
+    }
+
+    private func deliverNVIDIAError(
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        defaultConnection: NWConnection,
+        statusCode: Int,
+        message: String
+    ) {
+        let connections = takeInflightNVIDIAConnections(for: state.coalescingKey) ?? [defaultConnection]
+        for connection in connections {
+            sendError(
+                to: connection,
+                statusCode: statusCode,
+                message: message
+            )
+        }
+    }
+
+    private func headerTuples(from headers: [AnyHashable: Any]) -> [(String, String)] {
+        headers.map { key, value in
+            ("\(key)", "\(value)")
+        }
+    }
+
+    private func startNextNVIDIAFallbackIfAvailable(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        originalConnection: NWConnection,
+        state: OpenAICompatTemporaryShim.NVIDIARetryState
+    ) -> Bool {
+        guard let transition = OpenAICompatTemporaryShim.nextFallbackRequestTransition(
+            method: method,
+            path: path,
+            currentBody: body,
+            fallbackModelsRemaining: state.fallbackModelsRemaining
+        ) else {
+            return false
+        }
+        let retryBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: transition.body)
+        let nextState = OpenAICompatTemporaryShim.NVIDIARetryState(
+            model: transition.model,
+            initialTransportRetries: retryBudget?.transport ?? 0,
+            initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
+            transportRetriesRemaining: retryBudget?.transport ?? 0,
+            semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
+            retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
+            salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
+            bestEffortRepairedBodyData: nil,
+            fallbackModelsRemaining: transition.remainingFallbackModels,
+            coalescingKey: state.coalescingKey
+        )
+        NSLog("[ThinkingProxy] Falling back NVIDIA request from %@ to %@", state.model, transition.model)
+        forwardNvidiaReasoningRequest(
+            method: method,
+            path: path,
+            headers: headers,
+            body: transition.body,
+            originalConnection: originalConnection,
+            state: nextState
+        )
+        return true
     }
 
     /// Strips `cache_control` fields from the request body that cause 400 errors via the OAuth route
@@ -3148,8 +3484,20 @@ class ThinkingProxy {
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
-                self.sendHTTPResponse(
-                    to: originalConnection,
+                if (statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504),
+                   self.startNextNVIDIAFallbackIfAvailable(
+                        method: method,
+                        path: path,
+                        headers: self.headerTuples(from: headers),
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: state
+                   ) {
+                    return
+                }
+                self.deliverNVIDIAHTTPResponse(
+                    state: state,
+                    defaultConnection: originalConnection,
                     statusCode: statusCode,
                     headers: headers,
                     body: bodyData
@@ -3165,8 +3513,20 @@ class ThinkingProxy {
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
-                self.sendError(
-                    to: originalConnection,
+                if (statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504),
+                   self.startNextNVIDIAFallbackIfAvailable(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        body: body,
+                        originalConnection: originalConnection,
+                        state: state
+                   ) {
+                    return
+                }
+                self.deliverNVIDIAError(
+                    state: state,
+                    defaultConnection: originalConnection,
                     statusCode: statusCode,
                     message: message
                 )

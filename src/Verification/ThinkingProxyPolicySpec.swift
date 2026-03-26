@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 @main
 struct ThinkingProxyPolicySpec {
@@ -601,6 +602,61 @@ struct ThinkingProxyPolicySpec {
 
             expectEqual(winningEvent.attemptLane, 2, "telemetry should preserve the attempt lane that produced the response", recorder: recorder)
             expectEqual(winningEvent.winnerAttemptLane, 2, "telemetry should record which hedge lane ultimately won", recorder: recorder)
+        }
+
+        run("temporary nvidia coalescing registry shares one in-flight slot across duplicate safe requests", recorder: recorder) {
+            let proxy = ThinkingProxy()
+            let key = "POST /v1/chat/completions\n{\"model\":\"glm5\"}"
+            let firstConnection = NWConnection(
+                to: .hostPort(host: "127.0.0.1", port: 1),
+                using: .tcp
+            )
+            let secondConnection = NWConnection(
+                to: .hostPort(host: "127.0.0.1", port: 1),
+                using: .tcp
+            )
+
+            expectEqual(proxy.registerOrJoinNVIDIAInflightRequestForTesting(key: key, connection: firstConnection), true, "the first request should own the in-flight slot", recorder: recorder)
+            expectEqual(proxy.registerOrJoinNVIDIAInflightRequestForTesting(key: key, connection: secondConnection), false, "duplicate requests should join the existing in-flight slot", recorder: recorder)
+            expectEqual(proxy.inflightNVIDIAWaiterCount(for: key), 2, "joined duplicate requests should share the same waiter list", recorder: recorder)
+            expectEqual(proxy.takeInflightNVIDIAConnectionsForTesting(for: key)?.count, 2, "finishing the in-flight slot should return all coalesced waiters", recorder: recorder)
+            expectEqual(proxy.inflightNVIDIAWaiterCount(for: key), 0, "taking the slot should clear the coalescing registry", recorder: recorder)
+        }
+
+        run("temporary nvidia fallback chains are config-driven and skip quarantined fallback models", recorder: recorder) {
+            withMergedConfig(fallbackMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenNVIDIAHostedRouteForTesting(
+                    requestModel: "kimi-k2.5",
+                    until: Date().addingTimeInterval(60)
+                )
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.fallbackChain(forRequestModel: "glm5"),
+                    ["kimi-k2.5", "minimax-m2.5"],
+                    "fallback chains should load from merged config instead of being hardcoded",
+                    recorder: recorder
+                )
+
+                let transition = OpenAICompatTemporaryShim.nextFallbackRequestTransition(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: request,
+                    fallbackModelsRemaining: ["kimi-k2.5", "minimax-m2.5"]
+                )
+
+                expectEqual(transition?.model, "minimax-m2.5", "fallback planning should skip quarantined fallback routes and pick the next viable alias", recorder: recorder)
+                let rewritten = parseJSONObject(transition?.body, recorder: recorder)
+                expectEqual(rewritten["model"] as? String, "minimax-m2.5", "fallback planning should rewrite the request model to the chosen fallback alias", recorder: recorder)
+                OpenAICompatTemporaryShim.clearNVIDIAHostedRouteHealthForTesting()
+            }
         }
 
         run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
@@ -1949,6 +2005,28 @@ private func renamedAliasMergedConfigYAML() -> String {
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
         "  - alias: minimax-custom",
+        "    name: minimaxai/minimax-m2.5"
+    ].joined(separator: "\n")
+}
+
+private func fallbackMergedConfigYAML() -> String {
+    [
+        "nvidia-fallback-chains:",
+        "  glm5:",
+        "    - kimi-k2.5",
+        "    - minimax-m2.5",
+        "openai-compatibility:",
+        "- name: nvidia",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: glm5",
+        "    name: z-ai/glm5",
+        "  - alias: kimi-k2.5",
+        "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.5",
         "    name: minimaxai/minimax-m2.5"
     ].joined(separator: "\n")
 }
