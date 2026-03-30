@@ -209,6 +209,7 @@ enum OpenAICompatTemporaryShim {
         let providerID: String
         let baseURL: String
         let proxyURL: String
+        let apiKey: String?
     }
 
     struct SmartAliasDefinition: Equatable {
@@ -289,7 +290,7 @@ enum OpenAICompatTemporaryShim {
         }
 
         var isProvenPerfect: Bool {
-            observationCount > 0 && successRate == 1.0
+            observationCount > 0 && successRate >= 0.999
         }
     }
 
@@ -307,9 +308,9 @@ enum OpenAICompatTemporaryShim {
         private static let momentumBaseBonus: Double = 50.0
         private static let momentumDecayPerSecond: Double = 0.95
 
-        var momentumBonus: Double {
+        func momentumBonus(at now: Date) -> Double {
             guard status == .closed, let recoveredAt else { return 0.0 }
-            let elapsed = Date().timeIntervalSince(recoveredAt)
+            let elapsed = now.timeIntervalSince(recoveredAt)
             guard elapsed > 0 else { return Self.momentumBaseBonus }
             return Self.momentumBaseBonus * pow(Self.momentumDecayPerSecond, elapsed)
         }
@@ -2798,7 +2799,7 @@ enum OpenAICompatTemporaryShim {
             healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
         }
         let tier = modelTier(forRequestModel: requestModel)
-        let momentum = state?.momentumBonus ?? 0.0
+        let momentum = state?.momentumBonus(at: now) ?? 0.0
         let cost = ema.observationCount > 0 ? costFactor(forRequestModel: requestModel) : 1.0
         let adjustedScore = ema.observationCount > 0
             ? (ema.compositeScore + momentum) * tier.rawValue * cost
@@ -2819,6 +2820,7 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let version = json["version"] as? Int, version >= 1, version <= 2,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -2882,6 +2884,9 @@ enum OpenAICompatTemporaryShim {
             }
             entry["rolling_metrics"] = rollingMetricsDictionary(state.rollingMetrics)
             entry["ema_metrics"] = emaMetricsDictionary(state.emaMetrics)
+            if let recoveredAt = state.recoveredAt {
+                entry["recovered_at"] = iso8601String(from: recoveredAt)
+            }
             routes[routeHealthKey] = entry
         }
 
@@ -3257,6 +3262,7 @@ enum OpenAICompatTemporaryShim {
         } else {
             return 1.0
         }
+        guard price > 0 else { return 1.0 }
         let rawFactor = 1.0 / (price + 0.01)
         return pow(rawFactor, costPreference)
     }
@@ -3367,6 +3373,7 @@ enum OpenAICompatTemporaryShim {
             var name = ""
             var baseURL = ""
             var proxyURL: String?
+            var apiKey: String?
             var models: [ParsedModel] = []
         }
 
@@ -3499,7 +3506,8 @@ enum OpenAICompatTemporaryShim {
                     providerEndpointsByProviderID[providerID] = ProviderEndpoint(
                         providerID: providerID,
                         baseURL: endpointBaseURL,
-                        proxyURL: proxyURL
+                        proxyURL: proxyURL,
+                        apiKey: provider.apiKey
                     )
                 }
             }
@@ -3644,6 +3652,13 @@ enum OpenAICompatTemporaryShim {
 
             if indent == 2, trimmed.hasPrefix("proxy-url: "), let value = scalarValue(from: trimmed) {
                 currentProvider?.proxyURL = value
+                continue
+            }
+
+            // Capture first API key from api-key-entries (for direct proxied requests)
+            if indent == 4, trimmed.hasPrefix("api-key: "), let value = scalarValue(from: trimmed),
+               currentProvider?.apiKey == nil {
+                currentProvider?.apiKey = value
                 continue
             }
 
@@ -5093,6 +5108,9 @@ class ThinkingProxy {
         // serially. NVIDIA candidates (minimax-m2.5-nvidia, kimi-k2.5-nvidia) are raced against
         // each other for lowest latency. The prefix scan walks candidates until it finds a
         // contiguous run of NVIDIA reasoning models at the front of the remaining list.
+        // NOTE: This races at all failover depths (including depth 0). The health-based ranking
+        // ensures only healthy candidates reach the front, so depth-0 racing is safe and avoids
+        // serial latency penalties when multiple NVIDIA routes are available.
         let raceableFallbackModels = remainingCandidateModels.prefix { candidateModel in
             guard let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
                   candidateRoute.providerID.hasPrefix("nvidia"),
@@ -6153,6 +6171,7 @@ class ThinkingProxy {
                 path: path,
                 headers: effectiveHeaders,
                 body: body,
+                candidateModel: candidateModel,
                 timeoutInterval: timeoutInterval,
                 endpoint: endpoint
             ) { [weak self] bufferedResponse in
@@ -6669,6 +6688,7 @@ class ThinkingProxy {
         path: String,
         headers: [(String, String)],
         body: String,
+        candidateModel: String,
         timeoutInterval: TimeInterval,
         endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
         completion: @escaping (BufferedProxyResponse) -> Void
@@ -6676,48 +6696,43 @@ class ThinkingProxy {
         let upstreamURL = endpoint.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             + (path.hasPrefix("/") ? path : "/" + path)
         guard let url = URL(string: upstreamURL) else {
-            completion(
-                BufferedProxyResponse(
-                    data: nil,
-                    response: nil,
-                    error: URLError(.badURL),
-                    firstByteLatencyMilliseconds: nil,
-                    totalLatencyMilliseconds: nil
-                )
-            )
+            completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.badURL), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
             return {}
+        }
+
+        // Rewrite model alias to canonical model ID for upstream
+        var upstreamBody = body
+        if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+           let rewritten = OpenAICompatTemporaryShim.rewrittenRequestJSON(
+            method: method,
+            path: path,
+            replacingRequestModelIn: body,
+            with: route.canonicalModelID
+           ) {
+            upstreamBody = rewritten
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.httpBody = Data(body.utf8)
+        request.httpBody = Data(upstreamBody.utf8)
         request.timeoutInterval = timeoutInterval
 
-        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding", "authorization"]
         for (name, value) in headers where !excludedHeaders.contains(name.lowercased()) {
             request.setValue(value, forHTTPHeaderField: name)
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        // Inject auth if not already present (empty bearer for opencode)
-        if !headers.contains(where: { $0.0.lowercased() == "authorization" }) {
-            request.setValue("Bearer ", forHTTPHeaderField: "Authorization")
-        }
+        // Inject auth with the provider's API key (or empty bearer if no key configured)
+        let bearerToken = endpoint.apiKey ?? ""
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
 
         // Configure SOCKS5 proxy
         let configuration = URLSessionConfiguration.ephemeral
         guard let proxyComponents = URLComponents(string: endpoint.proxyURL),
               let proxyHost = proxyComponents.host,
               let proxyPort = proxyComponents.port else {
-            completion(
-                BufferedProxyResponse(
-                    data: nil,
-                    response: nil,
-                    error: URLError(.badURL),
-                    firstByteLatencyMilliseconds: nil,
-                    totalLatencyMilliseconds: nil
-                )
-            )
+            completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.badURL), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
             return {}
         }
 
@@ -6751,7 +6766,7 @@ class ThinkingProxy {
         }
         task.resume()
         return {
-            task.cancel()
+            session.invalidateAndCancel()
         }
     }
 
