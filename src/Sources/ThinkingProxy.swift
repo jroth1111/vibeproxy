@@ -232,6 +232,14 @@ enum OpenAICompatTemporaryShim {
             case .conservative: return 2000.0
             }
         }
+
+        var failureThresholdScaleFactor: Double {
+            switch self {
+            case .eager: return 0.5
+            case .balanced: return 1.0
+            case .conservative: return 2.0
+            }
+        }
     }
 
     enum RouteHealthStatus: String {
@@ -1856,7 +1864,8 @@ enum OpenAICompatTemporaryShim {
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
         at now: Date = Date(),
-        forcedOpenUntil: Date? = nil
+        forcedOpenUntil: Date? = nil,
+        healthSensitivity: HealthSensitivity? = nil
     ) {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
@@ -1869,7 +1878,8 @@ enum OpenAICompatTemporaryShim {
                 afterFailureAt: now,
                 telemetryEvent: telemetryEvent,
                 policy: routeCircuitBreakerPolicy,
-                forcedOpenUntil: forcedOpenUntil
+                forcedOpenUntil: forcedOpenUntil,
+                healthSensitivity: healthSensitivity
             )
             let enrichedTelemetryEvent = telemetryEvent.map {
                 enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
@@ -2466,7 +2476,8 @@ enum OpenAICompatTemporaryShim {
         afterFailureAt now: Date,
         telemetryEvent: RouteTelemetryEvent?,
         policy: RouteCircuitBreakerPolicy? = nil,
-        forcedOpenUntil: Date? = nil
+        forcedOpenUntil: Date? = nil,
+        healthSensitivity: HealthSensitivity? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
         let failurePenalty = failurePenalty(for: telemetryEvent)
@@ -2485,7 +2496,8 @@ enum OpenAICompatTemporaryShim {
             now: now
         )
         let failureThreshold = effectiveFailureThreshold(
-            policy: effectivePolicy
+            policy: effectivePolicy,
+            healthSensitivity: healthSensitivity
         )
         let effectiveForcedOpenUntil = [current?.openUntil, forcedOpenUntil]
             .compactMap { $0 }
@@ -2747,9 +2759,14 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func effectiveFailureThreshold(
-        policy: RouteCircuitBreakerPolicy
+        policy: RouteCircuitBreakerPolicy,
+        healthSensitivity: HealthSensitivity? = nil
     ) -> Int {
-        policy.failureThreshold
+        let baseThreshold = policy.failureThreshold
+        guard let sensitivity = healthSensitivity, sensitivity != .balanced else {
+            return baseThreshold
+        }
+        return max(1, Int(Double(baseThreshold) * sensitivity.failureThresholdScaleFactor))
     }
 
     private static func updatedRollingMetrics(
@@ -5450,7 +5467,8 @@ class ThinkingProxy {
                         OpenAICompatTemporaryShim.recordRouteFailure(
                             forRequestModel: requestModel,
                             telemetryEvent: telemetryEvent,
-                            forcedOpenUntil: cooldownUntil
+                            forcedOpenUntil: cooldownUntil,
+                            healthSensitivity: healthSensitivity
                         )
                         coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                         remainingAttempts -= 1
@@ -5534,6 +5552,7 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
+        let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
             let winningTelemetryEvent = annotatedSmartAliasTelemetryEvent(
@@ -5566,7 +5585,8 @@ class ThinkingProxy {
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
-                forcedOpenUntil: cooldownUntil
+                forcedOpenUntil: cooldownUntil,
+                healthSensitivity: healthSensitivity
             )
             attemptSmartAliasCandidate(
                 method: method,
@@ -5588,7 +5608,8 @@ class ThinkingProxy {
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
-                forcedOpenUntil: cooldownUntil
+                forcedOpenUntil: cooldownUntil,
+                healthSensitivity: healthSensitivity
             )
             attemptSmartAliasCandidate(
                 method: method,
@@ -5639,6 +5660,7 @@ class ThinkingProxy {
         coalescingKey: String?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
+        let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, _):
             deliverBufferedHTTPResponse(
@@ -5682,7 +5704,8 @@ class ThinkingProxy {
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: requestModel,
                 telemetryEvent: telemetryEvent,
-                forcedOpenUntil: cooldownUntil
+                forcedOpenUntil: cooldownUntil,
+                healthSensitivity: healthSensitivity
             )
             deliverBufferedError(
                 defaultConnection: originalConnection,

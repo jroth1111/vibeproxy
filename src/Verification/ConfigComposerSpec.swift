@@ -57,7 +57,7 @@ struct ConfigComposerSpec {
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"], "managed worker alias should race NVIDIA models first, then fallback to ZAI and free-tier providers", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "managed worker alias should serial through ZAI and free-tier first, then race NVIDIA models as last resort", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -140,8 +140,8 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"],
-                "managed worker ordering should replace stale user-defined fallback candidates with NVIDIA-first racing order",
+                ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"],
+                "managed worker ordering should replace stale user-defined fallback candidates with serial-first then NVIDIA-race order",
                 recorder: recorder
             )
         }

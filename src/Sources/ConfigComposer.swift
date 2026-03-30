@@ -728,7 +728,7 @@ enum ConfigComposer {
             "worker": [
                 "request-class": "plain-chat",
                 "failover": "silent",
-                "candidates": ["minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"]
+                "candidates": ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
             ]
         ]
     }
