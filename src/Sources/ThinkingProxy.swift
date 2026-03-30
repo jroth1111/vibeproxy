@@ -253,6 +253,36 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    struct RouteEMAMetrics: Equatable {
+        let successRate: Double
+        let averageLatencyMs: Double
+        let observationCount: Int
+
+        static let empty = RouteEMAMetrics(successRate: 1.0, averageLatencyMs: 0.0, observationCount: 0)
+
+        private static let emaAlpha = 0.2
+
+        func updated(isSuccess: Bool, latencyMs: Int?) -> RouteEMAMetrics {
+            let newSuccessRate = successRate * (1.0 - Self.emaAlpha) + (isSuccess ? 1.0 : 0.0) * Self.emaAlpha
+            let newLatency: Double
+            if let latencyMs {
+                newLatency = averageLatencyMs * (1.0 - Self.emaAlpha) + Double(latencyMs) * Self.emaAlpha
+            } else {
+                newLatency = averageLatencyMs
+            }
+            return RouteEMAMetrics(successRate: newSuccessRate, averageLatencyMs: newLatency, observationCount: observationCount + 1)
+        }
+
+        var compositeScore: Double {
+            guard observationCount > 0 else { return 500.0 }
+            return successRate * successRate * 1000.0 - averageLatencyMs
+        }
+
+        var isProvenPerfect: Bool {
+            observationCount > 0 && successRate == 1.0
+        }
+    }
+
     struct RouteCircuitState: Equatable {
         let status: RouteHealthStatus
         let failureScore: Int
@@ -261,6 +291,7 @@ enum OpenAICompatTemporaryShim {
         let lastScoreUpdatedAt: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
         let rollingMetrics: RouteRollingMetrics
+        let emaMetrics: RouteEMAMetrics
 
         func isUnavailable(at now: Date) -> Bool {
             switch status {
@@ -1794,7 +1825,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: until,
                 lastScoreUpdatedAt: until,
                 lastTelemetryEvent: nil,
-                rollingMetrics: .empty
+                rollingMetrics: .empty,
+                emaMetrics: .empty
             )
             persistRouteHealthLocked()
         }
@@ -2324,6 +2356,10 @@ enum OpenAICompatTemporaryShim {
             current: current?.rollingMetrics,
             telemetryEvent: telemetryEvent
         )
+        let nextEMA = (current?.emaMetrics ?? .empty).updated(
+            isSuccess: false,
+            latencyMs: nil
+        )
         let decayedFailureScore = decayedFailureScore(
             current?.failureScore ?? 0,
             lastUpdatedAt: current?.lastScoreUpdatedAt,
@@ -2346,7 +2382,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: effectiveForcedOpenUntil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         }
 
@@ -2364,7 +2401,8 @@ enum OpenAICompatTemporaryShim {
                     openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
-                    rollingMetrics: nextRollingMetrics
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA
                 )
             }
             return RouteCircuitState(
@@ -2374,7 +2412,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: nil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         case .open, .halfOpen:
             return RouteCircuitState(
@@ -2384,7 +2423,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: now.addingTimeInterval(effectivePolicy.cooldown),
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         }
     }
@@ -2400,6 +2440,10 @@ enum OpenAICompatTemporaryShim {
         let nextRollingMetrics = updatedRollingMetrics(
             current: current?.rollingMetrics,
             telemetryEvent: telemetryEvent
+        )
+        let nextEMA = (current?.emaMetrics ?? .empty).updated(
+            isSuccess: true,
+            latencyMs: telemetryEvent?.firstByteLatencyMilliseconds
         )
         let decayedScore = decayedFailureScore(
             current?.failureScore ?? 0,
@@ -2417,7 +2461,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: nil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         case .suspect:
             if reducedScore > 0 || shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
@@ -2428,7 +2473,8 @@ enum OpenAICompatTemporaryShim {
                     openUntil: nil,
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
-                    rollingMetrics: nextRollingMetrics
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA
                 )
             }
             return RouteCircuitState(
@@ -2438,7 +2484,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: nil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         case .open:
             if effectivePolicy.recoverySuccessThreshold <= 1 {
@@ -2449,7 +2496,8 @@ enum OpenAICompatTemporaryShim {
                     openUntil: nil,
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
-                    rollingMetrics: nextRollingMetrics
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA
                 )
             }
             return RouteCircuitState(
@@ -2459,7 +2507,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: nil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         case .halfOpen:
             let nextRecoverySuccesses = (current?.recoverySuccesses ?? 0) + 1
@@ -2471,7 +2520,8 @@ enum OpenAICompatTemporaryShim {
                     openUntil: nil,
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
-                    rollingMetrics: nextRollingMetrics
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA
                 )
             }
             return RouteCircuitState(
@@ -2481,7 +2531,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: nil,
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: nextRollingMetrics
+                rollingMetrics: nextRollingMetrics,
+                emaMetrics: nextEMA
             )
         }
     }
@@ -2497,7 +2548,8 @@ enum OpenAICompatTemporaryShim {
             openUntil: state.openUntil,
             lastScoreUpdatedAt: state.lastScoreUpdatedAt,
             lastTelemetryEvent: telemetryEvent,
-            rollingMetrics: state.rollingMetrics
+            rollingMetrics: state.rollingMetrics,
+            emaMetrics: state.emaMetrics
         )
     }
 
@@ -2722,7 +2774,8 @@ enum OpenAICompatTemporaryShim {
                 openUntil: openUntil,
                 lastScoreUpdatedAt: lastScoreUpdatedAt,
                 lastTelemetryEvent: lastTelemetryEvent,
-                rollingMetrics: rollingMetrics
+                rollingMetrics: rollingMetrics,
+                emaMetrics: parseEMAMetrics(entry["ema_metrics"])
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
@@ -2875,6 +2928,20 @@ enum OpenAICompatTemporaryShim {
             invalidSuccessCount: integerValue(dict["invalid_success_count"]) ?? 0,
             recentOutcomes: dict["recent_outcomes"] as? [String] ?? [],
             recentFirstByteLatencyMilliseconds: dict["recent_first_byte_latency_ms"] as? [Int] ?? []
+        )
+    }
+
+    private static func parseEMAMetrics(_ rawValue: Any?) -> RouteEMAMetrics {
+        guard let dict = rawValue as? [String: Any],
+              let successRate = dict["success_rate"] as? Double,
+              let averageLatencyMs = dict["average_latency_ms"] as? Double,
+              let observationCount = dict["observation_count"] as? Int else {
+            return .empty
+        }
+        return RouteEMAMetrics(
+            successRate: successRate,
+            averageLatencyMs: averageLatencyMs,
+            observationCount: observationCount
         )
     }
 
