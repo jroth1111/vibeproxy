@@ -1,10 +1,22 @@
-.PHONY: build release app install clean run help test verify info open factory-worker-sync factory-worker-check factory-worker-doctor factory-audit-once factory-audit-install
+.PHONY: build release app install clean run help test verify info open factory-worker-sync factory-worker-check factory-worker-doctor factory-audit-once factory-audit-install proxy-binary
 
 help: ## Show this help message
 	@echo "VibeProxy - macOS Menu Bar App"
 	@echo ""
 	@echo "Available targets:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
+
+CLI_PROXY_SRC ?= $(shell realpath ../CLIProxyAPIPlus_resync_20260327 2>/dev/null)
+CLI_PROXY_BIN := src/Sources/Resources/cli-proxy-api-plus
+
+proxy-binary: ## Build cli-proxy-api-plus from Go source
+	@if [ -z "$(CLI_PROXY_SRC)" ] || [ ! -d "$(CLI_PROXY_SRC)" ]; then \
+		echo "Go source not found at ../CLIProxyAPIPlus_resync_20260327"; exit 1; \
+	fi
+	@echo "Building cli-proxy-api-plus from Go source..."
+	@cd "$(CLI_PROXY_SRC)" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+		go build -ldflags="-s -w" -o "$(CURDIR)/$(CLI_PROXY_BIN)" ./cmd/server/
+	@echo "Built: $(CLI_PROXY_BIN) ($$(du -h $(CLI_PROXY_BIN) | cut -f1))"
 
 build: ## Build the Swift executable (debug)
 	@echo "🔨 Building Swift executable..."
