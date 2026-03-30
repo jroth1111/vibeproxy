@@ -332,14 +332,12 @@ enum OpenAICompatTemporaryShim {
 
         func isUnavailable(at now: Date) -> Bool {
             switch status {
-            case .closed, .suspect:
+            case .closed, .suspect, .halfOpen:
                 return false
             case .open:
                 if let openUntil {
                     return now < openUntil
                 }
-                return true
-            case .halfOpen:
                 return true
             }
         }
@@ -397,7 +395,10 @@ enum OpenAICompatTemporaryShim {
         case emptyContent = "empty_content"
         case reasoningOnlyContentMissing = "reasoning_only_content_missing"
         case reasoningLeakLength = "reasoning_leak_length"
+        case reasoningLeakContent = "reasoning_leak_content"
         case malformedToolArguments = "malformed_tool_arguments"
+        case invalidJson = "invalid_json"
+        case missingChoices = "missing_choices"
     }
 
     private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = [
@@ -423,9 +424,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 180,
-            firstResponseDeadline: 120,
-            bufferedResponseDeadline: 150,
+            attemptTimeout: 90,
+            firstResponseDeadline: 45,
+            bufferedResponseDeadline: 75,
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -1056,7 +1057,7 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        guard smartAlias.candidates.contains("glm-5.1-zai"),
+        guard smartAlias.candidates.first == "glm-5.1-zai",
               let primaryRoute = resolveConfiguredRoute(forRequestModel: "glm-5.1-zai"),
               primaryRoute.providerID == "zai",
               primaryRoute.canonicalModelID == "glm-5.1",
@@ -1174,17 +1175,8 @@ enum OpenAICompatTemporaryShim {
                 if lhsScore.healthPriority != rhsScore.healthPriority {
                     return lhsScore.healthPriority < rhsScore.healthPriority
                 }
-                // Sticky-on-zero-failures: a proven-perfect reasoning-tier model never
-                // loses to any lower-tier model, regardless of score.
-                if lhsScore.isProvenPerfect, lhsScore.tierWeight == ModelTier.reasoning.rawValue,
-                   lhsScore.tierWeight > rhsScore.tierWeight {
-                    return true
-                }
-                if rhsScore.isProvenPerfect, rhsScore.tierWeight == ModelTier.reasoning.rawValue,
-                   rhsScore.tierWeight > lhsScore.tierWeight {
-                    return false
-                }
-                // General proven-perfect preference (non-reasoning tiers)
+                // Proven-perfect preference: a model with zero observed failures always
+                // beats a model that has seen failures, regardless of score or tier.
                 if lhsScore.isProvenPerfect != rhsScore.isProvenPerfect {
                     return lhsScore.isProvenPerfect
                 }
@@ -1369,30 +1361,15 @@ enum OpenAICompatTemporaryShim {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
-    private static let suspectDeadlineReductionFactor: Double = 0.75
-    private static let openDeadlineReductionFactor: Double = 0.5
-
     static func effectiveFirstResponseDeadline(
         forRequestJSON jsonString: String,
         routeHealthStatus: RouteHealthStatus?
     ) -> TimeInterval? {
-        guard let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString),
-              let status = routeHealthStatus else {
-            return firstResponseDeadline(forRequestJSON: jsonString)
-        }
-
-        let reductionFactor: Double
-        switch status {
-        case .suspect:
-            reductionFactor = suspectDeadlineReductionFactor
-        case .open, .halfOpen:
-            reductionFactor = openDeadlineReductionFactor
-        case .closed:
-            return baseDeadline
-        }
-
-        let reducedDeadline = baseDeadline * reductionFactor
-        return reducedDeadline
+        // Note: Previously this applied deadline reduction for suspect/open routes.
+        // That behavior caused premature timeouts on slow but valid NVIDIA lanes.
+        // Now we preserve the base deadline regardless of health status - the circuit
+        // breaker already handles route selection, so deadlines shouldn't shrink.
+        return firstResponseDeadline(forRequestJSON: jsonString)
     }
 
     static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -2768,31 +2745,16 @@ enum OpenAICompatTemporaryShim {
         return max(0, failureScore - decaySteps)
     }
 
-    private static let highTimeoutRateThreshold: Double = 0.3
-    private static let highInvalidSuccessRateThreshold: Double = 0.2
-
     private static func effectiveFailureThreshold(
         policy: RouteCircuitBreakerPolicy,
         metrics: RouteRollingMetrics
     ) -> Int {
-        let baseThreshold = policy.failureThreshold
-
-        if metrics.requestCount == 0 {
-            return baseThreshold
-        }
-
-        let timeoutRate = metrics.timeoutRate
-        let invalidSuccessRate = metrics.invalidSuccessRate
-
-        if timeoutRate > highTimeoutRateThreshold {
-            return max(1, baseThreshold - 2)
-        }
-
-        if invalidSuccessRate > highInvalidSuccessRateThreshold {
-            return max(1, baseThreshold - 1)
-        }
-
-        return baseThreshold
+        // Note: Previously this reduced the threshold based on timeout/invalid-success rates.
+        // That behavior caused circuits to open after 2 failures instead of the declared 4,
+        // even when the rolling metrics were still being accumulated. Now we always return
+        // the base threshold from the policy - the circuit breaker policy should be stable
+        // and not dynamically adjusted based on early-stage metrics.
+        return policy.failureThreshold
     }
 
     private static func updatedRollingMetrics(
@@ -4060,6 +4022,7 @@ class ThinkingProxy {
         static let vercelGatewayHost = "ai-gateway.vercel.sh"
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
+        static let nvidiaReasoningTransportRetries = 2
         static let defaultMitigatedAttemptTimeout: TimeInterval = 30
         static let nvidiaCanaryTimeout: TimeInterval = 300
         static let healthcheckTimeout: TimeInterval = 0.5
@@ -4808,9 +4771,9 @@ class ThinkingProxy {
                 originalConnection: connection,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: model,
-                    initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
-                    transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
                     salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
@@ -6293,9 +6256,9 @@ class ThinkingProxy {
                 controller: controller,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: candidateModel,
-                    initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
-                    transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningSemanticRetries,
+                    transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     semanticRetriesRemaining: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     retryBackoffMilliseconds: retryBudget?.backoffMilliseconds ?? 0,
                     salvagesBestEffortRepair: retryBudget?.salvagesBestEffortRepair ?? false,
@@ -6316,7 +6279,7 @@ class ThinkingProxy {
         // Direct proxied path for providers with per-provider proxy-url (e.g., opencode via SOCKS5)
         if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
            let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: route.providerID) {
-            let cancel = sendDirectProxiedRequest(
+            _ = sendDirectProxiedRequest(
                 method: method,
                 path: path,
                 headers: effectiveHeaders,
@@ -6939,7 +6902,7 @@ class ThinkingProxy {
     ) {
         let timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
-        let cancel = sendDirectProxiedRequest(
+        _ = sendDirectProxiedRequest(
             method: method,
             path: path,
             headers: effectiveHeaders,
@@ -7545,7 +7508,7 @@ class ThinkingProxy {
                 )
                 if statusCode >= 200 && statusCode < 300 {
                     OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
-                } else if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
+                } else if statusCode == 429 || statusCode == 403 || statusCode == 404 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
@@ -7563,7 +7526,7 @@ class ThinkingProxy {
                     telemetryEvent,
                     winnerAttemptLane: attemptLane
                 )
-                if statusCode == 429 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
+                if statusCode == 429 || statusCode == 403 || statusCode == 404 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
