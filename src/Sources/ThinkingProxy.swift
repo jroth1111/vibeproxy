@@ -2950,6 +2950,36 @@ enum OpenAICompatTemporaryShim {
         if prunedUnknownEntries {
             persistRouteHealthLocked()
         }
+
+        // Self-heal: suspect routes with stale metrics auto-recover to closed.
+        let staleThreshold: TimeInterval = 5 * 60  // 5 minutes
+        let now = Date()
+        var healedAny = false
+        for key in routeCircuitStatesByRouteHealthKey.keys {
+            guard let state = routeCircuitStatesByRouteHealthKey[key],
+                  state.status == .suspect else { continue }
+            // If last event is older than threshold, this route has been idle.
+            // Skip routes with no last event — we cannot determine staleness.
+            guard let lastEvent = state.lastTelemetryEvent else { continue }
+            let age = now.timeIntervalSince(lastEvent.timestamp)
+            guard age > staleThreshold else { continue }
+            // Suspect with no recent failures — safe to close.
+            routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
+                status: .closed,
+                failureScore: 0,
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastScoreUpdatedAt: now,
+                lastTelemetryEvent: state.lastTelemetryEvent,
+                rollingMetrics: state.rollingMetrics,
+                emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                recoveredAt: now
+            )
+            healedAny = true
+        }
+        if healedAny {
+            persistRouteHealthLocked()
+        }
     }
 
     private static func persistRouteHealthLocked() {
