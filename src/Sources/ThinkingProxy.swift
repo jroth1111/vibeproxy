@@ -465,16 +465,6 @@ enum OpenAICompatTemporaryShim {
         "xiaomi/mimo-v2-pro:free": .economy,
         "minimax-m2.5-free": .standard,
     ]
-    // Price per million input tokens (0.0 = free tier)
-    private static let inputPricePerMillionTokensByCanonicalModelID: [String: Double] = [
-        "z-ai/glm5": 0.0,
-        "moonshotai/kimi-k2.5": 0.0,
-        "minimaxai/minimax-m2.5": 0.0,
-        "mimo-v2-pro-free": 0.0,
-        "xiaomi/mimo-v2-pro:free": 0.0,
-        "minimax-m2.5-free": 0.0,
-    ]
-    private static let costPreference: Double = 0.3
     static let canaryDisabledCanonicalModelIDs: Set<String> = []
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
@@ -3336,22 +3326,6 @@ enum OpenAICompatTemporaryShim {
             return tier
         }
         return .standard
-    }
-
-    static func costFactor(forRequestModel model: String) -> Double {
-        let normalized = normalizedRequestModel(model)
-        let price: Double
-        if let route = resolveConfiguredRoute(forRequestModel: normalized),
-           let p = inputPricePerMillionTokensByCanonicalModelID[route.canonicalModelID] {
-            price = p
-        } else if let p = inputPricePerMillionTokensByCanonicalModelID[normalized] {
-            price = p
-        } else {
-            return 1.0
-        }
-        guard price > 0 else { return 1.0 }
-        let rawFactor = 1.0 / (price + 0.01)
-        return pow(rawFactor, costPreference)
     }
 
     private static func reasoningString(from message: [String: Any]) -> String {
