@@ -205,6 +205,12 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    struct ProviderEndpoint: Equatable {
+        let providerID: String
+        let baseURL: String
+        let proxyURL: String
+    }
+
     struct SmartAliasDefinition: Equatable {
         let alias: String
         let requestClass: String
@@ -278,6 +284,10 @@ enum OpenAICompatTemporaryShim {
             return successRate * successRate * 1000.0 - averageLatencyMs
         }
 
+        static func resetForRecovery() -> RouteEMAMetrics {
+            RouteEMAMetrics(successRate: 0.8, averageLatencyMs: 0.0, observationCount: 3)
+        }
+
         var isProvenPerfect: Bool {
             observationCount > 0 && successRate == 1.0
         }
@@ -292,6 +302,17 @@ enum OpenAICompatTemporaryShim {
         let lastTelemetryEvent: RouteTelemetryEvent?
         let rollingMetrics: RouteRollingMetrics
         let emaMetrics: RouteEMAMetrics
+        let recoveredAt: Date?
+
+        private static let momentumBaseBonus: Double = 50.0
+        private static let momentumDecayPerSecond: Double = 0.95
+
+        var momentumBonus: Double {
+            guard status == .closed, let recoveredAt else { return 0.0 }
+            let elapsed = Date().timeIntervalSince(recoveredAt)
+            guard elapsed > 0 else { return Self.momentumBaseBonus }
+            return Self.momentumBaseBonus * pow(Self.momentumDecayPerSecond, elapsed)
+        }
 
         func isUnavailable(at now: Date) -> Bool {
             switch status {
@@ -319,6 +340,7 @@ enum OpenAICompatTemporaryShim {
         let nvidiaRoutesByRequestModel: [String: RouteIdentity]
         let anthropicRequestModels: Set<String>
         let smartAliasesByAlias: [String: SmartAliasDefinition]
+        let providerEndpointsByProviderID: [String: ProviderEndpoint]
     }
 
     private struct RouteCircuitBreakerPolicy {
@@ -345,6 +367,13 @@ enum OpenAICompatTemporaryShim {
     private enum ToolChoiceMode {
         case preserve
         case rejectRequiredOrFunctionChoice
+    }
+
+    enum ModelTier: Double {
+        case reasoning = 1.0
+        case standard = 0.85
+        case economy = 0.6
+        case free = 0.4
     }
 
     enum FailureClass: String, Hashable {
@@ -411,6 +440,24 @@ enum OpenAICompatTemporaryShim {
             forcesKimiInstantMode: false
         )
     ]
+    private static let modelTierByCanonicalModelID: [String: ModelTier] = [
+        "z-ai/glm5": .standard,
+        "moonshotai/kimi-k2.5": .reasoning,
+        "minimaxai/minimax-m2.5": .standard,
+        "mimo-v2-pro-free": .economy,
+        "xiaomi/mimo-v2-pro:free": .economy,
+        "minimax-m2.5-free": .standard,
+    ]
+    // Price per million input tokens (0.0 = free tier)
+    private static let inputPricePerMillionTokensByCanonicalModelID: [String: Double] = [
+        "z-ai/glm5": 0.0,
+        "moonshotai/kimi-k2.5": 0.0,
+        "minimaxai/minimax-m2.5": 0.0,
+        "mimo-v2-pro-free": 0.0,
+        "xiaomi/mimo-v2-pro:free": 0.0,
+        "minimax-m2.5-free": 0.0,
+    ]
+    private static let costPreference: Double = 0.3
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
             minimumMaxTokens: nil,
@@ -1100,12 +1147,20 @@ enum OpenAICompatTemporaryShim {
                 if lhsScore.healthPriority != rhsScore.healthPriority {
                     return lhsScore.healthPriority < rhsScore.healthPriority
                 }
-                // Stickiness: proven-perfect (observed >0, successRate==1.0) beats imperfect or untested
+                // Sticky-on-zero-failures: a proven-perfect higher-tier model never
+                // loses to a lower-tier model, even if the lower-tier has a higher score.
                 let lhsProvenPerfect = lhsScore.isProvenPerfect
                 let rhsProvenPerfect = rhsScore.isProvenPerfect
                 if lhsProvenPerfect != rhsProvenPerfect {
+                    if lhsProvenPerfect && lhsScore.tierWeight > rhsScore.tierWeight {
+                        return true
+                    }
+                    if rhsProvenPerfect && rhsScore.tierWeight > lhsScore.tierWeight {
+                        return false
+                    }
                     return lhsProvenPerfect
                 }
+                // Among same tier or both imperfect, prefer higher composite score
                 if lhsScore.compositeScore != rhsScore.compositeScore {
                     return lhsScore.compositeScore > rhsScore.compositeScore
                 }
@@ -1826,7 +1881,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: until,
                 lastTelemetryEvent: nil,
                 rollingMetrics: .empty,
-                emaMetrics: .empty
+                emaMetrics: .empty,
+                recoveredAt: nil
             )
             persistRouteHealthLocked()
         }
@@ -2383,7 +2439,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         }
 
@@ -2402,7 +2459,8 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: nextEMA
+                    emaMetrics: nextEMA,
+                    recoveredAt: nil
                 )
             }
             return RouteCircuitState(
@@ -2413,7 +2471,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         case .open, .halfOpen:
             return RouteCircuitState(
@@ -2424,7 +2483,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         }
     }
@@ -2462,7 +2522,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         case .suspect:
             if reducedScore > 0 || shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
@@ -2474,7 +2535,8 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: nextEMA
+                    emaMetrics: nextEMA,
+                    recoveredAt: nil
                 )
             }
             return RouteCircuitState(
@@ -2485,7 +2547,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         case .open:
             if effectivePolicy.recoverySuccessThreshold <= 1 {
@@ -2497,7 +2560,8 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: nextEMA
+                    emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                    recoveredAt: now
                 )
             }
             return RouteCircuitState(
@@ -2508,7 +2572,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         case .halfOpen:
             let nextRecoverySuccesses = (current?.recoverySuccesses ?? 0) + 1
@@ -2521,7 +2586,8 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: nextEMA
+                    emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                    recoveredAt: now
                 )
             }
             return RouteCircuitState(
@@ -2532,7 +2598,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
-                emaMetrics: nextEMA
+                emaMetrics: nextEMA,
+                recoveredAt: nil
             )
         }
     }
@@ -2549,7 +2616,8 @@ enum OpenAICompatTemporaryShim {
             lastScoreUpdatedAt: state.lastScoreUpdatedAt,
             lastTelemetryEvent: telemetryEvent,
             rollingMetrics: state.rollingMetrics,
-            emaMetrics: state.emaMetrics
+            emaMetrics: state.emaMetrics,
+            recoveredAt: state.recoveredAt
         )
     }
 
@@ -2713,7 +2781,7 @@ enum OpenAICompatTemporaryShim {
     private static func smartAliasFallbackRankingScore(
         forRequestModel requestModel: String,
         originalIndex: Int
-    ) -> (healthPriority: Int, compositeScore: Double, isProvenPerfect: Bool, originalIndex: Int) {
+    ) -> (healthPriority: Int, compositeScore: Double, isProvenPerfect: Bool, tierWeight: Double, originalIndex: Int) {
         let route = resolveConfiguredRoute(forRequestModel: requestModel)
         let state = route.flatMap { routeCircuitStatesByRouteHealthKey[$0.routeHealthKey] }
         let ema = state?.emaMetrics ?? .empty
@@ -2729,10 +2797,17 @@ enum OpenAICompatTemporaryShim {
         case .open:
             healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
         }
+        let tier = modelTier(forRequestModel: requestModel)
+        let momentum = state?.momentumBonus ?? 0.0
+        let cost = ema.observationCount > 0 ? costFactor(forRequestModel: requestModel) : 1.0
+        let adjustedScore = ema.observationCount > 0
+            ? (ema.compositeScore + momentum) * tier.rawValue * cost
+            : ema.compositeScore + momentum
         return (
             healthPriority: healthPriority,
-            compositeScore: ema.compositeScore,
+            compositeScore: adjustedScore,
             isProvenPerfect: ema.isProvenPerfect,
+            tierWeight: tier.rawValue,
             originalIndex: originalIndex
         )
     }
@@ -2774,7 +2849,8 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: lastScoreUpdatedAt,
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: rollingMetrics,
-                emaMetrics: parseEMAMetrics(entry["ema_metrics"])
+                emaMetrics: parseEMAMetrics(entry["ema_metrics"]),
+                recoveredAt: parseISO8601Date(entry["recovered_at"] as? String)
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
@@ -3158,6 +3234,33 @@ enum OpenAICompatTemporaryShim {
         resolveNVIDIAHostedRoute(forRequestModel: model) != nil
     }
 
+    static func modelTier(forRequestModel model: String) -> ModelTier {
+        let normalized = normalizedRequestModel(model)
+        if let route = resolveConfiguredRoute(forRequestModel: normalized),
+           let tier = modelTierByCanonicalModelID[route.canonicalModelID] {
+            return tier
+        }
+        if let tier = modelTierByCanonicalModelID[normalized] {
+            return tier
+        }
+        return .standard
+    }
+
+    static func costFactor(forRequestModel model: String) -> Double {
+        let normalized = normalizedRequestModel(model)
+        let price: Double
+        if let route = resolveConfiguredRoute(forRequestModel: normalized),
+           let p = inputPricePerMillionTokensByCanonicalModelID[route.canonicalModelID] {
+            price = p
+        } else if let p = inputPricePerMillionTokensByCanonicalModelID[normalized] {
+            price = p
+        } else {
+            return 1.0
+        }
+        let rawFactor = 1.0 / (price + 0.01)
+        return pow(rawFactor, costPreference)
+    }
+
     private static func reasoningString(from message: [String: Any]) -> String {
         if let reasoning = (message["reasoning"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !reasoning.isEmpty {
@@ -3180,6 +3283,10 @@ enum OpenAICompatTemporaryShim {
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
         resolvedRoutesByRequestModel()[normalizedRequestModel(model)]
+    }
+
+    static func providerEndpoint(forProviderID providerID: String) -> ProviderEndpoint? {
+        configuredRouteConfiguration().providerEndpointsByProviderID[providerID]
     }
 
     private static func normalizedRequestModel(_ model: String) -> String {
@@ -3231,7 +3338,8 @@ enum OpenAICompatTemporaryShim {
                 routesByRequestModel: loadedConfiguration.routesByRequestModel,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
                 anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
-                smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias
+                smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
+                providerEndpointsByProviderID: loadedConfiguration.providerEndpointsByProviderID
             )
             cachedRouteConfiguration = cachedMap
             return cachedMap
@@ -3242,11 +3350,12 @@ enum OpenAICompatTemporaryShim {
         routesByRequestModel: [String: RouteIdentity],
         nvidiaRoutesByRequestModel: [String: RouteIdentity],
         anthropicRequestModels: Set<String>,
-        smartAliasesByAlias: [String: SmartAliasDefinition]
+        smartAliasesByAlias: [String: SmartAliasDefinition],
+        providerEndpointsByProviderID: [String: ProviderEndpoint]
     ) {
         guard let path,
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return ([:], [:], [], [:])
+            return ([:], [:], [], [:], [:])
         }
 
         struct ParsedModel {
@@ -3257,6 +3366,7 @@ enum OpenAICompatTemporaryShim {
         struct ParsedProvider {
             var name = ""
             var baseURL = ""
+            var proxyURL: String?
             var models: [ParsedModel] = []
         }
 
@@ -3271,6 +3381,7 @@ enum OpenAICompatTemporaryShim {
         var nvidiaRoutesByRequestModel: [String: RouteIdentity] = [:]
         var anthropicRequestModels: Set<String> = []
         var smartAliasesByAlias: [String: SmartAliasDefinition] = [:]
+        var providerEndpointsByProviderID: [String: ProviderEndpoint] = [:]
         var currentSection: ParsedSection = .none
         var currentProvider: ParsedProvider?
         var insideModels = false
@@ -3379,6 +3490,17 @@ enum OpenAICompatTemporaryShim {
                 }
                 if section == .claudeAPIKey {
                     anthropicRequestModels.insert(canonicalModelID)
+                }
+            }
+            if let proxyURL = provider.proxyURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !proxyURL.isEmpty {
+                let endpointBaseURL = provider.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !endpointBaseURL.isEmpty {
+                    providerEndpointsByProviderID[providerID] = ProviderEndpoint(
+                        providerID: providerID,
+                        baseURL: endpointBaseURL,
+                        proxyURL: proxyURL
+                    )
                 }
             }
             currentProvider = nil
@@ -3520,6 +3642,11 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
+            if indent == 2, trimmed.hasPrefix("proxy-url: "), let value = scalarValue(from: trimmed) {
+                currentProvider?.proxyURL = value
+                continue
+            }
+
             guard insideModels else {
                 continue
             }
@@ -3552,7 +3679,8 @@ enum OpenAICompatTemporaryShim {
             routesByRequestModel,
             nvidiaRoutesByRequestModel,
             anthropicRequestModels,
-            smartAliasesByAlias.filter { !$0.key.isEmpty }
+            smartAliasesByAlias.filter { !$0.key.isEmpty },
+            providerEndpointsByProviderID
         )
     }
 
@@ -6016,6 +6144,34 @@ class ThinkingProxy {
             remainingBudget
         )
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
+
+        // Direct proxied path for providers with per-provider proxy-url (e.g., opencode via SOCKS5)
+        if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+           let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: route.providerID) {
+            let cancel = sendDirectProxiedRequest(
+                method: method,
+                path: path,
+                headers: effectiveHeaders,
+                body: body,
+                timeoutInterval: timeoutInterval,
+                endpoint: endpoint
+            ) { [weak self] bufferedResponse in
+                guard let self, controller?.isCancelled() != true else { return }
+                controller?.clearCurrentCancel()
+                self.handleSmartAliasBufferedCandidateResult(
+                    bufferedResponse,
+                    path: path,
+                    publicAlias: publicAlias,
+                    candidateModel: candidateModel,
+                    failoverDepth: failoverDepth,
+                    attemptLane: attemptLane,
+                    completion: completion
+                )
+            }
+            controller?.registerCurrentCancel(cancel)
+            return
+        }
+
         let cancel = sendBufferedProxyRequest(
             method: method,
             path: path,
@@ -6489,6 +6645,97 @@ class ThinkingProxy {
 
         let responseProgress = ResponseProgressDelegate()
         let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let task = session.dataTask(with: request) { data, response, error in
+            responseProgress.finish()
+            completion(
+                BufferedProxyResponse(
+                    data: data,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
+                )
+            )
+            session.finishTasksAndInvalidate()
+        }
+        task.resume()
+        return {
+            task.cancel()
+        }
+    }
+
+    private func sendDirectProxiedRequest(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        timeoutInterval: TimeInterval,
+        endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
+        completion: @escaping (BufferedProxyResponse) -> Void
+    ) -> (() -> Void) {
+        let upstreamURL = endpoint.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            + (path.hasPrefix("/") ? path : "/" + path)
+        guard let url = URL(string: upstreamURL) else {
+            completion(
+                BufferedProxyResponse(
+                    data: nil,
+                    response: nil,
+                    error: URLError(.badURL),
+                    firstByteLatencyMilliseconds: nil,
+                    totalLatencyMilliseconds: nil
+                )
+            )
+            return {}
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = timeoutInterval
+
+        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+        for (name, value) in headers where !excludedHeaders.contains(name.lowercased()) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue("close", forHTTPHeaderField: "Connection")
+
+        // Inject auth if not already present (empty bearer for opencode)
+        if !headers.contains(where: { $0.0.lowercased() == "authorization" }) {
+            request.setValue("Bearer ", forHTTPHeaderField: "Authorization")
+        }
+
+        // Configure SOCKS5 proxy
+        let configuration = URLSessionConfiguration.ephemeral
+        guard let proxyComponents = URLComponents(string: endpoint.proxyURL),
+              let proxyHost = proxyComponents.host,
+              let proxyPort = proxyComponents.port else {
+            completion(
+                BufferedProxyResponse(
+                    data: nil,
+                    response: nil,
+                    error: URLError(.badURL),
+                    firstByteLatencyMilliseconds: nil,
+                    totalLatencyMilliseconds: nil
+                )
+            )
+            return {}
+        }
+
+        var proxyDict: [AnyHashable: Any] = [
+            kCFStreamPropertySOCKSProxyHost as String: proxyHost,
+            kCFStreamPropertySOCKSProxyPort as String: proxyPort,
+            kCFStreamPropertySOCKSVersion as String: kCFStreamSocketSOCKSVersion5 as String
+        ]
+        if let user = proxyComponents.user, !user.isEmpty {
+            proxyDict[kCFStreamPropertySOCKSUser as String] = user
+        }
+        if let password = proxyComponents.password, !password.isEmpty {
+            proxyDict[kCFStreamPropertySOCKSPassword as String] = password
+        }
+        configuration.connectionProxyDictionary = proxyDict
+
+        let responseProgress = ResponseProgressDelegate()
+        let session = URLSession(configuration: configuration, delegate: responseProgress, delegateQueue: nil)
         let task = session.dataTask(with: request) { data, response, error in
             responseProgress.finish()
             completion(
@@ -7343,9 +7590,9 @@ class ThinkingProxy {
         {
           "model": "\(requestModel)",
           "messages": [
-            {"role": "user", "content": "Return exactly: OK"}
+            {"role": "user", "content": "Hi"}
           ],
-          "max_tokens": 32,
+          "max_tokens": 1,
           "stream": false
         }
         """

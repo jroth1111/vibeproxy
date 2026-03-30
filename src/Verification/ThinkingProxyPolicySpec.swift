@@ -912,6 +912,27 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("provider endpoint parsing captures per-provider proxy-url when set", recorder: recorder) {
+            withMergedConfig(workerWithProxyMergedConfigYAML()) {
+                guard let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "opencode") else {
+                    recorder.recordFailure("opencode provider should have a proxy endpoint")
+                    return
+                }
+                expectEqual(endpoint.baseURL, "https://opencode.ai/zen/v1", "opencode endpoint should have the configured base URL", recorder: recorder)
+                expectEqual(endpoint.proxyURL, "socks5://user:pass@proxy.example.com:1080", "opencode endpoint should have the configured proxy URL", recorder: recorder)
+
+                let nvidiaEndpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "nvidia")
+                expectNil(nvidiaEndpoint, "nvidia provider should not have a proxy endpoint", recorder: recorder)
+            }
+        }
+
+        run("provider endpoint returns nil when proxy-url is empty", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "opencode")
+                expectNil(endpoint, "opencode should have no proxy endpoint when proxy-url is empty", recorder: recorder)
+            }
+        }
+
         run("tool-heavy proxy worker smart router preserves the public-alias timeout budget on GPT-backed attempts", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
@@ -6624,6 +6645,50 @@ private func workerWithMimoMergedConfigYAML() -> String {
 
 private func workerMergedConfigYAML() -> String {
     workerWithMimoMergedConfigYAML()
+}
+
+private func workerWithProxyMergedConfigYAML() -> String {
+    [
+        "claude-api-key:",
+        "- api-key: test-zai-key",
+        "  base-url: https://api.z.ai/api/anthropic",
+        "  models:",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "openai-compatibility:",
+        "- name: kilocode",
+        "  api-key: test-kilo-key",
+        "  base-url: https://api.kilo.ai/api/openrouter/v1",
+        "  models:",
+        "  - alias: mimo-v2-pro-kilocode",
+        "    name: xiaomi/mimo-v2-pro:free",
+        "- name: opencode",
+        "  base-url: https://opencode.ai/zen/v1",
+        "  proxy-url: socks5://user:pass@proxy.example.com:1080",
+        "  models:",
+        "  - alias: mimo-v2-pro-opencode",
+        "    name: mimo-v2-pro-free",
+        "  - alias: minimax-m2.5-opencode",
+        "    name: minimax-m2.5-free",
+        "- name: nvidia",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: kimi-k2.5-nvidia",
+        "    name: moonshotai/kimi-k2.5",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5.1-zai",
+        "    - mimo-v2-pro-kilocode",
+        "    - mimo-v2-pro-opencode",
+        "    - minimax-m2.5-opencode",
+        "    - kimi-k2.5-nvidia"
+    ].joined(separator: "\n")
 }
 
 private func workerMisconfiguredMergedConfigYAML() -> String {
