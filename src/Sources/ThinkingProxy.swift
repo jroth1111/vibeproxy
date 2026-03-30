@@ -4886,49 +4886,48 @@ class ThinkingProxy {
             return
         }
 
-        if failoverDepth > 0 {
-            // Preserve the configured serial failover chain until the next remaining candidates are
-            // exclusively the NVIDIA lanes that are safe to hedge/race. This keeps the MiMo free-tier
-            // routes ahead of NVIDIA, while still allowing health-based ranking inside the NVIDIA race.
-            let raceableFallbackModels = remainingCandidateModels.prefix { candidateModel in
-                guard let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
-                      candidateRoute.providerID.hasPrefix("nvidia"),
-                      let candidateBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
-                        method: method,
-                        path: path,
-                        replacingRequestModelIn: currentBody,
-                        with: candidateModel
-                      ) else {
-                    return false
-                }
-                return OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+        // Non-NVIDIA candidates (glm-5.1-zai, mimo-v2-pro-*, minimax-m2.5-opencode) are tried
+        // serially. NVIDIA candidates (minimax-m2.5-nvidia, kimi-k2.5-nvidia) are raced against
+        // each other for lowest latency. The prefix scan walks candidates until it finds a
+        // contiguous run of NVIDIA reasoning models at the front of the remaining list.
+        let raceableFallbackModels = remainingCandidateModels.prefix { candidateModel in
+            guard let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+                  candidateRoute.providerID.hasPrefix("nvidia"),
+                  let candidateBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
                     method: method,
                     path: path,
-                    jsonString: candidateBody
-                )
+                    replacingRequestModelIn: currentBody,
+                    with: candidateModel
+                  ) else {
+                return false
             }
+            return OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
+                method: method,
+                path: path,
+                jsonString: candidateBody
+            )
+        }
 
-            if raceableFallbackModels.count >= 2 {
-                let deferredCandidateModels = Array(remainingCandidateModels.dropFirst(raceableFallbackModels.count))
-                attemptSmartAliasFallbackRace(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: currentBody,
-                    publicAlias: publicAlias,
-                    raceCandidateModels: Array(raceableFallbackModels),
-                    deferredCandidateModels: deferredCandidateModels,
-                    forceProbeCandidateModels: forceProbeCandidateModels,
-                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                    failoverDepth: failoverDepth,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome,
-                    deliveryMode: deliveryMode
-                )
-                return
-            }
+        if raceableFallbackModels.count >= 2 {
+            let deferredCandidateModels = Array(remainingCandidateModels.dropFirst(raceableFallbackModels.count))
+            attemptSmartAliasFallbackRace(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: currentBody,
+                publicAlias: publicAlias,
+                raceCandidateModels: Array(raceableFallbackModels),
+                deferredCandidateModels: deferredCandidateModels,
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                failoverDepth: failoverDepth,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: terminalFallbackOutcome,
+                deliveryMode: deliveryMode
+            )
+            return
         }
 
         guard let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
