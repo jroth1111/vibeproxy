@@ -2806,11 +2806,12 @@ enum OpenAICompatTemporaryShim {
                 entry["last_event"] = telemetryEventDictionary(lastTelemetryEvent)
             }
             entry["rolling_metrics"] = rollingMetricsDictionary(state.rollingMetrics)
+            entry["ema_metrics"] = emaMetricsDictionary(state.emaMetrics)
             routes[routeHealthKey] = entry
         }
 
         let payload: [String: Any] = [
-            "version": 1,
+            "version": 2,
             "routes": routes
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
@@ -2914,6 +2915,14 @@ enum OpenAICompatTemporaryShim {
             "invalid_success_count": metrics.invalidSuccessCount,
             "recent_outcomes": metrics.recentOutcomes,
             "recent_first_byte_latency_ms": metrics.recentFirstByteLatencyMilliseconds
+        ]
+    }
+
+    private static func emaMetricsDictionary(_ metrics: RouteEMAMetrics) -> [String: Any] {
+        [
+            "success_rate": metrics.successRate,
+            "average_latency_ms": metrics.averageLatencyMs,
+            "observation_count": metrics.observationCount
         ]
     }
 
