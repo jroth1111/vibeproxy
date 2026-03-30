@@ -2876,10 +2876,7 @@ enum OpenAICompatTemporaryShim {
         }
         let tier = modelTier(forRequestModel: requestModel)
         let momentum = state?.momentumBonus(at: now) ?? 0.0
-        let cost = ema.observationCount > 0 ? costFactor(forRequestModel: requestModel) : 1.0
-        let adjustedScore = ema.observationCount > 0
-            ? (ema.compositeScore + momentum) * tier.rawValue * cost
-            : ema.compositeScore + momentum
+        let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue
         return (
             healthPriority: healthPriority,
             compositeScore: adjustedScore,
