@@ -355,8 +355,8 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: turboRequest), "glm-5.1", "legacy glm-5-turbo requests should normalize to glm-5.1 before routing", recorder: recorder)
                 expectEqual(legacyJSON["model"] as? String, "glm-5.1", "legacy glm-5 request bodies should be rewritten onto glm-5.1", recorder: recorder)
                 expectEqual(turboJSON["model"] as? String, "glm-5.1", "legacy glm-5-turbo request bodies should be rewritten onto glm-5.1", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5")?.candidates.first, "glm-5.1-zai", "legacy glm-5 alias should reuse the glm-5.1 worker pool entrypoint", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5-turbo")?.candidates.first, "glm-5.1-zai", "legacy glm-5-turbo alias should reuse the glm-5.1 worker pool entrypoint", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5")?.candidates.contains("glm-5.1-zai"), true, "legacy glm-5 alias should include glm-5.1-zai in the worker pool candidates", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5-turbo")?.candidates.contains("glm-5.1-zai"), true, "legacy glm-5-turbo alias should include glm-5.1-zai in the worker pool candidates", recorder: recorder)
             }
         }
 

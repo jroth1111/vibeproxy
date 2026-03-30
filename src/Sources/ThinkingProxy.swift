@@ -1003,15 +1003,13 @@ enum OpenAICompatTemporaryShim {
         // The GPT-5.4 lane was removed after sustained 402/500 failures made it a latency penalty
         // with no reliability upside — the pool candidates (glm-5.1-zai, minimax, kimi, mimo)
         // now carry the full tool-heavy workload with health-ranked failover.
-        if isToolHeavyWorkerRequest,
-           toolHeavyWorkerPublicAliases.contains(publicAlias) {
-            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates, healthSensitivity: smartAlias.healthSensitivity)
-            if !rankedCandidates.isEmpty {
-                return rankedCandidates
-            }
-        }
-
         if isToolHeavyWorkerRequest {
+            if toolHeavyWorkerPublicAliases.contains(publicAlias) {
+                let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates, healthSensitivity: smartAlias.healthSensitivity)
+                if !rankedCandidates.isEmpty {
+                    return rankedCandidates
+                }
+            }
             return [primaryCandidate]
         }
 
@@ -1132,6 +1130,13 @@ enum OpenAICompatTemporaryShim {
                 skippedReasons.append((nextCandidateModel, "route_closed"))
                 continue
             }
+            if !forceAllowClosedModels.contains(nextCandidateModel),
+               let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
+               let cooldownUntil = providerCooldownsByProviderID[candidateRoute.providerID],
+               Date() < cooldownUntil {
+                skippedReasons.append((nextCandidateModel, "provider_cooldown"))
+                continue
+            }
             return (candidateBody, nextCandidateModel, remainingCandidateModels)
         }
 
@@ -1156,6 +1161,12 @@ enum OpenAICompatTemporaryShim {
                     replacingRequestModelIn: currentBody,
                     with: candidateModel
                   ) else {
+                return nil
+            }
+            if !forceAllowClosedModels.contains(candidateModel),
+               let route = resolveConfiguredRoute(forRequestModel: candidateModel),
+               let cooldownUntil = providerCooldownsByProviderID[route.providerID],
+               Date() < cooldownUntil {
                 return nil
             }
             return (candidateBody, candidateModel)
@@ -1794,7 +1805,11 @@ enum OpenAICompatTemporaryShim {
         }
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.status
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else { return nil }
+            // halfOpen routes are probeable — allow them through for candidate selection
+            // so the circuit breaker recovery mechanism can test the route.
+            if state.status == .halfOpen { return nil }
+            return state.isUnavailable(at: now) ? state.status : nil
         }
     }
 
@@ -2647,7 +2662,7 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                    emaMetrics: nextEMA,
                     recoveredAt: now
                 )
             }
@@ -6279,7 +6294,7 @@ class ThinkingProxy {
         // Direct proxied path for providers with per-provider proxy-url (e.g., opencode via SOCKS5)
         if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
            let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: route.providerID) {
-            _ = sendDirectProxiedRequest(
+            let directCancel = sendDirectProxiedRequest(
                 method: method,
                 path: path,
                 headers: effectiveHeaders,
@@ -6300,7 +6315,7 @@ class ThinkingProxy {
                     completion: completion
                 )
             }
-            controller?.registerCurrentCancel(cancel)
+            controller?.registerCurrentCancel(directCancel)
             return
         }
 
