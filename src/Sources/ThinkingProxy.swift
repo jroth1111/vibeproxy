@@ -911,7 +911,6 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
-    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -923,15 +922,9 @@ enum OpenAICompatTemporaryShim {
         "glm-5.1",
         publicFactoryWorkerSmartRouterAlias
     ]
-    private static let managedResolvedRoutesByRequestModel: [String: RouteIdentity] = [
-        proxyPoolToolWorkerPrimaryCandidate: RouteIdentity(
-            providerID: "openai",
-            canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
-        )
-    ]
 
     static func workerPrimaryCandidateModel() -> String {
-        proxyPoolToolWorkerPrimaryCandidate
+        smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
     }
 
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
@@ -3377,11 +3370,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func resolvedRoutesByRequestModel() -> [String: RouteIdentity] {
-        var routes = configuredRouteConfiguration().routesByRequestModel
-        for (requestModel, routeIdentity) in managedResolvedRoutesByRequestModel {
-            routes[requestModel] = routeIdentity
-        }
-        return routes
+        configuredRouteConfiguration().routesByRequestModel
     }
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
