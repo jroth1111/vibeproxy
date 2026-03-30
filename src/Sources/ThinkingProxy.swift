@@ -217,6 +217,21 @@ enum OpenAICompatTemporaryShim {
         let requestClass: String
         let failover: String
         let candidates: [String]
+        let healthSensitivity: HealthSensitivity
+    }
+
+    enum HealthSensitivity: String {
+        case eager = "eager"
+        case balanced = "balanced"
+        case conservative = "conservative"
+
+        var scoreGapThreshold: Double {
+            switch self {
+            case .eager: return 200.0
+            case .balanced: return 500.0
+            case .conservative: return 2000.0
+            }
+        }
     }
 
     enum RouteHealthStatus: String {
@@ -459,6 +474,7 @@ enum OpenAICompatTemporaryShim {
         "minimax-m2.5-free": 0.0,
     ]
     private static let costPreference: Double = 0.3
+    static let canaryDisabledCanonicalModelIDs: Set<String> = []
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
             minimumMaxTokens: nil,
@@ -674,6 +690,7 @@ enum OpenAICompatTemporaryShim {
     private static var cachedRouteConfiguration: CachedRouteConfiguration?
     private static let routeHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-health")
     private static var routeCircuitStatesByRouteHealthKey: [String: RouteCircuitState] = [:]
+    private static var providerCooldownsByProviderID: [String: Date] = [:]
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
@@ -987,7 +1004,7 @@ enum OpenAICompatTemporaryShim {
         // now carry the full tool-heavy workload with health-ranked failover.
         if isToolHeavyWorkerRequest,
            toolHeavyWorkerPublicAliases.contains(publicAlias) {
-            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates)
+            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates, healthSensitivity: smartAlias.healthSensitivity)
             if !rankedCandidates.isEmpty {
                 return rankedCandidates
             }
@@ -1138,7 +1155,10 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func rankedSmartAliasFallbackCandidateModels(_ candidateModels: [String]) -> [String] {
+    static func rankedSmartAliasFallbackCandidateModels(
+        _ candidateModels: [String],
+        healthSensitivity: HealthSensitivity = .balanced
+    ) -> [String] {
         let indexedModels = Array(candidateModels.enumerated())
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
@@ -1148,22 +1168,24 @@ enum OpenAICompatTemporaryShim {
                 if lhsScore.healthPriority != rhsScore.healthPriority {
                     return lhsScore.healthPriority < rhsScore.healthPriority
                 }
-                // Sticky-on-zero-failures: a proven-perfect higher-tier model never
-                // loses to a lower-tier model, even if the lower-tier has a higher score.
-                let lhsProvenPerfect = lhsScore.isProvenPerfect
-                let rhsProvenPerfect = rhsScore.isProvenPerfect
-                if lhsProvenPerfect != rhsProvenPerfect {
-                    if lhsProvenPerfect && lhsScore.tierWeight > rhsScore.tierWeight {
-                        return true
-                    }
-                    if rhsProvenPerfect && rhsScore.tierWeight > lhsScore.tierWeight {
-                        return false
-                    }
-                    return lhsProvenPerfect
+                // Sticky-on-zero-failures: a proven-perfect reasoning-tier model never
+                // loses to any lower-tier model, regardless of score.
+                if lhsScore.isProvenPerfect, lhsScore.tierWeight == ModelTier.reasoning.rawValue,
+                   lhsScore.tierWeight > rhsScore.tierWeight {
+                    return true
                 }
-                // Among same tier or both imperfect, prefer higher composite score
-                if lhsScore.compositeScore != rhsScore.compositeScore {
-                    return lhsScore.compositeScore > rhsScore.compositeScore
+                if rhsScore.isProvenPerfect, rhsScore.tierWeight == ModelTier.reasoning.rawValue,
+                   rhsScore.tierWeight > lhsScore.tierWeight {
+                    return false
+                }
+                // General proven-perfect preference (non-reasoning tiers)
+                if lhsScore.isProvenPerfect != rhsScore.isProvenPerfect {
+                    return lhsScore.isProvenPerfect
+                }
+                // Hysteresis: only reorder if score gap exceeds sensitivity threshold.
+                let scoreGap = lhsScore.compositeScore - rhsScore.compositeScore
+                if abs(scoreGap) >= healthSensitivity.scoreGapThreshold {
+                    return scoreGap > 0
                 }
                 return lhsScore.originalIndex < rhsScore.originalIndex
             }.map(\.element)
@@ -1720,6 +1742,20 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func quarantinedRequestModels(at now: Date = Date()) -> [String] {
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let routes = resolvedRoutesByRequestModel()
+            return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
+                guard state.isUnavailable(at: now) else { return nil }
+                if let match = routes.first(where: { $0.value.routeHealthKey == routeHealthKey }) {
+                    return match.key
+                }
+                return routeHealthKey.components(separatedBy: "::").last
+            }.sorted()
+        }
+    }
+
     private static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
         if let route = resolveConfiguredRoute(forRequestModel: requestModel) {
             return route
@@ -1727,6 +1763,21 @@ enum OpenAICompatTemporaryShim {
         if let smartAlias = smartAliasDefinition(forRequestModel: requestModel),
            let primaryCandidate = smartAlias.candidates.first {
             return resolveConfiguredRoute(forRequestModel: primaryCandidate)
+        }
+        return nil
+    }
+
+    static func resolveRouteIdentityForAnyProvider(
+        forRequestModel requestModel: String
+    ) -> RouteIdentity? {
+        if let route = resolveConfiguredRoute(forRequestModel: requestModel) {
+            return route
+        }
+        let normalized = normalizedRequestModel(requestModel)
+        for (prefix, providerID) in ProviderCatalog.oauthPassthroughPrefixes {
+            if normalized.hasPrefix(prefix) {
+                return RouteIdentity(providerID: providerID, canonicalModelID: normalized)
+            }
         }
         return nil
     }
@@ -1764,13 +1815,13 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func recommendedNVIDIACanaryInterval() -> TimeInterval {
+    static func recommendedCanaryInterval() -> TimeInterval {
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let metrics = routeCircuitStatesByRouteHealthKey.values
                 .filter { $0.isUnavailable(at: Date()) }
                 .map(\.rollingMetrics)
-            return recommendedNVIDIACanaryInterval(metrics: metrics)
+            return recommendedCanaryInterval(metrics: metrics)
         }
     }
 
@@ -1800,7 +1851,7 @@ enum OpenAICompatTemporaryShim {
         at now: Date = Date(),
         forcedOpenUntil: Date? = nil
     ) {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
         routeHealthQueue.sync {
@@ -1821,6 +1872,9 @@ enum OpenAICompatTemporaryShim {
                 replacingLastTelemetryEvent: enrichedTelemetryEvent
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
+            if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
+                providerCooldownsByProviderID[route.providerID] = cooldownUntil
+            }
             persistRouteHealthLocked()
             if let enrichedTelemetryEvent {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
@@ -1833,7 +1887,7 @@ enum OpenAICompatTemporaryShim {
         telemetryEvent: RouteTelemetryEvent? = nil,
         at now: Date = Date()
     ) {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
         routeHealthQueue.sync {
@@ -1863,6 +1917,7 @@ enum OpenAICompatTemporaryShim {
     static func clearRouteHealthForTesting() {
         routeHealthQueue.sync {
             routeCircuitStatesByRouteHealthKey = [:]
+            providerCooldownsByProviderID = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
         }
@@ -2765,7 +2820,7 @@ enum OpenAICompatTemporaryShim {
         return defaultSuspectHedgeDelay
     }
 
-    private static func recommendedNVIDIACanaryInterval(metrics: [RouteRollingMetrics]) -> TimeInterval {
+    private static func recommendedCanaryInterval(metrics: [RouteRollingMetrics]) -> TimeInterval {
         guard !metrics.isEmpty else { return defaultCanaryInterval }
         if metrics.contains(where: { $0.timeoutRate >= 0.5 }) {
             return fastCanaryInterval
@@ -2783,11 +2838,11 @@ enum OpenAICompatTemporaryShim {
         forRequestModel requestModel: String,
         originalIndex: Int
     ) -> (healthPriority: Int, compositeScore: Double, isProvenPerfect: Bool, tierWeight: Double, originalIndex: Int) {
-        let route = resolveConfiguredRoute(forRequestModel: requestModel)
+        let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel)
         let state = route.flatMap { routeCircuitStatesByRouteHealthKey[$0.routeHealthKey] }
         let ema = state?.emaMetrics ?? .empty
         let now = Date()
-        let healthPriority: Int
+        var healthPriority: Int
         switch state?.status ?? .closed {
         case .closed:
             healthPriority = 0
@@ -2797,6 +2852,10 @@ enum OpenAICompatTemporaryShim {
             healthPriority = 2
         case .open:
             healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
+        }
+        if healthPriority < 3, let providerID = route?.providerID,
+           let cooldownUntil = providerCooldownsByProviderID[providerID], now < cooldownUntil {
+            healthPriority = 3
         }
         let tier = modelTier(forRequestModel: requestModel)
         let momentum = state?.momentumBonus(at: now) ?? 0.0
@@ -2820,17 +2879,22 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 2,
+              let version = json["version"] as? Int, version >= 1, version <= 3,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
         }
 
         var loaded: [String: RouteCircuitState] = [:]
-        let validRouteHealthKeys = Set(resolvedRoutesByRequestModel().values.map(\.routeHealthKey))
+        let configuredRouteHealthKeys = Set(resolvedRoutesByRequestModel().values.map(\.routeHealthKey))
+        let oauthProviderIDs = Set(ProviderCatalog.oauthPassthroughPrefixes.map(\.providerID))
         var prunedUnknownEntries = false
         for (routeHealthKey, entry) in routes {
-            guard validRouteHealthKeys.contains(routeHealthKey) else {
+            let components = routeHealthKey.components(separatedBy: "::")
+            let providerID = components.first
+            let isKnownRoute = configuredRouteHealthKeys.contains(routeHealthKey)
+            let isOAuthRoute = (components.count == 2 && providerID.map { oauthProviderIDs.contains($0) } == true)
+            guard isKnownRoute || isOAuthRoute else {
                 prunedUnknownEntries = true
                 continue
             }
@@ -2856,6 +2920,14 @@ enum OpenAICompatTemporaryShim {
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
+        if let cooldowns = json["provider_cooldowns"] as? [String: String] {
+            let now = Date()
+            for (providerID, dateString) in cooldowns {
+                if let date = parseISO8601Date(dateString), date > now {
+                    providerCooldownsByProviderID[providerID] = date
+                }
+            }
+        }
         if prunedUnknownEntries {
             persistRouteHealthLocked()
         }
@@ -2891,8 +2963,9 @@ enum OpenAICompatTemporaryShim {
         }
 
         let payload: [String: Any] = [
-            "version": 2,
-            "routes": routes
+            "version": 3,
+            "routes": routes,
+            "provider_cooldowns": providerCooldownsByProviderID.mapValues { iso8601String(from: $0) }
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             return
@@ -3396,6 +3469,7 @@ enum OpenAICompatTemporaryShim {
         var currentSmartAliasName: String?
         var currentSmartAliasRequestClass: String?
         var currentSmartAliasFailover: String?
+        var currentSmartAliasHealthSensitivity: HealthSensitivity?
         var currentSmartAliasCandidates: [String] = []
 
         func indentation(of line: String) -> Int {
@@ -3519,23 +3593,27 @@ enum OpenAICompatTemporaryShim {
             guard let smartAliasName = currentSmartAliasName else {
                 currentSmartAliasRequestClass = nil
                 currentSmartAliasFailover = nil
+                currentSmartAliasHealthSensitivity = nil
                 currentSmartAliasCandidates = []
                 return
             }
             let requestClass = currentSmartAliasRequestClass?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let failover = currentSmartAliasFailover?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let healthSensitivity = currentSmartAliasHealthSensitivity ?? .balanced
             let candidates = currentSmartAliasCandidates.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             if !requestClass.isEmpty, !failover.isEmpty, !candidates.isEmpty {
                 smartAliasesByAlias[smartAliasName] = SmartAliasDefinition(
                     alias: smartAliasName,
                     requestClass: requestClass,
                     failover: failover,
-                    candidates: candidates
+                    candidates: candidates,
+                    healthSensitivity: healthSensitivity
                 )
             }
             currentSmartAliasName = nil
             currentSmartAliasRequestClass = nil
             currentSmartAliasFailover = nil
+            currentSmartAliasHealthSensitivity = nil
             currentSmartAliasCandidates = []
         }
 
@@ -3588,6 +3666,10 @@ enum OpenAICompatTemporaryShim {
                 }
                 if indent == 4, trimmed.hasPrefix("failover: "), let value = scalarValue(from: trimmed) {
                     currentSmartAliasFailover = value
+                    continue
+                }
+                if indent == 4, trimmed.hasPrefix("health-sensitivity: "), let value = scalarValue(from: trimmed) {
+                    currentSmartAliasHealthSensitivity = HealthSensitivity(rawValue: value)
                     continue
                 }
                 if indent == 4, trimmed == "candidates:" {
@@ -3909,9 +3991,9 @@ class ThinkingProxy {
     private(set) var isRunning = false
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
     private let nvidiaInflightQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-inflight")
-    private var nvidiaCanaryTimer: DispatchSourceTimer?
-    private let nvidiaCanaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-canary")
-    private var nvidiaCanarySweepInFlight = false
+    private var canaryTimer: DispatchSourceTimer?
+    private let canaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.canary")
+    private var canarySweepInFlight = false
     private let smartAliasForcedPrimaryRetryLimit = 2
     private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
@@ -4250,7 +4332,7 @@ class ThinkingProxy {
             }
             
             listener?.start(queue: .global(qos: .userInitiated))
-            startNVIDIACanaryLoop()
+            startCanaryLoop()
             
         } catch {
             NSLog("[ThinkingProxy] Failed to start: \(error)")
@@ -4266,7 +4348,7 @@ class ThinkingProxy {
             
             listener?.cancel()
             listener = nil
-            stopNVIDIACanaryLoop()
+            stopCanaryLoop()
             DispatchQueue.main.async { [weak self] in
                 self?.isRunning = false
             }
@@ -4632,6 +4714,25 @@ class ThinkingProxy {
             }
         }
 
+        // Direct proxied path for providers with per-provider proxy-url (e.g., opencode via SOCKS5)
+        // Must be checked before NVIDIA reasoning path to intercept proxied provider requests
+        if method == "POST",
+           let directProxyModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody),
+           let directProxyRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: directProxyModel),
+           let directProxyEndpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: directProxyRoute.providerID) {
+            NSLog("[ThinkingProxy] Routing %@ directly via SOCKS5 proxy to %@", directProxyModel, directProxyEndpoint.baseURL)
+            forwardDirectProxiedRequest(
+                method: method,
+                path: rewrittenPath,
+                headers: headers,
+                body: modifiedBody,
+                candidateModel: directProxyModel,
+                endpoint: directProxyEndpoint,
+                originalConnection: connection
+            )
+            return
+        }
+
         if OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
             method: method,
             path: rewrittenPath,
@@ -4690,14 +4791,14 @@ class ThinkingProxy {
             )
             return
         }
-        
+
         // Route Claude requests through Vercel AI Gateway when configured
         if vercelConfig.isActive && method == "POST" && isClaudeModelRequest(body: modifiedBody) {
             NSLog("[ThinkingProxy] Routing Claude request via Vercel AI Gateway")
             forwardToVercel(method: method, path: "/v1/messages", version: httpVersion, headers: headers, body: modifiedBody, thinkingEnabled: thinkingEnabled, originalConnection: connection)
             return
         }
-        
+
         forwardRequest(method: method, path: rewrittenPath, version: httpVersion, headers: headers, body: modifiedBody, thinkingEnabled: thinkingEnabled, originalConnection: connection)
     }
     
@@ -5138,6 +5239,7 @@ class ThinkingProxy {
                 currentBody: currentBody,
                 publicAlias: publicAlias,
                 raceCandidateModels: Array(raceableFallbackModels),
+                healthSensitivity: OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity ?? .balanced,
                 deferredCandidateModels: deferredCandidateModels,
                 forceProbeCandidateModels: forceProbeCandidateModels,
                 primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
@@ -5253,6 +5355,7 @@ class ThinkingProxy {
         currentBody: String,
         publicAlias: String,
         raceCandidateModels: [String],
+        healthSensitivity: OpenAICompatTemporaryShim.HealthSensitivity = .balanced,
         deferredCandidateModels: [String],
         forceProbeCandidateModels: Set<String>,
         primaryProbeRetriesRemaining: Int,
@@ -5263,7 +5366,7 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
-        let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels)
+        let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels, healthSensitivity: healthSensitivity)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
             method: method,
             path: path,
@@ -6693,8 +6796,16 @@ class ThinkingProxy {
         endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
         completion: @escaping (BufferedProxyResponse) -> Void
     ) -> (() -> Void) {
-        let upstreamURL = endpoint.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            + (path.hasPrefix("/") ? path : "/" + path)
+        // Strip /v1 prefix from path when base URL already ends with a versioned API path
+        let basePath = endpoint.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let effectivePath: String
+        if basePath.hasSuffix("/v1") {
+            let stripped = path.hasPrefix("/v1") ? String(path.dropFirst(3)) : path
+            effectivePath = stripped.isEmpty ? "" : (stripped.hasPrefix("/") ? stripped : "/" + stripped)
+        } else {
+            effectivePath = path.hasPrefix("/") ? path : "/" + path
+        }
+        let upstreamURL = basePath + effectivePath
         guard let url = URL(string: upstreamURL) else {
             completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.badURL), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
             return {}
@@ -6767,6 +6878,58 @@ class ThinkingProxy {
         task.resume()
         return {
             session.invalidateAndCancel()
+        }
+    }
+
+    private func forwardDirectProxiedRequest(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        candidateModel: String,
+        endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
+        originalConnection: NWConnection
+    ) {
+        let timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
+        let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
+        let cancel = sendDirectProxiedRequest(
+            method: method,
+            path: path,
+            headers: effectiveHeaders,
+            body: body,
+            candidateModel: candidateModel,
+            timeoutInterval: timeoutInterval,
+            endpoint: endpoint
+        ) { [weak self] bufferedResponse in
+            guard let self else { return }
+            if let error = bufferedResponse.error {
+                let nsError = error as NSError
+                let statusCode = (nsError.domain == NSURLErrorDomain && nsError.code == URLError.timedOut.rawValue) ? 504 : 502
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: statusCode,
+                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
+                )
+                return
+            }
+            guard let response = bufferedResponse.response,
+                  let data = bufferedResponse.data else {
+                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
+                return
+            }
+            var responseHeaders: [AnyHashable: Any] = [:]
+            for (key, value) in response.allHeaderFields {
+                responseHeaders[key] = value
+            }
+            let overridingModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body)
+            self.deliverBufferedHTTPResponse(
+                defaultConnection: originalConnection,
+                statusCode: response.statusCode,
+                headers: responseHeaders,
+                body: data,
+                coalescingKey: nil,
+                overridingModel: overridingModel
+            )
         }
     }
 
@@ -7448,42 +7611,42 @@ class ThinkingProxy {
         }.resume()
     }
 
-    private func startNVIDIACanaryLoop() {
+    private func startCanaryLoop() {
         stateQueue.sync {
-            guard nvidiaCanaryTimer == nil else { return }
-            scheduleNextNVIDIACanaryLocked(after: OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval())
+            guard canaryTimer == nil else { return }
+            scheduleNextCanaryLocked(after: OpenAICompatTemporaryShim.recommendedCanaryInterval())
         }
     }
 
-    private func scheduleNextNVIDIACanaryLocked(after interval: TimeInterval) {
-        nvidiaCanaryTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: nvidiaCanaryQueue)
+    private func scheduleNextCanaryLocked(after interval: TimeInterval) {
+        canaryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: canaryQueue)
         timer.schedule(deadline: .now() + interval)
         timer.setEventHandler { [weak self] in
-            self?.performNVIDIACanariesOnce { [weak self] in
+            self?.performCanariesOnce { [weak self] in
                 guard let self else { return }
                 self.stateQueue.sync {
                     guard self.isRunning else { return }
-                    self.scheduleNextNVIDIACanaryLocked(after: OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval())
+                    self.scheduleNextCanaryLocked(after: OpenAICompatTemporaryShim.recommendedCanaryInterval())
                 }
             }
         }
-        nvidiaCanaryTimer = timer
+        canaryTimer = timer
         timer.resume()
     }
 
-    private func stopNVIDIACanaryLoop() {
+    private func stopCanaryLoop() {
         stateQueue.sync {
-            nvidiaCanaryTimer?.cancel()
-            nvidiaCanaryTimer = nil
-            nvidiaCanarySweepInFlight = false
+            canaryTimer?.cancel()
+            canaryTimer = nil
+            canarySweepInFlight = false
         }
     }
 
-    func performNVIDIACanariesOnce(completion: (() -> Void)? = nil) {
+    func performCanariesOnce(completion: (() -> Void)? = nil) {
         let shouldStart = stateQueue.sync { () -> Bool in
-            guard !nvidiaCanarySweepInFlight else { return false }
-            nvidiaCanarySweepInFlight = true
+            guard !canarySweepInFlight else { return false }
+            canarySweepInFlight = true
             return true
         }
         guard shouldStart else {
@@ -7491,34 +7654,40 @@ class ThinkingProxy {
             return
         }
 
-        let requestModels = OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
+        let requestModels = OpenAICompatTemporaryShim.quarantinedRequestModels()
+            .filter { model in
+                guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) else {
+                    return true
+                }
+                return !OpenAICompatTemporaryShim.canaryDisabledCanonicalModelIDs.contains(route.canonicalModelID)
+            }
         guard !requestModels.isEmpty else {
-            stateQueue.sync { nvidiaCanarySweepInFlight = false }
+            stateQueue.sync { canarySweepInFlight = false }
             completion?()
             return
         }
 
-        runNVIDIACanary(at: 0, requestModels: requestModels) { [weak self] in
-            self?.stateQueue.sync { self?.nvidiaCanarySweepInFlight = false }
+        runCanary(at: 0, requestModels: requestModels) { [weak self] in
+            self?.stateQueue.sync { self?.canarySweepInFlight = false }
             completion?()
         }
     }
 
-    private func runNVIDIACanary(at index: Int, requestModels: [String], completion: @escaping () -> Void) {
+    private func runCanary(at index: Int, requestModels: [String], completion: @escaping () -> Void) {
         guard index < requestModels.count else {
             completion()
             return
         }
 
         let requestModel = requestModels[index]
-        let requestJSON = nvidiaCanaryRequestJSON(forRequestModel: requestModel)
+        let requestJSON = canaryRequestJSON(forRequestModel: requestModel)
         let transformedJSON = OpenAICompatTemporaryShim.transformRequest(
             method: "POST",
             path: "/v1/chat/completions",
             jsonString: requestJSON
         ) ?? requestJSON
 
-        sendNVIDIACanaryRequest(requestModel: requestModel, requestJSON: transformedJSON) { [weak self] data, response, error in
+        sendCanaryRequest(requestModel: requestModel, requestJSON: transformedJSON) { [weak self] data, response, error in
             guard let self else { return }
             let canaryState = OpenAICompatTemporaryShim.NVIDIARetryState(
                 model: requestModel,
@@ -7569,11 +7738,11 @@ class ThinkingProxy {
                 )
             }
 
-            self.runNVIDIACanary(at: index + 1, requestModels: requestModels, completion: completion)
+            self.runCanary(at: index + 1, requestModels: requestModels, completion: completion)
         }
     }
 
-    private func sendNVIDIACanaryRequest(
+    private func sendCanaryRequest(
         requestModel: String,
         requestJSON: String,
         completion: @escaping (Data?, HTTPURLResponse?, Error?) -> Void
@@ -7600,7 +7769,7 @@ class ThinkingProxy {
         }.resume()
     }
 
-    private func nvidiaCanaryRequestJSON(forRequestModel requestModel: String) -> String {
+    private func canaryRequestJSON(forRequestModel requestModel: String) -> String {
         """
         {
           "model": "\(requestModel)",
