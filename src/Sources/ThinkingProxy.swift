@@ -909,6 +909,7 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
+    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -3409,10 +3410,15 @@ enum OpenAICompatTemporaryShim {
             }
 
             let loadedConfiguration = loadConfiguredRouteConfiguration(from: path)
+            var routesWithManaged = loadedConfiguration.routesByRequestModel
+            routesWithManaged[proxyPoolToolWorkerPrimaryCandidate] = RouteIdentity(
+                providerID: "openai",
+                canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
+            )
             let cachedMap = CachedRouteConfiguration(
                 configPath: path,
                 modificationDate: modificationDate,
-                routesByRequestModel: loadedConfiguration.routesByRequestModel,
+                routesByRequestModel: routesWithManaged,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
                 anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
                 smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
@@ -7659,7 +7665,7 @@ class ThinkingProxy {
             return
         }
 
-        let requestModels = OpenAICompatTemporaryShim.quarantinedRequestModels()
+        let requestModels = OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
             .filter { model in
                 guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) else {
                     return true

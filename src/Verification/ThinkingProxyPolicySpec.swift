@@ -811,13 +811,13 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
                     path: "/v1/chat/completions",
                     currentBody: request,
-                    candidateModelsRemaining: ["mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia"]
+                    candidateModelsRemaining: ["mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia"]
                 )
 
                 expectEqual(transition?.model, "mimo-v2-pro-opencode", "fallback planning should skip quarantined MiMo routes and pick the next configured alias", recorder: recorder)
@@ -832,7 +832,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "glm-5.1 should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -841,7 +841,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "proxy-worker-smart-router should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "proxy-worker-smart-router should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -878,7 +878,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy glm-5.1 requests should use health-ranked pool candidates", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy glm-5.1 requests should use health-ranked pool candidates", recorder: recorder)
             }
         }
 
@@ -908,7 +908,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy proxy-worker-smart-router requests should use health-ranked pool candidates", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy proxy-worker-smart-router requests should use health-ranked pool candidates", recorder: recorder)
             }
         }
 
@@ -3063,7 +3063,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary worker smart alias tries opencode mimo-v2-pro after kilocode fails and preserves the outward alias", recorder: recorder) {
+         run("temporary worker smart alias tries kilocode mimo-v2-pro after opencode fails and preserves the outward alias", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -3100,7 +3100,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-kilocode":
+                    case "mimo-v2-pro-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -3108,12 +3108,12 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-opencode":
+                    case "mimo-v2-pro-kilocode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-opencode",
+                                  "id": "chatcmpl-kilocode",
                                   "object": "chat.completion",
                                   "model": "mimo-v2-pro-free",
                                   "choices": [
@@ -3168,14 +3168,14 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode"], "worker should try glm-5.1, then kilocode MiMo, then opencode MiMo before NVIDIA", recorder: recorder)
-                expectEqual(deliveredStatus, 200, "worker should return the opencode MiMo fallback response", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode"], "worker should try glm-5.1, then opencode MiMo, then kilocode MiMo before NVIDIA", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should return the kilocode MiMo fallback response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker responses should preserve the outward alias instead of leaking the winner model", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "worker", "worker should expose the public alias in response headers for auditability", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-opencode", "worker should expose the winning MiMo backend model in response headers", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "opencode", "worker should expose the winning MiMo backend provider in response headers", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "mimo-v2-pro-free", "worker should expose the winning MiMo canonical model in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-kilocode", "worker should expose the winning kilocode MiMo backend model in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "kilocode", "worker should expose the winning kilocode MiMo backend provider in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "xiaomi/mimo-v2-pro:free", "worker should expose the winning MiMo canonical model in response headers", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "route health should track non-NVIDIA worker candidates so the pool can quarantine flaky primaries", recorder: recorder)
 
                 let kilocodeReferer = seenHeadersByModel["mimo-v2-pro-kilocode"]?.first(where: { $0.0.lowercased() == "http-referer" })?.1
@@ -3185,12 +3185,12 @@ struct ThinkingProxyPolicySpec {
 
                 let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
                 expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 }), true, "worker telemetry should record the failed kilocode MiMo attempt at depth 1", recorder: recorder)
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.failoverDepth == 2 && $0.finalWinnerRequestModel == "mimo-v2-pro-opencode" }), true, "worker telemetry should record the winning opencode MiMo attempt and final winner", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.failoverDepth == 1 }), true, "worker telemetry should record the failed opencode MiMo attempt at depth 1", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 2 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "worker telemetry should record the winning kilocode MiMo attempt and final winner", recorder: recorder)
             }
         }
 
-        run("temporary worker smart alias fails over from z.ai to kilocode mimo-v2-pro after a 429", recorder: recorder) {
+         run("temporary worker smart alias fails over from z.ai to kilocode mimo-v2-pro after a 429", recorder: recorder) {
             withMergedConfig(workerWithMimoMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -3220,6 +3220,12 @@ struct ThinkingProxyPolicySpec {
 
                     switch model {
                     case "glm-5.1-zai":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        ))
+                    case "mimo-v2-pro-opencode":
                         completion(ThinkingProxy.BufferedProxyResponse(
                             data: Data("{\"error\":\"rate limited\"}".utf8),
                             response: httpURLResponse(statusCode: 429),
@@ -3265,7 +3271,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "worker should try glm-5.1 first then fall over to kilocode mimo-v2-pro", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode"], "worker should try glm-5.1, then opencode, then fall over to kilocode mimo-v2-pro", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "kilocode mimo-v2-pro should be delivered as a successful response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "response model should be rewritten to the public alias", recorder: recorder)
@@ -3278,7 +3284,7 @@ struct ThinkingProxyPolicySpec {
 
                 let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
                 expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "telemetry should record the failed glm-5.1 attempt at depth 0", recorder: recorder)
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "telemetry should record the winning kilocode attempt at depth 1", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 2 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "telemetry should record the winning kilocode attempt at depth 2", recorder: recorder)
             }
         }
 
@@ -3303,7 +3309,7 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                    case "glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode":
                         completion(ThinkingProxy.BufferedProxyResponse(
                             data: Data("{\"error\":\"rate limited\"}".utf8),
                             response: httpURLResponse(statusCode: 429),
@@ -3349,7 +3355,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"], "worker should try opencode MiniMax free after both MiMo legs and before NVIDIA", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode"], "worker should try opencode MiniMax free after both MiMo legs and before NVIDIA", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "opencode MiniMax free should be returned as a successful worker fallback", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias when opencode MiniMax free wins", recorder: recorder)
@@ -3383,7 +3389,7 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                    case "glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode":
                         completion(ThinkingProxy.BufferedProxyResponse(
                             data: Data("{\"error\":\"rate limited\"}".utf8),
                             response: httpURLResponse(statusCode: 429),
@@ -3467,7 +3473,7 @@ struct ThinkingProxyPolicySpec {
 
                 // glm-5.1, kilo, MiMo opencode, and MiniMax free opencode are tried serially; then NVIDIA races
                 let seenBeforeNvidia = seenModels.prefix(4)
-                expectEqual(Array(seenBeforeNvidia), ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"], "worker should try both MiMo legs and the opencode MiniMax free leg before falling through to NVIDIA", recorder: recorder)
+                expectEqual(Array(seenBeforeNvidia), ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode"], "worker should try both MiMo legs and the opencode MiniMax free leg before falling through to NVIDIA", recorder: recorder)
                 expectEqual(seenModels.contains("minimax-m2.5-nvidia") || seenModels.contains("kimi-k2.5-nvidia"), true, "worker should reach the nvidia race after all mimo providers fail", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "nvidia fallback should deliver a successful response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -3577,7 +3583,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "glm-5.1 should use the worker pool ordering and reach kilocode MiMo before NVIDIA", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode"], "glm-5.1 should use the worker pool ordering and reach kilocode MiMo after opencode", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "glm-5.1 should return the fallback candidate's success response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "glm-5.1", "glm-5.1 pooled responses should preserve the public entrypoint instead of leaking the winner model", recorder: recorder)
@@ -3587,7 +3593,7 @@ struct ThinkingProxyPolicySpec {
 
                 let glmEvents = recordedEvents.filter { $0.requestedAlias == "glm-5.1" }
                 expectEqual(glmEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "glm-5.1 telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
-                expectEqual(glmEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "glm-5.1 telemetry should record the winning MiMo fallback candidate and final winner", recorder: recorder)
+                expectEqual(glmEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 2 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "glm-5.1 telemetry should record the winning MiMo fallback candidate and final winner", recorder: recorder)
             }
         }
 
@@ -3678,7 +3684,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "worker should treat a route-unavailable z.ai 404 as candidate failure and move to the first MiMo fallback", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode"], "worker should treat a route-unavailable z.ai 404 as candidate failure and fall through opencode to kilocode MiMo", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed after failing over from a z.ai 404", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias after a z.ai 404 fallback", recorder: recorder)
@@ -3733,7 +3739,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -3792,7 +3798,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels.prefix(6).map { $0 }, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "kimi-k2.5-nvidia", "minimax-m2.5-nvidia"], "worker should exhaust the free serial legs first, then launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
+                expectEqual(seenModels.prefix(6).map { $0 }, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "kimi-k2.5-nvidia", "minimax-m2.5-nvidia"], "worker should exhaust the free serial legs first, then launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should keep succeeding while reordering its fallback race by route health", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -3821,7 +3827,7 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                         return {}
-                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -3945,7 +3951,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -4074,7 +4080,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -4190,7 +4196,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should treat malformed primary 200 bodies as retryable candidate failures, exhaust the free serial fallbacks, then race the NVIDIA fallbacks", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should treat malformed primary 200 bodies as retryable candidate failures, exhaust the free serial fallbacks, then race the NVIDIA fallbacks", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still return a successful fallback response after a malformed primary 200", recorder: recorder)
                 expectNil(deliveredMessage, "worker should not surface an error when a later fallback returns a valid response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -4226,7 +4232,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -4314,7 +4320,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the free serial legs fail and the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the free serial legs fail and the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed once the deferred last-resort backend returns a valid response", recorder: recorder)
                 expectNil(deliveredMessage, "worker should not surface an error when the deferred last-resort backend succeeds", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -4607,7 +4613,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 503, "worker should return one clean 503 when no configured candidate is usable", recorder: recorder)
                 expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "worker should emit a stable final failure message after exhausting the pool", recorder: recorder)
             }
@@ -6635,8 +6641,8 @@ private func workerWithMimoMergedConfigYAML() -> String {
         "    failover: silent",
         "    candidates:",
         "    - glm-5.1-zai",
-        "    - mimo-v2-pro-kilocode",
         "    - mimo-v2-pro-opencode",
+        "    - mimo-v2-pro-kilocode",
         "    - minimax-m2.5-opencode",
         "    - minimax-m2.5-nvidia",
         "    - kimi-k2.5-nvidia"
@@ -6684,8 +6690,8 @@ private func workerWithProxyMergedConfigYAML() -> String {
         "    failover: silent",
         "    candidates:",
         "    - glm-5.1-zai",
-        "    - mimo-v2-pro-kilocode",
         "    - mimo-v2-pro-opencode",
+        "    - mimo-v2-pro-kilocode",
         "    - minimax-m2.5-opencode",
         "    - kimi-k2.5-nvidia"
     ].joined(separator: "\n")
@@ -6772,8 +6778,8 @@ private func workerMergedConfigWithLastResortYAML() -> String {
         "    failover: silent",
         "    candidates:",
         "    - glm-5.1-zai",
-        "    - mimo-v2-pro-kilocode",
         "    - mimo-v2-pro-opencode",
+        "    - mimo-v2-pro-kilocode",
         "    - minimax-m2.5-opencode",
         "    - minimax-m2.5-nvidia",
         "    - kimi-k2.5-nvidia",
