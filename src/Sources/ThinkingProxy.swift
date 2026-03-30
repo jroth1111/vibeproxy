@@ -1100,14 +1100,14 @@ enum OpenAICompatTemporaryShim {
                 if lhsScore.healthPriority != rhsScore.healthPriority {
                     return lhsScore.healthPriority < rhsScore.healthPriority
                 }
-                if lhsScore.timeoutRate != rhsScore.timeoutRate {
-                    return lhsScore.timeoutRate < rhsScore.timeoutRate
+                // Stickiness: proven-perfect (observed >0, successRate==1.0) beats imperfect or untested
+                let lhsProvenPerfect = lhsScore.isProvenPerfect
+                let rhsProvenPerfect = rhsScore.isProvenPerfect
+                if lhsProvenPerfect != rhsProvenPerfect {
+                    return lhsProvenPerfect
                 }
-                if lhsScore.invalidSuccessRate != rhsScore.invalidSuccessRate {
-                    return lhsScore.invalidSuccessRate < rhsScore.invalidSuccessRate
-                }
-                if lhsScore.averageFirstByteLatencyMilliseconds != rhsScore.averageFirstByteLatencyMilliseconds {
-                    return lhsScore.averageFirstByteLatencyMilliseconds < rhsScore.averageFirstByteLatencyMilliseconds
+                if lhsScore.compositeScore != rhsScore.compositeScore {
+                    return lhsScore.compositeScore > rhsScore.compositeScore
                 }
                 return lhsScore.originalIndex < rhsScore.originalIndex
             }.map(\.element)
@@ -2713,10 +2713,10 @@ enum OpenAICompatTemporaryShim {
     private static func smartAliasFallbackRankingScore(
         forRequestModel requestModel: String,
         originalIndex: Int
-    ) -> (healthPriority: Int, timeoutRate: Double, invalidSuccessRate: Double, averageFirstByteLatencyMilliseconds: Int, originalIndex: Int) {
+    ) -> (healthPriority: Int, compositeScore: Double, isProvenPerfect: Bool, originalIndex: Int) {
         let route = resolveConfiguredRoute(forRequestModel: requestModel)
         let state = route.flatMap { routeCircuitStatesByRouteHealthKey[$0.routeHealthKey] }
-        let metrics = state?.rollingMetrics ?? .empty
+        let ema = state?.emaMetrics ?? .empty
         let now = Date()
         let healthPriority: Int
         switch state?.status ?? .closed {
@@ -2731,9 +2731,8 @@ enum OpenAICompatTemporaryShim {
         }
         return (
             healthPriority: healthPriority,
-            timeoutRate: metrics.timeoutRate,
-            invalidSuccessRate: metrics.invalidSuccessRate,
-            averageFirstByteLatencyMilliseconds: metrics.averageFirstByteLatencyMilliseconds ?? Int.max,
+            compositeScore: ema.compositeScore,
+            isProvenPerfect: ema.isProvenPerfect,
             originalIndex: originalIndex
         )
     }
