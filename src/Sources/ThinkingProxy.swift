@@ -1834,7 +1834,11 @@ enum OpenAICompatTemporaryShim {
         }
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.isUnavailable(at: now) ?? false
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else { return false }
+            // halfOpen routes are probeable — allow them through for candidate selection
+            // so the circuit breaker recovery mechanism can test the route.
+            if state.status == .halfOpen { return false }
+            return state.isUnavailable(at: now)
         }
     }
 
@@ -2481,8 +2485,7 @@ enum OpenAICompatTemporaryShim {
             now: now
         )
         let failureThreshold = effectiveFailureThreshold(
-            policy: effectivePolicy,
-            metrics: nextRollingMetrics
+            policy: effectivePolicy
         )
         let effectiveForcedOpenUntil = [current?.openUntil, forcedOpenUntil]
             .compactMap { $0 }
@@ -2744,15 +2747,9 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func effectiveFailureThreshold(
-        policy: RouteCircuitBreakerPolicy,
-        metrics: RouteRollingMetrics
+        policy: RouteCircuitBreakerPolicy
     ) -> Int {
-        // Note: Previously this reduced the threshold based on timeout/invalid-success rates.
-        // That behavior caused circuits to open after 2 failures instead of the declared 4,
-        // even when the rolling metrics were still being accumulated. Now we always return
-        // the base threshold from the policy - the circuit breaker policy should be stable
-        // and not dynamically adjusted based on early-stage metrics.
-        return policy.failureThreshold
+        policy.failureThreshold
     }
 
     private static func updatedRollingMetrics(
