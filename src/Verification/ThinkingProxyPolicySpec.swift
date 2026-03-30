@@ -665,7 +665,7 @@ struct ThinkingProxyPolicySpec {
                     telemetryEvent: timeoutEvent,
                     at: now.addingTimeInterval(3)
                 )
-                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval(), 30, "quarantined slow routes should still be canaried aggressively once they truly open", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.recommendedCanaryInterval(), 30, "quarantined slow routes should still be canaried aggressively once they truly open", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -5036,7 +5036,7 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     let semaphore = DispatchSemaphore(value: 0)
-                    proxy.performNVIDIACanariesOnce {
+                    proxy.performCanariesOnce {
                         semaphore.signal()
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
@@ -5052,7 +5052,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(lastEvent?.healthTransition, "open->closed", "successful canaries should record the route-health transition", recorder: recorder)
 
                     let secondSemaphore = DispatchSemaphore(value: 0)
-                    proxy.performNVIDIACanariesOnce {
+                    proxy.performCanariesOnce {
                         secondSemaphore.signal()
                     }
                     let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)
@@ -5107,7 +5107,7 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     let semaphore = DispatchSemaphore(value: 0)
-                    proxy.performNVIDIACanariesOnce {
+                    proxy.performCanariesOnce {
                         semaphore.signal()
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
@@ -5120,7 +5120,7 @@ struct ThinkingProxyPolicySpec {
                     )
 
                     let secondSemaphore = DispatchSemaphore(value: 0)
-                    proxy.performNVIDIACanariesOnce {
+                    proxy.performCanariesOnce {
                         secondSemaphore.signal()
                     }
                     let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)

@@ -1,4 +1,4 @@
-.PHONY: build app install clean run help
+.PHONY: build release app install clean run help test verify info open factory-worker-sync factory-worker-check factory-worker-doctor factory-audit-once factory-audit-install
 
 help: ## Show this help message
 	@echo "VibeProxy - macOS Menu Bar App"
@@ -40,10 +40,33 @@ clean: ## Clean build artifacts
 	@rm -rf src/Sources/Resources/static
 	@echo "✅ Clean complete"
 
-test: ## Run a quick test build
-	@echo "🧪 Testing build..."
+test: ## Build and run verification checks
+	@echo "🧪 Building app target..."
 	@cd src && swift build
-	@echo "✅ Test build successful"
+	@echo "🧪 Running verification specs..."
+	@./scripts/run-verification-specs.sh
+	@echo "✅ Verification successful"
+
+verify: test ## Alias for test
+
+factory-worker-sync: ## Rewrite Factory worker snapshots from the global authority file
+	@./scripts/sync-factory-worker-contract.sh --write
+
+factory-worker-check: ## Check whether Factory worker snapshots drifted from the global authority file
+	@./scripts/sync-factory-worker-contract.sh --check
+
+factory-worker-doctor: ## Verify mission worker readiness against the explicit Factory worker contract
+	@./scripts/factory-worker-preflight.sh
+
+factory-audit-once: ## Audit Factory logs/state once and repair local drift or proxy readiness issues
+	@./scripts/factory-audit-and-repair.sh
+
+factory-audit-install: ## Install and load the 30-minute Factory audit launch agent
+	@mkdir -p "$$HOME/Library/LaunchAgents"
+	@cp ops/launchd/com.vibeproxy.factory-audit.plist "$$HOME/Library/LaunchAgents/com.vibeproxy.factory-audit.plist"
+	@launchctl bootout "gui/$$(id -u)/com.vibeproxy.factory-audit" >/dev/null 2>&1 || true
+	@launchctl bootstrap "gui/$$(id -u)" "$$HOME/Library/LaunchAgents/com.vibeproxy.factory-audit.plist"
+	@launchctl kickstart -k "gui/$$(id -u)/com.vibeproxy.factory-audit"
 
 info: ## Show project information
 	@echo "Project: VibeProxy - macOS Menu Bar App"

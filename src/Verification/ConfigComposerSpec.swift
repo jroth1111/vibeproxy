@@ -54,10 +54,10 @@ struct ConfigComposerSpec {
             let worker = dictionary(smartAliases["worker"])
 
             expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
-            expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5", recorder: recorder)
-            expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5-nvidia", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "managed worker alias should prefer z.ai first and then the most reliable NVIDIA fallbacks", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "managed worker alias should prefer z.ai first, then MiMo free fallbacks, then MiniMax free, then NVIDIA", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -87,6 +87,63 @@ struct ConfigComposerSpec {
             expectEqual(patchedMerged["max-retry-credentials"] as? Int, 1, "user retry settings should still override the patched bundled default", recorder: recorder)
             expectEqual(provider(named: "nvidia", in: patchedMerged)?["display-name"] as? String, "NVIDIA Override", "user overlays should still merge onto the hardcoded NVIDIA provider", recorder: recorder)
             expectEqual(apiKeys(in: provider(named: "nvidia", in: patchedMerged) ?? [:]), ["inline-a"], "user inline keys should still merge onto the hardcoded NVIDIA provider", recorder: recorder)
+        }
+
+        run("applyManagedProviderPatches supersedes stale managed aliases from additive user config", recorder: recorder) {
+            let root: [String: Any] = [
+                "openai-compatibility": [
+                    [
+                        "name": "nvidia",
+                        "display-name": "User NVIDIA",
+                        "base-url": "https://stale.example.com/v1",
+                        "api-key-entries": [
+                            ["api-key": "inline-a"]
+                        ],
+                        "models": [
+                            ["name": "z-ai/glm5", "alias": "glm5"],
+                            ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"]
+                        ]
+                    ],
+                    [
+                        "name": "nvidia-minimax",
+                        "api-key-entries": [
+                            ["api-key": "inline-b"]
+                        ],
+                        "models": [
+                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                        ]
+                    ]
+                ],
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5.1", "minimax-m2.5", "kimi-k2.5"]
+                    ]
+                ]
+            ]
+
+            let patched = ConfigComposer.applyManagedProviderPatches(to: root)
+            let worker = dictionary(dictionary(patched["smart-aliases"])["worker"])
+
+            expectEqual(
+                modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]),
+                ["glm5", "kimi-k2.5-nvidia"],
+                "managed NVIDIA aliases should replace stale user-defined aliases while preserving auth entries",
+                recorder: recorder
+            )
+            expectEqual(
+                modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]),
+                ["minimax-m2.5-nvidia"],
+                "managed NVIDIA MiniMax aliases should replace stale user-defined aliases",
+                recorder: recorder
+            )
+            expectEqual(
+                stringArray(worker["candidates"]),
+                ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"],
+                "managed worker ordering should replace stale user-defined fallback candidates",
+                recorder: recorder
+            )
         }
 
         run("applyManagedProviderPatches leaves user policies untouched", recorder: recorder) {
@@ -250,7 +307,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
                     ]
                 ]
             ]
@@ -263,7 +320,7 @@ struct ConfigComposerSpec {
             let smartAliases = dictionary(merged["smart-aliases"])
             let worker = dictionary(smartAliases["worker"])
             expectEqual(worker["request-class"] as? String, "plain-chat", "smart alias request class should survive additive config composition", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "smart alias candidate order should be preserved", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "smart alias candidate order should be preserved", recorder: recorder)
         }
 
         run("parseCustomProviders ignores reserved providers and keeps UI metadata", recorder: recorder) {
@@ -329,7 +386,7 @@ struct ConfigComposerSpec {
             expectEqual(stringArray(exclusions["gemini-cli"]), ["*"], "disabled managed provider should get wildcard exclusion", recorder: recorder)
         }
 
-        run("composeRuntimeConfig strips UI metadata, deduplicates keys, and injects zai", recorder: recorder) {
+        run("composeRuntimeConfig strips UI metadata, deduplicates keys, and injects zai on claude-api-key", recorder: recorder) {
             let baseRoot: [String: Any] = [
                 "openai-compatibility": [
                     [
@@ -369,11 +426,12 @@ struct ConfigComposerSpec {
             expectNil(nvidia?["icon-system"], "runtime config should strip icon-system", recorder: recorder)
             expectEqual(apiKeys(in: nvidia ?? [:]), ["inline-a", "inline-b", "auth-c"], "runtime keys should be deduplicated and exclude disabled auth records", recorder: recorder)
 
-            let zai = provider(named: "zai", in: runtime)
-            expectEqual(apiKeys(in: zai ?? [:]), ["zai-key-1"], "managed zai provider should be injected", recorder: recorder)
+            let zaiEntries = managedZAIClaudeEntries(in: runtime)
+            expectEqual(zaiEntries.count, 1, "managed zai provider should be injected once into claude-api-key", recorder: recorder)
+            expectEqual(singleAPIKeys(in: zaiEntries), ["zai-key-1"], "managed zai provider should carry the configured auth key", recorder: recorder)
         }
 
-        run("composeRuntimeConfig preserves user-authored zai models and merges inline plus managed keys", recorder: recorder) {
+        run("composeRuntimeConfig canonicalizes managed zai models and merges inline plus managed keys on claude-api-key", recorder: recorder) {
             let baseRoot: [String: Any] = [
                 "openai-compatibility": [
                     [
@@ -386,7 +444,7 @@ struct ConfigComposerSpec {
                         "models": [
                             ["name": "glm-4.7", "alias": "glm-4.7"],
                             ["name": "glm-5", "alias": "glm-5"],
-                            ["name": "glm-5-turbo", "alias": "glm-5-turbo"]
+                            ["name": "glm-5.1", "alias": "glm-5.1-zai"]
                         ]
                     ]
                 ]
@@ -402,27 +460,117 @@ struct ConfigComposerSpec {
                 includeManagedZAIProvider: true
             )
 
-            let zai = provider(named: "zai", in: runtime)
+            let zaiEntries = managedZAIClaudeEntries(in: runtime)
             expectEqual(
-                apiKeys(in: zai ?? [:]),
+                singleAPIKeys(in: zaiEntries),
                 ["inline-zai", "managed-zai"],
                 "managed zai runtime should deduplicate inline and auth-file API keys",
                 recorder: recorder
             )
             expectEqual(
-                modelAliases(in: zai ?? [:]),
-                ["glm-4.7", "glm-5", "glm-5-turbo"],
-                "managed zai runtime should preserve user-authored model aliases",
+                modelAliases(in: zaiEntries.first ?? [:]),
+                ["glm-4.7", "glm-5.1-zai"],
+                "managed zai runtime should rewrite stale user-authored aliases to the canonical managed set without retaining legacy glm-5",
                 recorder: recorder
             )
             expectNil(
-                zai?["display-name"],
+                zaiEntries.first?["display-name"],
                 "managed zai runtime should strip UI metadata before writing merged config",
+                recorder: recorder
+            )
+            expectNil(
+                provider(named: "zai", in: runtime),
+                "managed zai should no longer be emitted on openai-compatibility",
                 recorder: recorder
             )
         }
 
-        run("composeRuntimeConfig injects modern default zai models when no user-defined models exist", recorder: recorder) {
+        run("composeRuntimeConfig keeps keyed managed providers after patching", recorder: recorder) {
+            let baseRoot = ConfigComposer.applyManagedProviderPatches(
+                to: [
+                    "claude-api-key": [
+                        [
+                            "api-key": "inline-zai",
+                            "base-url": "https://api.z.ai/api/anthropic",
+                            "models": [
+                                ["name": "glm-4.7", "alias": "glm-4.7"],
+                                ["name": "glm-5", "alias": "glm-5"],
+                                ["name": "glm-5.1", "alias": "glm-5.1"]
+                            ]
+                        ]
+                    ],
+                    "openai-compatibility": [
+                        [
+                            "name": "nvidia",
+                            "api-key-entries": [
+                                ["api-key": "inline-a"]
+                            ]
+                        ],
+                        [
+                            "name": "nvidia-minimax",
+                            "api-key-entries": [
+                                ["api-key": "inline-b"]
+                            ]
+                        ],
+                        [
+                            "name": "opencode",
+                            "api-key-entries": [
+                                ["api-key": "opencode-key"]
+                            ]
+                        ],
+                        [
+                            "name": "kilocode",
+                            "api-key-entries": [
+                                ["api-key": "kilocode-key"]
+                            ]
+                        ]
+                    ]
+                ]
+            )
+
+            let runtime = ConfigComposer.composeRuntimeConfig(
+                baseRoot: baseRoot,
+                reservedCustomProviderKeys: reservedProviderIDs,
+                disabledCustomProviderIDs: [],
+                disabledOAuthProviderKeys: [],
+                zaiAPIKeys: [],
+                customProviderAuthRecords: [],
+                includeManagedZAIProvider: true
+            )
+
+            expectEqual(
+                modelAliases(in: provider(named: "opencode", in: runtime) ?? [:]),
+                ["mimo-v2-pro-opencode", "minimax-m2.5-opencode"],
+                "managed opencode providers with configured auth should survive runtime composition",
+                recorder: recorder
+            )
+            expectEqual(
+                apiKeys(in: provider(named: "opencode", in: runtime) ?? [:]),
+                ["opencode-key"],
+                "managed opencode providers should emit the configured runtime api-key entry",
+                recorder: recorder
+            )
+            expectEqual(
+                apiKeys(in: provider(named: "kilocode", in: runtime) ?? [:]),
+                ["kilocode-key"],
+                "managed kilocode providers should emit only the configured runtime api-key entry",
+                recorder: recorder
+            )
+            expectEqual(
+                apiKeys(in: provider(named: "kilocode", in: runtime) ?? [:]).count,
+                1,
+                "managed kilocode providers should no longer inherit extra inline secrets from source",
+                recorder: recorder
+            )
+            expectEqual(
+                modelAliases(in: managedZAIClaudeEntries(in: runtime).first ?? [:]),
+                ["glm-4.7", "glm-5.1-zai"],
+                "managed zai runtime should expose canonical GLM aliases even when the base config is stale",
+                recorder: recorder
+            )
+        }
+
+        run("composeRuntimeConfig injects modern default zai models on claude-api-key when no user-defined models exist", recorder: recorder) {
             let runtime = ConfigComposer.composeRuntimeConfig(
                 baseRoot: [:],
                 reservedCustomProviderKeys: reservedProviderIDs,
@@ -433,10 +581,10 @@ struct ConfigComposerSpec {
                 includeManagedZAIProvider: true
             )
 
-            let zai = provider(named: "zai", in: runtime)
+            let zai = managedZAIClaudeEntries(in: runtime).first
             expectEqual(
                 modelAliases(in: zai ?? [:]),
-                ["glm-4.7", "glm-5", "glm-5-turbo"],
+                ["glm-4.7", "glm-5.1-zai"],
                 "default managed zai models should expose the current GLM aliases on a clean install",
                 recorder: recorder
             )
@@ -476,7 +624,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5-turbo", "minimax-m2.5"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia"]
                     ]
                 ]
             ]
@@ -494,7 +642,7 @@ struct ConfigComposerSpec {
             let smartAliases = dictionary(runtime["smart-aliases"])
             let worker = dictionary(smartAliases["worker"])
             expectEqual(worker["failover"] as? String, "silent", "runtime config should preserve smart alias failover mode", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5-turbo", "minimax-m2.5"], "runtime config should preserve smart alias candidate order", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.5-nvidia"], "runtime config should preserve smart alias candidate order", recorder: recorder)
         }
 
         run("wildcard oauth exclusions are detectable", recorder: recorder) {
@@ -616,7 +764,7 @@ struct ConfigComposerSpec {
                         "name": "nvidia",
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
-                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
                         ]
                     ]
                 ],
@@ -624,7 +772,7 @@ struct ConfigComposerSpec {
                     " worker ": [
                         "request-class": "streaming",
                         "failover": "visible",
-                        "candidates": ["glm-5-turbo", " unknown ", "minimax-m2.5", "minimax-m2.5"]
+                        "candidates": ["glm-5.1-zai", " unknown ", "minimax-m2.5-nvidia", "minimax-m2.5-nvidia"]
                     ],
                     "fanout": [
                         "request-class": "plain-chat",
@@ -654,8 +802,8 @@ struct ConfigComposerSpec {
                         "name": "nvidia",
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
-                            ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"],
-                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                            ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5-nvidia"],
+                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
                         ]
                     ]
                 ],
@@ -663,7 +811,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
                     ]
                 ]
             ]
@@ -672,6 +820,34 @@ struct ConfigComposerSpec {
                 ConfigComposer.validateSmartAliases(in: root),
                 [],
                 "smart alias validation should accept known Z.AI defaults plus configured provider aliases",
+                recorder: recorder
+            )
+        }
+
+        run("validateSmartAliases accepts worker pools that target claude-api-key model aliases", recorder: recorder) {
+            let root: [String: Any] = [
+                "claude-api-key": [
+                    [
+                        "api-key": "test-zai-key",
+                        "base-url": "https://api.z.ai/api/anthropic",
+                        "models": [
+                            ["name": "glm-5.1", "alias": "glm-5.1-zai"]
+                        ]
+                    ]
+                ],
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5.1-zai"]
+                    ]
+                ]
+            ]
+
+            expectEqual(
+                ConfigComposer.validateSmartAliases(in: root),
+                [],
+                "smart alias validation should accept GLM aliases supplied through claude-api-key entries",
                 recorder: recorder
             )
         }
@@ -723,6 +899,16 @@ private func providerEntries(in root: [String: Any]) -> [[String: Any]] {
     ConfigComposer.stringKeyedDictionaryArray(root["openai-compatibility"])
 }
 
+private func claudeAPIKeyEntries(in root: [String: Any]) -> [[String: Any]] {
+    ConfigComposer.stringKeyedDictionaryArray(root["claude-api-key"])
+}
+
+private func managedZAIClaudeEntries(in root: [String: Any]) -> [[String: Any]] {
+    claudeAPIKeyEntries(in: root).filter {
+        (($0["base-url"] as? String) ?? "").contains("api.z.ai")
+    }
+}
+
 private func provider(named name: String, in root: [String: Any]) -> [String: Any]? {
     providerEntries(in: root).first { $0["name"] as? String == name }
 }
@@ -744,6 +930,10 @@ private func stringArray(_ value: Any?) -> [String] {
 
 private func apiKeys(in provider: [String: Any]) -> [String] {
     ConfigComposer.stringKeyedDictionaryArray(provider["api-key-entries"]).compactMap { $0["api-key"] as? String }
+}
+
+private func singleAPIKeys(in entries: [[String: Any]]) -> [String] {
+    entries.compactMap { $0["api-key"] as? String }
 }
 
 private func modelAliases(in provider: [String: Any]) -> [String] {

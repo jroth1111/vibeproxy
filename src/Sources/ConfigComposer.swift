@@ -9,6 +9,7 @@ struct ConfigProviderAuthRecord: Equatable {
 enum ConfigComposer {
     static let uiMetadataKeys: Set<String> = ["display-name", "help-text", "icon-system"]
     static let additiveUserConfigRootKeys: Set<String> = [
+        "claude-api-key",
         "debug",
         "logging-to-file",
         "max-retry-credentials",
@@ -221,6 +222,12 @@ enum ConfigComposer {
                 errors.append("\(path).failover must be 'silent'.")
             }
 
+            if let sensitivityValue = normalizedString(entry["health-sensitivity"]) {
+                if sensitivityValue != "eager" && sensitivityValue != "balanced" && sensitivityValue != "conservative" {
+                    errors.append("\(path).health-sensitivity must be 'eager', 'balanced', or 'conservative'.")
+                }
+            }
+
             guard let candidates = entry["candidates"] as? [Any] else {
                 errors.append("\(path).candidates must be an array of model aliases.")
                 continue
@@ -298,7 +305,9 @@ enum ConfigComposer {
         }
         
         var mergedOpenAICompatibility: [[String: Any]] = []
+        var mergedClaudeAPIKeyEntries: [[String: Any]] = []
         var managedZAIBaseEntry: [String: Any]?
+        var managedZAIClaudeBaseEntry: [String: Any]?
         for entry in stringKeyedDictionaryArray(mergedRoot["openai-compatibility"]) {
             guard let providerName = normalizedProviderID(from: entry) else {
                 continue
@@ -315,26 +324,35 @@ enum ConfigComposer {
                 if disabledCustomProviderIDs.contains(providerName) {
                     continue
                 }
-                
-                let inlineEntries = apiKeyEntries(from: entry)
+
+                let inlineEntries = apiKeys(from: entry).map { ["api-key": $0] }
                 let authEntries = authEntriesByProviderID[providerName] ?? []
                 let effectiveEntries = deduplicatedAPIKeyEntries(inlineEntries + authEntries)
                 guard !effectiveEntries.isEmpty else {
                     continue
                 }
                 sanitizedEntry["api-key-entries"] = effectiveEntries
+                sanitizedEntry.removeValue(forKey: "api-key")
             }
             
             mergedOpenAICompatibility.append(sanitizedEntry)
         }
+
+        for entry in stringKeyedDictionaryArray(mergedRoot["claude-api-key"]) {
+            if isManagedZAIClaudeEntry(entry) {
+                managedZAIClaudeBaseEntry = entry
+                continue
+            }
+            mergedClaudeAPIKeyEntries.append(entry)
+        }
         
         if includeManagedZAIProvider {
-            let managedZAIEntry = makeZAIProviderEntry(
-                baseEntry: managedZAIBaseEntry,
-                apiKeys: zaiAPIKeys
+            let managedZAIEntries = makeZAIClaudeProviderEntries(
+                baseEntry: managedZAIClaudeBaseEntry ?? managedZAIBaseEntry,
+                managedAPIKeys: zaiAPIKeys
             )
-            if !apiKeyEntries(from: managedZAIEntry).isEmpty {
-                mergedOpenAICompatibility.append(managedZAIEntry)
+            if !managedZAIEntries.isEmpty {
+                mergedClaudeAPIKeyEntries.append(contentsOf: managedZAIEntries)
             }
         }
         
@@ -342,6 +360,12 @@ enum ConfigComposer {
             mergedRoot.removeValue(forKey: "openai-compatibility")
         } else {
             mergedRoot["openai-compatibility"] = mergedOpenAICompatibility
+        }
+
+        if mergedClaudeAPIKeyEntries.isEmpty {
+            mergedRoot.removeValue(forKey: "claude-api-key")
+        } else {
+            mergedRoot["claude-api-key"] = mergedClaudeAPIKeyEntries
         }
         
         return mergedRoot
@@ -482,7 +506,15 @@ enum ConfigComposer {
 
             if let existingIndex = indexByName[name] {
                 let existingEntry = mergedEntries[existingIndex]
-                mergedEntries[existingIndex] = mergeDictionary(managedEntry, overlaidWith: existingEntry)
+                var mergedEntry = mergeDictionary(managedEntry, overlaidWith: existingEntry)
+                mergedEntry["name"] = name
+                if let managedBaseURL = managedEntry["base-url"] {
+                    mergedEntry["base-url"] = managedBaseURL
+                }
+                if let managedModels = managedEntry["models"] {
+                    mergedEntry["models"] = managedModels
+                }
+                mergedEntries[existingIndex] = mergedEntry
             } else {
                 mergedEntries.append(managedEntry)
             }
@@ -492,12 +524,12 @@ enum ConfigComposer {
     }
 
     private static func mergeManagedSmartAliasEntries(base: [String: Any], managed: [String: Any]) -> [String: Any] {
-        var merged = managed
-        for (key, value) in base {
+        var merged = base
+        for (key, value) in managed {
             let mergedValue: Any
-            if let baseEntry = stringKeyedDictionary(value),
-               let managedEntry = stringKeyedDictionary(merged[key] as Any) {
-                mergedValue = mergeDictionary(managedEntry, overlaidWith: baseEntry)
+            if let baseEntry = stringKeyedDictionary(merged[key] as Any),
+               let managedEntry = stringKeyedDictionary(value) {
+                mergedValue = mergeDictionary(baseEntry, overlaidWith: managedEntry)
             } else {
                 mergedValue = value
             }
@@ -515,8 +547,27 @@ enum ConfigComposer {
         }
     }
 
+    private static func apiKeys(from entry: [String: Any]) -> [String] {
+        var keys = deduplicatedAPIKeys(from: entry)
+        if let inlineAPIKey = normalizedString(entry["api-key"]) {
+            keys.append(inlineAPIKey)
+        }
+        return deduplicatedAPIKeys(keys)
+    }
+
     private static func deduplicatedAPIKeys(from entry: [String: Any]) -> [String] {
         deduplicatedAPIKeyEntries(apiKeyEntries(from: entry)).compactMap { $0["api-key"] }
+    }
+
+    private static func deduplicatedAPIKeys(_ keys: [String]) -> [String] {
+        var seen: Set<String> = []
+        return keys.filter { key in
+            guard !seen.contains(key) else {
+                return false
+            }
+            seen.insert(key)
+            return true
+        }
     }
     
     private static func deduplicatedAPIKeyEntries(_ entries: [[String: String]]) -> [[String: String]] {
@@ -552,24 +603,28 @@ enum ConfigComposer {
         return merged.isEmpty ? nil : merged
     }
     
-    private static func makeZAIProviderEntry(baseEntry: [String: Any]?, apiKeys: [String]) -> [String: Any] {
+    private static func makeZAIClaudeProviderEntries(baseEntry: [String: Any]?, managedAPIKeys: [String]) -> [[String: Any]] {
         var entry = stripCustomProviderUIMetadata(from: baseEntry ?? [:])
-        entry["name"] = "zai"
+        let preservedAPIKeys = apiKeys(from: entry)
+        entry.removeValue(forKey: "name")
+        entry.removeValue(forKey: "api-key")
+        entry.removeValue(forKey: "api-key-entries")
 
         if normalizedString(entry["base-url"]) == nil {
-            entry["base-url"] = "https://api.z.ai/api/coding/paas/v4"
+            entry["base-url"] = "https://api.z.ai/api/anthropic"
         }
 
-        let inlineEntries = apiKeyEntries(from: entry)
-        entry["api-key-entries"] = deduplicatedAPIKeyEntries(
-            inlineEntries + apiKeys.map { ["api-key": $0] }
+        let effectiveAPIKeys = deduplicatedAPIKeys(
+            preservedAPIKeys + managedAPIKeys
         )
 
-        if stringKeyedDictionaryArray(entry["models"]).isEmpty {
-            entry["models"] = defaultZAIModels()
-        }
+        entry["models"] = defaultZAIModels()
 
-        return entry
+        return effectiveAPIKeys.map { apiKey in
+            var keyedEntry = entry
+            keyedEntry["api-key"] = apiKey
+            return keyedEntry
+        }
     }
 
     private static func normalizedProviderID(from entry: [String: Any]) -> String? {
@@ -597,14 +652,27 @@ enum ConfigComposer {
                 }
             }
         }
+        for entry in stringKeyedDictionaryArray(root["claude-api-key"]) {
+            for modelEntry in stringKeyedDictionaryArray(entry["models"]) {
+                if let alias = normalizedString(modelEntry["alias"]) ?? normalizedString(modelEntry["name"]) {
+                    aliases.insert(alias)
+                }
+            }
+        }
         return aliases
+    }
+
+    private static func isManagedZAIClaudeEntry(_ entry: [String: Any]) -> Bool {
+        guard let baseURL = normalizedString(entry["base-url"])?.lowercased() else {
+            return false
+        }
+        return baseURL.contains("api.z.ai")
     }
 
     private static func defaultZAIModels() -> [[String: String]] {
         [
             ["name": "glm-4.7", "alias": "glm-4.7"],
-            ["name": "glm-5", "alias": "glm-5"],
-            ["name": "glm-5-turbo", "alias": "glm-5-turbo"]
+            ["name": "glm-5.1", "alias": "glm-5.1-zai"]
         ]
     }
 
@@ -618,7 +686,7 @@ enum ConfigComposer {
                 "base-url": "https://integrate.api.nvidia.com/v1",
                 "models": [
                     ["name": "z-ai/glm5", "alias": "glm5"],
-                    ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"]
+                    ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5-nvidia"]
                 ]
             ],
             [
@@ -628,7 +696,28 @@ enum ConfigComposer {
                 "icon-system": "bolt.fill",
                 "base-url": "https://integrate.api.nvidia.com/v1",
                 "models": [
-                    ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                    ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
+                ]
+            ],
+            [
+                "name": "opencode",
+                "display-name": "OpenCode",
+                "help-text": "OpenCode free MiMo-V2-Pro & MiniMax M2.5 via opencode.ai/zen.",
+                "icon-system": "network",
+                "base-url": "https://opencode.ai/zen/v1",
+                "models": [
+                    ["name": "mimo-v2-pro-free", "alias": "mimo-v2-pro-opencode"],
+                    ["name": "minimax-m2.5-free", "alias": "minimax-m2.5-opencode"]
+                ]
+            ],
+            [
+                "name": "kilocode",
+                "display-name": "KiloCode",
+                "help-text": "KiloCode free MiMo-V2-Pro via api.kilo.ai.",
+                "icon-system": "network",
+                "base-url": "https://api.kilo.ai/api/openrouter/v1",
+                "models": [
+                    ["name": "xiaomi/mimo-v2-pro:free", "alias": "mimo-v2-pro-kilocode"]
                 ]
             ]
         ]
@@ -639,7 +728,7 @@ enum ConfigComposer {
             "worker": [
                 "request-class": "plain-chat",
                 "failover": "silent",
-                "candidates": ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"]
+                "candidates": ["minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"]
             ]
         ]
     }

@@ -831,9 +831,9 @@ struct SettingsView: View {
                     }
                     Button("Add Key") {
                         showingZaiApiKeyPrompt = false
-                        startZaiAuth(apiKey: zaiApiKey)
+                        startZaiAuth(apiKey: zaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
-                    .disabled(zaiApiKey.isEmpty)
+                    .disabled(zaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .keyboardShortcut(.defaultAction)
                 }
             }
@@ -860,9 +860,12 @@ struct SettingsView: View {
                     Button("Add Key") {
                         let currentProvider = provider
                         selectedCustomProvider = nil
-                        startCustomProviderAuth(provider: currentProvider, apiKey: customProviderApiKey)
+                        startCustomProviderAuth(
+                            provider: currentProvider,
+                            apiKey: customProviderApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
                     }
-                    .disabled(customProviderApiKey.isEmpty)
+                    .disabled(customProviderApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .keyboardShortcut(.defaultAction)
                 }
             }

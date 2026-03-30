@@ -99,6 +99,20 @@ struct CustomProviderCredentialStoreSpec {
             }
         }
 
+        run("save trims surrounding whitespace from provider ids and API keys", recorder: recorder) {
+            withTemporaryDirectory(recorder: recorder) { directoryURL in
+                let store = CustomProviderCredentialStore(directoryURL: directoryURL)
+                _ = try? store.save(
+                    providerID: "  nvidia  ",
+                    apiKey: "  nvapi-trimmed1234567890  "
+                )
+
+                let loadResult = store.loadAll()
+                expectEqual(loadResult.records.first?.providerID, "nvidia", "provider ids should be normalized before persistence", recorder: recorder)
+                expectEqual(loadResult.records.first?.apiKey, "nvapi-trimmed1234567890", "API keys should be trimmed before persistence", recorder: recorder)
+            }
+        }
+
         run("malformed credential files are ignored gracefully", recorder: recorder) {
             withTemporaryDirectory(recorder: recorder) { directoryURL in
                 let store = CustomProviderCredentialStore(directoryURL: directoryURL)

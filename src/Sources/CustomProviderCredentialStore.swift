@@ -32,6 +32,7 @@ enum CustomProviderCredentialStoreError: LocalizedError {
     case invalidCredentialJSON(String)
     case malformedCredential(String)
     case failedToDeleteCredential(String)
+    case missingPreferredCredentialRecord(String)
 
     var errorDescription: String? {
         switch self {
@@ -41,7 +42,8 @@ enum CustomProviderCredentialStoreError: LocalizedError {
              .failedToReadCredential(let message),
              .invalidCredentialJSON(let message),
              .malformedCredential(let message),
-             .failedToDeleteCredential(let message):
+             .failedToDeleteCredential(let message),
+             .missingPreferredCredentialRecord(let message):
             return message
         }
     }
@@ -72,33 +74,41 @@ final class CustomProviderCredentialStore {
         createdAt: String = ISO8601DateFormatter().string(from: Date())
     ) throws -> CustomProviderCredentialSaveResult {
         try queue.sync {
+            guard let normalizedProviderID = ConfigComposer.normalizedString(providerID),
+                  let normalizedAPIKey = ConfigComposer.normalizedString(apiKey) else {
+                throw CustomProviderCredentialStoreError.malformedCredential(
+                    "Custom provider credentials require a non-empty provider and api_key."
+                )
+            }
+            let normalizedLabel = ConfigComposer.normalizedString(label)
+
             try ensureDirectoryExists()
 
             let existingRecords = loadAllUnlocked().records.filter { record in
-                record.providerID == providerID && record.apiKey == apiKey
+                record.providerID == normalizedProviderID && record.apiKey == normalizedAPIKey
             }
             if !existingRecords.isEmpty {
                 if existingRecords.contains(where: { $0.isDisabled }) {
                     let updatedRecords = try setDisabledUnlocked(
-                        providerID: providerID,
-                        apiKey: apiKey,
+                        providerID: normalizedProviderID,
+                        apiKey: normalizedAPIKey,
                         isDisabled: false
                     )
-                    return .reenabled(preferredRecord(from: updatedRecords))
+                    return .reenabled(try preferredRecord(from: updatedRecords))
                 }
-                return .alreadyPresent(preferredRecord(from: existingRecords))
+                return .alreadyPresent(try preferredRecord(from: existingRecords))
             }
 
-            let filename = "openai-compat-\(sanitizeFilenameComponent(providerID))-\(UUID().uuidString.prefix(8)).json"
+            let filename = "openai-compat-\(sanitizeFilenameComponent(normalizedProviderID))-\(UUID().uuidString.prefix(8)).json"
             let filePath = directoryURL.appendingPathComponent(filename)
             let authData = credentialJSONObject(
-                providerID: providerID,
-                apiKey: apiKey,
-                label: label,
+                providerID: normalizedProviderID,
+                apiKey: normalizedAPIKey,
+                label: normalizedLabel,
                 createdAt: createdAt,
                 isDisabled: false
             )
-            try writeCredentialJSONUnlocked(authData, to: filePath, providerID: providerID)
+            try writeCredentialJSONUnlocked(authData, to: filePath, providerID: normalizedProviderID)
 
             return .created(try record(from: authData, filePath: filePath))
         }
@@ -175,12 +185,12 @@ final class CustomProviderCredentialStore {
                 "Credential file at \(filePath.path) has an unexpected type."
             )
         }
-        guard let providerID = json["provider"] as? String, !providerID.isEmpty else {
+        guard let providerID = ConfigComposer.normalizedString(json["provider"]) else {
             throw CustomProviderCredentialStoreError.malformedCredential(
                 "Credential file at \(filePath.path) is missing a provider."
             )
         }
-        guard let apiKey = json["api_key"] as? String, !apiKey.isEmpty else {
+        guard let apiKey = ConfigComposer.normalizedString(json["api_key"]) else {
             throw CustomProviderCredentialStoreError.malformedCredential(
                 "Credential file at \(filePath.path) is missing an api_key."
             )
@@ -189,7 +199,7 @@ final class CustomProviderCredentialStore {
         return CustomProviderCredentialRecord(
             providerID: providerID,
             apiKey: apiKey,
-            label: (json["label"] as? String) ?? maskAPIKey(apiKey),
+            label: ConfigComposer.normalizedString(json["label"]) ?? maskAPIKey(apiKey),
             filePath: filePath,
             isDisabled: json["disabled"] as? Bool ?? false
         )
@@ -334,8 +344,8 @@ final class CustomProviderCredentialStore {
         }
     }
 
-    private func preferredRecord(from records: [CustomProviderCredentialRecord]) -> CustomProviderCredentialRecord {
-        records.sorted { lhs, rhs in
+    private func preferredRecord(from records: [CustomProviderCredentialRecord]) throws -> CustomProviderCredentialRecord {
+        guard let preferredRecord = records.sorted(by: { lhs, rhs in
             if lhs.isDisabled != rhs.isDisabled {
                 return !lhs.isDisabled
             }
@@ -346,7 +356,13 @@ final class CustomProviderCredentialStore {
             }
 
             return lhs.filePath.lastPathComponent < rhs.filePath.lastPathComponent
-        }.first!
+        }).first else {
+            throw CustomProviderCredentialStoreError.missingPreferredCredentialRecord(
+                "Expected at least one credential record when selecting the preferred custom provider credential."
+            )
+        }
+
+        return preferredRecord
     }
 
     private func isManagedCredentialFile(_ filePath: URL) -> Bool {

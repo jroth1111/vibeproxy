@@ -53,6 +53,10 @@ final class ZAIAPIKeyStore {
         createdAt: String = ISO8601DateFormatter().string(from: Date())
     ) throws -> URL {
         try queue.sync {
+            guard let normalizedAPIKey = ConfigComposer.normalizedString(apiKey) else {
+                throw ZAIAPIKeyStoreError.malformedKey("Z.AI API key must not be empty.")
+            }
+
             do {
                 try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             } catch {
@@ -65,8 +69,8 @@ final class ZAIAPIKeyStore {
             let filePath = directoryURL.appendingPathComponent(filename)
             let authData: [String: Any] = [
                 "type": Self.authType,
-                "email": maskAPIKey(apiKey),
-                "api_key": apiKey,
+                "email": maskAPIKey(normalizedAPIKey),
+                "api_key": normalizedAPIKey,
                 "created": createdAt
             ]
 
@@ -104,7 +108,9 @@ final class ZAIAPIKeyStore {
             var apiKeys: [String] = []
             var issues: [ZAIAPIKeyLoadIssue] = []
 
-            for file in files where isManagedKeyFile(file) {
+            for file in files
+                .filter({ isManagedKeyFile($0) })
+                .sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 do {
                     if let apiKey = try loadActiveAPIKey(at: file) {
                         apiKeys.append(apiKey)
@@ -159,7 +165,7 @@ final class ZAIAPIKeyStore {
                 "Z.AI API key file at \(filePath.path) has an unexpected type."
             )
         }
-        guard let apiKey = json["api_key"] as? String, !apiKey.isEmpty else {
+        guard let apiKey = ConfigComposer.normalizedString(json["api_key"]) else {
             throw ZAIAPIKeyStoreError.malformedKey(
                 "Z.AI API key file at \(filePath.path) is missing an api_key."
             )

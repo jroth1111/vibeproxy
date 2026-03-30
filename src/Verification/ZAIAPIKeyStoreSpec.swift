@@ -52,6 +52,16 @@ struct ZAIAPIKeyStoreSpec {
             }
         }
 
+        run("save trims surrounding whitespace from API keys", recorder: recorder) {
+            withTemporaryDirectory(recorder: recorder) { directoryURL in
+                let store = ZAIAPIKeyStore(directoryURL: directoryURL)
+                _ = try? store.save(apiKey: "  zai-trimmed1234567890  ")
+
+                let loadResult = store.loadActiveAPIKeys()
+                expectEqual(loadResult.apiKeys, ["zai-trimmed1234567890"], "saved Z.AI keys should be normalized before persistence", recorder: recorder)
+            }
+        }
+
         run("malformed managed Z.AI key files are ignored gracefully", recorder: recorder) {
             withTemporaryDirectory(recorder: recorder) { directoryURL in
                 let store = ZAIAPIKeyStore(directoryURL: directoryURL)

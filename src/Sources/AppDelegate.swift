@@ -4,6 +4,62 @@ import WebKit
 import UserNotifications
 import Sparkle
 
+private final class FileSystemMonitor {
+    let source: DispatchSourceFileSystemObject
+
+    private let fileDescriptor: Int32
+    private var hasResumed = false
+    private var isCancelled = false
+    private var didCloseFileDescriptor = false
+
+    init?(path: String, eventMask: DispatchSource.FileSystemEvent, queue: DispatchQueue) {
+        let fileDescriptor = open(path, O_EVTONLY)
+        guard fileDescriptor >= 0 else {
+            return nil
+        }
+
+        self.fileDescriptor = fileDescriptor
+        self.source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileDescriptor,
+            eventMask: eventMask,
+            queue: queue
+        )
+
+        self.source.setCancelHandler { [weak self] in
+            self?.closeFileDescriptorIfNeeded()
+        }
+    }
+
+    func resume() {
+        guard !hasResumed else { return }
+        hasResumed = true
+        source.resume()
+    }
+
+    func cancel() {
+        guard hasResumed, !isCancelled else {
+            closeFileDescriptorIfNeeded()
+            return
+        }
+
+        isCancelled = true
+        source.cancel()
+    }
+
+    deinit {
+        if hasResumed, !isCancelled {
+            source.cancel()
+        }
+        closeFileDescriptorIfNeeded()
+    }
+
+    private func closeFileDescriptorIfNeeded() {
+        guard !didCloseFileDescriptor else { return }
+        didCloseFileDescriptor = true
+        close(fileDescriptor)
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem!
     var menu: NSMenu!
@@ -13,8 +69,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     private let notificationCenter = UNUserNotificationCenter.current()
     private var notificationPermissionGranted = false
     private let updaterController: SPUStandardUpdaterController
-    private var authFileMonitor: DispatchSourceFileSystemObject?
-    private var userConfigFileMonitor: DispatchSourceFileSystemObject?
+    private var authFileMonitor: FileSystemMonitor?
+    private var userConfigFileMonitor: FileSystemMonitor?
     private var configInputPoller: DispatchSourceTimer?
     private var pendingAuthRefresh: DispatchWorkItem?
     private var polledConfigInputsFingerprint = ""
@@ -378,8 +434,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         NotificationCenter.default.removeObserver(self, name: .serverStatusChanged, object: nil)
         NotificationCenter.default.removeObserver(self, name: .authDirectoryChanged, object: nil)
         pendingAuthRefresh?.cancel()
-        authFileMonitor?.cancel()
-        authFileMonitor = nil
+        stopMonitoringConfigInputs()
         // Final cleanup - stop server if still running
         if serverManager.isRunning {
             thinkingProxy.stop()
@@ -404,16 +459,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
         try? FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
 
-        let fileDescriptor = open(authDir.path, O_EVTONLY)
-        guard fileDescriptor >= 0 else { return }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileDescriptor,
+        guard let monitor = FileSystemMonitor(
+            path: authDir.path,
             eventMask: [.write, .delete, .rename],
             queue: DispatchQueue.main
-        )
+        ) else {
+            return
+        }
 
-        source.setEventHandler { [weak self] in
+        monitor.source.setEventHandler { [weak self] in
             self?.refreshUserConfigFileMonitor()
             self?.pendingAuthRefresh?.cancel()
             let workItem = DispatchWorkItem {
@@ -423,12 +477,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
         }
 
-        source.setCancelHandler {
-            close(fileDescriptor)
-        }
-
-        source.resume()
-        authFileMonitor = source
+        monitor.resume()
+        authFileMonitor = monitor
         refreshUserConfigFileMonitor()
         startPollingConfigInputs()
     }
@@ -445,17 +495,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             return
         }
 
-        let fileDescriptor = open(configURL.path, O_EVTONLY)
-        guard fileDescriptor >= 0 else { return }
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileDescriptor,
+        guard let monitor = FileSystemMonitor(
+            path: configURL.path,
             eventMask: [.write, .delete, .rename],
             queue: DispatchQueue.main
-        )
+        ) else {
+            return
+        }
 
-        source.setEventHandler { [weak self] in
-            if source.data.contains(.delete) || source.data.contains(.rename) {
+        monitor.source.setEventHandler { [weak self] in
+            if monitor.source.data.contains(.delete) || monitor.source.data.contains(.rename) {
                 self?.refreshUserConfigFileMonitor()
             }
             self?.pendingAuthRefresh?.cancel()
@@ -466,12 +515,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
         }
 
-        source.setCancelHandler {
-            close(fileDescriptor)
-        }
-
-        source.resume()
-        userConfigFileMonitor = source
+        monitor.resume()
+        userConfigFileMonitor = monitor
     }
 
     private func startPollingConfigInputs() {
@@ -491,6 +536,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         }
         poller.resume()
         configInputPoller = poller
+    }
+
+    private func stopMonitoringConfigInputs() {
+        configInputPoller?.cancel()
+        configInputPoller = nil
+        userConfigFileMonitor?.cancel()
+        userConfigFileMonitor = nil
+        authFileMonitor?.cancel()
+        authFileMonitor = nil
     }
 
     private func postObservedConfigInputsChanged(reason: String) {

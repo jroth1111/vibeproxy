@@ -423,9 +423,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 90,
-            firstResponseDeadline: 45,
-            bufferedResponseDeadline: 75,
+            attemptTimeout: 180,
+            firstResponseDeadline: 120,
+            bufferedResponseDeadline: 150,
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -1056,12 +1056,11 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        guard let primaryCandidate = smartAlias.candidates.first,
-              primaryCandidate == "glm-5.1-zai",
-              let primaryRoute = resolveConfiguredRoute(forRequestModel: primaryCandidate),
+        guard smartAlias.candidates.contains("glm-5.1-zai"),
+              let primaryRoute = resolveConfiguredRoute(forRequestModel: "glm-5.1-zai"),
               primaryRoute.providerID == "zai",
               primaryRoute.canonicalModelID == "glm-5.1",
-              isAnthropicConfiguredRoute(forRequestModel: primaryCandidate) else {
+              isAnthropicConfiguredRoute(forRequestModel: "glm-5.1-zai") else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
                 message: "The \(requestModel) pooled alias is misconfigured: primary candidate must resolve to Anthropic-backed Z.AI glm-5.1."
@@ -1110,9 +1109,12 @@ enum OpenAICompatTemporaryShim {
         forceAllowClosedModels: Set<String> = []
     ) -> (body: String, model: String, remainingCandidateModels: [String])? {
         var remainingCandidateModels = candidateModelsRemaining
+        var skippedReasons: [(model: String, reason: String)] = []
+
         while !remainingCandidateModels.isEmpty {
             let nextCandidateModel = remainingCandidateModels.removeFirst()
             guard resolveConfiguredRoute(forRequestModel: nextCandidateModel) != nil else {
+                skippedReasons.append((nextCandidateModel, "no_route"))
                 continue
             }
             guard let candidateBody = rewrittenRequestJSON(
@@ -1121,14 +1123,18 @@ enum OpenAICompatTemporaryShim {
                 replacingRequestModelIn: currentBody,
                     with: nextCandidateModel
             ) else {
+                skippedReasons.append((nextCandidateModel, "rewrite_failed"))
                 continue
             }
             if isConfiguredRouteOpen(forRequestModel: nextCandidateModel) &&
                 !forceAllowClosedModels.contains(nextCandidateModel) {
+                skippedReasons.append((nextCandidateModel, "route_closed"))
                 continue
             }
             return (candidateBody, nextCandidateModel, remainingCandidateModels)
         }
+
+        NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
         return nil
     }
 
@@ -1363,12 +1369,30 @@ enum OpenAICompatTemporaryShim {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
+    private static let suspectDeadlineReductionFactor: Double = 0.75
+    private static let openDeadlineReductionFactor: Double = 0.5
+
     static func effectiveFirstResponseDeadline(
         forRequestJSON jsonString: String,
         routeHealthStatus: RouteHealthStatus?
     ) -> TimeInterval? {
-        _ = routeHealthStatus
-        return firstResponseDeadline(forRequestJSON: jsonString)
+        guard let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString),
+              let status = routeHealthStatus else {
+            return firstResponseDeadline(forRequestJSON: jsonString)
+        }
+
+        let reductionFactor: Double
+        switch status {
+        case .suspect:
+            reductionFactor = suspectDeadlineReductionFactor
+        case .open, .halfOpen:
+            reductionFactor = openDeadlineReductionFactor
+        case .closed:
+            return baseDeadline
+        }
+
+        let reducedDeadline = baseDeadline * reductionFactor
+        return reducedDeadline
     }
 
     static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -1394,23 +1418,24 @@ enum OpenAICompatTemporaryShim {
         salvagesBestEffortRepair: Bool
     ) -> SemanticFailureDisposition {
         let bestEffortRepairedBodyData = evaluation.repairedBodyData ?? preservedBestEffortRepair
-        if evaluation.shouldRetry, semanticRetriesRemaining > 0 {
+
+        if !evaluation.shouldRetry {
+            return .returnRepaired(evaluation.normalizedBodyData ?? bestEffortRepairedBodyData ?? Data())
+        }
+
+        if semanticRetriesRemaining > 0 {
             return .retry(
                 nextSemanticRetriesRemaining: semanticRetriesRemaining - 1,
                 preservedBestEffortRepair: bestEffortRepairedBodyData
             )
         }
 
-        if evaluation.shouldRetry,
-           salvagesBestEffortRepair,
+        if salvagesBestEffortRepair,
            let repairedBodyData = bestEffortRepairedBodyData {
             return .returnRepaired(repairedBodyData)
         }
 
-        return evaluation.shouldRetry ? .returnGatewayError : .retry(
-            nextSemanticRetriesRemaining: semanticRetriesRemaining,
-            preservedBestEffortRepair: bestEffortRepairedBodyData
-        )
+        return .returnGatewayError
     }
 
     static func transportFailureDisposition(
@@ -1763,6 +1788,9 @@ enum OpenAICompatTemporaryShim {
         if let smartAlias = smartAliasDefinition(forRequestModel: requestModel),
            let primaryCandidate = smartAlias.candidates.first {
             return resolveConfiguredRoute(forRequestModel: primaryCandidate)
+        }
+        if let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
+            return route
         }
         return nil
     }
@@ -2740,12 +2768,31 @@ enum OpenAICompatTemporaryShim {
         return max(0, failureScore - decaySteps)
     }
 
+    private static let highTimeoutRateThreshold: Double = 0.3
+    private static let highInvalidSuccessRateThreshold: Double = 0.2
+
     private static func effectiveFailureThreshold(
         policy: RouteCircuitBreakerPolicy,
         metrics: RouteRollingMetrics
     ) -> Int {
-        _ = metrics
-        return policy.failureThreshold
+        let baseThreshold = policy.failureThreshold
+
+        if metrics.requestCount == 0 {
+            return baseThreshold
+        }
+
+        let timeoutRate = metrics.timeoutRate
+        let invalidSuccessRate = metrics.invalidSuccessRate
+
+        if timeoutRate > highTimeoutRateThreshold {
+            return max(1, baseThreshold - 2)
+        }
+
+        if invalidSuccessRate > highInvalidSuccessRateThreshold {
+            return max(1, baseThreshold - 1)
+        }
+
+        return baseThreshold
     }
 
     private static func updatedRollingMetrics(
