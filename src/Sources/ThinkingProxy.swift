@@ -286,6 +286,7 @@ enum OpenAICompatTemporaryShim {
         let modificationDate: Date?
         let routesByRequestModel: [String: RouteIdentity]
         let nvidiaRoutesByRequestModel: [String: RouteIdentity]
+        let anthropicRequestModels: Set<String>
         let smartAliasesByAlias: [String: SmartAliasDefinition]
     }
 
@@ -326,10 +327,11 @@ enum OpenAICompatTemporaryShim {
     private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = [
         "z-ai/glm5": RequestPolicy(
             minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 200,
-            firstResponseDeadline: 25,
-            bufferedResponseDeadline: 28,
+            attemptTimeout: 300,
+            firstResponseDeadline: 240,
+            bufferedResponseDeadline: 285,
             transportRetries: 0,
             semanticRetries: 1,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -343,10 +345,11 @@ enum OpenAICompatTemporaryShim {
         ),
         "moonshotai/kimi-k2.5": RequestPolicy(
             minimumMaxTokens: 384,
+            maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 200,
-            firstResponseDeadline: 25,
-            bufferedResponseDeadline: 28,
+            attemptTimeout: 90,
+            firstResponseDeadline: 45,
+            bufferedResponseDeadline: 75,
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -360,10 +363,11 @@ enum OpenAICompatTemporaryShim {
         ),
         "minimaxai/minimax-m2.5": RequestPolicy(
             minimumMaxTokens: 128,
+            maximumMaxTokens: 65536,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 200,
-            firstResponseDeadline: 25,
-            bufferedResponseDeadline: 28,
+            attemptTimeout: 300,
+            firstResponseDeadline: 240,
+            bufferedResponseDeadline: 285,
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -379,6 +383,7 @@ enum OpenAICompatTemporaryShim {
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
             minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
@@ -396,6 +401,7 @@ enum OpenAICompatTemporaryShim {
         ),
         "glm-5": RequestPolicy(
             minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
@@ -411,8 +417,9 @@ enum OpenAICompatTemporaryShim {
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
         ),
-        "glm-5-turbo": RequestPolicy(
+        "glm-5.1": RequestPolicy(
             minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
             firstResponseDeadline: nil,
@@ -427,11 +434,138 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
+        ),
+        "proxy-worker-smart-router": RequestPolicy(
+            minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: false,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "mimo-v2-pro-kilocode": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "xiaomi/mimo-v2-pro:free": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "mimo-v2-pro-opencode": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "mimo-v2-pro-free": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "minimax-m2.5-free": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: true,
+            salvagesBestEffortRepair: true,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
+        ),
+        "minimax-m2.5-opencode": RequestPolicy(
+            minimumMaxTokens: 128,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 200,
+            firstResponseDeadline: nil,
+            bufferedResponseDeadline: nil,
+            transportRetries: 2,
+            semanticRetries: 2,
+            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: true,
+            allowsThinkLeakRepair: true,
+            salvagesBestEffortRepair: true,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
         )
     ]
 
     private struct RequestPolicy {
         let minimumMaxTokens: Int?
+        let maximumMaxTokens: Int?
         let strippedFields: Set<String>
         let attemptTimeout: TimeInterval?
         let firstResponseDeadline: TimeInterval?
@@ -464,18 +598,21 @@ enum OpenAICompatTemporaryShim {
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
-        failureThreshold: 2,
+        failureThreshold: 4,
         cooldown: 300,
-        recoverySuccessThreshold: 2
+        recoverySuccessThreshold: 1
     )
     private static let routeRollingWindow = 8
     private static let fastCanaryInterval: TimeInterval = 30
     private static let defaultCanaryInterval: TimeInterval = 60
-    private static let defaultSuspectHedgeDelay: TimeInterval = 6
-    private static let suspectFirstResponseDeadline: TimeInterval = 8
+    private static let defaultSuspectHedgeDelay: TimeInterval = 45
     private static let routeFailureScoreDecayInterval: TimeInterval = 180
+    private static let legacyRequestModelRewrites: [String: String] = [
+        "glm-5": "glm-5.1",
+        "glm-5-turbo": "glm-5.1"
+    ]
 
-    private enum ToolCallValidation {
+    fileprivate enum ToolCallValidation {
         case none
         case valid
         case invalid
@@ -492,11 +629,19 @@ enum OpenAICompatTemporaryShim {
               isChatCompletionsPath(path),
               let jsonData = jsonString.data(using: .utf8),
               var json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-              let model = json["model"] as? String,
-              let policy = policy(forModel: model) else {
+              let rawModel = json["model"] as? String else {
+            return nil
+        }
+        let model = normalizedRequestModel(rawModel)
+        guard let policy = policy(forModel: model) else {
             return nil
         }
         var modified = false
+
+        if model != rawModel {
+            json["model"] = model
+            modified = true
+        }
 
         if let messages = json["messages"] as? [[String: Any]] {
             var normalizedMessages = messages
@@ -527,6 +672,16 @@ enum OpenAICompatTemporaryShim {
             } else {
                 json["max_tokens"] = minimumMaxTokens
                 modified = true
+            }
+        }
+
+        if let maximumMaxTokens = policy.maximumMaxTokens {
+            for tokenField in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                if let currentMaxTokens = integerValue(json[tokenField]),
+                   currentMaxTokens > maximumMaxTokens {
+                    json[tokenField] = maximumMaxTokens
+                    modified = true
+                }
             }
         }
 
@@ -659,8 +814,169 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
+    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
+    private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
+    private static let publicWorkerPoolAliases: Set<String> = [
+        "worker",
+        "glm-5.1",
+        publicFactoryWorkerSmartRouterAlias
+    ]
+    private static let toolHeavyWorkerPublicAliases: Set<String> = [
+        "worker",
+        "glm-5.1",
+        publicFactoryWorkerSmartRouterAlias
+    ]
+    private static let managedResolvedRoutesByRequestModel: [String: RouteIdentity] = [
+        proxyPoolToolWorkerPrimaryCandidate: RouteIdentity(
+            providerID: "openai",
+            canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
+        )
+    ]
+
+    static func workerPrimaryCandidateModel() -> String {
+        proxyPoolToolWorkerPrimaryCandidate
+    }
+
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
-        configuredRouteConfiguration().smartAliasesByAlias[requestModel]
+        let requestModel = normalizedRequestModel(requestModel)
+        let smartAliases = configuredRouteConfiguration().smartAliasesByAlias
+        if let exact = smartAliases[requestModel] {
+            return exact
+        }
+
+        // `worker` is a proxy-internal pool alias. It is useful inside VibeProxy for policy, failover,
+        // and audit semantics, but clients like Factory should not need to couple themselves to that
+        // internal alias name.
+        //
+        // Factory currently re-resolves the raw API model string in some runtime paths and does not
+        // reliably preserve the original custom-model identity. That means the inner API model can
+        // leak back into Droid's built-in model lookup even though the user selected a custom model.
+        //
+        // The pooled route therefore keeps a neutral public alias for Droid/Factory safety and one
+        // legacy concrete alias for direct proxy users:
+        // - `proxy-worker-smart-router` is the Droid-safe public entrypoint for Factory workers
+        // - `glm-5.1` remains a legacy direct public pooled entrypoint for existing proxy callers
+        //
+        // Factory mission workers now use the neutral `proxy-worker-smart-router` public alias so the
+        // user-facing worker contract stays stable while VibeProxy can still choose the best runtime
+        // lane per request class. That alias must therefore behave like a real smart router, not a
+        // single hard-coded backend with a friendlier name.
+        //
+        // Important: callers hitting this branch still see their original public alias on the way out.
+        // The internal `worker` alias remains a proxy concern, not an external runtime contract.
+        if requestModel == "glm-5.1" || requestModel == publicFactoryWorkerSmartRouterAlias {
+            return smartAliases["worker"]
+        }
+
+        return nil
+    }
+
+    static func effectiveSmartAliasCandidateModels(
+        forPublicAlias publicAlias: String,
+        method: String,
+        path: String,
+        jsonString: String,
+        smartAlias: SmartAliasDefinition
+    ) -> [String] {
+        guard publicWorkerPoolAliases.contains(publicAlias),
+              method == "POST" else {
+            return smartAlias.candidates
+        }
+
+        guard isChatCompletionsPath(path),
+              let primaryCandidate = smartAlias.candidates.first else {
+            return smartAlias.candidates
+        }
+
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return [primaryCandidate]
+        }
+
+        let hasTools = (json["tools"] as? [Any])?.isEmpty == false
+        let hasStructuredOutput = json["response_format"] != nil
+        let isOversizedExecPayload = jsonString.utf8.count >= 65536
+        let isToolHeavyWorkerRequest = hasTools || hasStructuredOutput || isOversizedExecPayload
+
+        // Factory mission workers send large tool-bearing Exec payloads. Those requests have
+        // repeatedly produced success-shaped 200s with empty assistant content from the GLM lane,
+        // which breaks the worker contract even though the transport technically succeeded.
+        //
+        // Tool-heavy worker/smart-router requests use the same health-ranked pool as plain chat.
+        // The GPT-5.4 lane was removed after sustained 402/500 failures made it a latency penalty
+        // with no reliability upside — the pool candidates (glm-5.1-zai, minimax, kimi, mimo)
+        // now carry the full tool-heavy workload with health-ranked failover.
+        if isToolHeavyWorkerRequest,
+           toolHeavyWorkerPublicAliases.contains(publicAlias) {
+            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates)
+            if !rankedCandidates.isEmpty {
+                return rankedCandidates
+            }
+        }
+
+        if isToolHeavyWorkerRequest {
+            return [primaryCandidate]
+        }
+
+        return smartAlias.candidates
+    }
+
+    static func forcedSmartAliasProbeCandidateModels(
+        forPublicAlias publicAlias: String,
+        method: String,
+        path: String,
+        jsonString: String,
+        smartAlias: SmartAliasDefinition
+    ) -> Set<String> {
+        let effectiveCandidates = effectiveSmartAliasCandidateModels(
+            forPublicAlias: publicAlias,
+            method: method,
+            path: path,
+            jsonString: jsonString,
+            smartAlias: smartAlias
+        )
+
+        guard publicWorkerPoolAliases.contains(publicAlias),
+              method == "POST",
+              isChatCompletionsPath(path),
+              effectiveCandidates.count == 1,
+              let validatedCandidate = effectiveCandidates.first else {
+            return []
+        }
+
+        // When a Factory-style worker request is pinned to a single validated lane because the
+        // broader pool is not a valid contract for that request class, stale circuit state must
+        // not suppress that only safe backend entirely. Probe it directly and let the live attempt
+        // decide whether the route is still bad; a success will close the circuit immediately.
+        return [validatedCandidate]
+    }
+
+    static func smartAliasContractError(forRequestModel requestModel: String) -> ClientFacingNVIDIAFailure? {
+        // Validate the internal alias and the one explicit public pooled entrypoint against the same
+        // underlying pool contract. `worker` stays proxy-internal; `glm-5.1` is the only remaining
+        // external pooled alias.
+        guard publicWorkerPoolAliases.contains(requestModel),
+              let smartAlias = smartAliasDefinition(forRequestModel: requestModel) else {
+            return nil
+        }
+
+        guard let primaryCandidate = smartAlias.candidates.first,
+              primaryCandidate == "glm-5.1-zai",
+              let primaryRoute = resolveConfiguredRoute(forRequestModel: primaryCandidate),
+              primaryRoute.providerID == "zai",
+              primaryRoute.canonicalModelID == "glm-5.1",
+              isAnthropicConfiguredRoute(forRequestModel: primaryCandidate) else {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 500,
+                message: "The \(requestModel) pooled alias is misconfigured: primary candidate must resolve to Anthropic-backed Z.AI glm-5.1."
+            )
+        }
+
+        return nil
+    }
+
+    static func isAnthropicConfiguredRoute(forRequestModel requestModel: String) -> Bool {
+        configuredRouteConfiguration().anthropicRequestModels.contains(requestModel)
     }
 
     static func isSafePlainChatRequest(
@@ -694,7 +1010,8 @@ enum OpenAICompatTemporaryShim {
         method: String,
         path: String,
         currentBody: String,
-        candidateModelsRemaining: [String]
+        candidateModelsRemaining: [String],
+        forceAllowClosedModels: Set<String> = []
     ) -> (body: String, model: String, remainingCandidateModels: [String])? {
         var remainingCandidateModels = candidateModelsRemaining
         while !remainingCandidateModels.isEmpty {
@@ -706,11 +1023,12 @@ enum OpenAICompatTemporaryShim {
                 method: method,
                 path: path,
                 replacingRequestModelIn: currentBody,
-                with: nextCandidateModel
+                    with: nextCandidateModel
             ) else {
                 continue
             }
-            if isConfiguredRouteOpen(forRequestModel: nextCandidateModel) {
+            if isConfiguredRouteOpen(forRequestModel: nextCandidateModel) &&
+                !forceAllowClosedModels.contains(nextCandidateModel) {
                 continue
             }
             return (candidateBody, nextCandidateModel, remainingCandidateModels)
@@ -722,11 +1040,13 @@ enum OpenAICompatTemporaryShim {
         method: String,
         path: String,
         currentBody: String,
-        candidateModelsRemaining: [String]
+        candidateModelsRemaining: [String],
+        forceAllowClosedModels: Set<String> = []
     ) -> [(body: String, model: String)] {
         candidateModelsRemaining.compactMap { candidateModel in
             guard resolveConfiguredRoute(forRequestModel: candidateModel) != nil,
-                  !isConfiguredRouteOpen(forRequestModel: candidateModel),
+                  (!isConfiguredRouteOpen(forRequestModel: candidateModel) ||
+                    forceAllowClosedModels.contains(candidateModel)),
                   let candidateBody = rewrittenRequestJSON(
                     method: method,
                     path: path,
@@ -838,11 +1158,11 @@ enum OpenAICompatTemporaryShim {
         }
 
         if route.providerID == "zai",
-           route.canonicalModelID == "glm-5-turbo",
+           route.canonicalModelID == "glm-5.1",
            isResponsesPath(path) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "Z.AI glm-5-turbo does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions."
+                message: "Z.AI glm-5.1 does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions."
             )
         }
 
@@ -926,6 +1246,10 @@ enum OpenAICompatTemporaryShim {
         policy(forRequestJSON: jsonString)?.attemptTimeout
     }
 
+    static func attemptTimeout(forRequestModel requestModel: String) -> TimeInterval? {
+        policy(forModel: requestModel)?.attemptTimeout
+    }
+
     static func firstResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
@@ -934,12 +1258,8 @@ enum OpenAICompatTemporaryShim {
         forRequestJSON jsonString: String,
         routeHealthStatus: RouteHealthStatus?
     ) -> TimeInterval? {
-        let baseline = firstResponseDeadline(forRequestJSON: jsonString)
-        guard routeHealthStatus == .suspect,
-              let baseline else {
-            return baseline
-        }
-        return min(baseline, suspectFirstResponseDeadline)
+        _ = routeHealthStatus
+        return firstResponseDeadline(forRequestJSON: jsonString)
     }
 
     static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -1214,13 +1534,41 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func modelName(forRequestJSON jsonString: String) -> String? {
+    static func rawModelName(forRequestJSON jsonString: String) -> String? {
         guard let jsonData = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
               let model = json["model"] as? String else {
             return nil
         }
         return model
+    }
+
+    static func modelName(forRequestJSON jsonString: String) -> String? {
+        guard let model = rawModelName(forRequestJSON: jsonString) else {
+            return nil
+        }
+        return normalizedRequestModel(model)
+    }
+
+    static func normalizedRequestModelRewrite(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> (rewrittenJSONString: String, originalModel: String, normalizedModel: String)? {
+        guard let originalModel = rawModelName(forRequestJSON: jsonString) else {
+            return nil
+        }
+        let normalizedModel = normalizedRequestModel(originalModel)
+        guard normalizedModel != originalModel,
+              let rewrittenJSONString = rewrittenRequestJSON(
+                method: method,
+                path: path,
+                replacingRequestModelIn: jsonString,
+                with: normalizedModel
+              ) else {
+            return nil
+        }
+        return (rewrittenJSONString, originalModel, normalizedModel)
     }
 
     static func filteredModelListBodyRemovingOpenNVIDIARoutes(_ bodyData: Data, now: Date = Date()) -> Data? {
@@ -1231,32 +1579,30 @@ enum OpenAICompatTemporaryShim {
 
         let unavailableModelIDs = unavailableRequestModelIDs(at: now)
         var changed = false
-        var filteredData = data.filter { entry in
+        var seenNormalizedIDs: Set<String> = []
+        let filteredData = data.compactMap { entry -> [String: Any]? in
             guard let id = entry["id"] as? String else {
-                return true
+                return entry
             }
-            let keep = !unavailableModelIDs.contains(id)
+            let normalizedID = normalizedRequestModel(id)
+            let keep = !unavailableModelIDs.contains(id) && !unavailableModelIDs.contains(normalizedID)
             if !keep {
                 changed = true
+                return nil
             }
-            return keep
-        }
 
-        let existingIDs = Set(filteredData.compactMap { $0["id"] as? String })
-        for smartAlias in configuredRouteConfiguration().smartAliasesByAlias.values.sorted(by: { $0.alias < $1.alias }) {
-            guard !existingIDs.contains(smartAlias.alias),
-                  smartAlias.candidates.contains(where: {
-                      resolveConfiguredRoute(forRequestModel: $0) != nil &&
-                      !isConfiguredRouteOpen(forRequestModel: $0, at: now)
-                  }) else {
-                continue
+            var filteredEntry = entry
+            if normalizedID != id {
+                filteredEntry["id"] = normalizedID
+                changed = true
             }
-            filteredData.append([
-                "id": smartAlias.alias,
-                "object": "model",
-                "owned_by": "smart-alias"
-            ])
-            changed = true
+
+            guard seenNormalizedIDs.insert(normalizedID).inserted else {
+                changed = true
+                return nil
+            }
+
+            return filteredEntry
         }
 
         guard changed else {
@@ -1274,7 +1620,7 @@ enum OpenAICompatTemporaryShim {
     static func quarantinedNVIDIAHostedRequestModels(at now: Date = Date()) -> [String] {
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            let routesByHealthKey = configuredRouteConfiguration().routesByRequestModel.values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
+            let routesByHealthKey = resolvedRoutesByRequestModel().values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
                 routesByHealthKey[route.routeHealthKey] = route
             }
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
@@ -1287,9 +1633,20 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    private static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
+        if let route = resolveConfiguredRoute(forRequestModel: requestModel) {
+            return route
+        }
+        if let smartAlias = smartAliasDefinition(forRequestModel: requestModel),
+           let primaryCandidate = smartAlias.candidates.first {
+            return resolveConfiguredRoute(forRequestModel: primaryCandidate)
+        }
+        return nil
+    }
+
     static func routeHealthStatus(forRequestModel requestModel: String, at now: Date = Date()) -> RouteHealthStatus? {
         _ = now
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
         return routeHealthQueue.sync {
@@ -1299,7 +1656,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func rollingMetrics(forRequestModel requestModel: String) -> RouteRollingMetrics? {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
         return routeHealthQueue.sync {
@@ -1309,7 +1666,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func recommendedNVIDIAHedgeDelay(forRequestModel requestModel: String) -> TimeInterval {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return defaultSuspectHedgeDelay
         }
         return routeHealthQueue.sync {
@@ -1331,7 +1688,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func isConfiguredRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return false
         }
         return routeHealthQueue.sync {
@@ -1353,7 +1710,8 @@ enum OpenAICompatTemporaryShim {
     static func recordRouteFailure(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
-        at now: Date = Date()
+        at now: Date = Date(),
+        forcedOpenUntil: Date? = nil
     ) {
         guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
             return
@@ -1365,7 +1723,8 @@ enum OpenAICompatTemporaryShim {
                 current: current,
                 afterFailureAt: now,
                 telemetryEvent: telemetryEvent,
-                policy: routeCircuitBreakerPolicy
+                policy: routeCircuitBreakerPolicy,
+                forcedOpenUntil: forcedOpenUntil
             )
             let enrichedTelemetryEvent = telemetryEvent.map {
                 enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
@@ -1441,10 +1800,10 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func routeHealthSnapshotForTesting() -> [String: RouteCircuitState] {
+    static func routeHealthSnapshot() -> [String: RouteCircuitState] {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            let routesByHealthKey = configuredRouteConfiguration().routesByRequestModel.values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
+            let routesByHealthKey = resolvedRoutesByRequestModel().values.reduce(into: [String: OpenAICompatTemporaryShim.RouteIdentity]()) { routesByHealthKey, route in
                 routesByHealthKey[route.routeHealthKey] = route
             }
             return routeCircuitStatesByRouteHealthKey.reduce(into: [String: RouteCircuitState]()) { snapshot, entry in
@@ -1452,6 +1811,10 @@ enum OpenAICompatTemporaryShim {
                 snapshot[canonicalModelID] = entry.value
             }
         }
+    }
+
+    static func routeHealthSnapshotForTesting() -> [String: RouteCircuitState] {
+        routeHealthSnapshot()
     }
 
     static func reloadPersistedRouteHealthForTesting() {
@@ -1570,15 +1933,340 @@ enum OpenAICompatTemporaryShim {
         return retryableTransportErrorCodes.contains(nsError.code)
     }
 
-    private static func isChatCompletionsPath(_ path: String) -> Bool {
+    fileprivate static func isChatCompletionsPath(_ path: String) -> Bool {
         path == "/v1/chat/completions" || path == "/api/v1/chat/completions"
     }
 
-    private static func isResponsesPath(_ path: String) -> Bool {
+    fileprivate static func isResponsesPath(_ path: String) -> Bool {
         path == "/v1/responses" || path == "/api/v1/responses"
     }
 
-    private static func integerValue(_ value: Any?) -> Int? {
+    fileprivate static func chatCompletionsPath(matching path: String) -> String {
+        path.hasPrefix("/api/") ? "/api/v1/chat/completions" : "/v1/chat/completions"
+    }
+
+    static func chatCompletionsRequestJSON(fromResponsesRequestJSON jsonString: String) -> String? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String else {
+            return nil
+        }
+
+        var chatJSON: [String: Any] = [
+            "model": normalizedRequestModel(model)
+        ]
+
+        var messages: [[String: Any]] = []
+        if let instructions = (json["instructions"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !instructions.isEmpty {
+            messages.append([
+                "role": "system",
+                "content": instructions
+            ])
+        }
+
+        guard let inputMessages = chatMessages(fromResponsesInput: json["input"]) else {
+            return nil
+        }
+        messages.append(contentsOf: inputMessages)
+        guard !messages.isEmpty else {
+            return nil
+        }
+
+        chatJSON["messages"] = messages
+
+        if let stream = json["stream"] as? Bool {
+            chatJSON["stream"] = stream
+        }
+        if json["tools"] != nil {
+            guard let convertedTools = chatCompletionTools(fromResponsesTools: json["tools"]) else {
+                return nil
+            }
+            chatJSON["tools"] = convertedTools
+        }
+        if let toolChoice = json["tool_choice"] {
+            chatJSON["tool_choice"] = toolChoice
+        }
+        if let parallelToolCalls = json["parallel_tool_calls"] {
+            chatJSON["parallel_tool_calls"] = parallelToolCalls
+        }
+
+        if let maxTokens = integerValue(json["max_output_tokens"])
+            ?? integerValue(json["max_tokens"])
+            ?? integerValue(json["max_completion_tokens"]) {
+            chatJSON["max_tokens"] = maxTokens
+        }
+
+        for passthroughField in [
+            "temperature",
+            "top_p",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "seed",
+            "n",
+            "user",
+            "response_format",
+            "metadata"
+        ] where json[passthroughField] != nil {
+            chatJSON[passthroughField] = json[passthroughField]
+        }
+
+        guard let rewrittenJSONData = try? JSONSerialization.data(withJSONObject: chatJSON),
+              let rewrittenJSONString = String(data: rewrittenJSONData, encoding: .utf8) else {
+            return nil
+        }
+        return transformRequest(
+            method: "POST",
+            path: chatCompletionsPath(matching: "/v1/chat/completions"),
+            jsonString: rewrittenJSONString
+        ) ?? rewrittenJSONString
+    }
+
+    private static func chatMessages(fromResponsesInput input: Any?) -> [[String: Any]]? {
+        guard let input else {
+            return []
+        }
+
+        if let inputString = input as? String {
+            return [[
+                "role": "user",
+                "content": inputString
+            ]]
+        }
+
+        guard let inputItems = input as? [Any] else {
+            return nil
+        }
+
+        var messages: [[String: Any]] = []
+        for inputItem in inputItems {
+            if let inputString = inputItem as? String {
+                messages.append([
+                    "role": "user",
+                    "content": inputString
+                ])
+                continue
+            }
+
+            guard let inputDictionary = inputItem as? [String: Any],
+                  let convertedMessages = chatMessages(fromResponsesInputItem: inputDictionary) else {
+                return nil
+            }
+            messages.append(contentsOf: convertedMessages)
+        }
+
+        return messages
+    }
+
+    private static func chatMessages(fromResponsesInputItem item: [String: Any]) -> [[String: Any]]? {
+        let normalizedRole = (item["role"] as? String)?.lowercased()
+        let normalizedType = (item["type"] as? String)?.lowercased()
+
+        if normalizedType == "reasoning" {
+            let summary = (flattenedResponseInputText(from: item["summary"]) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !summary.isEmpty else {
+                return []
+            }
+            return [[
+                "role": "assistant",
+                "content": "<thinking>\n\(summary)\n</thinking>"
+            ]]
+        }
+
+        if normalizedType == "function_call" || normalizedType == "custom_tool_call" {
+            let callID = (item["call_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = (item["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let callID, !callID.isEmpty, let name, !name.isEmpty else {
+                return nil
+            }
+
+            let arguments: String
+            if normalizedType == "custom_tool_call" {
+                let customInput: [String: Any] = [
+                    "input": (item["input"] as? String) ?? ""
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: customInput),
+                      let encoded = String(data: data, encoding: .utf8) else {
+                    return nil
+                }
+                arguments = encoded
+            } else if let rawArguments = item["arguments"] as? String {
+                arguments = rawArguments
+            } else {
+                return nil
+            }
+
+            return [[
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [[
+                    "id": callID,
+                    "type": "function",
+                    "function": [
+                        "name": name,
+                        "arguments": arguments
+                    ]
+                ]]
+            ]]
+        }
+
+        if normalizedType == "function_call_output" || normalizedType == "custom_tool_call_output" {
+            let callID = (item["call_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let callID, !callID.isEmpty else {
+                return nil
+            }
+            return [[
+                "role": "tool",
+                "tool_call_id": callID,
+                "content": stringValue(fromJSONValue: item["output"]) ?? ""
+            ]]
+        }
+
+        if let normalizedRole {
+            let chatRole = normalizedRole == "developer" ? "system" : normalizedRole
+            guard ["system", "user", "assistant", "tool"].contains(chatRole) else {
+                return nil
+            }
+
+            if chatRole == "tool" {
+                let toolCallID = (item["call_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let toolCallID, !toolCallID.isEmpty else {
+                    return nil
+                }
+                return [[
+                    "role": "tool",
+                    "tool_call_id": toolCallID,
+                    "content": stringValue(fromJSONValue: item["content"]) ?? stringValue(fromJSONValue: item["output"]) ?? ""
+                ]]
+            }
+
+            guard let content = flattenedResponseInputText(from: item["content"])
+                ?? stringValue(fromJSONValue: item["content"]) else {
+                return nil
+            }
+            return [[
+                "role": chatRole,
+                "content": content
+            ]]
+        }
+
+        return nil
+    }
+
+    private static func flattenedResponseInputText(from content: Any?) -> String? {
+        guard let content else {
+            return nil
+        }
+
+        if let stringContent = content as? String {
+            return stringContent
+        }
+
+        guard let segments = content as? [Any] else {
+            return nil
+        }
+
+        var collectedSegments: [String] = []
+        for segment in segments {
+            if let stringSegment = segment as? String {
+                collectedSegments.append(stringSegment)
+                continue
+            }
+
+            guard let dictionary = segment as? [String: Any] else {
+                return nil
+            }
+
+            let type = (dictionary["type"] as? String)?.lowercased()
+            let textValue = dictionary["text"] as? String
+            if let textValue,
+               type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" {
+                collectedSegments.append(textValue)
+                continue
+            }
+
+            return nil
+        }
+
+        guard !collectedSegments.isEmpty else {
+            return nil
+        }
+        return collectedSegments.joined()
+    }
+
+    private static func stringValue(fromJSONValue value: Any?) -> String? {
+        guard let value else {
+            return nil
+        }
+
+        if let stringValue = value as? String {
+            return stringValue
+        }
+        if let numberValue = value as? NSNumber {
+            return numberValue.stringValue
+        }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let encoded = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return encoded
+    }
+
+    private static func chatCompletionTools(fromResponsesTools value: Any?) -> [[String: Any]]? {
+        guard let value else {
+            return nil
+        }
+        guard let tools = value as? [Any] else {
+            return nil
+        }
+
+        var convertedTools: [[String: Any]] = []
+        for tool in tools {
+            guard let toolDictionary = tool as? [String: Any],
+                  let type = (toolDictionary["type"] as? String)?.lowercased() else {
+                return nil
+            }
+
+            switch type {
+            case "function":
+                if let nestedFunction = toolDictionary["function"] as? [String: Any] {
+                    convertedTools.append([
+                        "type": "function",
+                        "function": nestedFunction
+                    ])
+                    continue
+                }
+
+                guard let name = toolDictionary["name"] as? String else {
+                    return nil
+                }
+                var function: [String: Any] = [
+                    "name": name
+                ]
+                if let description = toolDictionary["description"] {
+                    function["description"] = description
+                }
+                if let parameters = toolDictionary["parameters"] {
+                    function["parameters"] = parameters
+                }
+                convertedTools.append([
+                    "type": "function",
+                    "function": function
+                ])
+            default:
+                return nil
+            }
+        }
+
+        return convertedTools
+    }
+
+    fileprivate static func integerValue(_ value: Any?) -> Int? {
         switch value {
         case let intValue as Int:
             return intValue
@@ -1589,11 +2277,45 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func providerCooldownUntil(
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        now: Date = Date()
+    ) -> Date? {
+        guard statusCode == 429,
+              let retryAfter = headerValue("Retry-After", in: headers)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !retryAfter.isEmpty else {
+            return nil
+        }
+
+        if let seconds = TimeInterval(retryAfter),
+           seconds > 0 {
+            return now.addingTimeInterval(seconds)
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter.date(from: retryAfter)
+    }
+
+    private static func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
+        for (key, value) in headers {
+            if String(describing: key).lowercased() == name.lowercased() {
+                return String(describing: value)
+            }
+        }
+        return nil
+    }
+
     private static func nextRouteCircuitState(
         current: RouteCircuitState?,
         afterFailureAt now: Date,
         telemetryEvent: RouteTelemetryEvent?,
-        policy: RouteCircuitBreakerPolicy? = nil
+        policy: RouteCircuitBreakerPolicy? = nil,
+        forcedOpenUntil: Date? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
         let failurePenalty = failurePenalty(for: telemetryEvent)
@@ -1611,6 +2333,22 @@ enum OpenAICompatTemporaryShim {
             policy: effectivePolicy,
             metrics: nextRollingMetrics
         )
+        let effectiveForcedOpenUntil = [current?.openUntil, forcedOpenUntil]
+            .compactMap { $0 }
+            .filter { $0 > now }
+            .max()
+
+        if let effectiveForcedOpenUntil {
+            return RouteCircuitState(
+                status: .open,
+                failureScore: failureThreshold,
+                recoverySuccesses: 0,
+                openUntil: effectiveForcedOpenUntil,
+                lastScoreUpdatedAt: now,
+                lastTelemetryEvent: lastTelemetryEvent,
+                rollingMetrics: nextRollingMetrics
+            )
+        }
 
         switch current?.status ?? .closed {
         case .closed, .suspect:
@@ -1703,6 +2441,17 @@ enum OpenAICompatTemporaryShim {
                 rollingMetrics: nextRollingMetrics
             )
         case .open:
+            if effectivePolicy.recoverySuccessThreshold <= 1 {
+                return RouteCircuitState(
+                    status: .closed,
+                    failureScore: 0,
+                    recoverySuccesses: 0,
+                    openUntil: nil,
+                    lastScoreUpdatedAt: now,
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics
+                )
+            }
             return RouteCircuitState(
                 status: .halfOpen,
                 failureScore: 0,
@@ -1819,12 +2568,7 @@ enum OpenAICompatTemporaryShim {
         policy: RouteCircuitBreakerPolicy,
         metrics: RouteRollingMetrics
     ) -> Int {
-        guard metrics.requestCount >= 3 else {
-            return policy.failureThreshold
-        }
-        if metrics.timeoutRate >= 0.5 || metrics.invalidSuccessRate >= 0.5 {
-            return max(1, policy.failureThreshold - 1)
-        }
+        _ = metrics
         return policy.failureThreshold
     }
 
@@ -1879,15 +2623,23 @@ enum OpenAICompatTemporaryShim {
 
     private static func recommendedNVIDIAHedgeDelay(metrics: RouteRollingMetrics?) -> TimeInterval {
         guard let metrics else { return defaultSuspectHedgeDelay }
-        if metrics.timeoutRate >= 0.5 {
-            return 3
+        if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
+           averageFirstByteLatencyMilliseconds >= 120_000 {
+            return 90
         }
         if metrics.invalidSuccessRate >= 0.5 {
-            return 2
+            return 15
         }
         if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
-           averageFirstByteLatencyMilliseconds >= 4_000 {
-            return 4
+           averageFirstByteLatencyMilliseconds >= 60_000 {
+            return 60
+        }
+        if metrics.timeoutRate >= 0.5 {
+            return 45
+        }
+        if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
+           averageFirstByteLatencyMilliseconds >= 20_000 {
+            return 45
         }
         return defaultSuspectHedgeDelay
     }
@@ -1947,7 +2699,13 @@ enum OpenAICompatTemporaryShim {
         }
 
         var loaded: [String: RouteCircuitState] = [:]
+        let validRouteHealthKeys = Set(resolvedRoutesByRequestModel().values.map(\.routeHealthKey))
+        var prunedUnknownEntries = false
         for (routeHealthKey, entry) in routes {
+            guard validRouteHealthKeys.contains(routeHealthKey) else {
+                prunedUnknownEntries = true
+                continue
+            }
             let status = (entry["status"] as? String)
                 .flatMap(RouteHealthStatus.init(rawValue:))
                 ?? ((parseISO8601Date(entry["open_until"]) != nil) ? .open : .closed)
@@ -1968,6 +2726,9 @@ enum OpenAICompatTemporaryShim {
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
+        if prunedUnknownEntries {
+            persistRouteHealthLocked()
+        }
     }
 
     private static func persistRouteHealthLocked() {
@@ -2256,7 +3017,7 @@ enum OpenAICompatTemporaryShim {
         return .flattened(collectedSegments.joined())
     }
 
-    private static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
+    fileprivate static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
         guard let toolCalls = message["tool_calls"] as? [[String: Any]],
               !toolCalls.isEmpty else {
             return .none
@@ -2308,6 +3069,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func policy(forModel model: String) -> RequestPolicy? {
+        let model = normalizedRequestModel(model)
         if let policy = nonNVIDIAMitigationPoliciesByRequestModel[model] {
             return policy
         }
@@ -2333,8 +3095,21 @@ enum OpenAICompatTemporaryShim {
         return ""
     }
 
+    private static func resolvedRoutesByRequestModel() -> [String: RouteIdentity] {
+        var routes = configuredRouteConfiguration().routesByRequestModel
+        for (requestModel, routeIdentity) in managedResolvedRoutesByRequestModel {
+            routes[requestModel] = routeIdentity
+        }
+        return routes
+    }
+
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
-        configuredRouteConfiguration().routesByRequestModel[model]
+        resolvedRoutesByRequestModel()[normalizedRequestModel(model)]
+    }
+
+    private static func normalizedRequestModel(_ model: String) -> String {
+        let legacyNormalized = legacyRequestModelRewrites[model] ?? model
+        return ThinkingProxy.factoryResolvedRouteModel(forIncomingModelID: legacyNormalized) ?? legacyNormalized
     }
 
     private static func resolveNVIDIAHostedRoute(forRequestModel model: String) -> RouteIdentity? {
@@ -2346,7 +3121,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
-        let routes = configuredRouteConfiguration().routesByRequestModel
+        let routes = resolvedRoutesByRequestModel()
         let openRouteHealthKeys: Set<String> = routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return Set(routeCircuitStatesByRouteHealthKey.compactMap { key, value in
@@ -2380,6 +3155,7 @@ enum OpenAICompatTemporaryShim {
                 modificationDate: modificationDate,
                 routesByRequestModel: loadedConfiguration.routesByRequestModel,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
+                anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
                 smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias
             )
             cachedRouteConfiguration = cachedMap
@@ -2390,11 +3166,12 @@ enum OpenAICompatTemporaryShim {
     private static func loadConfiguredRouteConfiguration(from path: String?) -> (
         routesByRequestModel: [String: RouteIdentity],
         nvidiaRoutesByRequestModel: [String: RouteIdentity],
+        anthropicRequestModels: Set<String>,
         smartAliasesByAlias: [String: SmartAliasDefinition]
     ) {
         guard let path,
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return ([:], [:], [:])
+            return ([:], [:], [], [:])
         }
 
         struct ParsedModel {
@@ -2417,6 +3194,7 @@ enum OpenAICompatTemporaryShim {
 
         var routesByRequestModel: [String: RouteIdentity] = [:]
         var nvidiaRoutesByRequestModel: [String: RouteIdentity] = [:]
+        var anthropicRequestModels: Set<String> = []
         var smartAliasesByAlias: [String: SmartAliasDefinition] = [:]
         var currentSection: ParsedSection = .none
         var currentProvider: ParsedProvider?
@@ -2516,10 +3294,16 @@ enum OpenAICompatTemporaryShim {
                     if isNVIDIAProvider {
                         nvidiaRoutesByRequestModel[alias] = routeIdentity
                     }
+                    if section == .claudeAPIKey {
+                        anthropicRequestModels.insert(alias)
+                    }
                 }
                 routesByRequestModel[canonicalModelID] = routeIdentity
                 if isNVIDIAProvider {
                     nvidiaRoutesByRequestModel[canonicalModelID] = routeIdentity
+                }
+                if section == .claudeAPIKey {
+                    anthropicRequestModels.insert(canonicalModelID)
                 }
             }
             currentProvider = nil
@@ -2692,6 +3476,7 @@ enum OpenAICompatTemporaryShim {
         return (
             routesByRequestModel,
             nvidiaRoutesByRequestModel,
+            anthropicRequestModels,
             smartAliasesByAlias.filter { !$0.key.isEmpty }
         )
     }
@@ -2734,7 +3519,7 @@ enum OpenAICompatTemporaryShim {
         return type == "function" || type == "required"
     }
 
-    private static func mergedConfigPath() -> String? {
+    static func mergedConfigPath() -> String? {
         if let overridePath = ProcessInfo.processInfo.environment["VIBEPROXY_MERGED_CONFIG_PATH"],
            !overridePath.isEmpty,
            FileManager.default.fileExists(atPath: overridePath) {
@@ -2768,6 +3553,74 @@ struct VercelGatewayConfig {
 }
 
 class ThinkingProxy {
+    private struct RuntimeProvenance {
+        let appVersion: String
+        let appBuild: String
+        let backendBinaryPath: String?
+        let backendBinaryFingerprint: String?
+        let mergedConfigPath: String?
+        let mergedConfigFingerprint: String?
+    }
+
+    private struct FactoryWorkerContract {
+        let workerModelID: String
+        let validationWorkerModelID: String?
+        let workerReasoningEffort: String?
+        let validationWorkerReasoningEffort: String?
+        let routeModel: String
+        let routeProvider: String
+        let requestSurface: String
+        let effectiveRouteModel: String
+        let effectiveRouteProvider: String?
+        let displayName: String?
+        let baseURL: String?
+        let routeHealthStatus: String?
+        let authoritativeSettingsPath: String
+        let snapshotDriftPaths: [String]
+
+        var ready: Bool {
+            snapshotDriftPaths.isEmpty && routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
+        }
+    }
+
+    private struct FactoryRoleContract {
+        let modelID: String
+        let reasoningEffort: String?
+        let routeModel: String
+        let routeProvider: String
+        let requestSurface: String
+        let effectiveRouteModel: String
+        let effectiveRouteProvider: String?
+        let displayName: String?
+        let baseURL: String?
+        let routeHealthStatus: String?
+
+        var ready: Bool {
+            routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
+        }
+    }
+
+    private struct FactoryModelBinding {
+        let incomingModelID: String
+        let authoritativeModelID: String
+        let routeModel: String
+        let routeProvider: String
+        let requestSurface: String
+        let displayName: String?
+        let baseURL: String?
+        let authoritativeSettingsPath: String
+        let source: String
+    }
+
+    private struct CachedFactoryModelBindings {
+        let settingsPath: String
+        let settingsFingerprint: String?
+        let bindingsByIncomingModelID: [String: FactoryModelBinding]
+    }
+
+    private static let factoryBindingsCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.factory-bindings-cache")
+    private static var cachedFactoryModelBindings: CachedFactoryModelBindings?
+
     struct BufferedProxyResponse {
         let data: Data?
         let response: HTTPURLResponse?
@@ -2800,7 +3653,8 @@ class ThinkingProxy {
         )
         case retryableFailure(
             requestModel: String,
-            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent,
+            cooldownUntil: Date?
         )
         case terminalResponse(
             requestModel: String,
@@ -2817,6 +3671,19 @@ class ThinkingProxy {
         )
     }
 
+    private enum SmartAliasDeliveryMode {
+        case bufferedJSON
+        case syntheticSSE
+        case bufferedResponsesJSON
+        case syntheticResponsesSSE
+    }
+
+    private enum FactoryBoundDeliveryMode {
+        case bufferedJSON
+        case syntheticChatCompletionsSSE
+        case syntheticResponsesSSE
+    }
+
     private var listener: NWListener?
     let proxyPort: UInt16 = 8317
     private let targetPort: UInt16 = 8318
@@ -2827,6 +3694,7 @@ class ThinkingProxy {
     private var nvidiaCanaryTimer: DispatchSourceTimer?
     private let nvidiaCanaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-canary")
     private var nvidiaCanarySweepInFlight = false
+    private let smartAliasForcedPrimaryRetryLimit = 2
     private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
@@ -2834,6 +3702,7 @@ class ThinkingProxy {
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
     var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
+    var forwardRequestInterceptorForTesting: ((String, String, String, [(String, String)], String, Bool, NWConnection, Bool) -> Bool)?
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
     
@@ -2845,7 +3714,8 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let defaultMitigatedAttemptTimeout: TimeInterval = 30
-        static let nvidiaCanaryTimeout: TimeInterval = 20
+        static let nvidiaCanaryTimeout: TimeInterval = 300
+        static let healthcheckTimeout: TimeInterval = 0.5
     }
 
     final class NVIDIAAttemptCoordinator {
@@ -3322,6 +4192,11 @@ class ThinkingProxy {
             return
         }
 
+        if method == "GET" && (path == "/healthz" || path == "/api/healthz") {
+            sendHealthResponse(to: connection)
+            return
+        }
+
         // Rewrite Amp CLI paths
         var rewrittenPath = path
         if path.starts(with: "/provider/") {
@@ -3355,6 +4230,8 @@ class ThinkingProxy {
         var modifiedBody = bodyString
         var thinkingEnabled = false
         var coalescingSourceBody = bodyString
+        let callerVisibleRequestedModel = OpenAICompatTemporaryShim.rawModelName(forRequestJSON: bodyString)
+        var factoryModelBinding = callerVisibleRequestedModel.flatMap { Self.factoryModelBinding(forIncomingModelID: $0) }
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -3365,7 +4242,24 @@ class ThinkingProxy {
             if let stripped = stripCacheControl(from: modifiedBody) {
                 modifiedBody = stripped
             }
-            if let shimmed = OpenAICompatTemporaryShim.transformRequest(
+
+            if let modelRewrite = OpenAICompatTemporaryShim.normalizedRequestModelRewrite(
+                method: method,
+                path: rewrittenPath,
+                jsonString: modifiedBody
+            ) {
+                modifiedBody = modelRewrite.rewrittenJSONString
+                if let binding = Self.factoryModelBinding(forIncomingModelID: modelRewrite.originalModel),
+                   binding.routeModel == modelRewrite.normalizedModel {
+                    factoryModelBinding = binding
+                    NSLog(
+                        "[ThinkingProxy] Normalized Factory model ID %@ onto %@ via %@",
+                        binding.incomingModelID,
+                        binding.routeModel,
+                        binding.source
+                    )
+                }
+            } else if let shimmed = OpenAICompatTemporaryShim.transformRequest(
                 method: method,
                 path: rewrittenPath,
                 jsonString: modifiedBody
@@ -3375,43 +4269,136 @@ class ThinkingProxy {
 
             coalescingSourceBody = modifiedBody
 
+            if let callerVisibleRequestedModel,
+               let factoryBindingError = Self.factoryModelBindingPreflightError(forIncomingModelID: callerVisibleRequestedModel) {
+                sendError(
+                    to: connection,
+                    statusCode: 409,
+                    message: factoryBindingError
+                )
+                return
+            }
+
+            if let factoryModelBinding,
+               let factoryBindingError = Self.factoryWorkerBindingContractError(for: factoryModelBinding) {
+                sendError(
+                    to: connection,
+                    statusCode: 409,
+                    message: factoryBindingError,
+                    overridingHeaders: smartAliasResolutionHeaders(
+                        publicAlias: factoryModelBinding.incomingModelID,
+                        resolvedRequestModel: factoryModelBinding.routeModel
+                    )
+                )
+                return
+            }
+
             if let requestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody),
                let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: requestModel) {
-                guard smartAlias.requestClass == "plain-chat",
-                      smartAlias.failover == "silent",
-                      OpenAICompatTemporaryShim.isSafePlainChatRequest(
-                        method: method,
-                        path: rewrittenPath,
-                        jsonString: modifiedBody
-                      ) else {
+                let publicAlias = factoryModelBinding?.incomingModelID ?? requestModel
+                // Preserve the caller-visible model name as the public alias for response rewriting
+                // and audit headers. Even when the explicit pooled alias `glm-5.1` reuses the
+                // internal `worker` pool, clients must only see the concrete public alias they
+                // asked for, never the proxy-internal pool name.
+                if let contractError = OpenAICompatTemporaryShim.smartAliasContractError(forRequestModel: requestModel) {
                     sendError(
                         to: connection,
-                        statusCode: 501,
-                        message: "The worker smart alias only supports non-streaming plain chat in this proxy; pin a specific model for streaming, tools, or structured output."
+                        statusCode: contractError.statusCode,
+                        message: contractError.message
                     )
                     return
                 }
-                let coalescingKey = coalescingKeyForSafeRequest(
-                    method: method,
+                let clientRequestedStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
+                guard let executionPlan = smartAliasExecutionPlan(
                     path: rewrittenPath,
                     body: modifiedBody,
-                    coalescingSourceBody: coalescingSourceBody,
-                    requestedModelAlias: requestModel
-                )
-                if let coalescingKey,
-                   !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
-                    NSLog("[ThinkingProxy] Joined coalesced smart-alias request for %@", requestModel)
+                    clientRequestedStream: clientRequestedStream
+                ) else {
+                    let message = OpenAICompatTemporaryShim.isResponsesPath(rewrittenPath)
+                        ? "The \(requestModel) pooled alias only supports /v1/responses payloads that can be normalized onto chat-completions in this proxy."
+                        : "The \(requestModel) pooled alias only supports /v1/chat/completions and /v1/responses requests in this proxy; use a specific model for unsupported routes."
+                    sendError(
+                        to: connection,
+                        statusCode: 501,
+                        message: message
+                    )
                     return
                 }
-                forwardSmartAliasRequest(
+                let failoverBody = clientRequestedStream
+                    ? (forcingNonStreamChatRequestBody(from: executionPlan.body) ?? executionPlan.body)
+                    : executionPlan.body
+                let effectiveCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: requestModel,
+                    method: method,
+                    path: executionPlan.path,
+                    jsonString: failoverBody,
+                    smartAlias: smartAlias
+                )
+                let forceProbeCandidateModels = OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+                    forPublicAlias: requestModel,
+                    method: method,
+                    path: executionPlan.path,
+                    jsonString: failoverBody,
+                    smartAlias: smartAlias
+                )
+
+                if !clientRequestedStream,
+                   smartAlias.requestClass == "plain-chat",
+                   smartAlias.failover == "silent",
+                   OpenAICompatTemporaryShim.isChatCompletionsPath(rewrittenPath),
+                   OpenAICompatTemporaryShim.isSafePlainChatRequest(
                     method: method,
                     path: rewrittenPath,
-                    headers: headers,
-                    body: modifiedBody,
-                    publicAlias: requestModel,
-                    candidateModels: smartAlias.candidates,
-                    originalConnection: connection,
-                    coalescingKey: coalescingKey
+                    jsonString: modifiedBody
+                   ) {
+                    let coalescingKey = coalescingKeyForSafeRequest(
+                        method: method,
+                        path: rewrittenPath,
+                        headers: headers,
+                        body: modifiedBody,
+                        coalescingSourceBody: coalescingSourceBody,
+                        requestedModelAlias: publicAlias
+                    )
+                    if let coalescingKey,
+                       !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
+                        NSLog("[ThinkingProxy] Joined coalesced smart-alias request for %@", publicAlias)
+                        return
+                    }
+                    forwardSmartAliasRequest(
+                        method: method,
+                        path: executionPlan.path,
+                        headers: headers,
+                        body: failoverBody,
+                        publicAlias: publicAlias,
+                        candidateModels: effectiveCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels,
+                        originalConnection: connection,
+                        coalescingKey: coalescingKey,
+                        deliveryMode: executionPlan.deliveryMode
+                    )
+                    return
+                }
+
+                if method == "POST" {
+                    forwardSmartAliasRequest(
+                        method: method,
+                        path: executionPlan.path,
+                        headers: headers,
+                        body: failoverBody,
+                        publicAlias: publicAlias,
+                        candidateModels: effectiveCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels,
+                        originalConnection: connection,
+                        coalescingKey: nil,
+                        deliveryMode: executionPlan.deliveryMode
+                    )
+                    return
+                }
+
+                sendError(
+                    to: connection,
+                    statusCode: 501,
+                    message: "The \(requestModel) pooled alias only supports /v1/chat/completions and /v1/responses requests in this proxy; use a specific model for unsupported routes."
                 )
                 return
             }
@@ -3437,6 +4424,7 @@ class ThinkingProxy {
             let coalescingKey = coalescingKeyForSafeRequest(
                 method: method,
                 path: rewrittenPath,
+                headers: headers,
                 body: modifiedBody,
                 coalescingSourceBody: coalescingSourceBody,
                 requestedModelAlias: nil
@@ -3466,6 +4454,24 @@ class ThinkingProxy {
             )
             return
         }
+
+        if method == "POST",
+           let factoryModelBinding,
+           let factoryBoundExecutionPlan = factoryBoundExecutionPlan(
+            path: rewrittenPath,
+            body: modifiedBody
+           ) {
+            forwardBufferedFactoryBoundRequest(
+                method: method,
+                path: rewrittenPath,
+                headers: headers,
+                body: factoryBoundExecutionPlan.body,
+                binding: factoryModelBinding,
+                deliveryMode: factoryBoundExecutionPlan.deliveryMode,
+                originalConnection: connection
+            )
+            return
+        }
         
         // Route Claude requests through Vercel AI Gateway when configured
         if vercelConfig.isActive && method == "POST" && isClaudeModelRequest(body: modifiedBody) {
@@ -3491,8 +4497,10 @@ class ThinkingProxy {
         body: String,
         publicAlias: String,
         candidateModels: [String],
+        forceProbeCandidateModels: Set<String>,
         originalConnection: NWConnection,
-        coalescingKey: String?
+        coalescingKey: String?,
+        deliveryMode: SmartAliasDeliveryMode
     ) {
         attemptSmartAliasCandidate(
             method: method,
@@ -3501,11 +4509,353 @@ class ThinkingProxy {
             currentBody: body,
             publicAlias: publicAlias,
             remainingCandidateModels: candidateModels,
+            forceProbeCandidateModels: forceProbeCandidateModels,
+            primaryProbeRetriesRemaining: forceProbeCandidateModels.isEmpty ? 0 : smartAliasForcedPrimaryRetryLimit,
             failoverDepth: 0,
             deadlineAt: Date().addingTimeInterval(smartAliasTotalTimeout(forRequestJSON: body)),
             originalConnection: originalConnection,
             coalescingKey: coalescingKey,
-            terminalFallbackOutcome: nil
+            terminalFallbackOutcome: nil,
+            deliveryMode: deliveryMode
+        )
+    }
+
+    private func forwardBufferedFactoryBoundRequest(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        binding: FactoryModelBinding,
+        deliveryMode: FactoryBoundDeliveryMode = .bufferedJSON,
+        originalConnection: NWConnection
+    ) {
+        let resolvedRequestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body) ?? binding.routeModel
+        let resolutionHeaders = smartAliasResolutionHeaders(
+            publicAlias: binding.incomingModelID,
+            resolvedRequestModel: resolvedRequestModel
+        )
+        let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: resolvedRequestModel)
+        let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: body)
+
+        sendBufferedProxyRequest(
+            method: method,
+            path: path,
+            headers: effectiveHeaders,
+            body: body,
+            timeoutInterval: timeoutInterval
+        ) { [weak self] bufferedResponse in
+            guard let self else { return }
+
+            if let error = bufferedResponse.error {
+                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
+                    binding: binding,
+                    statusCode: nil,
+                    responseBody: nil
+                ),
+                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    binding: binding,
+                    deliveryMode: deliveryMode,
+                    originalConnection: originalConnection
+                   ) {
+                    return
+                }
+                let nsError = error as NSError
+                let statusCode = (nsError.domain == NSURLErrorDomain && nsError.code == URLError.timedOut.rawValue) ? 504 : 502
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: statusCode,
+                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway",
+                    overridingHeaders: resolutionHeaders
+                )
+                return
+            }
+
+            guard let response = bufferedResponse.response,
+                  let responseData = bufferedResponse.data else {
+                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
+                    binding: binding,
+                    statusCode: nil,
+                    responseBody: nil
+                ),
+                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    binding: binding,
+                    deliveryMode: deliveryMode,
+                    originalConnection: originalConnection
+                   ) {
+                    return
+                }
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: 502,
+                    message: "Bad Gateway",
+                    overridingHeaders: resolutionHeaders
+                )
+                return
+            }
+
+            if !(200...299).contains(response.statusCode) {
+                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
+                    binding: binding,
+                    statusCode: response.statusCode,
+                    responseBody: responseData
+                ),
+                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    body: body,
+                    binding: binding,
+                    deliveryMode: deliveryMode,
+                    originalConnection: originalConnection
+                   ) {
+                    return
+                }
+            }
+
+            if !(200...299).contains(response.statusCode) || deliveryMode == .bufferedJSON {
+                self.deliverBufferedHTTPResponse(
+                    defaultConnection: originalConnection,
+                    statusCode: response.statusCode,
+                    headers: response.allHeaderFields,
+                    body: responseData,
+                    coalescingKey: nil,
+                    overridingModel: binding.incomingModelID,
+                    overridingHeaders: resolutionHeaders
+                )
+                return
+            }
+
+            let syntheticBody: Data?
+            switch deliveryMode {
+            case .bufferedJSON:
+                syntheticBody = nil
+            case .syntheticChatCompletionsSSE:
+                syntheticBody = self.syntheticChatCompletionsStreamBody(
+                    from: responseData,
+                    publicAlias: binding.incomingModelID
+                )
+            case .syntheticResponsesSSE:
+                syntheticBody = self.syntheticResponsesStreamBody(
+                    fromResponsesResponseBody: responseData,
+                    publicAlias: binding.incomingModelID
+                )
+            }
+
+            guard let syntheticBody else {
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: 502,
+                    message: "Factory-bound streaming backend returned an unusable response.",
+                    overridingHeaders: resolutionHeaders
+                )
+                return
+            }
+
+            let sseHeaders: [AnyHashable: Any] = [
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            ]
+            self.sendHTTPResponse(
+                to: originalConnection,
+                statusCode: 200,
+                headers: sseHeaders,
+                body: syntheticBody,
+                overridingHeaders: resolutionHeaders
+            )
+        }
+    }
+
+    private func shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
+        binding: FactoryModelBinding,
+        statusCode: Int?,
+        responseBody: Data?
+    ) -> Bool {
+        // Direct route requests (raw model IDs like "gpt-5.4(high)") should surface the real
+        // upstream error to the caller. The worker smart-alias path has its own candidate
+        // failover and does not go through this rescue. Silently rescuing direct routes
+        // masks permanent upstream failures (deactivated workspaces, revoked auth) and
+        // replaces them with responses from a completely different model, making debugging
+        // impossible.
+        guard binding.source == "authoritative_custom_model",
+              binding.requestSurface == "responses",
+              binding.routeProvider == "openai" || binding.routeProvider == "xai",
+              let workerContract = Self.factoryWorkerContract(),
+              workerContract.workerModelID != binding.incomingModelID,
+              workerContract.routeModel != binding.routeModel,
+              workerContract.snapshotDriftPaths.isEmpty,
+              workerContract.ready,
+              OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) != nil else {
+            return false
+        }
+
+        guard let statusCode else {
+            return true
+        }
+
+        if statusCode == 502 || statusCode == 503 || statusCode == 504 {
+            return true
+        }
+
+        guard let fallbackError = factoryDirectFallbackErrorDetails(
+            statusCode: statusCode,
+            responseBody: responseBody
+        ) else {
+            return false
+        }
+
+        let errorType = fallbackError.type.lowercased()
+        let errorCode = fallbackError.code.lowercased()
+        let errorMessage = fallbackError.message.lowercased()
+
+        if statusCode == 429,
+           errorType == "usage_limit_reached" || errorCode == "usage_limit_reached" || errorMessage.contains("usage limit") {
+            return true
+        }
+
+        if statusCode == 401 || statusCode == 403 {
+            return errorCode.contains("auth") || errorType.contains("auth") || errorMessage.contains("auth")
+        }
+
+        if statusCode >= 500 {
+            return errorCode.contains("auth_not_found") ||
+                errorType.contains("auth") ||
+                errorMessage.contains("auth_not_found") ||
+                errorMessage.contains("no auth available")
+        }
+
+        return false
+    }
+
+    private func factoryDirectFallbackErrorDetails(
+        statusCode: Int,
+        responseBody: Data?
+    ) -> (type: String, code: String, message: String)? {
+        _ = statusCode
+        guard let responseBody,
+              let root = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any],
+              let error = root["error"] as? [String: Any] else {
+            return nil
+        }
+
+        return (
+            (error["type"] as? String) ?? "",
+            (error["code"] as? String) ?? "",
+            (error["message"] as? String) ?? ""
+        )
+    }
+
+    private func forwardFactoryDirectBindingViaWorkerSmartAlias(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String,
+        binding: FactoryModelBinding,
+        deliveryMode: FactoryBoundDeliveryMode,
+        originalConnection: NWConnection
+    ) -> Bool {
+        guard let workerContract = Self.factoryWorkerContract(),
+              let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) else {
+            return false
+        }
+
+        let clientRequestedStream = deliveryMode != .bufferedJSON
+        guard let executionPlan = smartAliasExecutionPlan(
+            path: path,
+            body: body,
+            clientRequestedStream: clientRequestedStream
+        ) else {
+            return false
+        }
+
+        let failoverBody = clientRequestedStream
+            ? (forcingNonStreamChatRequestBody(from: executionPlan.body) ?? executionPlan.body)
+            : executionPlan.body
+        let candidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: workerContract.routeModel,
+            method: method,
+            path: executionPlan.path,
+            jsonString: failoverBody,
+            smartAlias: smartAlias
+        )
+        let forceProbeCandidateModels = OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+            forPublicAlias: workerContract.routeModel,
+            method: method,
+            path: executionPlan.path,
+            jsonString: failoverBody,
+            smartAlias: smartAlias
+        )
+
+        forwardSmartAliasRequest(
+            method: method,
+            path: executionPlan.path,
+            headers: headers,
+            body: failoverBody,
+            publicAlias: binding.incomingModelID,
+            candidateModels: candidateModels,
+            forceProbeCandidateModels: forceProbeCandidateModels,
+            originalConnection: originalConnection,
+            coalescingKey: nil,
+            deliveryMode: executionPlan.deliveryMode
+        )
+        return true
+    }
+
+    private func factoryBoundExecutionPlan(
+        path: String,
+        body: String
+    ) -> (body: String, deliveryMode: FactoryBoundDeliveryMode)? {
+        guard OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body) else {
+            return (body: body, deliveryMode: .bufferedJSON)
+        }
+
+        guard let bufferedBody = forcingNonStreamChatRequestBody(from: body) else {
+            return nil
+        }
+
+        if OpenAICompatTemporaryShim.isChatCompletionsPath(path) {
+            return (body: bufferedBody, deliveryMode: .syntheticChatCompletionsSSE)
+        }
+        if OpenAICompatTemporaryShim.isResponsesPath(path) {
+            return (body: bufferedBody, deliveryMode: .syntheticResponsesSSE)
+        }
+        return nil
+    }
+
+    private func smartAliasExecutionPlan(
+        path: String,
+        body: String,
+        clientRequestedStream: Bool
+    ) -> (path: String, body: String, deliveryMode: SmartAliasDeliveryMode)? {
+        if OpenAICompatTemporaryShim.isResponsesPath(path) {
+            guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(
+                fromResponsesRequestJSON: body
+            ) else {
+                return nil
+            }
+            return (
+                path: OpenAICompatTemporaryShim.chatCompletionsPath(matching: path),
+                body: chatBody,
+                deliveryMode: clientRequestedStream ? .syntheticResponsesSSE : .bufferedResponsesJSON
+            )
+        }
+
+        guard OpenAICompatTemporaryShim.isChatCompletionsPath(path) else {
+            return nil
+        }
+
+        return (
+            path: path,
+            body: body,
+            deliveryMode: clientRequestedStream ? .syntheticSSE : .bufferedJSON
         )
     }
 
@@ -3516,11 +4866,14 @@ class ThinkingProxy {
         currentBody: String,
         publicAlias: String,
         remainingCandidateModels: [String],
+        forceProbeCandidateModels: Set<String>,
+        primaryProbeRetriesRemaining: Int,
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
         coalescingKey: String?,
-        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        deliveryMode: SmartAliasDeliveryMode
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
@@ -3533,12 +4886,11 @@ class ThinkingProxy {
             return
         }
 
-        let rankedCandidateModels = failoverDepth == 0
-            ? remainingCandidateModels
-            : OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(remainingCandidateModels)
-
         if failoverDepth > 0 {
-            let raceableFallbackModels = rankedCandidateModels.filter { candidateModel in
+            // Preserve the configured serial failover chain until the next remaining candidates are
+            // exclusively the NVIDIA lanes that are safe to hedge/race. This keeps the MiMo free-tier
+            // routes ahead of NVIDIA, while still allowing health-based ranking inside the NVIDIA race.
+            let raceableFallbackModels = remainingCandidateModels.prefix { candidateModel in
                 guard let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
                       candidateRoute.providerID.hasPrefix("nvidia"),
                       let candidateBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
@@ -3557,20 +4909,23 @@ class ThinkingProxy {
             }
 
             if raceableFallbackModels.count >= 2 {
-                let deferredCandidateModels = rankedCandidateModels.filter { !raceableFallbackModels.contains($0) }
+                let deferredCandidateModels = Array(remainingCandidateModels.dropFirst(raceableFallbackModels.count))
                 attemptSmartAliasFallbackRace(
                     method: method,
                     path: path,
                     headers: headers,
                     currentBody: currentBody,
                     publicAlias: publicAlias,
-                    raceCandidateModels: raceableFallbackModels,
+                    raceCandidateModels: Array(raceableFallbackModels),
                     deferredCandidateModels: deferredCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                     failoverDepth: failoverDepth,
                     deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome
+                    terminalFallbackOutcome: terminalFallbackOutcome,
+                    deliveryMode: deliveryMode
                 )
                 return
             }
@@ -3580,13 +4935,16 @@ class ThinkingProxy {
             method: method,
             path: path,
             currentBody: currentBody,
-            candidateModelsRemaining: rankedCandidateModels
+            candidateModelsRemaining: remainingCandidateModels,
+            forceAllowClosedModels: forceProbeCandidateModels
         ) else {
             if let terminalFallbackOutcome {
                 deliverSmartAliasTerminalOutcome(
                     terminalFallbackOutcome,
+                    publicAlias: publicAlias,
                     originalConnection: originalConnection,
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
                 )
                 return
             }
@@ -3614,11 +4972,14 @@ class ThinkingProxy {
                     currentBody: transition.body,
                     publicAlias: publicAlias,
                     remainingCandidateModels: transition.remainingCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                     failoverDepth: failoverDepth + 1,
                     deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome
+                    terminalFallbackOutcome: terminalFallbackOutcome,
+                    deliveryMode: deliveryMode
                 )
                 return
             }
@@ -3653,11 +5014,14 @@ class ThinkingProxy {
                 candidateBody: transition.body,
                 publicAlias: publicAlias,
                 remainingCandidateModels: transition.remainingCandidateModels,
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                 failoverDepth: failoverDepth,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
-                terminalFallbackOutcome: terminalFallbackOutcome
+                terminalFallbackOutcome: terminalFallbackOutcome,
+                deliveryMode: deliveryMode
             )
         }
     }
@@ -3670,18 +5034,22 @@ class ThinkingProxy {
         publicAlias: String,
         raceCandidateModels: [String],
         deferredCandidateModels: [String],
+        forceProbeCandidateModels: Set<String>,
+        primaryProbeRetriesRemaining: Int,
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
         coalescingKey: String?,
-        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        deliveryMode: SmartAliasDeliveryMode
     ) {
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
             method: method,
             path: path,
             currentBody: currentBody,
-            candidateModelsRemaining: rankedRaceCandidateModels
+            candidateModelsRemaining: rankedRaceCandidateModels,
+            forceAllowClosedModels: forceProbeCandidateModels
         )
 
         guard raceTransitions.count >= 2 else {
@@ -3692,11 +5060,14 @@ class ThinkingProxy {
                 currentBody: currentBody,
                 publicAlias: publicAlias,
                 remainingCandidateModels: raceTransitions.map(\.model) + deferredCandidateModels,
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                 failoverDepth: failoverDepth,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
-                terminalFallbackOutcome: terminalFallbackOutcome
+                terminalFallbackOutcome: terminalFallbackOutcome,
+                deliveryMode: deliveryMode
             )
             return
         }
@@ -3760,18 +5131,21 @@ class ThinkingProxy {
                             forRequestModel: requestModel,
                             telemetryEvent: winningTelemetryEvent
                         )
-                        self.deliverBufferedHTTPResponse(
+                        self.deliverSmartAliasSuccessfulResponse(
                             defaultConnection: originalConnection,
                             statusCode: statusCode,
                             headers: headers,
                             body: body,
+                            publicAlias: publicAlias,
+                            resolvedRequestModel: requestModel,
                             coalescingKey: coalescingKey,
-                            overridingModel: publicAlias
+                            deliveryMode: deliveryMode
                         )
-                    case .retryableFailure(let requestModel, let telemetryEvent):
+                    case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
                         OpenAICompatTemporaryShim.recordRouteFailure(
                             forRequestModel: requestModel,
-                            telemetryEvent: telemetryEvent
+                            telemetryEvent: telemetryEvent,
+                            forcedOpenUntil: cooldownUntil
                         )
                         coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                         remainingAttempts -= 1
@@ -3800,11 +5174,14 @@ class ThinkingProxy {
                             currentBody: currentBody,
                             publicAlias: publicAlias,
                             remainingCandidateModels: deferredCandidateModels,
+                            forceProbeCandidateModels: forceProbeCandidateModels,
+                            primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                             failoverDepth: failoverDepth + raceTransitions.count,
                             deadlineAt: deadlineAt,
                             originalConnection: originalConnection,
                             coalescingKey: coalescingKey,
-                            terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome
+                            terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
+                            deliveryMode: deliveryMode
                         )
                         return
                     }
@@ -3812,8 +5189,10 @@ class ThinkingProxy {
                     if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
                         self.deliverSmartAliasTerminalOutcome(
                             terminalOutcome,
+                            publicAlias: publicAlias,
                             originalConnection: originalConnection,
-                            coalescingKey: coalescingKey
+                            coalescingKey: coalescingKey,
+                            deliveryMode: deliveryMode
                         )
                         return
                     }
@@ -3841,11 +5220,14 @@ class ThinkingProxy {
         candidateBody: String,
         publicAlias: String,
         remainingCandidateModels: [String],
+        forceProbeCandidateModels: Set<String>,
+        primaryProbeRetriesRemaining: Int,
         failoverDepth: Int,
         deadlineAt: Date,
         originalConnection: NWConnection,
         coalescingKey: String?,
-        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?
+        terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        deliveryMode: SmartAliasDeliveryMode
     ) {
         switch outcome {
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -3862,18 +5244,46 @@ class ThinkingProxy {
                 forRequestModel: requestModel,
                 telemetryEvent: winningTelemetryEvent
             )
-            deliverBufferedHTTPResponse(
+            deliverSmartAliasSuccessfulResponse(
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 headers: responseHeaders,
                 body: responseBody,
+                publicAlias: publicAlias,
+                resolvedRequestModel: requestModel,
                 coalescingKey: coalescingKey,
-                overridingModel: publicAlias
+                deliveryMode: deliveryMode
             )
-        case .retryableFailure(_, let telemetryEvent):
+        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
+            where remainingCandidateModels.isEmpty &&
+                primaryProbeRetriesRemaining > 0 &&
+                forceProbeCandidateModels.contains(requestModel):
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
-                telemetryEvent: telemetryEvent
+                telemetryEvent: telemetryEvent,
+                forcedOpenUntil: cooldownUntil
+            )
+            attemptSmartAliasCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: candidateBody,
+                publicAlias: publicAlias,
+                remainingCandidateModels: [requestModel],
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining - 1,
+                failoverDepth: failoverDepth,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: terminalFallbackOutcome,
+                deliveryMode: deliveryMode
+            )
+        case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: telemetryEvent.requestModel,
+                telemetryEvent: telemetryEvent,
+                forcedOpenUntil: cooldownUntil
             )
             attemptSmartAliasCandidate(
                 method: method,
@@ -3882,20 +5292,27 @@ class ThinkingProxy {
                 currentBody: candidateBody,
                 publicAlias: publicAlias,
                 remainingCandidateModels: remainingCandidateModels,
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                 failoverDepth: failoverDepth + 1,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
-                terminalFallbackOutcome: terminalFallbackOutcome
+                terminalFallbackOutcome: terminalFallbackOutcome,
+                deliveryMode: deliveryMode
             )
-        case .terminalResponse(_, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+        case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
             OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
             deliverBufferedHTTPResponse(
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 headers: responseHeaders,
                 body: responseBody,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: smartAliasResolutionHeaders(
+                    publicAlias: publicAlias,
+                    resolvedRequestModel: requestModel
+                )
             )
         case .terminalError(_, let statusCode, let message, let telemetryEvent):
             if let telemetryEvent {
@@ -3912,17 +5329,23 @@ class ThinkingProxy {
 
     private func deliverSmartAliasTerminalOutcome(
         _ outcome: SmartAliasCandidateAttemptOutcome,
+        publicAlias: String,
         originalConnection: NWConnection,
-        coalescingKey: String?
+        coalescingKey: String?,
+        deliveryMode: SmartAliasDeliveryMode
     ) {
         switch outcome {
-        case .terminalResponse(_, let statusCode, let responseHeaders, let responseBody, _):
+        case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, _):
             deliverBufferedHTTPResponse(
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 headers: responseHeaders,
                 body: responseBody,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: smartAliasResolutionHeaders(
+                    publicAlias: publicAlias,
+                    resolvedRequestModel: requestModel
+                )
             )
         case .terminalError(_, let statusCode, let message, _):
             deliverBufferedError(
@@ -3940,17 +5363,21 @@ class ThinkingProxy {
                 forRequestModel: requestModel,
                 telemetryEvent: winningTelemetryEvent
             )
-            deliverBufferedHTTPResponse(
+            deliverSmartAliasSuccessfulResponse(
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 headers: responseHeaders,
                 body: responseBody,
-                coalescingKey: coalescingKey
+                publicAlias: publicAlias,
+                resolvedRequestModel: requestModel,
+                coalescingKey: coalescingKey,
+                deliveryMode: deliveryMode
             )
-        case .retryableFailure(let requestModel, let telemetryEvent):
+        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: requestModel,
-                telemetryEvent: telemetryEvent
+                telemetryEvent: telemetryEvent,
+                forcedOpenUntil: cooldownUntil
             )
             deliverBufferedError(
                 defaultConnection: originalConnection,
@@ -3959,6 +5386,493 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey
             )
         }
+    }
+
+    private func deliverSmartAliasSuccessfulResponse(
+        defaultConnection: NWConnection,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        body: Data,
+        publicAlias: String,
+        resolvedRequestModel: String,
+        coalescingKey: String?,
+        deliveryMode: SmartAliasDeliveryMode
+    ) {
+        let overridingHeaders = smartAliasResolutionHeaders(
+            publicAlias: publicAlias,
+            resolvedRequestModel: resolvedRequestModel
+        )
+
+        switch deliveryMode {
+        case .bufferedJSON:
+            deliverBufferedHTTPResponse(
+                defaultConnection: defaultConnection,
+                statusCode: statusCode,
+                headers: headers,
+                body: body,
+                coalescingKey: coalescingKey,
+                overridingModel: publicAlias,
+                overridingHeaders: overridingHeaders
+            )
+        case .bufferedResponsesJSON:
+            guard let bufferedResponsesBody = responsesBody(
+                fromChatCompletionsResponseBody: body,
+                publicAlias: publicAlias
+            ) else {
+                deliverBufferedError(
+                    defaultConnection: defaultConnection,
+                    statusCode: 502,
+                    message: "Worker Responses backend returned an unusable response.",
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
+
+            deliverBufferedHTTPResponse(
+                defaultConnection: defaultConnection,
+                statusCode: statusCode,
+                headers: headers,
+                body: bufferedResponsesBody,
+                coalescingKey: coalescingKey,
+                overridingHeaders: overridingHeaders
+            )
+        case .syntheticSSE:
+            guard let syntheticBody = syntheticChatCompletionsStreamBody(
+                from: body,
+                publicAlias: publicAlias
+            ) else {
+                deliverBufferedError(
+                    defaultConnection: defaultConnection,
+                    statusCode: 502,
+                    message: "Worker streaming backend returned an unusable response.",
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
+
+            let sseHeaders: [AnyHashable: Any] = [
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            ]
+            sendHTTPResponse(
+                to: defaultConnection,
+                statusCode: 200,
+                headers: sseHeaders,
+                body: syntheticBody,
+                overridingHeaders: overridingHeaders
+            )
+        case .syntheticResponsesSSE:
+            guard let syntheticBody = syntheticResponsesStreamBody(
+                fromChatCompletionsResponseBody: body,
+                publicAlias: publicAlias
+            ) else {
+                deliverBufferedError(
+                    defaultConnection: defaultConnection,
+                    statusCode: 502,
+                    message: "Worker Responses backend returned an unusable response.",
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
+
+            let sseHeaders: [AnyHashable: Any] = [
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            ]
+            sendHTTPResponse(
+                to: defaultConnection,
+                statusCode: 200,
+                headers: sseHeaders,
+                body: syntheticBody,
+                overridingHeaders: overridingHeaders
+            )
+        }
+    }
+
+    private func forcingNonStreamChatRequestBody(from jsonString: String) -> String? {
+        guard let data = jsonString.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        json["stream"] = false
+        guard let normalized = try? JSONSerialization.data(withJSONObject: json),
+              let normalizedString = String(data: normalized, encoding: .utf8) else {
+            return nil
+        }
+        return normalizedString
+    }
+
+    private func syntheticChatCompletionsStreamBody(from responseBody: Data, publicAlias: String) -> Data? {
+        guard let root = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any] else {
+            return nil
+        }
+
+        let id = (root["id"] as? String) ?? "chatcmpl-worker"
+        let created = (root["created"] as? Int) ?? Int(Date().timeIntervalSince1970)
+        let choices = (root["choices"] as? [[String: Any]]) ?? []
+        guard !choices.isEmpty else {
+            return nil
+        }
+
+        var lines: [String] = []
+        for (fallbackIndex, choice) in choices.enumerated() {
+            let index = choice["index"] as? Int ?? fallbackIndex
+            let message = choice["message"] as? [String: Any] ?? [:]
+            var delta: [String: Any] = ["role": "assistant"]
+
+            if let content = message["content"] as? String, !content.isEmpty {
+                delta["content"] = content
+            }
+            if let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+                delta["tool_calls"] = toolCalls
+            }
+            if let refusal = message["refusal"] as? String, !refusal.isEmpty {
+                delta["refusal"] = refusal
+            }
+
+            let initialChunk: [String: Any] = [
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicAlias,
+                "choices": [[
+                    "index": index,
+                    "delta": delta,
+                    "finish_reason": NSNull()
+                ]]
+            ]
+            guard let initialData = try? JSONSerialization.data(withJSONObject: initialChunk),
+                  let initialString = String(data: initialData, encoding: .utf8) else {
+                return nil
+            }
+            lines.append("data: \(initialString)\n\n")
+
+            let finalChunk: [String: Any] = [
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicAlias,
+                "choices": [[
+                    "index": index,
+                    "delta": [:],
+                    "finish_reason": choice["finish_reason"] ?? "stop"
+                ]]
+            ]
+            guard let finalData = try? JSONSerialization.data(withJSONObject: finalChunk),
+                  let finalString = String(data: finalData, encoding: .utf8) else {
+                return nil
+            }
+            lines.append("data: \(finalString)\n\n")
+        }
+
+        lines.append("data: [DONE]\n\n")
+        return Data(lines.joined().utf8)
+    }
+
+    private func responsesBody(
+        fromChatCompletionsResponseBody responseBody: Data,
+        publicAlias: String
+    ) -> Data? {
+        guard let translatedResponse = translatedResponsesObject(
+            fromChatCompletionsResponseBody: responseBody,
+            publicAlias: publicAlias
+        ) else {
+            return nil
+        }
+        return try? JSONSerialization.data(withJSONObject: translatedResponse)
+    }
+
+    private func syntheticResponsesStreamBody(
+        fromChatCompletionsResponseBody responseBody: Data,
+        publicAlias: String
+    ) -> Data? {
+        guard let translatedResponse = translatedResponsesObject(
+            fromChatCompletionsResponseBody: responseBody,
+            publicAlias: publicAlias
+        ) else {
+            return nil
+        }
+
+        return syntheticResponsesStreamBody(
+            fromResponsesObject: translatedResponse,
+            publicAlias: publicAlias
+        )
+    }
+
+    private func syntheticResponsesStreamBody(
+        fromResponsesResponseBody responseBody: Data,
+        publicAlias: String
+    ) -> Data? {
+        guard var responseObject = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any] else {
+            return nil
+        }
+        responseObject["model"] = publicAlias
+
+        return syntheticResponsesStreamBody(
+            fromResponsesObject: responseObject,
+            publicAlias: publicAlias
+        )
+    }
+
+    private func syntheticResponsesStreamBody(
+        fromResponsesObject responseObject: [String: Any],
+        publicAlias: String
+    ) -> Data? {
+        var translatedResponse = responseObject
+        translatedResponse["model"] = publicAlias
+
+        let outputItems = (translatedResponse["output"] as? [[String: Any]]) ?? []
+        var createdResponse = translatedResponse
+        createdResponse["status"] = "in_progress"
+        createdResponse["output"] = []
+
+        var lines: [String] = []
+        guard let createdLine = sseDataLine(for: [
+            "type": "response.created",
+            "response": createdResponse
+        ]) else {
+            return nil
+        }
+        lines.append(createdLine)
+
+        for (outputIndex, outputItem) in outputItems.enumerated() {
+            guard let type = outputItem["type"] as? String else {
+                return nil
+            }
+
+            switch type {
+            case "message":
+                guard let itemID = outputItem["id"] as? String,
+                      let addedLine = sseDataLine(for: [
+                        "type": "response.output_item.added",
+                        "output_index": outputIndex,
+                        "item": outputItem
+                      ]) else {
+                    return nil
+                }
+                lines.append(addedLine)
+
+                let contentArray = (outputItem["content"] as? [[String: Any]]) ?? []
+                let outputText = contentArray.compactMap { $0["text"] as? String }.joined()
+                if !outputText.isEmpty {
+                    guard let deltaLine = sseDataLine(for: [
+                        "type": "response.output_text.delta",
+                        "output_index": outputIndex,
+                        "item_id": itemID,
+                        "content_index": 0,
+                        "delta": outputText
+                    ]),
+                    let doneTextLine = sseDataLine(for: [
+                        "type": "response.output_text.done",
+                        "output_index": outputIndex,
+                        "item_id": itemID,
+                        "content_index": 0,
+                        "text": outputText
+                    ]) else {
+                        return nil
+                    }
+                    lines.append(deltaLine)
+                    lines.append(doneTextLine)
+                }
+
+                guard let doneItemLine = sseDataLine(for: [
+                    "type": "response.output_item.done",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(doneItemLine)
+            case "function_call":
+                var addedItem = outputItem
+                let arguments = (outputItem["arguments"] as? String) ?? ""
+                addedItem["arguments"] = ""
+
+                guard let addedLine = sseDataLine(for: [
+                    "type": "response.output_item.added",
+                    "output_index": outputIndex,
+                    "item": addedItem
+                ]) else {
+                    return nil
+                }
+                lines.append(addedLine)
+
+                if !arguments.isEmpty {
+                    guard let deltaLine = sseDataLine(for: [
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": outputIndex,
+                        "delta": arguments
+                    ]),
+                    let doneArgumentsLine = sseDataLine(for: [
+                        "type": "response.function_call_arguments.done",
+                        "output_index": outputIndex,
+                        "arguments": arguments
+                    ]) else {
+                        return nil
+                    }
+                    lines.append(deltaLine)
+                    lines.append(doneArgumentsLine)
+                }
+
+                guard let doneItemLine = sseDataLine(for: [
+                    "type": "response.output_item.done",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(doneItemLine)
+            default:
+                return nil
+            }
+        }
+
+        let finalEventType = ((translatedResponse["status"] as? String) == "incomplete")
+            ? "response.incomplete"
+            : "response.completed"
+        guard let finalLine = sseDataLine(for: [
+            "type": finalEventType,
+            "response": translatedResponse
+        ]) else {
+            return nil
+        }
+        lines.append(finalLine)
+        lines.append("data: [DONE]\n\n")
+
+        return Data(lines.joined().utf8)
+    }
+
+    private func translatedResponsesObject(
+        fromChatCompletionsResponseBody responseBody: Data,
+        publicAlias: String
+    ) -> [String: Any]? {
+        guard let root = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any],
+              let choices = root["choices"] as? [[String: Any]],
+              let firstChoice = choices.first else {
+            return nil
+        }
+
+        let created = (root["created"] as? Int) ?? Int(Date().timeIntervalSince1970)
+        let responseID = translatedResponsesID(fromChatCompletionsID: root["id"] as? String)
+        let finishReason = ((firstChoice["finish_reason"] as? String) ?? "stop").lowercased()
+        let message = firstChoice["message"] as? [String: Any] ?? [:]
+
+        var outputItems: [[String: Any]] = []
+        let rawContent = (message["content"] as? String) ?? ""
+        if !rawContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            outputItems.append([
+                "id": "msg_\(responseID)",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [[
+                    "type": "output_text",
+                    "text": rawContent,
+                    "annotations": []
+                ]]
+            ])
+        }
+
+        if let toolCalls = message["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
+            for (toolIndex, toolCall) in toolCalls.enumerated() {
+                guard let function = toolCall["function"] as? [String: Any],
+                      let functionName = function["name"] as? String,
+                      let functionArguments = function["arguments"] as? String else {
+                    return nil
+                }
+                let callID = (toolCall["id"] as? String) ?? "call_\(toolIndex)"
+                outputItems.append([
+                    "id": "fc_\(callID)",
+                    "type": "function_call",
+                    "call_id": callID,
+                    "name": functionName,
+                    "arguments": functionArguments,
+                    "status": "completed"
+                ])
+            }
+        }
+
+        guard !outputItems.isEmpty else {
+            return nil
+        }
+
+        let status = finishReason == "length" ? "incomplete" : "completed"
+        var response: [String: Any] = [
+            "id": responseID,
+            "object": "response",
+            "created": created,
+            "status": status,
+            "model": publicAlias,
+            "output": outputItems
+        ]
+
+        if status == "incomplete" {
+            response["incomplete_details"] = [
+                "reason": "max_output_tokens"
+            ]
+        }
+
+        if let usage = translatedResponsesUsage(fromChatCompletionsUsage: root["usage"] as? [String: Any]) {
+            response["usage"] = usage
+        }
+
+        return response
+    }
+
+    private func translatedResponsesUsage(fromChatCompletionsUsage usage: [String: Any]?) -> [String: Any]? {
+        guard let usage else {
+            return nil
+        }
+
+        let inputTokens = OpenAICompatTemporaryShim.integerValue(usage["prompt_tokens"]) ?? 0
+        let outputTokens = OpenAICompatTemporaryShim.integerValue(usage["completion_tokens"]) ?? 0
+        let totalTokens = OpenAICompatTemporaryShim.integerValue(usage["total_tokens"]) ?? (inputTokens + outputTokens)
+
+        var translatedUsage: [String: Any] = [
+            "input_tokens": inputTokens,
+            "output_tokens": outputTokens,
+            "total_tokens": totalTokens
+        ]
+
+        if let promptDetails = usage["prompt_tokens_details"] as? [String: Any],
+           let cachedTokens = OpenAICompatTemporaryShim.integerValue(promptDetails["cached_tokens"]) {
+            translatedUsage["input_tokens_details"] = [
+                "cached_tokens": cachedTokens
+            ]
+        }
+
+        if let completionDetails = usage["completion_tokens_details"] as? [String: Any] {
+            var outputDetails: [String: Any] = [:]
+            if let reasoningTokens = OpenAICompatTemporaryShim.integerValue(completionDetails["reasoning_tokens"]) {
+                outputDetails["reasoning_tokens"] = reasoningTokens
+            }
+            if !outputDetails.isEmpty {
+                translatedUsage["output_tokens_details"] = outputDetails
+            }
+        }
+
+        return translatedUsage
+    }
+
+    private func translatedResponsesID(fromChatCompletionsID chatCompletionID: String?) -> String {
+        let normalizedID = (chatCompletionID?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+            $0.isEmpty ? nil : $0
+        } ?? "chatcmpl-worker"
+        if normalizedID.hasPrefix("resp_") {
+            return normalizedID
+        }
+        return "resp_\(normalizedID)"
+    }
+
+    private func sseDataLine(for json: [String: Any]) -> String? {
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: json),
+              let jsonString = String(data: jsonData, encoding: .utf8) else {
+            return nil
+        }
+        return "data: \(jsonString)\n\n"
     }
 
     private func executeSmartAliasCandidate(
@@ -4023,11 +5937,15 @@ class ThinkingProxy {
             return
         }
 
-        let timeoutInterval = min(smartAliasCandidateTimeout(forRequestJSON: body), remainingBudget)
+        let timeoutInterval = min(
+            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias),
+            remainingBudget
+        )
+        let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
         let cancel = sendBufferedProxyRequest(
             method: method,
             path: path,
-            headers: headers,
+            headers: effectiveHeaders,
             body: body,
             timeoutInterval: timeoutInterval
         ) { [weak self] bufferedResponse in
@@ -4073,7 +5991,10 @@ class ThinkingProxy {
             return
         }
 
-        let timeoutInterval = min(smartAliasCandidateTimeout(forRequestJSON: body), remainingBudget)
+        let timeoutInterval = min(
+            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias),
+            remainingBudget
+        )
         let cancel = sendBufferedProxyRequest(
             method: method,
             path: path,
@@ -4143,10 +6064,15 @@ class ThinkingProxy {
                     bodyData: responseBody,
                     path: path
                 ).shouldFailover {
+                    let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
+                        statusCode: statusCode,
+                        headers: responseHeaders
+                    )
                     completion(
                         .retryableFailure(
                             requestModel: candidateModel,
-                            telemetryEvent: telemetryEvent
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: cooldownUntil
                         )
                     )
                     return
@@ -4180,10 +6106,17 @@ class ThinkingProxy {
                     bodyData: nil,
                     path: path
                 ).shouldFailover {
+                    let cooldownUntil = attempt.response.map {
+                        OpenAICompatTemporaryShim.providerCooldownUntil(
+                            statusCode: statusCode,
+                            headers: $0.allHeaderFields
+                        )
+                    } ?? nil
                     completion(
                         .retryableFailure(
                             requestModel: candidateModel,
-                            telemetryEvent: telemetryEvent
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: cooldownUntil
                         )
                     )
                     return
@@ -4238,7 +6171,8 @@ class ThinkingProxy {
             completion(
                 .retryableFailure(
                     requestModel: candidateModel,
-                    telemetryEvent: telemetryEvent
+                    telemetryEvent: telemetryEvent,
+                    cooldownUntil: nil
                 )
             )
             return
@@ -4270,7 +6204,8 @@ class ThinkingProxy {
             completion(
                 .retryableFailure(
                     requestModel: candidateModel,
-                    telemetryEvent: telemetryEvent
+                    telemetryEvent: telemetryEvent,
+                    cooldownUntil: nil
                 )
             )
             return
@@ -4308,10 +6243,15 @@ class ThinkingProxy {
         )
 
         if shouldFailover {
+            let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
+                statusCode: statusCode,
+                headers: response.allHeaderFields
+            )
             completion(
                 .retryableFailure(
                     requestModel: candidateModel,
-                    telemetryEvent: telemetryEvent
+                    telemetryEvent: telemetryEvent,
+                    cooldownUntil: cooldownUntil
                 )
             )
             return
@@ -4377,6 +6317,14 @@ class ThinkingProxy {
             return "missing_choices"
         }
         let message = choices[0]["message"] as? [String: Any] ?? [:]
+        switch OpenAICompatTemporaryShim.validateToolCalls(in: message) {
+        case .invalid:
+            return "malformed_tool_arguments"
+        case .valid:
+            return nil
+        case .none:
+            break
+        }
         let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
             return "empty_content"
@@ -4486,18 +6434,18 @@ class ThinkingProxy {
         }
     }
 
-    private func smartAliasCandidateTimeout(forRequestJSON jsonString: String) -> TimeInterval {
-        min(
-            OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: jsonString) ?? Config.defaultMitigatedAttemptTimeout,
-            Config.defaultMitigatedAttemptTimeout
-        )
+    private func smartAliasCandidateTimeout(forRequestJSON jsonString: String, publicAlias: String? = nil) -> TimeInterval {
+        let candidateTimeout = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: jsonString) ?? 0
+        let aliasTimeout = publicAlias.flatMap { OpenAICompatTemporaryShim.attemptTimeout(forRequestModel: $0) } ?? 0
+        let resolvedTimeout = max(candidateTimeout, aliasTimeout)
+        return resolvedTimeout > 0 ? resolvedTimeout : Config.defaultMitigatedAttemptTimeout
     }
 
     private func smartAliasTotalTimeout(forRequestJSON jsonString: String) -> TimeInterval {
         if let smartAliasTotalTimeoutOverrideForTesting {
             return smartAliasTotalTimeoutOverrideForTesting
         }
-        return min(smartAliasCandidateTimeout(forRequestJSON: jsonString) + 10, 40)
+        return min(smartAliasCandidateTimeout(forRequestJSON: jsonString) + 60, 360)
     }
 
     private func remainingSmartAliasBudget(until deadlineAt: Date) -> TimeInterval {
@@ -4507,10 +6455,15 @@ class ThinkingProxy {
     private func coalescingKeyForSafeRequest(
         method: String,
         path: String,
+        headers: [(String, String)],
         body: String,
         coalescingSourceBody: String,
         requestedModelAlias: String?
     ) -> String? {
+        guard let identityPartition = coalescingIdentityPartition(headers: headers) else {
+            return nil
+        }
+
         if let requestedModelAlias,
            OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: requestedModelAlias) != nil,
            OpenAICompatTemporaryShim.isSafePlainChatRequest(
@@ -4518,7 +6471,7 @@ class ThinkingProxy {
                 path: path,
                 jsonString: coalescingSourceBody
            ) {
-            return "\(method) \(path)\n\(coalescingSourceBody)"
+            return "\(identityPartition)\n\(method) \(path)\n\(coalescingSourceBody)"
         }
 
         guard OpenAICompatTemporaryShim.allowsPlainSafeNVIDIARequest(
@@ -4530,7 +6483,33 @@ class ThinkingProxy {
         OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: model) == .suspect else {
             return nil
         }
-        return "\(method) \(path)\n\(body)"
+        return "\(identityPartition)\n\(method) \(path)\n\(body)"
+    }
+
+    private func coalescingIdentityPartition(headers: [(String, String)]) -> String? {
+        let identityHeaderNames = Set([
+            "authorization",
+            "x-factory-session",
+            "x-session-id",
+            "x-assistant-message-id",
+            "x-api-provider",
+            "cookie"
+        ])
+
+        let selectedPairs = headers.compactMap { name, value -> String? in
+            let normalizedName = name.lowercased()
+            let normalizedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard identityHeaderNames.contains(normalizedName), !normalizedValue.isEmpty else {
+                return nil
+            }
+            return "\(normalizedName)=\(normalizedValue)"
+        }
+
+        guard !selectedPairs.isEmpty else {
+            return nil
+        }
+
+        return selectedPairs.sorted().joined(separator: "\n")
     }
 
     private func registerOrJoinInflightRequest(
@@ -4575,7 +6554,8 @@ class ThinkingProxy {
         headers: [AnyHashable: Any],
         body: Data,
         coalescingKey: String?,
-        overridingModel: String? = nil
+        overridingModel: String? = nil,
+        overridingHeaders: [String: String] = [:]
     ) {
         let deliveredBody = rewrittenResponseBody(
             body,
@@ -4588,9 +6568,30 @@ class ThinkingProxy {
                 to: connection,
                 statusCode: statusCode,
                 headers: headers,
-                body: deliveredBody
+                body: deliveredBody,
+                overridingHeaders: overridingHeaders
             )
         }
+    }
+
+    private func smartAliasResolutionHeaders(
+        publicAlias: String,
+        resolvedRequestModel: String
+    ) -> [String: String] {
+        var headers: [String: String] = [
+            "X-Public-Model": publicAlias,
+            "X-Resolved-Model": resolvedRequestModel
+        ]
+        if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: resolvedRequestModel) {
+            headers["X-Resolved-Provider"] = route.providerID
+            headers["X-Resolved-Canonical-Model"] = route.canonicalModelID
+        }
+        if let factoryBinding = Self.factoryModelBinding(forIncomingModelID: publicAlias) {
+            headers["X-Factory-Authoritative-Model-ID"] = factoryBinding.authoritativeModelID
+            headers["X-Factory-Model-Binding"] = factoryBinding.source
+            headers["X-Factory-Request-Surface"] = factoryBinding.requestSurface
+        }
+        return headers
     }
 
     private func deliverBufferedError(
@@ -4613,6 +6614,21 @@ class ThinkingProxy {
         headers.map { key, value in
             ("\(key)", "\(value)")
         }
+    }
+
+    // Injects provider-specific headers required by certain free-tier upstream services.
+    // Currently adds HTTP-Referer for opencode and kilocode candidate routes.
+    private func headersInjectingRouteSpecific(
+        _ headers: [(String, String)],
+        forCandidateModel candidateModel: String
+    ) -> [(String, String)] {
+        guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
+              (route.providerID == "opencode" || route.providerID == "kilocode") else {
+            return headers
+        }
+        let alreadyHasReferer = headers.contains { $0.0.lowercased() == "http-referer" }
+        guard !alreadyHasReferer else { return headers }
+        return headers + [("HTTP-Referer", "https://openclaw.ai")]
     }
 
     private func rewrittenResponseBody(
@@ -5239,7 +7255,7 @@ class ThinkingProxy {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = Data(requestJSON.utf8)
-        request.timeoutInterval = Config.nvidiaCanaryTimeout
+        request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: requestJSON) ?? Config.nvidiaCanaryTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("close", forHTTPHeaderField: "Connection")
 
@@ -5471,6 +7487,20 @@ class ThinkingProxy {
      Forwards the request to CLIProxyAPI on port 8318 (pass-through for non-thinking requests)
      */
     private func forwardRequest(method: String, path: String, version: String, headers: [(String, String)], body: String, thinkingEnabled: Bool = false, originalConnection: NWConnection, retryWithApiPrefix: Bool = false) {
+        if let forwardRequestInterceptorForTesting,
+           forwardRequestInterceptorForTesting(
+            method,
+            path,
+            version,
+            headers,
+            body,
+            thinkingEnabled,
+            originalConnection,
+            retryWithApiPrefix
+           ) {
+            return
+        }
+
         // Create connection to CLIProxyAPI
         guard let port = NWEndpoint.Port(rawValue: targetPort) else {
             NSLog("[ThinkingProxy] Invalid target port: %d", targetPort)
@@ -5685,7 +7715,12 @@ class ThinkingProxy {
     /**
      Sends an error response to the client
      */
-    private func sendError(to connection: NWConnection, statusCode: Int, message: String) {
+    private func sendError(
+        to connection: NWConnection,
+        statusCode: Int,
+        message: String,
+        overridingHeaders: [String: String] = [:]
+    ) {
         if let deliveredErrorForTesting {
             deliveredErrorForTesting(statusCode, message)
             connection.cancel()
@@ -5697,11 +7732,18 @@ class ThinkingProxy {
             return
         }
         
-        let headers = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n" +
-                     "Content-Type: text/plain\r\n" +
-                     "Content-Length: \(bodyData.count)\r\n" +
-                     "Connection: close\r\n" +
-                     "\r\n"
+        var headers = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n" +
+            "Content-Type: text/plain\r\n"
+        var effectiveHeaders = proxyMetadataHeaders()
+        for (name, value) in overridingHeaders {
+            effectiveHeaders[name] = value
+        }
+        for (name, value) in effectiveHeaders {
+            headers += "\(name): \(value)\r\n"
+        }
+        headers += "Content-Length: \(bodyData.count)\r\n" +
+            "Connection: close\r\n" +
+            "\r\n"
         
         guard let headerData = headers.data(using: .utf8) else {
             connection.cancel()
@@ -5741,14 +7783,22 @@ class ThinkingProxy {
         body: Data,
         overridingHeaders: [String: String] = [:]
     ) {
+        var effectiveOverridingHeaders = proxyMetadataHeaders()
+        for (name, value) in overridingHeaders {
+            effectiveOverridingHeaders[name] = value
+        }
         if let deliveredHTTPResponseForTesting {
-            deliveredHTTPResponseForTesting(statusCode, headers, body)
+            var deliveredHeaders = headers
+            for (name, value) in effectiveOverridingHeaders {
+                deliveredHeaders[name] = value
+            }
+            deliveredHTTPResponseForTesting(statusCode, deliveredHeaders, body)
             connection.cancel()
             return
         }
         var response = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n"
         var excludedHeaders: Set<String> = ["content-length", "connection", "transfer-encoding"]
-        excludedHeaders.formUnion(overridingHeaders.keys.map { $0.lowercased() })
+        excludedHeaders.formUnion(effectiveOverridingHeaders.keys.map { $0.lowercased() })
 
         for (rawName, rawValue) in headers {
             guard let name = rawName as? String,
@@ -5758,7 +7808,7 @@ class ThinkingProxy {
             response += "\(name): \(String(describing: rawValue))\r\n"
         }
 
-        for (name, value) in overridingHeaders {
+        for (name, value) in effectiveOverridingHeaders {
             response += "\(name): \(value)\r\n"
         }
 
@@ -5778,5 +7828,897 @@ class ThinkingProxy {
         connection.send(content: responseData, completion: .contentProcessed({ _ in
             connection.cancel()
         }))
+    }
+
+    private func sendHealthResponse(to connection: NWConnection) {
+        let backendReachable = isBackendReachable(timeout: Config.healthcheckTimeout)
+        let provenance = runtimeProvenance()
+        var payload: [String: Any] = [
+            "status": backendReachable ? "ok" : "degraded",
+            "frontend": [
+                "port": Int(proxyPort)
+            ],
+            "backend": [
+                "host": targetHost,
+                "port": Int(targetPort),
+                "reachable": backendReachable
+            ],
+            "provenance": provenanceDictionary(from: provenance)
+        ]
+
+        if let factoryWorkerContract = ThinkingProxy.factoryWorkerContract() {
+            payload["factory_worker"] = factoryWorkerContractDictionary(
+                from: factoryWorkerContract,
+                backendReachable: backendReachable
+            )
+        }
+        if let factoryRoleContracts = ThinkingProxy.factoryRoleContracts() {
+            payload["factory_roles"] = factoryRoleContractsDictionary(
+                from: factoryRoleContracts,
+                backendReachable: backendReachable
+            )
+        }
+
+        let routeHealthSnapshot = OpenAICompatTemporaryShim.routeHealthSnapshot()
+        if !routeHealthSnapshot.isEmpty {
+            let routes = routeHealthSnapshot.keys.sorted().reduce(into: [String: [String: Any]]()) { result, requestModel in
+                guard let state = routeHealthSnapshot[requestModel] else { return }
+                result[requestModel] = [
+                    "status": state.status.rawValue,
+                    "failure_score": state.failureScore,
+                    "recovery_successes": state.recoverySuccesses
+                ]
+            }
+            payload["route_health"] = [
+                "routes": routes,
+                "quarantined_models": OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
+            ]
+        }
+
+        guard let body = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            sendError(to: connection, statusCode: 500, message: "Internal Server Error")
+            return
+        }
+
+        sendHTTPResponse(
+            to: connection,
+            statusCode: 200,
+            headers: ["Content-Type": "application/json"],
+            body: body
+        )
+    }
+
+    private func proxyMetadataHeaders() -> [String: String] {
+        let provenance = runtimeProvenance()
+        var headers: [String: String] = [
+            "X-VibeProxy-App-Version": provenance.appVersion,
+            "X-VibeProxy-App-Build": provenance.appBuild
+        ]
+        if let backendBinaryFingerprint = provenance.backendBinaryFingerprint {
+            headers["X-VibeProxy-Backend-Fingerprint"] = backendBinaryFingerprint
+        }
+        if let mergedConfigFingerprint = provenance.mergedConfigFingerprint {
+            headers["X-VibeProxy-Config-Fingerprint"] = mergedConfigFingerprint
+        }
+        return headers
+    }
+
+    private func runtimeProvenance() -> RuntimeProvenance {
+        let infoDictionary = Bundle.main.infoDictionary
+        let appVersion = infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        let appBuild = infoDictionary?["CFBundleVersion"] as? String ?? "0"
+        let backendBinaryPath = Bundle.main.resourcePath.map {
+            ($0 as NSString).appendingPathComponent("cli-proxy-api-plus")
+        }
+        let mergedConfigPath = OpenAICompatTemporaryShim.mergedConfigPath()
+
+        return RuntimeProvenance(
+            appVersion: appVersion,
+            appBuild: appBuild,
+            backendBinaryPath: backendBinaryPath,
+            backendBinaryFingerprint: ThinkingProxy.fileFingerprint(at: backendBinaryPath),
+            mergedConfigPath: mergedConfigPath,
+            mergedConfigFingerprint: ThinkingProxy.fileFingerprint(at: mergedConfigPath)
+        )
+    }
+
+    private func provenanceDictionary(from provenance: RuntimeProvenance) -> [String: Any] {
+        var dict: [String: Any] = [
+            "app_version": provenance.appVersion,
+            "app_build": provenance.appBuild
+        ]
+        if let backendBinaryPath = provenance.backendBinaryPath {
+            dict["backend_binary_path"] = backendBinaryPath
+        }
+        if let backendBinaryFingerprint = provenance.backendBinaryFingerprint {
+            dict["backend_binary_fingerprint"] = backendBinaryFingerprint
+        }
+        if let mergedConfigPath = provenance.mergedConfigPath {
+            dict["merged_config_path"] = mergedConfigPath
+        }
+        if let mergedConfigFingerprint = provenance.mergedConfigFingerprint {
+            dict["merged_config_fingerprint"] = mergedConfigFingerprint
+        }
+        return dict
+    }
+
+    private func factoryWorkerContractDictionary(
+        from contract: FactoryWorkerContract,
+        backendReachable: Bool
+    ) -> [String: Any] {
+        var dict: [String: Any] = [
+            "worker_model_id": contract.workerModelID,
+            "route_model": contract.routeModel,
+            "route_provider": contract.routeProvider,
+            "request_surface": contract.requestSurface,
+            "authoritative_settings_path": contract.authoritativeSettingsPath,
+            "snapshot_sync_ok": contract.snapshotDriftPaths.isEmpty,
+            "snapshot_drift_count": contract.snapshotDriftPaths.count,
+            "ready": backendReachable && contract.ready
+        ]
+        dict["effective_route_model"] = contract.effectiveRouteModel
+        if let validationWorkerModelID = contract.validationWorkerModelID {
+            dict["validation_worker_model_id"] = validationWorkerModelID
+        }
+        if let workerReasoningEffort = contract.workerReasoningEffort {
+            dict["worker_reasoning_effort"] = workerReasoningEffort
+        }
+        if let validationWorkerReasoningEffort = contract.validationWorkerReasoningEffort {
+            dict["validation_worker_reasoning_effort"] = validationWorkerReasoningEffort
+        }
+        if let displayName = contract.displayName {
+            dict["display_name"] = displayName
+        }
+        if let baseURL = contract.baseURL {
+            dict["base_url"] = baseURL
+        }
+        if let routeHealthStatus = contract.routeHealthStatus {
+            dict["route_health_status"] = routeHealthStatus
+        }
+        if let effectiveRouteProvider = contract.effectiveRouteProvider {
+            dict["effective_route_provider"] = effectiveRouteProvider
+        }
+        if let bindings = Self.factoryModelBindings()?.bindingsByIncomingModelID.values {
+            let workerBindings = bindings.filter {
+                $0.authoritativeModelID == contract.workerModelID &&
+                $0.routeModel == contract.routeModel &&
+                $0.routeProvider == contract.routeProvider
+            }
+            let acceptedRequestModelIDs = Array(Set(workerBindings.map(\.incomingModelID))).sorted()
+            let rescuedRequestModelIDs = Array(Set(workerBindings.compactMap { binding in
+                binding.source == "retired_worker_alias_rescue" ? binding.incomingModelID : nil
+            })).sorted()
+
+            if !acceptedRequestModelIDs.isEmpty {
+                dict["accepted_request_model_ids"] = acceptedRequestModelIDs
+            }
+            if !rescuedRequestModelIDs.isEmpty {
+                dict["rescued_request_model_ids"] = rescuedRequestModelIDs
+            }
+        }
+        if !contract.snapshotDriftPaths.isEmpty {
+            dict["snapshot_drift_paths"] = contract.snapshotDriftPaths
+        }
+        return dict
+    }
+
+    private func factoryRoleContractsDictionary(
+        from contracts: (orchestration: FactoryRoleContract?, verification: FactoryRoleContract?),
+        backendReachable: Bool
+    ) -> [String: Any] {
+        var dict: [String: Any] = [:]
+        if let orchestration = contracts.orchestration {
+            dict["orchestration"] = factoryRoleContractDictionary(
+                from: orchestration,
+                backendReachable: backendReachable
+            )
+        }
+        if let verification = contracts.verification {
+            dict["verification"] = factoryRoleContractDictionary(
+                from: verification,
+                backendReachable: backendReachable
+            )
+        }
+        return dict
+    }
+
+    private func factoryRoleContractDictionary(
+        from contract: FactoryRoleContract,
+        backendReachable: Bool
+    ) -> [String: Any] {
+        var dict: [String: Any] = [
+            "model_id": contract.modelID,
+            "route_model": contract.routeModel,
+            "route_provider": contract.routeProvider,
+            "request_surface": contract.requestSurface,
+            "effective_route_model": contract.effectiveRouteModel,
+            "ready": backendReachable && contract.ready
+        ]
+        if let reasoningEffort = contract.reasoningEffort {
+            dict["reasoning_effort"] = reasoningEffort
+        }
+        if let effectiveRouteProvider = contract.effectiveRouteProvider {
+            dict["effective_route_provider"] = effectiveRouteProvider
+        }
+        if let displayName = contract.displayName {
+            dict["display_name"] = displayName
+        }
+        if let baseURL = contract.baseURL {
+            dict["base_url"] = baseURL
+        }
+        if let routeHealthStatus = contract.routeHealthStatus {
+            dict["route_health_status"] = routeHealthStatus
+        }
+        return dict
+    }
+
+    private static func factoryWorkerRequestSurface(forProvider provider: String) -> String {
+        switch provider {
+        case "generic-chat-completion-api":
+            return "chat_completions"
+        case "openai", "xai":
+            return "responses"
+        case "anthropic":
+            return "messages"
+        default:
+            return "unknown"
+        }
+    }
+
+    private static func firstAvailableFactoryWorkerCandidateModel(from candidateModels: [String]) -> String? {
+        if let availableCandidate = candidateModels.first(where: {
+            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: $0) != .open
+        }) {
+            return availableCandidate
+        }
+        return candidateModels.first
+    }
+
+    private static func effectiveFactoryWorkerCandidateModels(
+        routeModel: String,
+        requestSurface: String
+    ) -> [String] {
+        guard requestSurface == "chat_completions",
+              let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) else {
+            return [routeModel]
+        }
+
+        let syntheticWorkerRequest = """
+        {
+          "model": "\(routeModel)",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return exactly: OK"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        }
+        """
+
+        return OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: routeModel,
+            method: "POST",
+            path: "/v1/chat/completions",
+            jsonString: syntheticWorkerRequest,
+            smartAlias: smartAlias
+        )
+    }
+
+    private static func effectiveFactoryResponsesFallbackCandidateModels(
+        routeModel: String
+    ) -> [String] {
+        guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) else {
+            return [routeModel]
+        }
+
+        let syntheticPlainChatRequest = """
+        {
+          "model": "\(routeModel)",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return exactly: OK"
+            }
+          ],
+          "max_tokens": 32
+        }
+        """
+
+        return OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: routeModel,
+            method: "POST",
+            path: "/v1/chat/completions",
+            jsonString: syntheticPlainChatRequest,
+            smartAlias: smartAlias
+        )
+    }
+
+    private static func effectiveFactoryContractHealthStatus(
+        routeModel: String,
+        requestSurface: String,
+        effectiveRouteModel: String
+    ) -> String? {
+        let workerPrimaryCandidate = OpenAICompatTemporaryShim.workerPrimaryCandidateModel()
+        guard requestSurface == "chat_completions",
+              OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil,
+              OpenAICompatTemporaryShim.routeHealthStatus(
+                forRequestModel: workerPrimaryCandidate
+              ) == .open,
+              effectiveRouteModel != workerPrimaryCandidate else {
+            return OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: effectiveRouteModel)?.rawValue
+        }
+
+        return nil
+    }
+
+    private static func effectiveFactoryCandidateModels(
+        routeModel: String,
+        routeProvider: String,
+        requestSurface: String
+    ) -> [String] {
+        if OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil {
+            return effectiveFactoryWorkerCandidateModels(
+                routeModel: routeModel,
+                requestSurface: requestSurface
+            )
+        }
+        return [routeModel]
+    }
+
+    private static func effectiveFactoryRouteModel(
+        routeModel: String,
+        routeProvider: String,
+        requestSurface: String
+    ) -> String {
+        let candidateModels = effectiveFactoryCandidateModels(
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface
+        )
+        return firstAvailableFactoryWorkerCandidateModel(from: candidateModels) ?? routeModel
+    }
+
+    private static func factoryRoleContract(
+        modelID: String?,
+        reasoningEffort: String?,
+        customModels: [[String: Any]]
+    ) -> FactoryRoleContract? {
+        guard let modelID,
+              let customModel = customModels.first(where: { ($0["id"] as? String) == modelID }),
+              let routeModel = customModel["model"] as? String,
+              let routeProvider = customModel["provider"] as? String else {
+            return nil
+        }
+
+        let requestSurface = factoryWorkerRequestSurface(forProvider: routeProvider)
+        let directEffectiveRouteModel = effectiveFactoryRouteModel(
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface
+        )
+        let directEffectiveRouteProvider =
+            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: directEffectiveRouteModel)?.providerID
+        let directRouteHealthStatus =
+            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: directEffectiveRouteModel)?.rawValue
+        let roleFallback = effectiveFactoryFallbackRoleRoute(
+            modelID: modelID,
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface,
+            directEffectiveRouteModel: directEffectiveRouteModel,
+            directEffectiveRouteProvider: directEffectiveRouteProvider,
+            directRouteHealthStatus: directRouteHealthStatus
+        )
+
+        return FactoryRoleContract(
+            modelID: modelID,
+            reasoningEffort: reasoningEffort,
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface,
+            effectiveRouteModel: roleFallback.model,
+            effectiveRouteProvider: roleFallback.provider,
+            displayName: customModel["displayName"] as? String,
+            baseURL: customModel["baseUrl"] as? String,
+            routeHealthStatus: roleFallback.healthStatus
+        )
+    }
+
+    private static func effectiveFactoryFallbackRoleRoute(
+        modelID: String,
+        routeModel: String,
+        routeProvider: String,
+        requestSurface: String,
+        directEffectiveRouteModel: String,
+        directEffectiveRouteProvider: String?,
+        directRouteHealthStatus: String?
+    ) -> (model: String, provider: String?, healthStatus: String?) {
+        guard requestSurface == "responses",
+              routeProvider == "openai" || routeProvider == "xai",
+              directRouteHealthStatus == OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue,
+              let workerContract = factoryWorkerContract(),
+              workerContract.workerModelID != modelID,
+              workerContract.routeModel != routeModel,
+              workerContract.snapshotDriftPaths.isEmpty,
+              workerContract.ready,
+              OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) != nil else {
+            return (
+                model: directEffectiveRouteModel,
+                provider: directEffectiveRouteProvider,
+                healthStatus: directRouteHealthStatus
+            )
+        }
+
+        return (
+            model: firstAvailableFactoryWorkerCandidateModel(
+                from: effectiveFactoryResponsesFallbackCandidateModels(
+                    routeModel: workerContract.routeModel
+                )
+            ) ?? workerContract.effectiveRouteModel,
+            provider: OpenAICompatTemporaryShim.resolveConfiguredRoute(
+                forRequestModel: firstAvailableFactoryWorkerCandidateModel(
+                    from: effectiveFactoryResponsesFallbackCandidateModels(
+                        routeModel: workerContract.routeModel
+                    )
+                ) ?? workerContract.effectiveRouteModel
+            )?.providerID,
+            healthStatus: nil
+        )
+    }
+
+    private static func factoryRoleContracts() -> (orchestration: FactoryRoleContract?, verification: FactoryRoleContract?)? {
+        guard let settingsPath = ThinkingProxy.factorySettingsPath(),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessionDefaultSettings = root["sessionDefaultSettings"] as? [String: Any],
+              let missionModelSettings = root["missionModelSettings"] as? [String: Any],
+              let customModels = root["customModels"] as? [[String: Any]] else {
+            return nil
+        }
+
+        return (
+            orchestration: factoryRoleContract(
+                modelID: sessionDefaultSettings["model"] as? String,
+                reasoningEffort: sessionDefaultSettings["reasoningEffort"] as? String,
+                customModels: customModels
+            ),
+            verification: factoryRoleContract(
+                modelID: missionModelSettings["validationWorkerModel"] as? String,
+                reasoningEffort: missionModelSettings["validationWorkerReasoningEffort"] as? String,
+                customModels: customModels
+            )
+        )
+    }
+
+    private static func factoryWorkerContract() -> FactoryWorkerContract? {
+        guard let settingsPath = ThinkingProxy.factorySettingsPath(),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let missionModelSettings = root["missionModelSettings"] as? [String: Any],
+              let sessionDefaultSettings = root["sessionDefaultSettings"] as? [String: Any],
+              let workerModelID = missionModelSettings["workerModel"] as? String,
+              let customModels = root["customModels"] as? [[String: Any]],
+              let workerModel = customModels.first(where: { ($0["id"] as? String) == workerModelID }),
+              let routeModel = workerModel["model"] as? String,
+              let routeProvider = workerModel["provider"] as? String else {
+            return nil
+        }
+
+        let requestSurface = factoryWorkerRequestSurface(forProvider: routeProvider)
+        let effectiveRouteModel = ThinkingProxy.effectiveFactoryRouteModel(
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface
+        )
+        let effectiveRouteProvider =
+            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: effectiveRouteModel)?.providerID
+
+        let snapshotDriftPaths = factoryWorkerSnapshotDriftPaths(
+            settingsPath: settingsPath,
+            sessionModelID: sessionDefaultSettings["model"] as? String,
+            sessionReasoningEffort: sessionDefaultSettings["reasoningEffort"] as? String,
+            sessionAutonomyMode: sessionDefaultSettings["autonomyMode"] as? String,
+            workerModelID: workerModelID,
+            validationWorkerModelID: missionModelSettings["validationWorkerModel"] as? String,
+            workerReasoningEffort: missionModelSettings["workerReasoningEffort"] as? String,
+            validationWorkerReasoningEffort: missionModelSettings["validationWorkerReasoningEffort"] as? String,
+            workerModel: workerModel,
+            canonicalCustomModels: customModels
+        )
+
+        return FactoryWorkerContract(
+            workerModelID: workerModelID,
+            validationWorkerModelID: missionModelSettings["validationWorkerModel"] as? String,
+            workerReasoningEffort: missionModelSettings["workerReasoningEffort"] as? String,
+            validationWorkerReasoningEffort: missionModelSettings["validationWorkerReasoningEffort"] as? String,
+            routeModel: routeModel,
+            routeProvider: routeProvider,
+            requestSurface: requestSurface,
+            effectiveRouteModel: effectiveRouteModel,
+            effectiveRouteProvider: effectiveRouteProvider,
+            displayName: workerModel["displayName"] as? String,
+            baseURL: workerModel["baseUrl"] as? String,
+            routeHealthStatus: effectiveFactoryContractHealthStatus(
+                routeModel: routeModel,
+                requestSurface: requestSurface,
+                effectiveRouteModel: effectiveRouteModel
+            ),
+            authoritativeSettingsPath: settingsPath,
+            snapshotDriftPaths: snapshotDriftPaths
+        )
+    }
+
+    private static func retiredFactoryWorkerModelIDs(excluding currentWorkerModelID: String) -> Set<String> {
+        let retiredIDs: Set<String> = [
+            "custom:Proxy-WorkerPool-8",
+            "custom:Factory-Worker-GPT-5.4-High-8",
+            "custom:Proxy-Worker-Smart-Router-8"
+        ]
+        return retiredIDs.subtracting([currentWorkerModelID])
+    }
+
+    fileprivate static func factoryResolvedRouteModel(forIncomingModelID incomingModelID: String) -> String? {
+        factoryModelBinding(forIncomingModelID: incomingModelID)?.routeModel
+    }
+
+    private static func factoryModelBindingPreflightError(forIncomingModelID incomingModelID: String) -> String? {
+        guard incomingModelID.hasPrefix("custom:"),
+              factoryModelBinding(forIncomingModelID: incomingModelID) == nil else {
+            return nil
+        }
+
+        let retiredWorkerModelIDs: Set<String>
+        if let contract = factoryWorkerContract() {
+            retiredWorkerModelIDs = retiredFactoryWorkerModelIDs(excluding: contract.workerModelID)
+        } else {
+            retiredWorkerModelIDs = [
+                "custom:Proxy-WorkerPool-8",
+                "custom:Factory-Worker-GPT-5.4-High-8",
+                "custom:Proxy-Worker-Smart-Router-8"
+            ]
+        }
+
+        guard retiredWorkerModelIDs.contains(incomingModelID) else {
+            return nil
+        }
+
+        if let contract = factoryWorkerContract() {
+            return "Factory sent retired worker model \(incomingModelID), but VibeProxy could not bind it onto the authoritative worker model \(contract.workerModelID). Check /healthz factory_worker snapshot drift and resync Factory settings."
+        }
+
+        if let settingsPath = factorySettingsPath() {
+            return "Factory sent retired worker model \(incomingModelID), but VibeProxy could not derive an authoritative worker contract from \(settingsPath). Check that missionModelSettings.workerModel and its customModels entry are present."
+        }
+
+        return "Factory sent retired worker model \(incomingModelID), but VibeProxy could not find ~/.factory/settings.json (or FACTORY_SETTINGS_PATH) to derive the authoritative worker contract."
+    }
+
+    private static func factoryWorkerBindingContractError(for binding: FactoryModelBinding) -> String? {
+        guard let contract = factoryWorkerContract(),
+              binding.authoritativeModelID == contract.workerModelID,
+              !contract.snapshotDriftPaths.isEmpty else {
+            return nil
+        }
+
+        let driftedPaths = contract.snapshotDriftPaths.joined(separator: ", ")
+        return "Factory worker snapshot drift detected for \(binding.incomingModelID) against authoritative worker model \(contract.workerModelID). Refusing to proxy the request until Factory settings are resynced. Drifted paths: \(driftedPaths)"
+    }
+
+    private static func factoryModelBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
+        factoryModelBindings()?.bindingsByIncomingModelID[incomingModelID]
+    }
+
+    private static func factoryModelBindings() -> CachedFactoryModelBindings? {
+        guard let settingsPath = ThinkingProxy.factorySettingsPath() else {
+            return nil
+        }
+
+        let settingsFingerprint = ThinkingProxy.fileFingerprint(at: settingsPath)
+        if let cached = factoryBindingsCacheQueue.sync(execute: { cachedFactoryModelBindings }),
+           cached.settingsPath == settingsPath,
+           cached.settingsFingerprint == settingsFingerprint {
+            return cached
+        }
+
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            factoryBindingsCacheQueue.sync {
+                cachedFactoryModelBindings = nil
+            }
+            return nil
+        }
+
+        let customModels = root["customModels"] as? [[String: Any]] ?? []
+        var bindingsByIncomingModelID: [String: FactoryModelBinding] = [:]
+
+        for customModel in customModels {
+            guard let incomingModelID = customModel["id"] as? String,
+                  let routeModel = customModel["model"] as? String,
+                  let routeProvider = customModel["provider"] as? String else {
+                continue
+            }
+
+            bindingsByIncomingModelID[incomingModelID] = FactoryModelBinding(
+                incomingModelID: incomingModelID,
+                authoritativeModelID: incomingModelID,
+                routeModel: routeModel,
+                routeProvider: routeProvider,
+                requestSurface: factoryWorkerRequestSurface(forProvider: routeProvider),
+                displayName: customModel["displayName"] as? String,
+                baseURL: customModel["baseUrl"] as? String,
+                authoritativeSettingsPath: settingsPath,
+                source: "authoritative_custom_model"
+            )
+
+            let supportsRawRouteRescue = routeProvider == "openai" || routeProvider == "xai"
+            if supportsRawRouteRescue,
+               routeModel != incomingModelID,
+               !routeModel.isEmpty,
+               bindingsByIncomingModelID[routeModel] == nil {
+                bindingsByIncomingModelID[routeModel] = FactoryModelBinding(
+                    incomingModelID: routeModel,
+                    authoritativeModelID: incomingModelID,
+                    routeModel: routeModel,
+                    routeProvider: routeProvider,
+                    requestSurface: factoryWorkerRequestSurface(forProvider: routeProvider),
+                    displayName: customModel["displayName"] as? String,
+                    baseURL: customModel["baseUrl"] as? String,
+                    authoritativeSettingsPath: settingsPath,
+                    source: "raw_managed_route_rescue"
+                )
+            }
+        }
+
+        if let missionModelSettings = root["missionModelSettings"] as? [String: Any],
+           let workerModelID = missionModelSettings["workerModel"] as? String,
+           let workerModel = customModels.first(where: { ($0["id"] as? String) == workerModelID }),
+           let routeModel = workerModel["model"] as? String,
+           let routeProvider = workerModel["provider"] as? String {
+            for retiredModelID in retiredFactoryWorkerModelIDs(excluding: workerModelID) {
+                bindingsByIncomingModelID[retiredModelID] = FactoryModelBinding(
+                    incomingModelID: retiredModelID,
+                    authoritativeModelID: workerModelID,
+                    routeModel: routeModel,
+                    routeProvider: routeProvider,
+                    requestSurface: factoryWorkerRequestSurface(forProvider: routeProvider),
+                    displayName: workerModel["displayName"] as? String,
+                    baseURL: workerModel["baseUrl"] as? String,
+                    authoritativeSettingsPath: settingsPath,
+                    source: "retired_worker_alias_rescue"
+                )
+            }
+        }
+
+        let cached = CachedFactoryModelBindings(
+            settingsPath: settingsPath,
+            settingsFingerprint: settingsFingerprint,
+            bindingsByIncomingModelID: bindingsByIncomingModelID
+        )
+        factoryBindingsCacheQueue.sync {
+            cachedFactoryModelBindings = cached
+        }
+        return cached
+    }
+
+    private static func factoryWorkerSnapshotDriftPaths(
+        settingsPath: String,
+        sessionModelID: String?,
+        sessionReasoningEffort: String?,
+        sessionAutonomyMode: String?,
+        workerModelID: String,
+        validationWorkerModelID: String?,
+        workerReasoningEffort: String?,
+        validationWorkerReasoningEffort: String?,
+        workerModel: [String: Any],
+        canonicalCustomModels: [[String: Any]]
+    ) -> [String] {
+        let fileManager = FileManager.default
+        let factoryRoot = ((settingsPath as NSString).deletingLastPathComponent as NSString).standardizingPath
+        var driftedPaths: [String] = []
+        let retiredWorkerModelIDs = retiredFactoryWorkerModelIDs(excluding: workerModelID)
+
+        func recordDrift(_ path: String) {
+            driftedPaths.append((path as NSString).standardizingPath)
+        }
+
+        func loadJSONObject(at path: String) -> [String: Any]? {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            return object
+        }
+
+        func canonicalJSONData(for object: Any) -> Data? {
+            guard JSONSerialization.isValidJSONObject(object) else {
+                return nil
+            }
+            return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        }
+
+        func jsonObjectsEqual(_ lhs: Any, _ rhs: Any) -> Bool {
+            canonicalJSONData(for: lhs) == canonicalJSONData(for: rhs)
+        }
+
+        func containsRetiredWorkerModelID(_ customModels: [[String: Any]]) -> Bool {
+            customModels.contains { model in
+                guard let id = model["id"] as? String else {
+                    return false
+                }
+                return retiredWorkerModelIDs.contains(id)
+            }
+        }
+
+        func expectedMissionSettingsMatch(_ object: [String: Any]) -> Bool {
+            object["workerModel"] as? String == workerModelID &&
+                object["validationWorkerModel"] as? String == validationWorkerModelID &&
+                object["workerReasoningEffort"] as? String == workerReasoningEffort &&
+                object["validationWorkerReasoningEffort"] as? String == validationWorkerReasoningEffort
+        }
+
+        func expectedSettingsMatch(_ object: [String: Any], requireWorkerModelDefinition: Bool) -> Bool {
+            guard let sessionDefaultSettings = object["sessionDefaultSettings"] as? [String: Any],
+                  sessionDefaultSettings["model"] as? String == sessionModelID,
+                  sessionDefaultSettings["reasoningEffort"] as? String == sessionReasoningEffort,
+                  sessionDefaultSettings["autonomyMode"] as? String == sessionAutonomyMode,
+                  let missionModelSettings = object["missionModelSettings"] as? [String: Any],
+                  missionModelSettings["workerModel"] as? String == workerModelID,
+                  missionModelSettings["validationWorkerModel"] as? String == validationWorkerModelID,
+                  missionModelSettings["workerReasoningEffort"] as? String == workerReasoningEffort,
+                  missionModelSettings["validationWorkerReasoningEffort"] as? String == validationWorkerReasoningEffort else {
+                return false
+            }
+
+            guard let customModels = object["customModels"] as? [[String: Any]],
+                  !containsRetiredWorkerModelID(customModels),
+                  jsonObjectsEqual(customModels, canonicalCustomModels) else {
+                return false
+            }
+
+            guard requireWorkerModelDefinition else {
+                return true
+            }
+
+            guard let definedWorkerModel = customModels.first(where: { ($0["id"] as? String) == workerModelID }) else {
+                return false
+            }
+            return jsonObjectsEqual(definedWorkerModel, workerModel)
+        }
+
+        func expectedRuntimeCatalogMatch(_ object: [String: Any]) -> Bool {
+            guard let customModels = object["customModels"] as? [[String: Any]],
+                  !containsRetiredWorkerModelID(customModels),
+                  jsonObjectsEqual(customModels, canonicalCustomModels),
+                  let definedWorkerModel = customModels.first(where: { ($0["id"] as? String) == workerModelID }) else {
+                return false
+            }
+            return jsonObjectsEqual(definedWorkerModel, workerModel)
+        }
+
+        let localSettingsPath = (factoryRoot as NSString).appendingPathComponent("settings.local.json")
+        if fileManager.fileExists(atPath: localSettingsPath) {
+            if let object = loadJSONObject(at: localSettingsPath),
+               expectedSettingsMatch(object, requireWorkerModelDefinition: true) {
+                // Expected snapshot.
+            } else {
+                recordDrift(localSettingsPath)
+            }
+        }
+
+        for projectSettingsPath in ThinkingProxy.factoryProjectSettingsPaths() where fileManager.fileExists(atPath: projectSettingsPath) {
+            if let object = loadJSONObject(at: projectSettingsPath),
+               expectedSettingsMatch(object, requireWorkerModelDefinition: false) {
+                // Expected snapshot.
+            } else {
+                recordDrift(projectSettingsPath)
+            }
+        }
+
+        for missionSettingsPath in ThinkingProxy.factoryMissionFilePaths(root: factoryRoot, name: "model-settings.json") {
+            if let object = loadJSONObject(at: missionSettingsPath),
+               expectedMissionSettingsMatch(object) {
+                // Expected snapshot.
+            } else {
+                recordDrift(missionSettingsPath)
+            }
+        }
+
+        for runtimeCatalogPath in ThinkingProxy.factoryMissionFilePaths(root: factoryRoot, name: "runtime-custom-models.json") {
+            if let object = loadJSONObject(at: runtimeCatalogPath),
+               expectedRuntimeCatalogMatch(object) {
+                // Expected snapshot.
+            } else {
+                recordDrift(runtimeCatalogPath)
+            }
+        }
+
+        return Array(Set(driftedPaths)).sorted()
+    }
+
+    private static func fileFingerprint(at path: String?) -> String? {
+        guard let path,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: path) else {
+            return nil
+        }
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? -1
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\((path as NSString).lastPathComponent):\(size):\(Int(modifiedAt))"
+    }
+
+    private static func factorySettingsPath() -> String? {
+        if let overridePath = ProcessInfo.processInfo.environment["FACTORY_SETTINGS_PATH"],
+           !overridePath.isEmpty,
+           FileManager.default.fileExists(atPath: overridePath) {
+            return overridePath
+        }
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".factory/settings.json")
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    private static func factoryProjectSettingsPaths() -> [String] {
+        if let overrideValue = ProcessInfo.processInfo.environment["FACTORY_PROJECT_SETTINGS_PATHS"] {
+            return overrideValue
+                .split(separator: ":")
+                .map { String($0) }
+                .filter { !$0.isEmpty }
+        }
+
+        return [
+            (NSHomeDirectory() as NSString).appendingPathComponent("CascadeProjects/songbird4/.factory/settings.json"),
+            (NSHomeDirectory() as NSString).appendingPathComponent("CascadeProjects/voc/.factory/settings.json"),
+            (NSHomeDirectory() as NSString).appendingPathComponent("CascadeProjects/merchant-warrior2/.factory/settings.json"),
+            (NSHomeDirectory() as NSString).appendingPathComponent("CascadeProjects/pi_agent_rust/.factory/settings.json")
+        ]
+    }
+
+    private static func factoryMissionFilePaths(root: String, name: String) -> [String] {
+        let missionRoot = (root as NSString).appendingPathComponent("missions")
+        guard FileManager.default.fileExists(atPath: missionRoot),
+              let enumerator = FileManager.default.enumerator(atPath: missionRoot) else {
+            return []
+        }
+
+        var paths: [String] = []
+        for case let relativePath as String in enumerator where (relativePath as NSString).lastPathComponent == name {
+            paths.append((missionRoot as NSString).appendingPathComponent(relativePath))
+        }
+        return paths.sorted()
+    }
+
+    private func isBackendReachable(timeout: TimeInterval) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        let port = NWEndpoint.Port(rawValue: targetPort)!
+        let connection = NWConnection(host: NWEndpoint.Host(targetHost), port: port, using: .tcp)
+        let probeQueue = DispatchQueue(label: "io.automaze.vibeproxy.healthcheck-probe")
+        var reachable = false
+
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                reachable = true
+                semaphore.signal()
+            case .failed, .waiting, .cancelled:
+                semaphore.signal()
+            default:
+                break
+            }
+        }
+
+        connection.start(queue: probeQueue)
+        _ = semaphore.wait(timeout: .now() + timeout)
+        connection.cancel()
+        return reachable
     }
 }

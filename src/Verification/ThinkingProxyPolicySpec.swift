@@ -10,7 +10,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "minimax-m2.5",
+                  "model": "minimax-m2.5-nvidia",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ],
@@ -39,7 +39,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "kimi-k2.5",
+                  "model": "kimi-k2.5-nvidia",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ],
@@ -62,6 +62,56 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(chatTemplate?["thinking"], false, "kimi should force chat_template_kwargs.thinking=false", recorder: recorder)
                 expectEqual(chatTemplate?["enable_thinking"], false, "kimi should force chat_template_kwargs.enable_thinking=false", recorder: recorder)
                 expectEqual(json["include_reasoning"] as? Bool, false, "kimi should request no reasoning field in buffered mode", recorder: recorder)
+            }
+        }
+
+        run("temporary mimo free shim floors max_tokens for alias and canonical request names", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                for model in ["mimo-v2-pro-kilocode", "xiaomi/mimo-v2-pro:free", "mimo-v2-pro-opencode", "mimo-v2-pro-free"] {
+                    let request = """
+                    {
+                      "model": "\(model)",
+                      "messages": [
+                        {"role": "user", "content": "Return exactly: OK"}
+                      ],
+                      "max_tokens": 24
+                    }
+                    """
+
+                    let transformed = OpenAICompatTemporaryShim.transformRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: request
+                    )
+
+                    let json = parseJSONObject(transformed, recorder: recorder)
+                    expectEqual(json["max_tokens"] as? Int, 128, "\(model) should be floored to max_tokens 128 so visible answer tokens are not starved by reasoning", recorder: recorder)
+                }
+            }
+        }
+
+        run("temporary opencode minimax shim floors max_tokens for alias and canonical request names", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                for model in ["minimax-m2.5-opencode", "minimax-m2.5-free"] {
+                    let request = """
+                    {
+                      "model": "\(model)",
+                      "messages": [
+                        {"role": "user", "content": "Return exactly: OK"}
+                      ],
+                      "max_tokens": 24
+                    }
+                    """
+
+                    let transformed = OpenAICompatTemporaryShim.transformRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: request
+                    )
+
+                    let json = parseJSONObject(transformed, recorder: recorder)
+                    expectEqual(json["max_tokens"] as? Int, 128, "\(model) should be floored to max_tokens 128 so low-budget requests still have room for visible output", recorder: recorder)
+                }
             }
         }
 
@@ -128,7 +178,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "kimi-k2.5",
+                  "model": "kimi-k2.5-nvidia",
                   "messages": [
                     {"role": "user", "content": "Use the tool."}
                   ],
@@ -247,11 +297,11 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary zai glm-5-turbo preflight rejects /v1/responses", recorder: recorder) {
+        run("temporary direct glm-5.1-zai route rejects /v1/responses", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "glm-5-turbo",
+                  "model": "glm-5.1-zai",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ]
@@ -264,8 +314,49 @@ struct ThinkingProxyPolicySpec {
                     jsonString: request
                 )
 
-                expectEqual(preflightError?.statusCode ?? 0, 501, "glm-5-turbo should fail fast on /v1/responses instead of surfacing a useless success-shaped response", recorder: recorder)
-                expectEqual(preflightError?.message, "Z.AI glm-5-turbo does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions.", "glm-5-turbo /v1/responses rejections should steer callers to the supported surfaces", recorder: recorder)
+                expectEqual(preflightError?.statusCode ?? 0, 501, "direct glm-5.1-zai requests should fail fast on /v1/responses instead of surfacing a useless success-shaped response", recorder: recorder)
+                expectEqual(preflightError?.message, "Z.AI glm-5.1 does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions.", "direct glm-5.1-zai /v1/responses rejections should steer callers to the supported surfaces", recorder: recorder)
+            }
+        }
+
+        run("legacy zai glm aliases normalize to glm-5.1", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let legacyRequest = """
+                {
+                  "model": "glm-5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+                let turboRequest = """
+                {
+                  "model": "glm-5-turbo",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let transformedLegacy = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: legacyRequest
+                )
+                let transformedTurbo = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: turboRequest
+                )
+                let legacyJSON = parseJSONObject(transformedLegacy ?? legacyRequest, recorder: recorder)
+                let turboJSON = parseJSONObject(transformedTurbo ?? turboRequest, recorder: recorder)
+
+                expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: legacyRequest), "glm-5.1", "legacy glm-5 requests should normalize to glm-5.1 before routing", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: turboRequest), "glm-5.1", "legacy glm-5-turbo requests should normalize to glm-5.1 before routing", recorder: recorder)
+                expectEqual(legacyJSON["model"] as? String, "glm-5.1", "legacy glm-5 request bodies should be rewritten onto glm-5.1", recorder: recorder)
+                expectEqual(turboJSON["model"] as? String, "glm-5.1", "legacy glm-5-turbo request bodies should be rewritten onto glm-5.1", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5")?.candidates.first, "glm-5.1-zai", "legacy glm-5 alias should reuse the glm-5.1 worker pool entrypoint", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5-turbo")?.candidates.first, "glm-5.1-zai", "legacy glm-5-turbo alias should reuse the glm-5.1 worker pool entrypoint", recorder: recorder)
             }
         }
 
@@ -277,24 +368,36 @@ struct ThinkingProxyPolicySpec {
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
+                let kimiRequest = """
+                {
+                  "model": "kimi-k2.5-nvidia",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
                 let minimaxRequest = """
                 {
-                  "model": "minimax-m2.5",
+                  "model": "minimax-m2.5-nvidia",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
 
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 200, "glm5 should keep the long per-attempt timeout", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 200, "minimax should keep the long per-attempt timeout", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 25, "glm5 should fail closed on first-byte stalls", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 25, "minimax should also guard first-byte stalls", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 28, "glm5 should bound the full buffered response time", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 28, "minimax should also bound the full buffered response time", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 300, "glm5 should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 90, "kimi should fail fast enough to stop an unhealthy fallback lane from consuming the whole worker budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 300, "minimax should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 240, "glm5 should allow long first-byte latency before failing", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 45, "kimi should use a much shorter first-byte deadline than the healthier NVIDIA lanes", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 240, "minimax should also allow long first-byte latency before failing", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 285, "glm5 should bound the full buffered response with a long latency budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: kimiRequest), 75, "kimi should not keep a buffered fallback request open for minutes", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 285, "minimax should also keep a long buffered-response budget", recorder: recorder)
 
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
+                let kimiBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: kimiRequest)
                 let minimaxBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: minimaxRequest)
                 expectEqual(glm5Budget?.transport, 0, "glm5 should not spend extra proxy transport retries", recorder: recorder)
                 expectEqual(glm5Budget?.semantic, 1, "glm5 should reserve one semantic retry for malformed tool-call payloads", recorder: recorder)
+                expectEqual(kimiBudget?.transport, 0, "kimi should still avoid extra transport retries", recorder: recorder)
+                expectEqual(kimiBudget?.semantic, 2, "kimi should keep semantic retries for malformed provider payloads", recorder: recorder)
                 expectEqual(minimaxBudget?.transport, 0, "minimax should leave transport failover to the backend manager", recorder: recorder)
                 expectEqual(minimaxBudget?.semantic, 2, "minimax should keep semantic retries", recorder: recorder)
                 expectEqual(minimaxBudget?.backoffMilliseconds, 250, "minimax should use retry backoff", recorder: recorder)
@@ -302,7 +405,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia suspect routes use shorter first-byte deadlines than healthy routes", recorder: recorder) {
+        run("temporary nvidia suspect routes keep the same first-byte deadline as healthy routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let glm5Request = """
                 {
@@ -316,7 +419,7 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .closed
                     ),
-                    25,
+                    240,
                     "healthy routes should keep the baseline first-byte deadline",
                     recorder: recorder
                 )
@@ -325,14 +428,14 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .suspect
                     ),
-                    8,
-                    "suspect routes should fail first-byte stalls faster than healthy routes",
+                    240,
+                    "suspect routes should not shrink the first-byte deadline for slow NVIDIA models",
                     recorder: recorder
                 )
             }
         }
 
-        run("temporary nvidia route circuit degrades to suspect before quarantine, then enters half-open on recovery", recorder: recorder) {
+        run("temporary nvidia route circuit degrades to suspect before quarantine, then closes immediately on recovery", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -346,19 +449,19 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "suspect state should retain the current failure score", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "two failures should quarantine the route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "two failures should still leave the route available while it is only suspect", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "three failures should still avoid immediate quarantine for slow routes", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "four failures should finally quarantine the route", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "one success should only move the route into half-open recovery", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one success should immediately close the route once a canary proves recovery", recorder: recorder)
 
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first recovery success should transition to half-open", recorder: recorder)
-                expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open state should track recovery successes", recorder: recorder)
-
-                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "recovery threshold successes should close the route again", recorder: recorder)
-                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "second recovery success should restore the healthy state", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first recovery success should restore the healthy state", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -414,6 +517,43 @@ struct ThinkingProxyPolicySpec {
                 )
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "enough clean successes should still restore the healthy state", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary provider retry-after cooldowns immediately suppress worker routes for the advised window", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let headers: [AnyHashable: Any] = ["Retry-After": "2"]
+                let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
+                    statusCode: 429,
+                    headers: headers,
+                    now: now
+                )
+                let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "mimo-v2-pro-opencode",
+                    canonicalModelID: "mimo-v2-pro-free",
+                    transportOutcome: "send_error",
+                    failureClass: "classified_429",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 429,
+                    retryCount: 0,
+                    source: "smart_alias"
+                )
+
+                expectEqual(cooldownUntil?.timeIntervalSince(now), 2, "retry-after seconds should be parsed into a short-lived route cooldown", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "mimo-v2-pro-opencode",
+                    telemetryEvent: cooldownEvent,
+                    at: now,
+                    forcedOpenUntil: cooldownUntil
+                )
+
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(1)), true, "provider-advised cooldowns should immediately suppress the hot route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(3)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -508,14 +648,24 @@ struct ThinkingProxyPolicySpec {
                     telemetryEvent: timeoutEvent,
                     at: now
                 )
-                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 3, "high recent timeout rates should shorten suspect hedge delay", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 45, "high recent timeout rates should keep a cautious hedge delay instead of racing immediately", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: timeoutEvent,
                     at: now.addingTimeInterval(1)
                 )
-                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval(), 30, "quarantined routes with severe timeout history should be canaried more aggressively", recorder: recorder)
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now.addingTimeInterval(2)
+                )
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: timeoutEvent,
+                    at: now.addingTimeInterval(3)
+                )
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIACanaryInterval(), 30, "quarantined slow routes should still be canaried aggressively once they truly open", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -555,7 +705,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia rolling metrics can lower the quarantine threshold for repeatedly bad routes", recorder: recorder) {
+        run("temporary nvidia rolling metrics do not lower the quarantine threshold for slow routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
@@ -599,7 +749,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "routes with repeated recent badness should quarantine after a lower adaptive threshold", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "rolling metrics should retain caution without prematurely quarantining a slow route", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -649,7 +799,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
-                    requestModel: "kimi-k2.5",
+                    requestModel: "mimo-v2-pro-kilocode",
                     until: Date().addingTimeInterval(60)
                 )
                 let request = """
@@ -661,32 +811,2036 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
-                expectEqual(smartAlias?.candidates, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should load its candidate order from merged config", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
                     path: "/v1/chat/completions",
                     currentBody: request,
-                    candidateModelsRemaining: ["kimi-k2.5", "minimax-m2.5"]
+                    candidateModelsRemaining: ["mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia"]
                 )
 
-                expectEqual(transition?.model, "minimax-m2.5", "fallback planning should skip quarantined fallback routes and pick the next viable alias", recorder: recorder)
+                expectEqual(transition?.model, "mimo-v2-pro-opencode", "fallback planning should skip quarantined MiMo routes and pick the next configured alias", recorder: recorder)
                 let rewritten = parseJSONObject(transition?.body, recorder: recorder)
-                expectEqual(rewritten["model"] as? String, "minimax-m2.5", "fallback planning should rewrite the request model to the chosen fallback alias", recorder: recorder)
+                expectEqual(rewritten["model"] as? String, "mimo-v2-pro-opencode", "fallback planning should rewrite the request model to the chosen fallback alias", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
-        run("temporary worker smart alias rejects streaming, tools, and structured output requests", recorder: recorder) {
+        run("temporary glm-5.1 public entrypoint reuses the internal worker failover pool", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
+                let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1")
+                expectEqual(smartAlias?.requestClass, "plain-chat", "glm-5.1 should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
+                expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
+            }
+        }
+
+        run("neutral proxy worker smart router alias reuses the internal worker failover pool", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router")
+                expectEqual(smartAlias?.requestClass, "plain-chat", "proxy-worker-smart-router should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
+                expectEqual(smartAlias?.failover, "silent", "proxy-worker-smart-router should inherit silent failover from the internal worker pool", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
+            }
+        }
+
+        run("temporary gpt-4.1-mini public entrypoint is no longer a pooled alias", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "gpt-4.1-mini")
+                expectNil(smartAlias, "gpt-4.1-mini should no longer resolve through the pooled worker alias path", recorder: recorder)
+            }
+        }
+
+        run("glm-5.1 public entrypoint uses health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1") else {
+                    recorder.recordFailure("glm-5.1 should still inherit the worker pool definition")
+                    return
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm-5.1",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "glm-5.1",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+
+                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy glm-5.1 requests should use health-ranked pool candidates", recorder: recorder)
+            }
+        }
+
+        run("neutral proxy worker smart router alias uses health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
+                    recorder.recordFailure("proxy-worker-smart-router should inherit the worker pool definition")
+                    return
+                }
+
+                let requestJSON = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "proxy-worker-smart-router",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+
+                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy proxy-worker-smart-router requests should use health-ranked pool candidates", recorder: recorder)
+            }
+        }
+
+        run("tool-heavy proxy worker smart router preserves the public-alias timeout budget on GPT-backed attempts", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var capturedTimeout: TimeInterval?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, timeoutInterval, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    capturedTimeout = timeoutInterval
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-worker-timeout-budget",
+                              "object": "chat.completion",
+                              "model": "\(json["model"] as? String ?? "unknown")",
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {"model":"proxy-worker-smart-router","messages":[{"role":"user","content":"Return exactly: OK"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"stream":false}
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("tool-heavy smart-router request should complete under test transport")
+                    return
+                }
+
+                expectEqual(Int(capturedTimeout ?? 0), 200, "tool-heavy smart-router attempts should preserve the alias timeout budget instead of inheriting the rewritten GPT default", recorder: recorder)
+            }
+        }
+
+        run("Factory smart-router custom model IDs reuse the worker pool and preserve caller-visible IDs", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedBody: String?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        forwardedBody = body
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-factory-smart-router",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { _, headers, body in
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(genericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "tools": [
+                            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                          ],
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("Factory smart-router custom model ID should return a response")
+                        return
+                    }
+
+                    let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "tool-heavy Factory smart-router custom IDs should route to the health-ranked pool", recorder: recorder)
+
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    expectEqual(deliveredJSON["model"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should stay caller-visible on the way out", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should be preserved in proxy audit headers", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "smart-router custom IDs should expose the pool primary candidate", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should expose the authoritative Factory model id", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "smart-router custom IDs should expose the binding source", recorder: recorder)
+                }
+            }
+        }
+
+        run("Factory GPT orchestration alias rescues direct auth failures through the smart-router worker chain", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedPaths: [String] = []
+                    var forwardedModels: [String] = []
+                    var deliveredStatus: Int?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        forwardedPaths.append(path)
+                        forwardedModels.append(json["model"] as? String ?? "")
+
+                        if path == "/v1/responses" {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "error": {
+                                        "message": "auth_not_found: no auth available",
+                                        "type": "server_error",
+                                        "code": "internal_server_error"
+                                      }
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(
+                                        statusCode: 500,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-rescued-factory-role",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                        deliveredStatus = statusCode
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                        {
+                          "model": "\(genericCompatFactoryWorkerContract.validationWorkerModelID)",
+                          "input": "Return exactly: OK"
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("rescued Factory GPT orchestration alias should return a response")
+                        return
+                    }
+
+                    expectEqual(forwardedPaths, ["/v1/responses", "/v1/chat/completions"], "rescued Factory GPT orchestration should try the direct responses lane first, then fall back through chat-completions smart routing", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.4(high)", "glm-5.1-zai"], "rescued Factory GPT orchestration should preserve the direct configured route before switching to the smart-router fallback candidate", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "rescued Factory GPT orchestration should succeed after worker-chain failover", recorder: recorder)
+
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    expectEqual(deliveredJSON["model"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "rescued Factory GPT orchestration should preserve the outward custom model id", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "rescued Factory GPT orchestration should preserve the caller-visible model header", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "rescued Factory GPT orchestration should expose the worker-chain fallback winner", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "rescued Factory GPT orchestration should expose the fallback provider", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "rescued Factory GPT orchestration should keep the authoritative custom binding source", recorder: recorder)
+                }
+            }
+        }
+
+        run("Factory GPT orchestration alias rescues streaming quota failures through the smart-router worker chain", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedPaths: [String] = []
+                    var forwardedModels: [String] = []
+                    var deliveredStatus: Int?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        forwardedPaths.append(path)
+                        forwardedModels.append(json["model"] as? String ?? "")
+
+                        if path == "/v1/responses" {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "error": {
+                                        "type": "usage_limit_reached",
+                                        "message": "The usage limit has been reached"
+                                      }
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(
+                                        statusCode: 429,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-rescued-factory-role-stream",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                        deliveredStatus = statusCode
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                        {
+                          "model": "\(genericCompatFactoryWorkerContract.validationWorkerModelID)",
+                          "stream": true,
+                          "input": "Return exactly: OK"
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("rescued streaming Factory GPT orchestration alias should return a response")
+                        return
+                    }
+
+                    expectEqual(forwardedPaths, ["/v1/responses", "/v1/chat/completions"], "rescued streaming Factory GPT orchestration should try the direct responses lane first, then fall back through chat-completions smart routing", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.4(high)", "glm-5.1-zai"], "rescued streaming Factory GPT orchestration should preserve the direct configured route before switching to the smart-router fallback candidate", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "rescued streaming Factory GPT orchestration should succeed after worker-chain failover", recorder: recorder)
+                    expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "rescued streaming Factory GPT orchestration should return synthetic Responses SSE", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "rescued streaming Factory GPT orchestration should preserve the caller-visible model header", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "rescued streaming Factory GPT orchestration should expose the worker-chain fallback winner", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "rescued streaming Factory GPT orchestration should expose the fallback provider", recorder: recorder)
+                    let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                    expectEqual(deliveredText.contains("\"model\":\"\(genericCompatFactoryWorkerContract.validationWorkerModelID)\""), true, "rescued streaming Factory GPT orchestration should preserve the outward custom model inside synthetic SSE events", recorder: recorder)
+                    expectEqual(deliveredText.contains("response.created"), true, "rescued streaming Factory GPT orchestration should emit Responses SSE lifecycle events", recorder: recorder)
+                    expectEqual(deliveredText.contains("data: [DONE]"), true, "rescued streaming Factory GPT orchestration should terminate with the OpenAI SSE sentinel", recorder: recorder)
+                }
+            }
+        }
+
+        run("raw managed GPT orchestration route surfaces direct auth failures to the caller", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedPaths: [String] = []
+                    var forwardedModels: [String] = []
+                    var deliveredStatus: Int?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        forwardedPaths.append(path)
+                        forwardedModels.append(json["model"] as? String ?? "")
+
+                        if path == "/v1/responses" {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "error": {
+                                        "message": "auth_not_found: no auth available",
+                                        "type": "server_error",
+                                        "code": "internal_server_error"
+                                      }
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(
+                                        statusCode: 500,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-rescued-raw-factory-role",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                        deliveredStatus = statusCode
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                        {
+                          "model": "gpt-5.4(high)",
+                          "input": "Return exactly: OK"
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("raw managed GPT route should return a response for auth failures")
+                        return
+                    }
+
+                    expectEqual(forwardedPaths, ["/v1/responses"], "raw managed GPT should only attempt the direct route without silent rescue", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.4(high)"], "raw managed GPT should forward the original model without rescue", recorder: recorder)
+                    expectEqual(deliveredStatus, 500, "raw managed GPT auth failures should surface the upstream error status to the caller", recorder: recorder)
+
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let errorDict = deliveredJSON["error"] as? [String: Any]
+                    expectEqual(errorDict?["code"] as? String, "internal_server_error", "raw managed GPT should surface the upstream error code", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.4(high)", "raw managed GPT failure should expose the route model that failed", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "raw managed GPT failure should expose the provider that failed", recorder: recorder)
+                }
+            }
+        }
+
+        run("raw managed GPT orchestration route surfaces streaming quota failures to the caller", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedPaths: [String] = []
+                    var forwardedModels: [String] = []
+                    var deliveredStatus: Int?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        forwardedPaths.append(path)
+                        forwardedModels.append(json["model"] as? String ?? "")
+
+                        if path == "/v1/responses" {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "error": {
+                                        "type": "usage_limit_reached",
+                                        "message": "The usage limit has been reached"
+                                      }
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(
+                                        statusCode: 429,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-rescued-raw-factory-role-stream",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                        deliveredStatus = statusCode
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                        {
+                          "model": "gpt-5.4(high)",
+                          "stream": true,
+                          "input": "Return exactly: OK"
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("streaming raw managed GPT route should return a response for quota failures")
+                        return
+                    }
+
+                    expectEqual(forwardedPaths, ["/v1/responses"], "streaming raw managed GPT should only attempt the direct route without silent rescue", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.4(high)"], "streaming raw managed GPT should forward the original model without rescue", recorder: recorder)
+                    expectEqual(deliveredStatus, 429, "streaming raw managed GPT quota failures should surface the upstream error status to the caller", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.4(high)", "streaming raw managed GPT failure should expose the route model that failed", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "streaming raw managed GPT failure should expose the provider that failed", recorder: recorder)
+                }
+            }
+        }
+
+        run("retired Factory worker model IDs are rescued onto the current worker route", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedBody: String?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        forwardedBody = body
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-retired-factory-worker",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { _, headers, body in
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "custom:Factory-Worker-GPT-5.4-High-8",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("retired Factory worker model ID should be rescued by the proxy")
+                        return
+                    }
+
+                    let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "retired Factory worker IDs should be rerouted through the current worker smart-router primary", recorder: recorder)
+
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    expectEqual(deliveredJSON["model"] as? String, "custom:Factory-Worker-GPT-5.4-High-8", "retired Factory worker IDs should stay caller-visible after proxy rescue", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "custom:Factory-Worker-GPT-5.4-High-8", "retired Factory worker IDs should be preserved in audit headers", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "retired Factory worker IDs should expose the authoritative current worker route", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, genericCompatFactoryWorkerContract.workerModelID, "retired Factory worker IDs should expose the current authoritative Factory worker id", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "retired_worker_alias_rescue", "retired Factory worker IDs should expose that they were proxy-rescued", recorder: recorder)
+                }
+            }
+        }
+
+        run("retired Factory worker model IDs fail closed with a contract error when no authoritative worker binding exists", recorder: recorder) {
+            withFactorySettings("""
+            {
+              "missionModelSettings": {
+                "workerModel": "custom:GPT-5.4-High-Proxy-2"
+              },
+              "customModels": []
+            }
+            """) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
                 var deliveredMessage: String?
+
                 proxy.deliveredErrorForTesting = { statusCode, message in
                     deliveredStatus = statusCode
                     deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {
+                      "model": "custom:Factory-Worker-GPT-5.4-High-8",
+                      "stream": false,
+                      "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("retired Factory worker ids without an authoritative binding should fail closed")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 409, "retired Factory worker ids without a binding should return a contract error instead of leaking into an opaque backend failure", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("custom:Factory-Worker-GPT-5.4-High-8"), true, "contract errors should name the retired leaked worker id", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("authoritative worker contract"), true, "contract errors should explain the missing authoritative binding", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias forwards non-streaming tool requests to the primary backend", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedBody = body
+                    expectEqual(path, "/v1/chat/completions", "worker rich-request primary path should still use chat-completions upstream", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-worker-rich",
+                              "object": "chat.completion",
+                              "model": "gpt-5.4(high)",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker rich-request primary path should return a response")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker rich requests should target the health-ranked pool primary", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "worker rich requests should preserve explicit non-streaming semantics", recorder: recorder)
+                let forwardedTools = forwardedJSON["tools"] as? [[String: Any]]
+                expectEqual(forwardedTools?.count, 1, "worker rich requests should preserve tool definitions toward the primary backend", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "worker rich requests should succeed through the primary backend path", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker rich-request responses should still surface the public alias", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker rich-request responses should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker rich-request responses should expose the pool primary provider", recorder: recorder)
+            }
+        }
+
+        run("Factory openai custom model IDs preserve caller-visible identity on direct routes", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "resp_factory_direct",
+                              "object": "response",
+                              "model": "gpt-5.4(high)",
+                              "status": "completed",
+                              "output": [
+                                {
+                                  "type": "message",
+                                  "role": "assistant",
+                                  "status": "completed",
+                                  "content": [
+                                    {"type": "output_text", "text": "OK", "annotations": []}
+                                  ]
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, headers, body in
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("openai Factory custom model IDs should return a buffered direct response")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedPath, "/v1/responses", "openai Factory custom IDs should preserve the responses API path", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "openai Factory custom IDs should be rewritten to their configured route model before proxy forwarding", recorder: recorder)
+
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should stay caller-visible on the way out", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should emit the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "openai Factory custom IDs should expose the direct resolved model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "openai Factory custom IDs should expose the direct provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should expose the authoritative Factory model id", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "openai Factory custom IDs should expose the binding source", recorder: recorder)
+            }
+        }
+
+        run("Factory openai custom model IDs preserve direct auth-unavailable errors without cross-model failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "message": "auth_not_found: no auth available",
+                                "type": "server_error",
+                                "code": "internal_server_error"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 500,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("Factory direct auth failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "Factory direct auth failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "Factory direct auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 500, "Factory direct auth failures should surface the direct-lane error", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["message"] as? String, "auth_not_found: no auth available", "Factory direct auth failures should preserve the upstream auth error", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "Factory direct auth failures should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "Factory direct auth failures should still expose the direct route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "Factory direct auth failures should still expose the direct provider", recorder: recorder)
+            }
+        }
+
+        run("Factory openai custom model IDs preserve direct quota errors without cross-model failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "type": "usage_limit_reached",
+                                "message": "The usage limit has been reached"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("Factory direct quota failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "Factory direct quota failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "Factory direct quota failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 429, "Factory direct quota failures should surface the direct-lane error", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["type"] as? String, "usage_limit_reached", "Factory direct quota failures should preserve the upstream quota classification", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "Factory direct quota failures should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "Factory direct quota failures should still expose the direct route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "Factory direct quota failures should still expose the direct provider", recorder: recorder)
+            }
+        }
+
+        run("Factory openai custom model IDs preserve caller-visible identity on streaming direct responses", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming openai Factory custom IDs should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "resp_factory_direct_stream",
+                              "object": "response",
+                              "model": "gpt-5.4(high)",
+                              "status": "completed",
+                              "output": [
+                                {
+                                  "type": "message",
+                                  "id": "msg_factory_direct_stream",
+                                  "role": "assistant",
+                                  "status": "completed",
+                                  "content": [
+                                    {"type": "output_text", "text": "OK", "annotations": []}
+                                  ]
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "stream": true,
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("openai Factory custom model IDs should return a synthetic SSE response")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedPath, "/v1/responses", "streaming openai Factory custom IDs should preserve the responses API path", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming openai Factory custom IDs should be rewritten to their configured route model", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "streaming openai Factory custom IDs should buffer upstream direct routes with stream=false", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "streaming openai Factory custom IDs should succeed", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streaming openai Factory custom IDs should surface an SSE content type", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "streaming openai Factory custom IDs should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming openai Factory custom IDs should expose the resolved direct model", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"model\":\"\(openAIFactoryWorkerContract.workerModelID)\""), true, "streaming openai Factory custom IDs should preserve the outward custom model inside synthetic SSE events", recorder: recorder)
+                expectEqual(deliveredText.contains("response.created"), true, "streaming openai Factory custom IDs should emit Responses SSE lifecycle events", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "streaming openai Factory custom IDs should terminate with the OpenAI SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("Factory openai streaming custom model IDs preserve direct auth-unavailable errors without cross-model failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming Factory auth failures should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "message": "auth_not_found: no auth available",
+                                "type": "server_error",
+                                "code": "internal_server_error"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 500,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "stream": true,
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("streaming Factory direct auth failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "streaming Factory direct auth failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "streaming Factory direct auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 500, "streaming Factory direct auth failures should surface the direct-lane error", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming Factory direct auth failures should return the backend error body rather than synthetic SSE", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["message"] as? String, "auth_not_found: no auth available", "streaming Factory direct auth failures should preserve the upstream auth error", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "streaming Factory direct auth failures should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming Factory direct auth failures should still expose the direct route model", recorder: recorder)
+            }
+        }
+
+        run("Raw managed GPT route models preserve direct auth-unavailable errors without worker failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "message": "auth_not_found: no auth available",
+                                "type": "server_error",
+                                "code": "internal_server_error"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 500,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.routeModel)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("raw managed GPT route auth failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "raw managed GPT route auth failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "raw managed GPT route auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 500, "raw managed GPT route auth failures should surface the direct-lane error", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["message"] as? String, "auth_not_found: no auth available", "raw managed GPT route auth failures should preserve the upstream auth error", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.routeModel, "raw managed GPT route auth failures should preserve the caller-visible route header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "raw managed GPT route auth failures should still expose the direct route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "raw managed GPT route auth failures should still expose the authoritative Factory model id", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "raw_managed_route_rescue", "raw managed GPT route auth failures should preserve the raw-route binding source", recorder: recorder)
+            }
+        }
+
+        run("Raw managed GPT streaming route models preserve direct auth-unavailable errors without worker failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming raw managed GPT auth failures should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "message": "auth_not_found: no auth available",
+                                "type": "server_error",
+                                "code": "internal_server_error"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 500,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.routeModel)",
+                      "stream": true,
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("streaming raw managed GPT auth failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "streaming raw managed GPT auth failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "streaming raw managed GPT auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 500, "streaming raw managed GPT auth failures should surface the direct-lane error", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming raw managed GPT auth failures should return the backend error body rather than synthetic SSE", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["message"] as? String, "auth_not_found: no auth available", "streaming raw managed GPT auth failures should preserve the upstream auth error", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming raw managed GPT auth failures should preserve the outward raw route model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "streaming raw managed GPT auth failures should still expose the authoritative Factory model id", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "raw_managed_route_rescue", "streaming raw managed GPT auth failures should preserve the raw-route binding source", recorder: recorder)
+            }
+        }
+
+        run("Factory openai streaming custom model IDs preserve direct quota errors without cross-model failover", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPaths: [String] = []
+                var forwardedModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming Factory quota failures should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    forwardedPaths.append(path)
+                    forwardedModels.append(json["model"] as? String ?? "")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "error": {
+                                "type": "usage_limit_reached",
+                                "message": "The usage limit has been reached"
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "stream": true,
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("streaming Factory direct quota failures should preserve the direct-lane error")
+                    return
+                }
+
+                expectEqual(forwardedPaths, ["/v1/responses"], "streaming Factory direct quota failures should stay on the direct responses lane", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.4(high)"], "streaming Factory direct quota failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(deliveredStatus, 429, "streaming Factory direct quota failures should surface the direct-lane error", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming Factory direct quota failures should return the backend error body rather than synthetic SSE", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let deliveredError = deliveredJSON["error"] as? [String: Any]
+                expectEqual(deliveredError?["type"] as? String, "usage_limit_reached", "streaming Factory direct quota failures should preserve the upstream quota classification", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, openAIFactoryWorkerContract.workerModelID, "streaming Factory direct quota failures should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming Factory direct quota failures should still expose the direct route model", recorder: recorder)
+            }
+        }
+
+        run("Factory generic-chat direct custom model IDs preserve caller-visible identity on streaming chat routes", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: directChatFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming generic-chat Factory custom IDs should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl_factory_direct_stream",
+                              "object": "chat.completion",
+                              "model": "gpt-5.4(high)",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {
+                      "model": "\(directChatFactoryWorkerContract.workerModelID)",
+                      "stream": true,
+                      "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("generic-chat direct Factory custom IDs should return a synthetic SSE response")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedPath, "/v1/chat/completions", "streaming generic-chat Factory custom IDs should preserve the chat-completions path", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, directChatFactoryWorkerContract.routeModel, "streaming generic-chat Factory custom IDs should be rewritten to their configured route model", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "streaming generic-chat Factory custom IDs should buffer upstream direct routes with stream=false", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "streaming generic-chat Factory custom IDs should succeed", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streaming generic-chat Factory custom IDs should surface an SSE content type", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, directChatFactoryWorkerContract.workerModelID, "streaming generic-chat Factory custom IDs should preserve the caller-visible model header", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, directChatFactoryWorkerContract.routeModel, "streaming generic-chat Factory custom IDs should expose the resolved direct model", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"model\":\"\(directChatFactoryWorkerContract.workerModelID)\""), true, "streaming generic-chat Factory custom IDs should preserve the outward custom model inside synthetic SSE chunks", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "streaming generic-chat Factory custom IDs should terminate with the OpenAI SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias forwards non-streaming structured-output requests to the primary backend", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedBody: String?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-worker-json",
+                              "object": "chat.completion",
+                              "model": "gpt-5.4(high)",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "{\\\"ok\\\":true}"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "stream": false,
+                  "response_format": {"type": "json_object"},
+                  "messages": [{"role": "user", "content": "Return a JSON object with ok=true"}]
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker structured-output primary path should return a response")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker structured-output requests should target the health-ranked pool primary", recorder: recorder)
+                expectEqual((forwardedJSON["response_format"] as? [String: Any])?["type"] as? String, "json_object", "worker structured-output requests should preserve response_format toward the validated GPT worker lane", recorder: recorder)
+            }
+        }
+
+        run("temporary glm-5.1 pooled alias normalizes non-streaming responses onto the chat-completions failover core", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-zai-responses-buffered",
+                              "object": "chat.completion",
+                              "model": "glm-5.1",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ],
+                              "usage": {
+                                "prompt_tokens": 11,
+                                "completion_tokens": 2,
+                                "total_tokens": 13
+                              }
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm-5.1",
+                  "input": "Return exactly: OK",
+                  "stream": false,
+                  "max_output_tokens": 32
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/responses",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("glm-5.1 responses primary path should return a buffered response")
+                    return
+                }
+
+                expectEqual(forwardedPath, "/v1/chat/completions", "glm-5.1 responses requests should normalize onto the chat-completions execution core upstream", recorder: recorder)
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "glm-5.1 responses requests should enter the real worker failover chain at the Z.AI primary lane", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "glm-5.1 responses requests should preserve explicit non-streaming semantics toward chat completions", recorder: recorder)
+                expectEqual(forwardedJSON["max_tokens"] as? Int, 32, "glm-5.1 responses requests should translate max_output_tokens onto max_tokens for chat completions", recorder: recorder)
+                let forwardedMessages = forwardedJSON["messages"] as? [[String: Any]]
+                expectEqual(forwardedMessages?.count, 1, "glm-5.1 responses requests should translate input into a chat messages array", recorder: recorder)
+                expectEqual(forwardedMessages?.first?["role"] as? String, "user", "glm-5.1 responses requests should preserve the user role", recorder: recorder)
+                expectEqual(forwardedMessages?.first?["content"] as? String, "Return exactly: OK", "glm-5.1 responses requests should preserve input content when normalizing to chat completions", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "glm-5.1 responses requests should succeed through the worker failover core", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "glm-5.1", "glm-5.1 responses requests should still surface the public alias in buffered JSON responses", recorder: recorder)
+                expectEqual(deliveredJSON["object"] as? String, "response", "glm-5.1 responses requests should emit a Responses API envelope back to the caller", recorder: recorder)
+                expectEqual(deliveredJSON["status"] as? String, "completed", "glm-5.1 responses requests should emit a completed Responses status for stop-finished chat completions", recorder: recorder)
+                let output = deliveredJSON["output"] as? [[String: Any]]
+                expectEqual(output?.count, 1, "glm-5.1 responses requests should translate the winning chat response into one output item", recorder: recorder)
+                expectEqual(output?.first?["type"] as? String, "message", "glm-5.1 responses requests should emit message output items", recorder: recorder)
+                let outputContent = (output?.first?["content"] as? [[String: Any]])?.first
+                expectEqual(outputContent?["text"] as? String, "OK", "glm-5.1 responses requests should preserve assistant text inside the Responses envelope", recorder: recorder)
+                expectEqual((deliveredJSON["usage"] as? [String: Any])?["input_tokens"] as? Int, 11, "glm-5.1 responses requests should translate prompt token usage onto Responses input_tokens", recorder: recorder)
+                expectEqual((deliveredJSON["usage"] as? [String: Any])?["output_tokens"] as? Int, 2, "glm-5.1 responses requests should translate completion token usage onto Responses output_tokens", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 responses requests should expose the winning worker route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 responses requests should expose the winning worker route provider", recorder: recorder)
+            }
+        }
+
+        run("temporary glm-5.1 pooled alias synthesizes streaming responses from the chat-completions failover core", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.deliveredErrorForTesting = { _, message in
+                    recorder.recordFailure("glm-5.1 streaming responses requests should not fail closed: \(message)")
+                    delivered.signal()
+                }
+                proxy.bufferedProxyTransportForTesting = { method, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    expectEqual(method, "POST", "glm-5.1 streaming responses should stay on POST", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-zai-responses-streaming",
+                              "object": "chat.completion",
+                              "model": "glm-5.1",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm-5.1",
+                  "input": "Return exactly: OK",
+                  "stream": true,
+                  "max_output_tokens": 32
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/responses",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("glm-5.1 streaming responses should return a synthetic Responses SSE response")
+                    return
+                }
+
+                expectEqual(forwardedPath, "/v1/chat/completions", "glm-5.1 streaming responses should normalize onto the chat-completions execution core upstream", recorder: recorder)
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "glm-5.1 streaming responses should enter the real worker failover chain at the Z.AI primary lane", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "glm-5.1 streaming responses should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "glm-5.1 streaming responses should succeed through the worker failover core", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "glm-5.1 streaming responses should surface an SSE content type", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 streaming responses should expose the winning worker route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 streaming responses should expose the winning worker route provider", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"type\":\"response.output_text.delta\""), true, "glm-5.1 streaming responses should emit Responses text delta events", recorder: recorder)
+                expectEqual(deliveredText.contains("\"type\":\"response.completed\""), true, "glm-5.1 streaming responses should emit a terminal Responses completion event", recorder: recorder)
+                expectEqual(deliveredText.contains("\"model\":\"glm-5.1\""), true, "glm-5.1 streaming responses should preserve the public alias in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "glm-5.1 streaming responses should terminate with the SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("temporary glm-5.1 pooled alias pins tool-bearing responses to the validated GPT lane and preserves the public alias outwardly", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var bodiesByModel: [String: [String: Any]] = [:]
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    bodiesByModel[model] = json
+                    lock.unlock()
+                    expectEqual(path, "/v1/chat/completions", "glm-5.1 tool-bearing responses should normalize onto the chat-completions execution core upstream", recorder: recorder)
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-glm-responses-tools",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                          {
+                                            "id": "call_lookup_glm_1",
+                                            "type": "function",
+                                            "function": {
+                                              "name": "lookup",
+                                              "arguments": "{\\"city\\":\\"Sydney\\"}"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      "finish_reason": "tool_calls"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        recorder.recordFailure("tool-bearing glm-5.1 responses requests should pin to the validated GPT lane")
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm-5.1",
+                  "stream": true,
+                  "tools": [
+                    {"type": "function", "name": "lookup", "description": "Lookup a city", "parameters": {"type": "object"}}
+                  ],
+                  "tool_choice": "auto",
+                  "input": "Find the weather"
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/responses",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("glm-5.1 tool-bearing responses requests should return a synthetic Responses SSE stream through the validated GPT lane")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing glm-5.1 responses requests should pin to the pool primary instead of entering the broader fallback race", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "glm-5.1 tool-bearing responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
+                let forwardedMessages = bodiesByModel["glm-5.1-zai"]?["messages"] as? [[String: Any]]
+                expectEqual(forwardedMessages?.last?["content"] as? String, "Find the weather", "glm-5.1 tool-bearing responses requests should translate input onto a chat messages array", recorder: recorder)
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
+                expectEqual(forwardedTools?.count, 1, "glm-5.1 tool-bearing responses requests should preserve tool definitions toward the pool primary", recorder: recorder)
+                let forwardedFunction = forwardedTools?.first?["function"] as? [String: Any]
+                expectEqual(forwardedFunction?["name"] as? String, "lookup", "glm-5.1 tool-bearing responses requests should normalize Responses tool definitions onto chat-completions function objects", recorder: recorder)
+                expectEqual(forwardedFunction?["description"] as? String, "Lookup a city", "glm-5.1 tool-bearing responses requests should preserve tool descriptions when normalizing onto chat completions", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "glm-5.1 tool-bearing responses requests should still succeed through the pool primary", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "glm-5.1 tool-bearing responses requests should surface a Responses SSE content type", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 tool-bearing responses requests should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 tool-bearing responses requests should expose the pool primary provider", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"type\":\"response.function_call_arguments.delta\""), true, "glm-5.1 tool-bearing responses requests should emit function-call argument deltas in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("\"call_id\":\"call_lookup_glm_1\""), true, "glm-5.1 tool-bearing responses requests should preserve the winning tool call id in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("\"model\":\"glm-5.1\""), true, "glm-5.1 tool-bearing responses requests should preserve the outward alias in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "glm-5.1 tool-bearing responses requests should terminate with the SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("temporary worker responses requests pin tool-bearing traffic to the GPT lane and synthesize function-call response events", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var bodiesByModel: [String: [String: Any]] = [:]
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    bodiesByModel[model] = json
+                    lock.unlock()
+                    expectEqual(path, "/v1/chat/completions", "worker responses requests should normalize onto the chat-completions execution core upstream", recorder: recorder)
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-worker-responses-tools",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                          {
+                                            "id": "call_lookup_1",
+                                            "type": "function",
+                                            "function": {
+                                              "name": "lookup",
+                                              "arguments": "{\\"city\\":\\"Sydney\\"}"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      "finish_reason": "tool_calls"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        recorder.recordFailure("tool-bearing worker responses requests should pin to the validated GPT lane")
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "stream": true,
+                  "tools": [
+                    {"type": "function", "name": "lookup", "description": "Lookup a city", "parameters": {"type": "object"}}
+                  ],
+                  "tool_choice": "auto",
+                  "input": "Find the weather"
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/responses",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker responses requests should return a synthetic Responses SSE stream through the validated GPT lane")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing worker responses requests should pin to the pool primary instead of entering the broader fallback race", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "worker responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
+                let forwardedMessages = bodiesByModel["glm-5.1-zai"]?["messages"] as? [[String: Any]]
+                expectEqual(forwardedMessages?.last?["content"] as? String, "Find the weather", "worker responses requests should translate input onto a chat messages array", recorder: recorder)
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
+                expectEqual(forwardedTools?.count, 1, "worker responses requests should preserve tool definitions toward the pool primary", recorder: recorder)
+                let forwardedFunction = forwardedTools?.first?["function"] as? [String: Any]
+                expectEqual(forwardedFunction?["name"] as? String, "lookup", "worker responses requests should normalize Responses tool definitions onto chat-completions function objects", recorder: recorder)
+                expectEqual(forwardedFunction?["description"] as? String, "Lookup a city", "worker responses requests should preserve tool descriptions when normalizing onto chat completions", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "worker responses requests should still succeed through the pool primary", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker responses requests should surface a Responses SSE content type", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker responses requests should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker responses requests should expose the pool primary provider", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"type\":\"response.function_call_arguments.delta\""), true, "worker responses requests should emit function-call argument deltas in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("\"call_id\":\"call_lookup_1\""), true, "worker responses requests should preserve the winning tool call id in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("\"model\":\"worker\""), true, "worker responses requests should preserve the outward alias in the synthetic Responses stream", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "worker responses requests should terminate with the SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias pins tool-bearing streaming requests to the validated GPT lane and returns a synthetic worker SSE stream", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var bodiesByModel: [String: [String: Any]] = [:]
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("worker streaming failover should not bypass the buffered smart-alias transport anymore")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    bodiesByModel[model] = json
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-stream-primary",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        recorder.recordFailure("tool-bearing worker streaming requests should not fail over beyond the validated GPT lane")
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
                     delivered.signal()
                 }
 
@@ -710,28 +2864,194 @@ struct ThinkingProxyPolicySpec {
                     connection: connection
                 )
 
-                guard delivered.wait(timeout: .now() + 1) == .success else {
-                    recorder.recordFailure("worker preflight should return an error response")
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker streaming requests should return a synthetic SSE response through the validated GPT lane")
                     return
                 }
-                expectEqual(deliveredStatus, 501, "worker should fail closed for unsupported request classes", recorder: recorder)
+
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing worker streaming requests should pin to the pool primary instead of entering the fallback race", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "worker streaming requests should buffer the upstream alias transport with stream=false", recorder: recorder)
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
+                expectEqual(forwardedTools?.count, 1, "worker streaming requests should preserve tool definitions toward the pool primary", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "worker streaming requests should still succeed through the pool primary", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker streaming responses should surface an SSE content type to Factory", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker streaming responses should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker streaming responses should expose the pool primary provider", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"model\":\"worker\""), true, "worker streaming responses should preserve the outward alias inside the synthetic SSE chunks", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "worker streaming responses should terminate with the OpenAI SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias fails closed when the primary route is not Z.AI glm-5.1", recorder: recorder) {
+            withMergedConfig(workerMisconfiguredMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, _ in
+                    recorder.recordFailure("worker misconfiguration should fail before any upstream transport is attempted")
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker contract misconfiguration should return an error response")
+                    return
+                }
+                expectEqual(deliveredStatus, 500, "worker should fail closed when its primary route contract is violated", recorder: recorder)
                 expectEqual(
-                    deliveredMessage?.contains("only supports non-streaming plain chat"),
-                    true,
-                    "worker rejection should explain the supported request class",
+                    deliveredMessage,
+                    "The worker pooled alias is misconfigured: primary candidate must resolve to Anthropic-backed Z.AI glm-5.1.",
+                    "worker should emit a stable misconfiguration error",
                     recorder: recorder
                 )
             }
         }
 
-        run("temporary worker smart alias silently fails over from z.ai to nvidia and preserves the outward alias", recorder: recorder) {
+        run("temporary worker smart alias preserves the OpenAI chat envelope toward 8318 and rewrites the response back to worker", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedMethod: String?
+                var forwardedPath: String?
+                var forwardedHeaders: [(String, String)] = []
+                var forwardedBody: String?
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { method, path, headers, body, _, completion in
+                    forwardedMethod = method
+                    forwardedPath = path
+                    forwardedHeaders = headers
+                    forwardedBody = body
+
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-zai-primary",
+                              "object": "chat.completion",
+                              "model": "glm-5.1",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "X-Upstream-Hop": "stub-8318"
+                                ]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [
+                    {"role": "system", "content": "You are terse."},
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "stream": false,
+                  "temperature": 0
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        headers: [
+                            ("Authorization", "Bearer factory-local-proxy"),
+                            ("X-Factory-Session", "mission-worker-test")
+                        ],
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker contract test should deliver a response")
+                    return
+                }
+
+                expectEqual(forwardedMethod, "POST", "worker should preserve the POST method when forwarding to 8318", recorder: recorder)
+                expectEqual(forwardedPath, "/v1/chat/completions", "worker should preserve the chat-completions path when forwarding to 8318", recorder: recorder)
+
+                let forwardedHeaderMap = Dictionary(uniqueKeysWithValues: forwardedHeaders.map { ($0.0.lowercased(), $0.1) })
+                expectEqual(forwardedHeaderMap["authorization"], "Bearer factory-local-proxy", "worker should forward caller authorization headers toward 8318", recorder: recorder)
+                expectEqual(forwardedHeaderMap["x-factory-session"], "mission-worker-test", "worker should forward custom caller headers toward 8318", recorder: recorder)
+                expectEqual(forwardedHeaderMap["content-type"], "application/json", "worker should preserve the OpenAI JSON content type toward 8318", recorder: recorder)
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker should rewrite the outbound model to the primary candidate before forwarding to 8318", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "worker should preserve explicit non-streaming chat semantics toward 8318", recorder: recorder)
+                expectEqual(forwardedJSON["temperature"] as? Int, 0, "worker should preserve unrelated OpenAI chat parameters toward 8318", recorder: recorder)
+                let forwardedMessages = forwardedJSON["messages"] as? [[String: Any]]
+                expectEqual(forwardedMessages?.count, 2, "worker should preserve the OpenAI messages array toward 8318", recorder: recorder)
+                expectEqual(forwardedMessages?.first?["role"] as? String, "system", "worker should leave the system message in the OpenAI envelope toward 8318", recorder: recorder)
+                expectEqual(forwardedMessages?.last?["role"] as? String, "user", "worker should preserve the user message toward 8318", recorder: recorder)
+
+                expectEqual(deliveredStatus, 200, "worker should surface the successful 8318 response to the caller", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should rewrite the response model back to the public alias", recorder: recorder)
+                expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String), "stop", "worker should preserve the OpenAI finish_reason from the winning backend", recorder: recorder)
+                expectEqual((((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String), "OK", "worker should preserve the assistant content from the winning backend", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker should expose the resolved primary model on the client response", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker should expose the resolved primary provider on the client response", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Upstream-Hop"] as? String, "stub-8318", "worker should preserve unrelated upstream response headers when returning to the caller", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias tries opencode mimo-v2-pro after kilocode fails and preserves the outward alias", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
                 var deliveredBody: Data?
                 var seenModels: [String] = []
+                var seenHeadersByModel: [String: [(String, String)]] = [:]
                 var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
                 let lock = NSLock()
 
@@ -742,15 +3062,16 @@ struct ThinkingProxyPolicySpec {
                 }
                 defer { OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil }
 
-                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                proxy.bufferedProxyTransportForTesting = { _, _, headers, body, _, completion in
                     let json = parseJSONObject(body, recorder: recorder)
                     let model = json["model"] as? String ?? ""
                     lock.lock()
                     seenModels.append(model)
+                    seenHeadersByModel[model] = headers
                     lock.unlock()
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -758,14 +3079,22 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "mimo-v2-pro-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-test",
+                                  "id": "chatcmpl-opencode",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5",
+                                  "model": "mimo-v2-pro-free",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -789,8 +3118,9 @@ struct ThinkingProxyPolicySpec {
                         )
                     }
                 }
-                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
                     deliveredStatus = statusCode
+                    deliveredHeaders = headers
                     deliveredBody = body
                     delivered.signal()
                 }
@@ -817,27 +3147,338 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should try z.ai first, then race the healthy NVIDIA fallbacks after the primary fails", recorder: recorder)
-                expectEqual(deliveredStatus, 200, "worker should return the fallback candidate's success response", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode"], "worker should try glm-5.1, then kilocode MiMo, then opencode MiMo before NVIDIA", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should return the opencode MiMo fallback response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker responses should preserve the outward alias instead of leaking the winner model", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "route health should track non-NVIDIA worker candidates so the pool can quarantine flaky primaries", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "worker", "worker should expose the public alias in response headers for auditability", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-opencode", "worker should expose the winning MiMo backend model in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "opencode", "worker should expose the winning MiMo backend provider in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "mimo-v2-pro-free", "worker should expose the winning MiMo canonical model in response headers", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "route health should track non-NVIDIA worker candidates so the pool can quarantine flaky primaries", recorder: recorder)
+
+                let kilocodeReferer = seenHeadersByModel["mimo-v2-pro-kilocode"]?.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                let opencodeReferer = seenHeadersByModel["mimo-v2-pro-opencode"]?.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                expectEqual(kilocodeReferer, "https://openclaw.ai", "kilocode requests should carry the free-tier HTTP-Referer header", recorder: recorder)
+                expectEqual(opencodeReferer, "https://openclaw.ai", "opencode requests should carry the free-tier HTTP-Referer header", recorder: recorder)
 
                 let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5-turbo" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "minimax-m2.5" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "minimax-m2.5" }), true, "worker telemetry should record the winning fallback candidate and final winner", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 }), true, "worker telemetry should record the failed kilocode MiMo attempt at depth 1", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.failoverDepth == 2 && $0.finalWinnerRequestModel == "mimo-v2-pro-opencode" }), true, "worker telemetry should record the winning opencode MiMo attempt and final winner", recorder: recorder)
             }
         }
 
-        run("temporary worker smart alias silently fails over when z.ai returns 404 route unavailable", recorder: recorder) {
+        run("temporary worker smart alias fails over from z.ai to kilocode mimo-v2-pro after a 429", recorder: recorder) {
+            withMergedConfig(workerWithMimoMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+                var seenModels: [String] = []
+                var seenHeadersByModel: [String: [(String, String)]] = [:]
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer { OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil }
+
+                proxy.bufferedProxyTransportForTesting = { method, path, headers, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    seenHeadersByModel[model] = headers
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        ))
+                    case "mimo-v2-pro-kilocode":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-kilo",
+                              "object": "chat.completion",
+                              "model": "xiaomi/mimo-v2-pro",
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        ))
+                    default:
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"unexpected model\"}".utf8),
+                            response: httpURLResponse(statusCode: 500),
+                            error: nil
+                        ))
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {"model":"worker","messages":[{"role":"user","content":"Return exactly: OK"}],"stream":false}
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should eventually deliver a response after glm-5.1 429")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "worker should try glm-5.1 first then fall over to kilocode mimo-v2-pro", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "kilocode mimo-v2-pro should be delivered as a successful response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "response model should be rewritten to the public alias", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-kilocode", "resolved model header should name the winning kilocode candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "kilocode", "resolved provider header should identify kilocode", recorder: recorder)
+
+                let kilocodeHeaders = seenHeadersByModel["mimo-v2-pro-kilocode"] ?? []
+                let referer = kilocodeHeaders.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                expectEqual(referer, "https://openclaw.ai", "kilocode requests should carry the HTTP-Referer header required by the free tier", recorder: recorder)
+
+                let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "telemetry should record the failed glm-5.1 attempt at depth 0", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "telemetry should record the winning kilocode attempt at depth 1", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias tries opencode MiniMax free after both mimo-v2-pro providers fail and before NVIDIA", recorder: recorder) {
+            withMergedConfig(workerWithMimoMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+                var seenModels: [String] = []
+                var seenHeadersByModel: [String: [(String, String)]] = [:]
+                let lock = NSLock()
+
+                proxy.bufferedProxyTransportForTesting = { _, _, headers, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    seenHeadersByModel[model] = headers
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        ))
+                    case "minimax-m2.5-opencode":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-opencode-minimax",
+                              "object": "chat.completion",
+                              "model": "minimax/minimax-m2.5-20260211",
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        ))
+                    default:
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"unexpected model\"}".utf8),
+                            response: httpURLResponse(statusCode: 500),
+                            error: nil
+                        ))
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {"model":"worker","messages":[{"role":"user","content":"Return exactly: OK"}],"stream":false}
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should eventually deliver the opencode MiniMax free response")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"], "worker should try opencode MiniMax free after both MiMo legs and before NVIDIA", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "opencode MiniMax free should be returned as a successful worker fallback", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias when opencode MiniMax free wins", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "minimax-m2.5-opencode", "resolved model header should identify the opencode MiniMax free candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "opencode", "resolved provider header should identify opencode", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "minimax-m2.5-free", "resolved canonical model should expose the upstream free model id", recorder: recorder)
+
+                let opencodeMinimaxHeaders = seenHeadersByModel["minimax-m2.5-opencode"] ?? []
+                let referer = opencodeMinimaxHeaders.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                expectEqual(referer, "https://openclaw.ai", "opencode MiniMax free requests should carry the HTTP-Referer header required by the free tier", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias falls over to nvidia race after opencode MiniMax free returns reasoning-only output", recorder: recorder) {
+            withMergedConfig(workerWithMimoMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+                var seenModels: [String] = []
+                var seenHeadersByModel: [String: [(String, String)]] = [:]
+                let lock = NSLock()
+
+                proxy.bufferedProxyTransportForTesting = { method, path, headers, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    seenHeadersByModel[model] = headers
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        ))
+                    case "minimax-m2.5-opencode":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "gen-1774709641-IkHjO3hMcIwXCTm68N1s",
+                              "object": "chat.completion",
+                              "created": 1774709641,
+                              "model": "minimax/minimax-m2.5-20260211",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "finish_reason": "length",
+                                  "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "reasoning": "The user has just said \\\"Hi\\\""
+                                  }
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        ))
+                    case "minimax-m2.5-nvidia":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-minimax",
+                              "object": "chat.completion",
+                              "model": "minimaxai/minimax-m2.5",
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        ))
+                    case "kimi-k2.5-nvidia":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-kimi",
+                              "object": "chat.completion",
+                              "model": "moonshotai/kimi-k2.5",
+                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        ))
+                    default:
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"unexpected model\"}".utf8),
+                            response: httpURLResponse(statusCode: 500),
+                            error: nil
+                        ))
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {"model":"worker","messages":[{"role":"user","content":"Return exactly: OK"}],"stream":false}
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should eventually deliver a response after all mimo providers fail")
+                    return
+                }
+
+                // glm-5.1, kilo, MiMo opencode, and MiniMax free opencode are tried serially; then NVIDIA races
+                let seenBeforeNvidia = seenModels.prefix(4)
+                expectEqual(Array(seenBeforeNvidia), ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode"], "worker should try both MiMo legs and the opencode MiniMax free leg before falling through to NVIDIA", recorder: recorder)
+                expectEqual(seenModels.contains("minimax-m2.5-nvidia") || seenModels.contains("kimi-k2.5-nvidia"), true, "worker should reach the nvidia race after all mimo providers fail", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "nvidia fallback should deliver a successful response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "response model should be rewritten to the public alias", recorder: recorder)
+
+                let opencodeHeaders = seenHeadersByModel["mimo-v2-pro-opencode"] ?? []
+                let referer = opencodeHeaders.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                expectEqual(referer, "https://openclaw.ai", "opencode requests should carry the HTTP-Referer header required by the free tier", recorder: recorder)
+                let opencodeMinimaxHeaders = seenHeadersByModel["minimax-m2.5-opencode"] ?? []
+                let opencodeMinimaxReferer = opencodeMinimaxHeaders.first(where: { $0.0.lowercased() == "http-referer" })?.1
+                expectEqual(opencodeMinimaxReferer, "https://openclaw.ai", "opencode MiniMax free requests should also carry the HTTP-Referer header required by the free tier", recorder: recorder)
+            }
+        }
+
+        run("temporary glm-5.1 public entrypoint silently fails over through the internal worker pool while preserving the outward model", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
-                let lock = NSLock()
-                var seenModels: [String] = []
                 var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
                 var deliveredBody: Data?
+                var seenModels: [String] = []
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer { OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil }
 
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
                     let json = parseJSONObject(body, recorder: recorder)
@@ -847,22 +3488,22 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
-                                data: Data("{\"error\":\"model not found for account\"}".utf8),
-                                response: httpURLResponse(statusCode: 404),
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-zai-404-fallback",
+                                  "id": "chatcmpl-test",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5",
+                                  "model": "xiaomi/mimo-v2-pro:free",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -886,8 +3527,110 @@ struct ThinkingProxyPolicySpec {
                         )
                     }
                 }
-                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
                     deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm-5.1",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("glm-5.1 pooled entrypoint should eventually return a successful response")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "glm-5.1 should use the worker pool ordering and reach kilocode MiMo before NVIDIA", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "glm-5.1 should return the fallback candidate's success response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "glm-5.1", "glm-5.1 pooled responses should preserve the public entrypoint instead of leaking the winner model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "glm-5.1", "glm-5.1 pooled responses should expose the public entrypoint in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-kilocode", "glm-5.1 pooled responses should expose the winning backend model in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "kilocode", "glm-5.1 pooled responses should expose the winning backend provider in response headers", recorder: recorder)
+
+                let glmEvents = recordedEvents.filter { $0.requestedAlias == "glm-5.1" }
+                expectEqual(glmEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "glm-5.1 telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
+                expectEqual(glmEvents.contains(where: { $0.requestModel == "mimo-v2-pro-kilocode" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "mimo-v2-pro-kilocode" }), true, "glm-5.1 telemetry should record the winning MiMo fallback candidate and final winner", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias silently fails over when z.ai returns 404 route unavailable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"model not found for account\"}".utf8),
+                                response: httpURLResponse(statusCode: 404),
+                                error: nil
+                            )
+                        )
+                    case "mimo-v2-pro-kilocode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-zai-404-fallback",
+                                  "object": "chat.completion",
+                                  "model": "xiaomi/mimo-v2-pro:free",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
                     deliveredBody = body
                     delivered.signal()
                 }
@@ -914,11 +3657,13 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should treat a route-unavailable z.ai 404 as candidate failure and race the healthy NVIDIA fallbacks", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode"], "worker should treat a route-unavailable z.ai 404 as candidate failure and move to the first MiMo fallback", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed after failing over from a z.ai 404", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias after a z.ai 404 fallback", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "route health should penalize z.ai route-unavailable 404 failures", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-kilocode", "worker should expose the MiMo fallback backend model after a z.ai 404", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "kilocode", "worker should expose the MiMo fallback backend provider after a z.ai 404", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "route health should penalize z.ai route-unavailable 404 failures", recorder: recorder)
             }
         }
 
@@ -926,10 +3671,10 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.recordRouteFailure(
-                    forRequestModel: "minimax-m2.5",
+                    forRequestModel: "minimax-m2.5-nvidia",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: Date(),
-                        requestModel: "minimax-m2.5",
+                        requestModel: "minimax-m2.5-nvidia",
                         requestedAlias: "worker",
                         canonicalModelID: "minimaxai/minimax-m2.5",
                         transportOutcome: "send_error",
@@ -959,7 +3704,15 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -1018,7 +3771,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels.prefix(3).map { $0 }, ["glm-5-turbo", "kimi-k2.5", "minimax-m2.5"], "worker should launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
+                expectEqual(seenModels.prefix(6).map { $0 }, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "kimi-k2.5-nvidia", "minimax-m2.5-nvidia"], "worker should exhaust the free serial legs first, then launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should keep succeeding while reordering its fallback race by route health", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -1038,7 +3791,7 @@ struct ThinkingProxyPolicySpec {
                     let json = parseJSONObject(body, recorder: recorder)
                     let model = json["model"] as? String ?? ""
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -1047,7 +3800,16 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                         return {}
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "minimax-m2.5-nvidia":
                         let workItem = DispatchWorkItem {
                             completion(
                                 ThinkingProxy.BufferedProxyResponse(
@@ -1055,7 +3817,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-win",
                                       "object": "chat.completion",
-                                      "model": "minimax-m2.5",
+                                      "model": "minimax-m2.5-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -1072,7 +3834,7 @@ struct ThinkingProxyPolicySpec {
                         }
                         DispatchQueue.global().asyncAfter(deadline: .now() + 0.02, execute: workItem)
                         return { workItem.cancel() }
-                    case "kimi-k2.5":
+                    case "kimi-k2.5-nvidia":
                         let workItem = DispatchWorkItem {
                             completion(
                                 ThinkingProxy.BufferedProxyResponse(
@@ -1080,7 +3842,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-loser",
                                       "object": "chat.completion",
-                                      "model": "kimi-k2.5",
+                                      "model": "kimi-k2.5-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -1154,7 +3916,7 @@ struct ThinkingProxyPolicySpec {
                     let model = json["model"] as? String ?? ""
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -1162,14 +3924,22 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-invalid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5",
+                                  "model": "minimax-m2.5-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -1183,7 +3953,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "kimi-k2.5":
+                    case "kimi-k2.5-nvidia":
                         DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
                             completion(
                                 ThinkingProxy.BufferedProxyResponse(
@@ -1191,7 +3961,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-valid-kimi",
                                       "object": "chat.completion",
-                                      "model": "kimi-k2.5",
+                                      "model": "kimi-k2.5-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -1259,6 +4029,7 @@ struct ThinkingProxyPolicySpec {
                 var seenModels: [String] = []
                 var deliveredStatus: Int?
                 var deliveredBody: Data?
+                var deliveredMessage: String?
 
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
                     let json = parseJSONObject(body, recorder: recorder)
@@ -1268,28 +4039,57 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-zai-invalid",
                                   "object": "chat.completion",
-                                  "model": "glm-5-turbo"
+                                  "model": "glm-5.1"
                                 }
                                 """.utf8),
                                 response: httpURLResponse(statusCode: 200),
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-opencode-minimax-invalid",
+                                  "object": "chat.completion",
+                                  "model": "minimax/minimax-m2.5-20260211",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": null, "reasoning": "The user has just said \\\"Hi\\\""},
+                                      "finish_reason": "length"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-fallback-valid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5",
+                                  "model": "minimax-m2.5-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -1303,7 +4103,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "kimi-k2.5":
+                    case "kimi-k2.5-nvidia":
                         DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
                             completion(
                                 ThinkingProxy.BufferedProxyResponse(
@@ -1311,7 +4111,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-kimi-slower",
                                       "object": "chat.completion",
-                                      "model": "kimi-k2.5",
+                                      "model": "kimi-k2.5-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -1341,6 +4141,11 @@ struct ThinkingProxyPolicySpec {
                     deliveredBody = body
                     delivered.signal()
                 }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
 
                 let requestJSON = """
                 {
@@ -1364,11 +4169,12 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should treat malformed primary 200 bodies as retryable candidate failures and race the NVIDIA fallbacks", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should treat malformed primary 200 bodies as retryable candidate failures, exhaust the free serial fallbacks, then race the NVIDIA fallbacks", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still return a successful fallback response after a malformed primary 200", recorder: recorder)
+                expectNil(deliveredMessage, "worker should not surface an error when a later fallback returns a valid response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "MINIMAX OK", "worker should return the first valid fallback after rejecting malformed primary success bodies", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5-turbo"]?.status, .suspect, "malformed primary 200 bodies should penalize route health for the primary", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "malformed primary 200 bodies should penalize route health for the primary", recorder: recorder)
             }
         }
 
@@ -1381,6 +4187,7 @@ struct ThinkingProxyPolicySpec {
                 var seenModels: [String] = []
                 var deliveredStatus: Int?
                 var deliveredBody: Data?
+                var deliveredMessage: String?
 
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
                     let json = parseJSONObject(body, recorder: recorder)
@@ -1390,7 +4197,7 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -1398,7 +4205,15 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5":
+                    case "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    case "minimax-m2.5-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"bad request\"}".utf8),
@@ -1406,7 +4221,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "kimi-k2.5":
+                    case "kimi-k2.5-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"unauthorized\"}".utf8),
@@ -1450,6 +4265,11 @@ struct ThinkingProxyPolicySpec {
                     deliveredBody = body
                     delivered.signal()
                 }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
 
                 let requestJSON = """
                 {
@@ -1473,8 +4293,9 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the free serial legs fail and the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed once the deferred last-resort backend returns a valid response", recorder: recorder)
+                expectNil(deliveredMessage, "worker should not surface an error when the deferred last-resort backend succeeds", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "LAST RESORT OK", "worker should surface the deferred last-resort backend once the raced fallbacks fail terminally", recorder: recorder)
             }
@@ -1493,7 +4314,7 @@ struct ThinkingProxyPolicySpec {
                     let json = parseJSONObject(body, recorder: recorder)
                     let model = json["model"] as? String ?? ""
                     switch model {
-                    case "glm-5-turbo":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -1549,7 +4370,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary worker smart alias coalesces duplicate safe requests behind one upstream sequence", recorder: recorder) {
+        run("temporary worker smart alias coalesces duplicate safe requests from the same caller identity behind one upstream sequence", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -1570,7 +4391,7 @@ struct ThinkingProxyPolicySpec {
                                 {
                                   "id": "chatcmpl-coalesced",
                                   "object": "chat.completion",
-                                  "model": "glm-5-turbo",
+                                  "model": "glm-5.1",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -1606,6 +4427,10 @@ struct ThinkingProxyPolicySpec {
                 let rawRequest = rawHTTPRequest(
                     method: "POST",
                     path: "/v1/chat/completions",
+                    headers: [
+                        ("Authorization", "Bearer shared-worker-token"),
+                        ("X-Factory-Session", "mission-worker-shared")
+                    ],
                     body: requestJSON
                 )
 
@@ -1619,6 +4444,93 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(transportInvocationCount, 1, "duplicate worker requests should share one upstream request sequence", recorder: recorder)
                 expectEqual(deliveredResponseCount, 2, "coalesced worker requests should fan out the winner to both waiting callers", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias does not coalesce identical safe requests across different caller identities", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let secondConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var transportInvocationCount = 0
+                var deliveredResponseCount = 0
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, completion in
+                    lock.lock()
+                    transportInvocationCount += 1
+                    let invocationNumber = transportInvocationCount
+                    lock.unlock()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-isolated-\(invocationNumber)",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    lock.lock()
+                    deliveredResponseCount += 1
+                    let shouldSignal = deliveredResponseCount == 2
+                    lock.unlock()
+                    if shouldSignal {
+                        delivered.signal()
+                    }
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+                let firstRequest = rawHTTPRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    headers: [
+                        ("Authorization", "Bearer worker-token-one"),
+                        ("X-Factory-Session", "mission-worker-one")
+                    ],
+                    body: requestJSON
+                )
+                let secondRequest = rawHTTPRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    headers: [
+                        ("Authorization", "Bearer worker-token-two"),
+                        ("X-Factory-Session", "mission-worker-two")
+                    ],
+                    body: requestJSON
+                )
+
+                proxy.processRequestForTesting(firstRequest, connection: firstConnection)
+                proxy.processRequestForTesting(secondRequest, connection: secondConnection)
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("identity-partitioned worker requests should each receive a response")
+                    return
+                }
+
+                expectEqual(transportInvocationCount, 2, "worker requests from different caller identities must not share one upstream request sequence", recorder: recorder)
+                expectEqual(deliveredResponseCount, 2, "identity-partitioned worker requests should still return one response per caller", recorder: recorder)
             }
         }
 
@@ -1674,38 +4586,33 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5-turbo", "minimax-m2.5", "kimi-k2.5"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-kilocode", "mimo-v2-pro-opencode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 503, "worker should return one clean 503 when no configured candidate is usable", recorder: recorder)
                 expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "worker should emit a stable final failure message after exhausting the pool", recorder: recorder)
             }
         }
 
-        run("temporary worker smart alias is injected into /v1/models only while at least one candidate is healthy", recorder: recorder) {
+        run("temporary worker smart alias stays hidden from /v1/models even while candidate routes are healthy", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let body = """
                 {
                   "object": "list",
                   "data": [
-                    {"id": "glm-5-turbo", "object": "model", "owned_by": "zai"},
-                    {"id": "minimax-m2.5", "object": "model", "owned_by": "nvidia"},
-                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"}
+                    {"id": "glm-5.1", "object": "model", "owned_by": "zai"},
+                    {"id": "minimax-m2.5-nvidia", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5-nvidia", "object": "model", "owned_by": "nvidia"}
                   ]
                 }
                 """
 
-                guard let injected = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
-                    recorder.recordFailure("worker should be injected into /v1/models when at least one candidate is healthy")
-                    return
-                }
-                let injectedJSON = parseDataJSONObject(injected, recorder: recorder)
-                let injectedIDs = ((injectedJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
-                expectEqual(injectedIDs.contains("worker"), true, "worker should appear in /v1/models when any candidate is available", recorder: recorder)
+                let unmodified = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8))
+                expectNil(unmodified, "worker should not be injected into /v1/models when the upstream list is already healthy", recorder: recorder)
 
                 let until = Date().addingTimeInterval(60)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5-turbo", until: until)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5", until: until)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
 
                 guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
                     recorder.recordFailure("filtered /v1/models should still be materialized after every worker candidate is quarantined")
@@ -1714,7 +4621,35 @@ struct ThinkingProxyPolicySpec {
                 }
                 let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
                 let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
-                expectEqual(filteredIDs.contains("worker"), false, "worker should disappear from /v1/models when every candidate is unavailable", recorder: recorder)
+                expectEqual(filteredIDs.contains("worker"), false, "worker should remain absent from /v1/models even after candidate filtering runs", recorder: recorder)
+                expectEqual(filteredIDs.contains("glm-5.1"), false, "filtered /v1/models should still remove unavailable concrete worker candidates", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("legacy zai glm ids are normalized out of /v1/models", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let body = """
+                {
+                  "object": "list",
+                  "data": [
+                    {"id": "glm-5", "object": "model", "owned_by": "zai"},
+                    {"id": "glm-5-turbo", "object": "model", "owned_by": "zai"},
+                    {"id": "glm-5.1", "object": "model", "owned_by": "zai"}
+                  ]
+                }
+                """
+
+                guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
+                    recorder.recordFailure("legacy Z.AI GLM ids should force a normalized /v1/models rewrite")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
+                let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
+                expectEqual(filteredIDs, ["glm-5.1"], "legacy Z.AI GLM ids should collapse to the canonical glm-5.1 listing", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -1726,47 +4661,42 @@ struct ThinkingProxyPolicySpec {
                 {
                   "object": "list",
                   "data": [
-                    {"id": "glm-5-turbo", "object": "model", "owned_by": "zai"},
-                    {"id": "minimax-m2.5", "object": "model", "owned_by": "nvidia"},
-                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"}
+                    {"id": "glm-5.1", "object": "model", "owned_by": "zai"},
+                    {"id": "minimax-m2.5-nvidia", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5-nvidia", "object": "model", "owned_by": "nvidia"}
                   ]
                 }
                 """
                 let expired = Date().addingTimeInterval(-60)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5-turbo", until: expired)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5", until: expired)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5-nvidia", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: expired)
 
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5-turbo"), false, "expired cooldown windows should make worker primaries eligible for live traffic again", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "minimax-m2.5"), false, "expired cooldown windows should make raced fallbacks eligible again", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1"), false, "expired cooldown windows should make worker primaries eligible for live traffic again", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "minimax-m2.5-nvidia"), false, "expired cooldown windows should make raced fallbacks eligible again", recorder: recorder)
 
-                guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
-                    recorder.recordFailure("filtered /v1/models should still materialize after cooldown expiry")
-                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-                    return
-                }
-
-                let filteredJSON = parseDataJSONObject(filtered, recorder: recorder)
-                let filteredIDs = ((filteredJSON["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
-                expectEqual(filteredIDs.contains("worker"), true, "worker should become discoverable again once every candidate cooldown has expired", recorder: recorder)
+                let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8))
+                expectNil(filtered, "healthy cooldown-expired worker candidates should leave /v1/models unchanged instead of re-injecting the smart alias", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
-        run("temporary nvidia half-open routes reopen immediately on another failure", recorder: recorder) {
+        run("temporary nvidia recovered routes become suspect again on the next failure", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
                 OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(10))
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "a half-open failure should immediately reopen quarantine", recorder: recorder)
-                expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 0, "reopening should reset the recovery counter", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "half-open failure should keep the route unavailable", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a post-recovery failure should re-enter suspect instead of immediately quarantining again", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 0, "closing the route should reset the recovery counter", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one new failure after recovery should still keep the route available", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -1775,12 +4705,12 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
-                    requestModel: "kimi-k2.5",
+                    requestModel: "kimi-k2.5-nvidia",
                     until: Date().addingTimeInterval(60)
                 )
                 let request = """
                 {
-                  "model": "kimi-k2.5",
+                  "model": "kimi-k2.5-nvidia",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ]
@@ -1810,7 +4740,7 @@ struct ThinkingProxyPolicySpec {
                   "object": "list",
                   "data": [
                     {"id": "glm5", "object": "model", "owned_by": "nvidia"},
-                    {"id": "kimi-k2.5", "object": "model", "owned_by": "nvidia"},
+                    {"id": "kimi-k2.5-nvidia", "object": "model", "owned_by": "nvidia"},
                     {"id": "gpt-5", "object": "model", "owned_by": "openai"}
                   ]
                 }
@@ -1826,7 +4756,7 @@ struct ThinkingProxyPolicySpec {
                 let data = json["data"] as? [[String: Any]]
                 let ids = (data ?? []).compactMap { $0["id"] as? String }
                 expectEqual(ids.contains("glm5"), false, "quarantined glm5 alias should be removed from /v1/models", recorder: recorder)
-                expectEqual(ids.contains("kimi-k2.5"), true, "healthy NVIDIA aliases should remain visible", recorder: recorder)
+                expectEqual(ids.contains("kimi-k2.5-nvidia"), true, "healthy NVIDIA aliases should remain visible", recorder: recorder)
                 expectEqual(ids.contains("gpt-5"), true, "non-NVIDIA models should remain visible", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -1859,6 +4789,16 @@ struct ThinkingProxyPolicySpec {
                         telemetryEvent: event,
                         at: now
                     )
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm5",
+                        telemetryEvent: event,
+                        at: now
+                    )
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm5",
+                        telemetryEvent: event,
+                        at: now
+                    )
 
                     guard FileManager.default.fileExists(atPath: path) else {
                         recorder.recordFailure("expected persistent NVIDIA route-health cache file to be written")
@@ -1870,12 +4810,12 @@ struct ThinkingProxyPolicySpec {
                     let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     let persisted = snapshot["z-ai/glm5"]
                     expectEqual(persisted?.status, .open, "persisted route health should retain open-circuit state", recorder: recorder)
-                    expectEqual(persisted?.failureScore ?? 0, 2, "persisted route health should retain the failure score", recorder: recorder)
+                    expectEqual(persisted?.failureScore ?? 0, 4, "persisted route health should retain the failure score", recorder: recorder)
                     expectEqual(persisted?.isUnavailable(at: now), true, "persisted route health should remain unavailable after reload", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "persisted route health should retain the transport outcome", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "persisted route health should retain the health transition", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.timeoutCount, 2, "persisted route health should retain rolling timeout counts", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 2, "persisted route health should retain recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.timeoutCount, 4, "persisted route health should retain rolling timeout counts", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "persisted route health should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                         recorder.recordFailure("expected to read persisted route-health cache file")
@@ -1885,12 +4825,72 @@ struct ThinkingProxyPolicySpec {
                     let routes = rawJSON["routes"] as? [String: Any]
                     let glm5 = routes?["nvidia::z-ai/glm5"] as? [String: Any]
                     expectEqual(glm5?["status"] as? String, "open", "persisted route-health file should store route status", recorder: recorder)
-                    expectEqual(glm5?["failure_score"] as? Int, 2, "persisted route-health file should store the failure score", recorder: recorder)
+                    expectEqual(glm5?["failure_score"] as? Int, 4, "persisted route-health file should store the failure score", recorder: recorder)
                     let lastEvent = glm5?["last_event"] as? [String: Any]
                     expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "persisted route-health file should store the health transition", recorder: recorder)
                     let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
-                    expectEqual(rollingMetrics?["timeout_count"] as? Int, 2, "persisted route-health file should store rolling timeout counts", recorder: recorder)
+                    expectEqual(rollingMetrics?["timeout_count"] as? Int, 4, "persisted route-health file should store rolling timeout counts", recorder: recorder)
                 }
+            }
+        }
+
+        run("persisted legacy zai glm route-health entries are pruned on reload", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                guard let path = ProcessInfo.processInfo.environment["VIBEPROXY_ROUTE_HEALTH_PATH"] else {
+                    recorder.recordFailure("expected temporary route-health path to be configured")
+                    return
+                }
+
+                let payload = """
+                {
+                  "version": 1,
+                  "routes": {
+                    "zai::glm-5-turbo": {
+                      "status": "closed",
+                      "failure_score": 1,
+                      "recovery_successes": 0,
+                      "rolling_metrics": {
+                        "request_count": 1,
+                        "success_count": 1,
+                        "timeout_count": 0,
+                        "invalid_success_count": 0,
+                        "recent_outcomes": ["send_response"],
+                        "recent_first_byte_latency_ms": []
+                      }
+                    },
+                    "zai::glm-5.1": {
+                      "status": "suspect",
+                      "failure_score": 2,
+                      "recovery_successes": 0,
+                      "rolling_metrics": {
+                        "request_count": 2,
+                        "success_count": 1,
+                        "timeout_count": 0,
+                        "invalid_success_count": 0,
+                        "recent_outcomes": ["send_response", "send_error:empty_content"],
+                        "recent_first_byte_latency_ms": []
+                      }
+                    }
+                  }
+                }
+                """
+
+                try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectNil(snapshot["glm-5-turbo"], "legacy glm-5-turbo route-health state should be dropped during reload", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.failureScore, 2, "current glm-5.1 route-health state should survive reload", recorder: recorder)
+
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let routes = json["routes"] as? [String: Any] else {
+                    recorder.recordFailure("expected pruned route-health file to be readable")
+                    return
+                }
+
+                expectEqual(routes["zai::glm-5-turbo"] == nil, true, "persisted route-health file should delete stale glm-5-turbo entries after reload", recorder: recorder)
+                expectEqual((routes["zai::glm-5.1"] as? [String: Any])?["failure_score"] as? Int, 2, "persisted route-health file should retain current glm-5.1 state", recorder: recorder)
             }
         }
 
@@ -1947,7 +4947,7 @@ struct ThinkingProxyPolicySpec {
                     headerFields: ["Content-Type": "application/json"]
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     initialTransportRetries: 2,
                     initialSemanticRetries: 1,
                     transportRetriesRemaining: 1,
@@ -1977,7 +4977,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia canary success moves quarantined routes into half-open recovery before reopening", recorder: recorder) {
+        run("temporary nvidia canary success immediately closes quarantined routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -2021,14 +5021,14 @@ struct ThinkingProxyPolicySpec {
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
                     expectEqual(seenRequestModel, "z-ai/glm5", "canary sweep should probe the quarantined canonical route exactly once", recorder: recorder)
-                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "one successful canary should keep the route unavailable while it is half-open", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "one successful canary should immediately restore the route", recorder: recorder)
                     var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                    expectEqual(snapshot["z-ai/glm5"]?.status, .halfOpen, "first successful canary should move the route into half-open recovery", recorder: recorder)
-                    expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 1, "half-open recovery should count successful canaries", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first successful canary should close the route immediately", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.recoverySuccesses, 0, "immediate recovery should not leave half-open state behind", recorder: recorder)
                     var lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "successful canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.transportOutcome, "send_response", "successful canaries should record a successful runtime outcome", recorder: recorder)
-                    expectEqual(lastEvent?.healthTransition, "open->half_open", "successful canaries should record the route-health transition", recorder: recorder)
+                    expectEqual(lastEvent?.healthTransition, "open->closed", "successful canaries should record the route-health transition", recorder: recorder)
 
                     let secondSemaphore = DispatchSemaphore(value: 0)
                     proxy.performNVIDIACanariesOnce {
@@ -2036,9 +5036,9 @@ struct ThinkingProxyPolicySpec {
                     }
                     let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)
                     expectEqual(secondWaitResult, .success, "second canary sweep should also complete promptly", recorder: recorder)
-                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "recovery threshold successful canaries should reopen the route", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "a healthy route should stay available on later sweeps", recorder: recorder)
                     snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                    expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "route should close after enough successful canaries", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "route should remain closed after later successful canaries", recorder: recorder)
                     lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "successful reopening should preserve the last canary telemetry event", recorder: recorder)
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -2046,7 +5046,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia canary failures reopen half-open routes and record canary telemetry", recorder: recorder) {
+        run("temporary nvidia canary failures keep quarantined routes open and record canary telemetry", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -2091,7 +5091,12 @@ struct ThinkingProxyPolicySpec {
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "first canary sweep should complete promptly", recorder: recorder)
-                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), true, "first successful canary should still leave the route unavailable", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "first successful canary should immediately restore the route", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm5",
+                        until: until
+                    )
 
                     let secondSemaphore = DispatchSemaphore(value: 0)
                     proxy.performNVIDIACanariesOnce {
@@ -2104,7 +5109,7 @@ struct ThinkingProxyPolicySpec {
                     let lastEvent = snapshot["z-ai/glm5"]?.lastTelemetryEvent
                     expectEqual(lastEvent?.source, "canary", "failed canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.failureClass, "transport_error_retryable", "failed canaries should preserve the route failure class", recorder: recorder)
-                    expectEqual(snapshot["z-ai/glm5"]?.status, .open, "failed canaries after half-open recovery should reopen quarantine", recorder: recorder)
+                    expectEqual(snapshot["z-ai/glm5"]?.status, .open, "failed canaries should leave the route quarantined", recorder: recorder)
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
@@ -2251,7 +5256,7 @@ struct ThinkingProxyPolicySpec {
                     headerFields: ["Content-Type": "application/json"]
                 )
                 let initialState = OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: "minimax-m2.5",
+                    model: "minimax-m2.5-nvidia",
                     initialTransportRetries: 0,
                     initialSemanticRetries: 1,
                     transportRetriesRemaining: 0,
@@ -2493,7 +5498,7 @@ struct ThinkingProxyPolicySpec {
                     headerFields: ["Content-Type": "application/json"]
                 )
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     initialTransportRetries: 0,
                     initialSemanticRetries: 0,
                     transportRetriesRemaining: 0,
@@ -2608,7 +5613,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let classification = OpenAICompatTemporaryShim.classifyUpstreamFailure(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     path: "/v1/chat/completions",
                     statusCode: 429,
                     bodyData: Data(body.utf8)
@@ -2666,7 +5671,7 @@ struct ThinkingProxyPolicySpec {
         run("temporary nvidia shim retries empty-body successes instead of forwarding them", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data()
                 )
@@ -2718,7 +5723,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5",
+                    model: "minimax-m2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -2744,7 +5749,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5",
+                    model: "minimax-m2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -2780,7 +5785,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -2808,7 +5813,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "kimi-k2.5",
+                    model: "kimi-k2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -2825,6 +5830,44 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(normalizedMessage?["content"] as? String, " OK", "normalized kimi responses should preserve visible content", recorder: recorder)
                 expectNil(normalizedMessage?["reasoning"], "normalized kimi responses should strip provider reasoning", recorder: recorder)
                 expectNil(normalizedMessage?["reasoning_content"], "normalized kimi responses should strip provider reasoning_content", recorder: recorder)
+            }
+        }
+
+        run("temporary mimo shim strips provider-specific reasoning from successful responses", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "stop",
+                      "message": {
+                        "content": "OK",
+                        "reasoning": "hidden chain of thought",
+                        "reasoning_content": "duplicate hidden chain of thought"
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "mimo-v2-pro-kilocode",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "successful MiMo responses should not be retried", recorder: recorder)
+                guard let normalizedBodyData = evaluation.normalizedBodyData else {
+                    recorder.recordFailure("expected normalized MiMo response body to be generated")
+                    return
+                }
+
+                let normalizedJSON = parseDataJSONObject(normalizedBodyData, recorder: recorder)
+                let normalizedChoices = normalizedJSON["choices"] as? [[String: Any]]
+                let normalizedMessage = normalizedChoices?.first?["message"] as? [String: Any]
+                expectEqual(normalizedMessage?["content"] as? String, "OK", "normalized MiMo responses should preserve visible content", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning"], "normalized MiMo responses should strip provider reasoning", recorder: recorder)
+                expectNil(normalizedMessage?["reasoning_content"], "normalized MiMo responses should strip provider reasoning_content", recorder: recorder)
             }
         }
 
@@ -2915,7 +5958,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5",
+                    model: "minimax-m2.5-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -2943,6 +5986,317 @@ struct ThinkingProxyPolicySpec {
             )
 
             expectNil(transformed, "unrelated models should not be rewritten", recorder: recorder)
+        }
+
+        run("healthz reports backend target, provenance, and route health snapshot", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm5",
+                        until: Date().addingTimeInterval(60)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredStatus: Int?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                        deliveredStatus = statusCode
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("healthz should return a response")
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let frontend = payload["frontend"] as? [String: Any]
+                    let backend = payload["backend"] as? [String: Any]
+                    let provenance = payload["provenance"] as? [String: Any]
+                    let routeHealth = payload["route_health"] as? [String: Any]
+                    let routes = routeHealth?["routes"] as? [String: Any]
+                    let glm5 = routes?["z-ai/glm5"] as? [String: Any]
+                    let quarantinedModels = routeHealth?["quarantined_models"] as? [String]
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let factoryRoles = payload["factory_roles"] as? [String: Any]
+                    let orchestration = factoryRoles?["orchestration"] as? [String: Any]
+                    let verification = factoryRoles?["verification"] as? [String: Any]
+                    let backendReachable = backend?["reachable"] as? Bool ?? false
+                    let expectedReady = backendReachable &&
+                        ((factoryWorker?["snapshot_sync_ok"] as? Bool) == true) &&
+                        ((factoryWorker?["route_health_status"] as? String) != "open")
+
+                    expectEqual(deliveredStatus, 200, "healthz should succeed", recorder: recorder)
+                    expectEqual(frontend?["port"] as? Int, 8317, "healthz should report the frontend port", recorder: recorder)
+                    expectEqual(backend?["host"] as? String, "127.0.0.1", "healthz should report the backend host", recorder: recorder)
+                    expectEqual(backend?["port"] as? Int, 8318, "healthz should report the backend port", recorder: recorder)
+                    expectEqual(backend?["reachable"] is Bool, true, "healthz should report backend reachability as a boolean", recorder: recorder)
+                    expectEqual((provenance?["merged_config_fingerprint"] as? String)?.isEmpty ?? true, false, "healthz should expose the merged-config fingerprint", recorder: recorder)
+                    expectEqual((deliveredHeaders?["X-VibeProxy-Config-Fingerprint"] as? String)?.isEmpty ?? true, false, "healthz should emit config provenance headers", recorder: recorder)
+                    expectEqual((deliveredHeaders?["X-VibeProxy-App-Version"] as? String)?.isEmpty ?? true, false, "healthz should emit app-version headers", recorder: recorder)
+                    expectEqual(glm5?["status"] as? String, "open", "healthz should surface route-health state", recorder: recorder)
+                    expectEqual(quarantinedModels?.contains("z-ai/glm5"), true, "healthz should list quarantined route models", recorder: recorder)
+                    expectEqual(factoryWorker?["worker_model_id"] as? String, openAIFactoryWorkerContract.workerModelID, "healthz should expose the authoritative Factory worker id", recorder: recorder)
+                    expectEqual(factoryWorker?["route_model"] as? String, openAIFactoryWorkerContract.routeModel, "healthz should expose the worker route model", recorder: recorder)
+                    expectEqual(factoryWorker?["route_provider"] as? String, openAIFactoryWorkerContract.routeProvider, "healthz should expose the worker route provider", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, openAIFactoryWorkerContract.effectiveRouteModel, "healthz should expose the effective worker route model", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the effective worker route provider", recorder: recorder)
+                    expectEqual(factoryWorker?["request_surface"] as? String, openAIFactoryWorkerContract.requestSurface, "healthz should expose the worker API surface", recorder: recorder)
+                    expectEqual(factoryWorker?["snapshot_sync_ok"] as? Bool, true, "healthz should expose snapshot sync state", recorder: recorder)
+                    expectEqual(factoryWorker?["snapshot_drift_count"] as? Int, 0, "healthz should report zero snapshot drift by default", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, expectedReady, "healthz should derive worker readiness from backend reachability and contract health", recorder: recorder)
+                    expectEqual(orchestration?["model_id"] as? String, openAIFactoryWorkerContract.validationWorkerModelID, "healthz should expose the orchestration model id", recorder: recorder)
+                    expectEqual(orchestration?["route_model"] as? String, "gpt-5.4(high)", "healthz should expose the orchestration route model", recorder: recorder)
+                    expectEqual(orchestration?["route_provider"] as? String, "openai", "healthz should expose the orchestration route provider", recorder: recorder)
+                    expectEqual(orchestration?["request_surface"] as? String, "responses", "healthz should expose the orchestration request surface", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should expose the orchestration effective route model", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_provider"] as? String, "openai", "healthz should expose the orchestration effective route provider", recorder: recorder)
+                    expectEqual(orchestration?["ready"] as? Bool, expectedReady, "healthz should derive orchestration readiness from backend reachability and contract health", recorder: recorder)
+                    expectEqual(verification?["model_id"] as? String, openAIFactoryWorkerContract.validationWorkerModelID, "healthz should expose the verification model id", recorder: recorder)
+                    expectEqual(verification?["route_model"] as? String, "gpt-5.4(high)", "healthz should expose the verification route model", recorder: recorder)
+                    expectEqual(verification?["route_provider"] as? String, "openai", "healthz should expose the verification route provider", recorder: recorder)
+                    expectEqual(verification?["request_surface"] as? String, "responses", "healthz should expose the verification request surface", recorder: recorder)
+                    expectEqual(verification?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should expose the verification effective route model", recorder: recorder)
+                    expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should expose the verification effective route provider", recorder: recorder)
+                    expectEqual(verification?["ready"] as? Bool, expectedReady, "healthz should derive verification readiness from backend reachability and contract health", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz exposes chat-completions worker contracts for generic compatible providers", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("generic-compatible healthz should return a response")
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let backend = payload["backend"] as? [String: Any]
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let factoryRoles = payload["factory_roles"] as? [String: Any]
+                    let orchestration = factoryRoles?["orchestration"] as? [String: Any]
+                    let verification = factoryRoles?["verification"] as? [String: Any]
+                    let backendReachable = backend?["reachable"] as? Bool ?? false
+                    let expectedReady = backendReachable &&
+                        ((factoryWorker?["snapshot_sync_ok"] as? Bool) == true) &&
+                        ((factoryWorker?["route_health_status"] as? String) != "open")
+                    let acceptedRequestModelIDs = factoryWorker?["accepted_request_model_ids"] as? [String]
+                    let rescuedRequestModelIDs = factoryWorker?["rescued_request_model_ids"] as? [String]
+
+                    expectEqual(factoryWorker?["worker_model_id"] as? String, genericCompatFactoryWorkerContract.workerModelID, "healthz should expose the compatible worker id", recorder: recorder)
+                    expectEqual(factoryWorker?["route_model"] as? String, genericCompatFactoryWorkerContract.routeModel, "healthz should expose the compatible worker route model", recorder: recorder)
+                    expectEqual(factoryWorker?["route_provider"] as? String, genericCompatFactoryWorkerContract.routeProvider, "healthz should expose the compatible worker route provider", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, genericCompatFactoryWorkerContract.effectiveRouteModel, "healthz should expose the effective runtime lane for compatible workers", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, genericCompatFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the effective runtime provider for compatible workers", recorder: recorder)
+                    expectEqual(factoryWorker?["request_surface"] as? String, genericCompatFactoryWorkerContract.requestSurface, "healthz should derive the chat-completions surface for generic compatible workers", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, expectedReady, "healthz should derive generic worker readiness from backend reachability and alias health", recorder: recorder)
+                    expectEqual(acceptedRequestModelIDs?.contains(genericCompatFactoryWorkerContract.workerModelID), true, "healthz should list the current compatible worker model ID as accepted", recorder: recorder)
+                    expectEqual(acceptedRequestModelIDs?.contains("custom:Factory-Worker-GPT-5.4-High-8"), true, "healthz should list leaked hidden Factory worker IDs as accepted rescue inputs", recorder: recorder)
+                    expectEqual(acceptedRequestModelIDs?.contains("custom:Proxy-WorkerPool-8"), true, "healthz should list the retired pooled worker ID as an accepted rescue input", recorder: recorder)
+                    expectEqual(rescuedRequestModelIDs?.contains("custom:Factory-Worker-GPT-5.4-High-8"), true, "healthz should explicitly mark the hidden Factory worker ID as rescued", recorder: recorder)
+                    expectEqual(orchestration?["model_id"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "healthz should expose the orchestration model id for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["route_model"] as? String, "gpt-5.4(high)", "healthz should expose the orchestration route model for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["route_provider"] as? String, "openai", "healthz should expose the orchestration route provider for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["request_surface"] as? String, "responses", "healthz should expose the orchestration request surface for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should keep orchestration on the direct GPT lane", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_provider"] as? String, "openai", "healthz should keep orchestration on the direct GPT provider", recorder: recorder)
+                    expectEqual(orchestration?["ready"] as? Bool, true, "healthz should keep orchestration ready when its direct GPT lane is healthy", recorder: recorder)
+                    expectEqual(verification?["model_id"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "healthz should expose the verification model id for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["route_model"] as? String, "gpt-5.4(high)", "healthz should expose the verification route model for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["route_provider"] as? String, "openai", "healthz should expose the verification route provider for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["request_surface"] as? String, "responses", "healthz should expose the verification request surface for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should keep verification on the direct GPT lane", recorder: recorder)
+                    expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should keep verification on the direct GPT provider", recorder: recorder)
+                    expectEqual(verification?["ready"] as? Bool, true, "healthz should keep verification ready when its direct GPT lane is healthy", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz keeps the smart-router worker ready when the preferred GPT lane is open but pooled fallbacks remain available", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "gpt-5.4(high)",
+                        until: Date().addingTimeInterval(300)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("fallback-aware healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let factoryRoles = payload["factory_roles"] as? [String: Any]
+                    let orchestration = factoryRoles?["orchestration"] as? [String: Any]
+                    let verification = factoryRoles?["verification"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should expose the first available pooled fallback when the preferred GPT lane is open", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should expose the fallback provider when GPT is quarantined", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should stop reporting the worker contract as open when a fallback lane remains available", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the smart-router worker ready when a fallback lane remains available", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should expose the worker-chain fallback winner for orchestration when the direct GPT lane is quarantined", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_provider"] as? String, "zai", "healthz should expose the worker-chain fallback provider for orchestration when the direct GPT lane is quarantined", recorder: recorder)
+                    expectEqual(orchestration?["route_health_status"] as? String, nil, "healthz should stop reporting orchestration as open once the worker-chain fallback remains available", recorder: recorder)
+                    expectEqual(orchestration?["ready"] as? Bool, true, "healthz should keep orchestration ready when the custom GPT alias can be rescued through the worker chain", recorder: recorder)
+                    expectEqual(verification?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should expose the worker-chain fallback winner for verification when the direct GPT lane is quarantined", recorder: recorder)
+                    expectEqual(verification?["effective_route_provider"] as? String, "zai", "healthz should expose the worker-chain fallback provider for verification when the direct GPT lane is quarantined", recorder: recorder)
+                    expectEqual(verification?["route_health_status"] as? String, nil, "healthz should stop reporting verification as open once the worker-chain fallback remains available", recorder: recorder)
+                    expectEqual(verification?["ready"] as? Bool, true, "healthz should keep verification ready when the custom GPT alias can be rescued through the worker chain", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz marks worker unready when Factory snapshots drift", recorder: recorder) {
+            let driftedSettings = """
+            {
+              "missionModelSettings": {
+                "workerModel": "\(openAIFactoryWorkerContract.workerModelID)",
+                "workerReasoningEffort": "none",
+                "validationWorkerModel": "\(openAIFactoryWorkerContract.validationWorkerModelID)",
+                "validationWorkerReasoningEffort": "none"
+              }
+            }
+            """
+
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract), extraFiles: [
+                    "settings.local.json": driftedSettings
+                ]) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("drifted healthz should return a response")
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let driftedPaths = factoryWorker?["snapshot_drift_paths"] as? [String]
+
+                    expectEqual(factoryWorker?["snapshot_sync_ok"] as? Bool, false, "healthz should report snapshot drift", recorder: recorder)
+                    expectEqual(factoryWorker?["snapshot_drift_count"] as? Int, 1, "healthz should count drifted snapshots", recorder: recorder)
+                    expectEqual(driftedPaths?.contains(where: { $0.hasSuffix("settings.local.json") }), true, "healthz should identify the drifted snapshot path", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should fail closed when snapshots drift", recorder: recorder)
+                }
+            }
+        }
+
+        run("Factory worker-bound requests fail closed when snapshots drift", recorder: recorder) {
+            let driftedSettings = """
+            {
+              "missionModelSettings": {
+                "workerModel": "\(openAIFactoryWorkerContract.workerModelID)",
+                "workerReasoningEffort": "none",
+                "validationWorkerModel": "\(openAIFactoryWorkerContract.validationWorkerModelID)",
+                "validationWorkerReasoningEffort": "none"
+              }
+            }
+            """
+
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract), extraFiles: [
+                "settings.local.json": driftedSettings
+            ]) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, _ in
+                    recorder.recordFailure("drifted Factory worker requests should fail before any upstream transport is attempted")
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("drifted Factory worker requests should fail closed with a contract error")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 409, "drifted Factory worker requests should return a contract error", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("snapshot drift"), true, "drifted Factory worker requests should explain the drifted worker contract", recorder: recorder)
+                expectEqual(deliveredMessage?.contains(openAIFactoryWorkerContract.workerModelID), true, "drifted Factory worker requests should name the authoritative worker model", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("settings.local.json"), true, "drifted Factory worker requests should identify the drifted snapshot path", recorder: recorder)
+            }
         }
 
         if recorder.failures == 0 {
@@ -3067,6 +6421,46 @@ private func withRouteHealthPath(body: (String) -> Void) {
     body(statePath.path)
 }
 
+private func withFactorySettings(
+    _ json: String,
+    projectSettingsPaths: [String] = [],
+    extraFiles: [String: String] = [:],
+    body: () -> Void
+) {
+    let key = "FACTORY_SETTINGS_PATH"
+    let projectKey = "FACTORY_PROJECT_SETTINGS_PATHS"
+    let fileManager = FileManager.default
+    let temporaryDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let settingsPath = temporaryDirectory.appendingPathComponent("settings.json")
+    let previousValue = ProcessInfo.processInfo.environment[key]
+    let previousProjectValue = ProcessInfo.processInfo.environment[projectKey]
+
+    try? fileManager.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+    try? json.write(to: settingsPath, atomically: true, encoding: .utf8)
+    for (relativePath, contents) in extraFiles {
+        let fileURL = temporaryDirectory.appendingPathComponent(relativePath)
+        try? fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? contents.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+    setenv(key, settingsPath.path, 1)
+    setenv(projectKey, projectSettingsPaths.joined(separator: ":"), 1)
+    defer {
+        if let previousValue {
+            setenv(key, previousValue, 1)
+        } else {
+            unsetenv(key)
+        }
+        if let previousProjectValue {
+            setenv(projectKey, previousProjectValue, 1)
+        } else {
+            unsetenv(projectKey)
+        }
+        try? fileManager.removeItem(at: temporaryDirectory)
+    }
+
+    body()
+}
+
 private func defaultMergedConfigYAML() -> String {
     [
         "openai-compatibility:",
@@ -3075,15 +6469,89 @@ private func defaultMergedConfigYAML() -> String {
         "  models:",
         "  - alias: glm5",
         "    name: z-ai/glm5",
-        "  - alias: kimi-k2.5",
+        "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
         "- name: nvidia-minimax",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: minimax-m2.5",
+        "  - alias: minimax-m2.5-nvidia",
         "    name: minimaxai/minimax-m2.5"
     ].joined(separator: "\n")
 }
+
+private struct FactoryWorkerSpecContract {
+    let workerModelID: String
+    let validationWorkerModelID: String
+    let routeModel: String
+    let routeProvider: String
+    let requestSurface: String
+    let effectiveRouteModel: String
+    let effectiveRouteProvider: String
+}
+
+private func factorySettingsJSON(contract: FactoryWorkerSpecContract) -> String {
+    """
+    {
+      "sessionDefaultSettings": {
+        "model": "\(contract.validationWorkerModelID)",
+        "reasoningEffort": "high",
+        "autonomyMode": "auto-high"
+      },
+      "missionModelSettings": {
+        "workerModel": "\(contract.workerModelID)",
+        "workerReasoningEffort": "none",
+        "validationWorkerModel": "\(contract.validationWorkerModelID)",
+        "validationWorkerReasoningEffort": "high"
+      },
+      "customModels": [
+        {
+          "id": "\(contract.workerModelID)",
+          "model": "\(contract.routeModel)",
+          "provider": "\(contract.routeProvider)",
+          "displayName": "Factory Worker via Proxy",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        },
+        {
+          "id": "\(contract.validationWorkerModelID)",
+          "model": "gpt-5.4(high)",
+          "provider": "openai",
+          "displayName": "Factory Validation via Proxy",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        }
+      ]
+    }
+    """
+}
+
+private let openAIFactoryWorkerContract = FactoryWorkerSpecContract(
+    workerModelID: "custom:GPT-5.4-High-Proxy-2",
+    validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
+    routeModel: "gpt-5.4(high)",
+    routeProvider: "openai",
+    requestSurface: "responses",
+    effectiveRouteModel: "gpt-5.4(high)",
+    effectiveRouteProvider: "openai"
+)
+
+private let genericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
+    workerModelID: "custom:Proxy-Worker-Smart-Router-8",
+    validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
+    routeModel: "proxy-worker-smart-router",
+    routeProvider: "generic-chat-completion-api",
+    requestSurface: "chat_completions",
+    effectiveRouteModel: "glm-5.1-zai",
+    effectiveRouteProvider: "zai"
+)
+
+private let directChatFactoryWorkerContract = FactoryWorkerSpecContract(
+    workerModelID: "custom:Direct-Chat-Proxy-2",
+    validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
+    routeModel: "gpt-5.4(high)",
+    routeProvider: "generic-chat-completion-api",
+    requestSurface: "chat_completions",
+    effectiveRouteModel: "gpt-5.4(high)",
+    effectiveRouteProvider: "openai"
+)
 
 private func renamedAliasMergedConfigYAML() -> String {
     [
@@ -3103,29 +6571,41 @@ private func renamedAliasMergedConfigYAML() -> String {
     ].joined(separator: "\n")
 }
 
-private func workerMergedConfigYAML() -> String {
+private func workerWithMimoMergedConfigYAML() -> String {
     [
-        "openai-compatibility:",
-        "- api-key-entries:",
-        "  - api-key: test-zai-key",
-        "  name: zai",
+        "claude-api-key:",
+        "- api-key: test-zai-key",
         "  base-url: https://api.z.ai/api/anthropic",
         "  models:",
-        "  - alias: glm-5-turbo",
-        "    name: glm-5-turbo",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "openai-compatibility:",
+        "- name: kilocode",
+        "  api-key: test-kilo-key",
+        "  base-url: https://api.kilo.ai/api/openrouter/v1",
+        "  models:",
+        "  - alias: mimo-v2-pro-kilocode",
+        "    name: xiaomi/mimo-v2-pro:free",
+        "- name: opencode",
+        "  base-url: https://opencode.ai/zen/v1",
+        "  models:",
+        "  - alias: mimo-v2-pro-opencode",
+        "    name: mimo-v2-pro-free",
+        "  - alias: minimax-m2.5-opencode",
+        "    name: minimax-m2.5-free",
         "- name: nvidia",
         "  api-key-entries:",
         "  - api-key: test-nvidia-key",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: kimi-k2.5",
+        "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
         "- api-key-entries:",
         "  - api-key: test-nvidia-minimax-key",
         "  name: nvidia-minimax",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: minimax-m2.5",
+        "  - alias: minimax-m2.5-nvidia",
         "    name: minimaxai/minimax-m2.5",
         "request-retry: 3",
         "smart-aliases:",
@@ -3133,35 +6613,85 @@ private func workerMergedConfigYAML() -> String {
         "    request-class: plain-chat",
         "    failover: silent",
         "    candidates:",
-        "    - glm-5-turbo",
-        "    - minimax-m2.5",
-        "    - kimi-k2.5"
+        "    - glm-5.1-zai",
+        "    - mimo-v2-pro-kilocode",
+        "    - mimo-v2-pro-opencode",
+        "    - minimax-m2.5-opencode",
+        "    - minimax-m2.5-nvidia",
+        "    - kimi-k2.5-nvidia"
     ].joined(separator: "\n")
 }
 
-private func workerMergedConfigWithLastResortYAML() -> String {
+private func workerMergedConfigYAML() -> String {
+    workerWithMimoMergedConfigYAML()
+}
+
+private func workerMisconfiguredMergedConfigYAML() -> String {
     [
         "openai-compatibility:",
-        "- api-key-entries:",
-        "  - api-key: test-zai-key",
-        "  name: zai",
-        "  base-url: https://api.z.ai/api/anthropic",
-        "  models:",
-        "  - alias: glm-5-turbo",
-        "    name: glm-5-turbo",
         "- name: nvidia",
         "  api-key-entries:",
         "  - api-key: test-nvidia-key",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: kimi-k2.5",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
         "- api-key-entries:",
         "  - api-key: test-nvidia-minimax-key",
         "  name: nvidia-minimax",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: minimax-m2.5",
+        "  - alias: minimax-m2.5-nvidia",
+        "    name: minimaxai/minimax-m2.5",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5.1-zai",
+        "    - minimax-m2.5-nvidia",
+        "    - kimi-k2.5-nvidia"
+    ].joined(separator: "\n")
+}
+
+private func workerMergedConfigWithLastResortYAML() -> String {
+    [
+        "claude-api-key:",
+        "- api-key: test-zai-key",
+        "  base-url: https://api.z.ai/api/anthropic",
+        "  models:",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "openai-compatibility:",
+        "- name: kilocode",
+        "  api-key: test-kilo-key",
+        "  base-url: https://api.kilo.ai/api/openrouter/v1",
+        "  models:",
+        "  - alias: mimo-v2-pro-kilocode",
+        "    name: xiaomi/mimo-v2-pro:free",
+        "- name: opencode",
+        "  base-url: https://opencode.ai/zen/v1",
+        "  models:",
+        "  - alias: mimo-v2-pro-opencode",
+        "    name: mimo-v2-pro-free",
+        "  - alias: minimax-m2.5-opencode",
+        "    name: minimax-m2.5-free",
+        "- name: nvidia",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: kimi-k2.5-nvidia",
+        "    name: moonshotai/kimi-k2.5",
+        "- api-key-entries:",
+        "  - api-key: test-nvidia-minimax-key",
+        "  name: nvidia-minimax",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.5-nvidia",
         "    name: minimaxai/minimax-m2.5",
         "- api-key-entries:",
         "  - api-key: test-openai-key",
@@ -3176,30 +6706,43 @@ private func workerMergedConfigWithLastResortYAML() -> String {
         "    request-class: plain-chat",
         "    failover: silent",
         "    candidates:",
-        "    - glm-5-turbo",
-        "    - minimax-m2.5",
-        "    - kimi-k2.5",
+        "    - glm-5.1-zai",
+        "    - mimo-v2-pro-kilocode",
+        "    - mimo-v2-pro-opencode",
+        "    - minimax-m2.5-opencode",
+        "    - minimax-m2.5-nvidia",
+        "    - kimi-k2.5-nvidia",
         "    - gpt-5.4-medium"
     ].joined(separator: "\n")
 }
 
-private func rawHTTPRequest(method: String, path: String, body: String) -> String {
+private func rawHTTPRequest(
+    method: String,
+    path: String,
+    headers: [(String, String)] = [],
+    body: String
+) -> String {
     let bodyData = Data(body.utf8)
-    return [
+    let requestLines = [
         "\(method) \(path) HTTP/1.1",
         "Host: 127.0.0.1:8317",
-        "Content-Type: application/json",
+        "Content-Type: application/json"
+    ] + headers.map { "\($0.0): \($0.1)" } + [
         "Content-Length: \(bodyData.count)",
         "",
         body
-    ].joined(separator: "\r\n")
+    ]
+    return requestLines.joined(separator: "\r\n")
 }
 
-private func httpURLResponse(statusCode: Int) -> HTTPURLResponse {
+private func httpURLResponse(
+    statusCode: Int,
+    headerFields: [String: String] = ["Content-Type": "application/json"]
+) -> HTTPURLResponse {
     HTTPURLResponse(
         url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
         statusCode: statusCode,
         httpVersion: "HTTP/1.1",
-        headerFields: ["Content-Type": "application/json"]
+        headerFields: headerFields
     )!
 }
