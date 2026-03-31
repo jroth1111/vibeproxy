@@ -1528,6 +1528,14 @@ enum OpenAICompatTemporaryShim {
                 message: "Upstream NVIDIA engine error"
             )
         }
+        
+        if statusCode == 500 || statusCode == 502,
+           body.contains("context canceled") || body.contains("context deadline exceeded") {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 504,
+                message: "Upstream proxy context canceled or timed out"
+            )
+        }
 
         return nil
     }
