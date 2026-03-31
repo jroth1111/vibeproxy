@@ -2773,8 +2773,9 @@ enum OpenAICompatTemporaryShim {
             if let resetDate = formatter.date(from: timestamp) {
                 let seconds = resetDate.timeIntervalSince(now)
                 if seconds > 0 {
-                    NSLog("[ThinkingProxy] GLM rate-limit 429: cooldown until %@ (%.0fs)", timestamp, seconds)
-                    return resetDate
+                    let cappedSeconds = min(seconds, maxProviderCooldown)
+                    NSLog("[ThinkingProxy] GLM rate-limit 429: cooldown until %@ (%.0fs — capping to %.0fs)", timestamp, seconds, cappedSeconds)
+                    return now.addingTimeInterval(cappedSeconds)
                 }
             }
         }
