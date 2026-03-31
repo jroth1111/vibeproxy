@@ -270,13 +270,15 @@ enum OpenAICompatTemporaryShim {
         )
 
         var timeoutRate: Double {
-            guard requestCount > 0 else { return 0 }
-            return Double(timeoutCount) / Double(requestCount)
+            guard !recentOutcomes.isEmpty else { return 0 }
+            let timeouts = recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count
+            return Double(timeouts) / Double(recentOutcomes.count)
         }
 
         var invalidSuccessRate: Double {
-            guard requestCount > 0 else { return 0 }
-            return Double(invalidSuccessCount) / Double(requestCount)
+            guard !recentOutcomes.isEmpty else { return 0 }
+            let invalid = recentOutcomes.filter { $0.hasPrefix("send_response:") }.count
+            return Double(invalid) / Double(recentOutcomes.count)
         }
 
         var averageFirstByteLatencyMilliseconds: Int? {
@@ -293,13 +295,21 @@ enum OpenAICompatTemporaryShim {
 
         static let empty = RouteEMAMetrics(successRate: 1.0, averageLatencyMs: 0.0, observationCount: 0)
 
-        private static let emaAlpha = 0.2
+        private static let emaBaseAlpha = 0.2
+        private static let emaMinObservationsForStable = 10.0
+
+        private var effectiveAlpha: Double {
+            let count = Double(observationCount)
+            guard count < Self.emaMinObservationsForStable else { return Self.emaBaseAlpha }
+            return min(1.0, Self.emaBaseAlpha + (1.0 - Self.emaBaseAlpha) * (1.0 - count / Self.emaMinObservationsForStable))
+        }
 
         func updated(isSuccess: Bool, latencyMs: Int?) -> RouteEMAMetrics {
-            let newSuccessRate = successRate * (1.0 - Self.emaAlpha) + (isSuccess ? 1.0 : 0.0) * Self.emaAlpha
+            let alpha = effectiveAlpha
+            let newSuccessRate = successRate * (1.0 - alpha) + (isSuccess ? 1.0 : 0.0) * alpha
             let newLatency: Double
             if let latencyMs {
-                newLatency = averageLatencyMs * (1.0 - Self.emaAlpha) + Double(latencyMs) * Self.emaAlpha
+                newLatency = averageLatencyMs * (1.0 - alpha) + Double(latencyMs) * alpha
             } else {
                 newLatency = averageLatencyMs
             }
@@ -2052,7 +2062,7 @@ enum OpenAICompatTemporaryShim {
     // Concurrency-aware failure tracking: deduplicate failures within window per route
     private static let routeFailureDedupQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-failure-dedup")
     private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
-    private static let failureDedupWindow: TimeInterval = 0.5  // 5 second window for burst deduplication
+    private static let failureDedupWindow: TimeInterval = 0.5  // 0.5 second window for burst deduplication
     private static var disableFailureDedupForTesting = false
     
     static func recordRouteFailure(
@@ -2231,6 +2241,7 @@ enum OpenAICompatTemporaryShim {
             routeHealthDirty = false
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
+            providerCooldownsByProviderID = [:]
             loadPersistedRouteHealthIfNeededLocked()
         }
     }
@@ -2705,13 +2716,12 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
+        let concurrencyThreshold: TimeInterval = 300
         if let seconds = TimeInterval(retryAfter),
            seconds > 0 {
-            // Distinguish noise from real rate limits:
-            // - Very short Retry-After (< 1s): likely concurrency noise, ignore
-            // - Short Retry-After (1-5 min): concurrency throttle, enforce cooldown
-            // - Long Retry-After (>= 5 min): rate limit, enforce cooldown
-            let concurrencyThreshold: TimeInterval = 300
+            // Distinguish concurrency noise from true provider rate limits:
+            // - Retry-After < 5 min: likely transient concurrency pressure, ignore
+            // - Retry-After >= 5 min: treat as provider-enforced cooldown
             if seconds < concurrencyThreshold {
                 NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
                 return nil
@@ -2723,7 +2733,18 @@ enum OpenAICompatTemporaryShim {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        return formatter.date(from: retryAfter)
+        guard let date = formatter.date(from: retryAfter) else {
+            return nil
+        }
+        let seconds = date.timeIntervalSince(now)
+        guard seconds > 0 else {
+            return nil
+        }
+        if seconds < concurrencyThreshold {
+            NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
+            return nil
+        }
+        return date
     }
 
     private static func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
@@ -3063,10 +3084,10 @@ enum OpenAICompatTemporaryShim {
         }
 
         return RouteRollingMetrics(
-            requestCount: prior.requestCount + 1,
-            successCount: prior.successCount + (telemetryEvent.failureClass == nil ? 1 : 0),
-            timeoutCount: prior.timeoutCount + (telemetryEvent.failureClass == "transport_timeout" ? 1 : 0),
-            invalidSuccessCount: prior.invalidSuccessCount + (isInvalidSuccessFailureClass(telemetryEvent.failureClass) ? 1 : 0),
+            requestCount: 0,
+            successCount: 0,
+            timeoutCount: 0,
+            invalidSuccessCount: 0,
             recentOutcomes: recentOutcomes,
             recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds
         )
@@ -5746,6 +5767,22 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+
+            if loopRetriesRemaining > 0, remainingSmartAliasBudget(until: deadlineAt) > 0 {
+                restartSmartAliasLoop(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: currentBody,
+                    publicAlias: publicAlias,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    loopRetriesRemaining: loopRetriesRemaining,
                     deliveryMode: deliveryMode
                 )
                 return
@@ -8523,7 +8560,7 @@ class ThinkingProxy {
             return
         }
 
-        let requestModels = OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
+        let requestModels = OpenAICompatTemporaryShim.quarantinedRequestModels()
             .filter { model in
                 guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) else {
                     return true
