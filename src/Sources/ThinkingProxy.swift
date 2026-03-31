@@ -2041,6 +2041,7 @@ enum OpenAICompatTemporaryShim {
     private static let routeFailureDedupQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-failure-dedup")
     private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
     private static let failureDedupWindow: TimeInterval = 5.0  // 5 second window for burst deduplication
+    private static var disableFailureDedupForTesting = false
     
     static func recordRouteFailure(
         forRequestModel requestModel: String,
@@ -2055,6 +2056,9 @@ enum OpenAICompatTemporaryShim {
         
         // Concurrency overshoot protection: deduplicate rapid failures on same route
         let shouldCountAsNewFailure = routeFailureDedupQueue.sync { () -> Bool in
+            if disableFailureDedupForTesting {
+                return true
+            }
             let key = route.routeHealthKey
             let recentTimestamps = recentFailureTimestampsByRoute[key] ?? []
             let cutoff = now.addingTimeInterval(-failureDedupWindow)
@@ -2155,6 +2159,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func clearRouteHealthForTesting() {
+        disableFailureDedupForTesting = true
         routeHealthQueue.sync {
             routeCircuitStatesByRouteHealthKey = [:]
             providerCooldownsByProviderID = [:]
@@ -2206,7 +2211,6 @@ enum OpenAICompatTemporaryShim {
 
     static func reloadPersistedRouteHealthForTesting() {
         routeHealthQueue.sync {
-            forcePersistRouteHealthLocked()
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
             loadPersistedRouteHealthIfNeededLocked()
@@ -5483,9 +5487,53 @@ class ThinkingProxy {
         statusCode: Int?,
         responseBody: Data?
     ) -> Bool {
-        _ = binding
-        _ = statusCode
-        _ = responseBody
+        guard binding.source == "authoritative_custom_model",
+              binding.requestSurface == "responses",
+              binding.routeProvider == "openai" || binding.routeProvider == "xai",
+              let workerContract = Self.factoryWorkerContract(),
+              workerContract.workerModelID != binding.incomingModelID,
+              workerContract.routeModel != binding.routeModel,
+              workerContract.snapshotDriftPaths.isEmpty,
+              workerContract.ready,
+              OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) != nil else {
+            return false
+        }
+
+        guard let statusCode else {
+            return true
+        }
+
+        if statusCode == 502 || statusCode == 503 || statusCode == 504 {
+            return true
+        }
+
+        guard let fallbackError = factoryDirectFallbackErrorDetails(
+            statusCode: statusCode,
+            responseBody: responseBody
+        ) else {
+            return false
+        }
+
+        let errorType = fallbackError.type.lowercased()
+        let errorCode = fallbackError.code.lowercased()
+        let errorMessage = fallbackError.message.lowercased()
+
+        if statusCode == 429,
+           errorType == "usage_limit_reached" || errorCode == "usage_limit_reached" || errorMessage.contains("usage limit") {
+            return true
+        }
+
+        if statusCode == 401 || statusCode == 403 {
+            return errorCode.contains("auth") || errorType.contains("auth") || errorMessage.contains("auth")
+        }
+
+        if statusCode >= 500 {
+            return errorCode.contains("auth_not_found") ||
+                errorType.contains("auth") ||
+                errorMessage.contains("auth_not_found") ||
+                errorMessage.contains("no auth available")
+        }
+
         return false
     }
 
@@ -7411,6 +7459,8 @@ class ThinkingProxy {
         candidateModel: String,
         timeoutInterval: TimeInterval,
         endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
+        firstResponseDeadlineSeconds: TimeInterval? = nil,
+        bufferedResponseDeadlineSeconds: TimeInterval? = nil,
         completion: @escaping (BufferedProxyResponse) -> Void
     ) -> (() -> Void) {
         // Strip /v1 prefix from path when base URL already ends with a versioned API path
@@ -7480,6 +7530,11 @@ class ThinkingProxy {
         }
         poolDelegate.register(task: task, delegate: responseProgress)
         taskHolder.taskIdentifier = task.taskIdentifier
+        responseProgress.installDeadlines(
+            firstResponseSeconds: firstResponseDeadlineSeconds,
+            bufferedResponseSeconds: bufferedResponseDeadlineSeconds,
+            for: task
+        )
         task.resume()
         return {
             task.cancel()
