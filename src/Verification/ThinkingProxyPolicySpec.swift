@@ -4777,7 +4777,8 @@ struct ThinkingProxyPolicySpec {
                         return
                     }
 
-                    OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
 
                     let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     let persisted = snapshot["z-ai/glm5"]
@@ -4848,6 +4849,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+                OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
                 OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
@@ -6299,6 +6301,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["mimo-v2-pro-free"]?.status, .suspect, "route should start as suspect after failure", recorder: recorder)
 
                 // Simulate startup reload — the self-healing logic should close stale suspects
+                OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
                 OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["mimo-v2-pro-free"]?.status, .closed, "stale suspect routes should auto-heal to closed on startup reload", recorder: recorder)

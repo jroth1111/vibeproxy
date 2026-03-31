@@ -2217,6 +2217,12 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func forcePersistRouteHealthForTesting() {
+        routeHealthQueue.sync {
+            forcePersistRouteHealthLocked()
+        }
+    }
+
     static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
         guard let policy = policy(forModel: model) else {
             return NvidiaReasoningEvaluation(failureClass: nil, repairedBodyData: nil, normalizedBodyData: nil)
@@ -6853,7 +6859,9 @@ class ThinkingProxy {
                 body: body,
                 candidateModel: candidateModel,
                 timeoutInterval: timeoutInterval,
-                endpoint: endpoint
+                endpoint: endpoint,
+                firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+                bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
             ) { [weak self] bufferedResponse in
                 permit.release()
                 guard let self, controller?.isCancelled() != true else { return }
