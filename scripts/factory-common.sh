@@ -77,13 +77,40 @@ load_factory_models() {
   fi
 
   # Resolve custom-model IDs to their route model + provider.
-  # For non-custom models (e.g. "gpt-5.4") these resolve to "".
-  FACTORY_WORKER_ROUTE_MODEL="$(jq -r --arg id "$FACTORY_WORKER_MODEL" '.customModels[] | select(.id == $id) | .model' "$settings")"
-  FACTORY_WORKER_ROUTE_PROVIDER="$(jq -r --arg id "$FACTORY_WORKER_MODEL" '.customModels[] | select(.id == $id) | .provider' "$settings")"
-  FACTORY_SESSION_ROUTE_MODEL="$(jq -r --arg id "$FACTORY_SESSION_MODEL" '.customModels[] | select(.id == $id) | .model' "$settings")"
-  FACTORY_SESSION_ROUTE_PROVIDER="$(jq -r --arg id "$FACTORY_SESSION_MODEL" '.customModels[] | select(.id == $id) | .provider' "$settings")"
-  FACTORY_VALIDATION_ROUTE_MODEL="$(jq -r --arg id "$FACTORY_VALIDATION_MODEL" '.customModels[] | select(.id == $id) | .model' "$settings")"
-  FACTORY_VALIDATION_ROUTE_PROVIDER="$(jq -r --arg id "$FACTORY_VALIDATION_MODEL" '.customModels[] | select(.id == $id) | .provider' "$settings")"
+  # For non-custom models (e.g. "gpt-5.4"), try:
+  #   1. Exact custom model ID match
+  #   2. Model name + reasoning effort (e.g. "gpt-5.4" + "high" -> "gpt-5.4(high)")
+  #   3. Model name prefix match
+  resolve_custom_model() {
+    local model_id="$1"
+    local reasoning="${2:-}"
+    jq -r --arg id "$model_id" --arg model_name "$model_id" --arg reasoning "$reasoning" '
+      (.customModels[] | select(.id == $id) | .model) //
+      (if ($reasoning | length) > 0 then
+        (.customModels[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .model)
+      else empty end) //
+      (.customModels[] | select($model_name | startswith(.model)) | .model) //
+      empty
+    ' "$settings"
+  }
+  resolve_custom_provider() {
+    local model_id="$1"
+    local reasoning="${2:-}"
+    jq -r --arg id "$model_id" --arg model_name "$model_id" --arg reasoning "$reasoning" '
+      (.customModels[] | select(.id == $id) | .provider) //
+      (if ($reasoning | length) > 0 then
+        (.customModels[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .provider)
+      else empty end) //
+      (.customModels[] | select($model_name | startswith(.model)) | .provider) //
+      empty
+    ' "$settings"
+  }
+  FACTORY_WORKER_ROUTE_MODEL="$(resolve_custom_model "$FACTORY_WORKER_MODEL" "$FACTORY_WORKER_REASONING")"
+  FACTORY_WORKER_ROUTE_PROVIDER="$(resolve_custom_provider "$FACTORY_WORKER_MODEL" "$FACTORY_WORKER_REASONING")"
+  FACTORY_SESSION_ROUTE_MODEL="$(resolve_custom_model "$FACTORY_SESSION_MODEL" "$FACTORY_SESSION_REASONING")"
+  FACTORY_SESSION_ROUTE_PROVIDER="$(resolve_custom_provider "$FACTORY_SESSION_MODEL" "$FACTORY_SESSION_REASONING")"
+  FACTORY_VALIDATION_ROUTE_MODEL="$(resolve_custom_model "$FACTORY_VALIDATION_MODEL" "$FACTORY_VALIDATION_REASONING")"
+  FACTORY_VALIDATION_ROUTE_PROVIDER="$(resolve_custom_provider "$FACTORY_VALIDATION_MODEL" "$FACTORY_VALIDATION_REASONING")"
 
   # Normalise null to empty for non-custom models.
   FACTORY_WORKER_ROUTE_MODEL="${FACTORY_WORKER_ROUTE_MODEL/null/}"
