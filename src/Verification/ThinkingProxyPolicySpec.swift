@@ -382,13 +382,13 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 300, "glm5 should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 90, "kimi should fail fast enough to stop an unhealthy fallback lane from consuming the whole worker budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 180, "kimi should have sufficient timeout for first-byte latency", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 300, "minimax should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 240, "glm5 should allow long first-byte latency before failing", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 45, "kimi should use a much shorter first-byte deadline than the healthier NVIDIA lanes", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 120, "kimi should use a reasonable first-byte deadline for NVIDIA-hosted model", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 240, "minimax should also allow long first-byte latency before failing", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 285, "glm5 should bound the full buffered response with a long latency budget", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: kimiRequest), 75, "kimi should not keep a buffered fallback request open for minutes", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: kimiRequest), 150, "kimi should bound the full buffered response appropriately", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 285, "minimax should also keep a long buffered-response budget", recorder: recorder)
 
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)

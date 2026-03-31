@@ -432,9 +432,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 90,
-            firstResponseDeadline: 45,
-            bufferedResponseDeadline: 75,
+            attemptTimeout: 180,
+            firstResponseDeadline: 120,
+            bufferedResponseDeadline: 150,
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -731,6 +731,133 @@ enum OpenAICompatTemporaryShim {
     }()
     #endif
 
+    // MARK: - Provider Concurrency Tracker
+
+    final class ProviderConcurrencyRegistry {
+        private let queue = DispatchQueue(label: "io.automaze.vibeproxy.concurrency-registry")
+        private var inflightCounts: [String: Int] = [:]
+        private var discoveredLimits: [String: Int] = [:]
+        private var consecutiveSuccessesAtLimit: [String: Int] = [:]
+        private var concurrent429Buckets: [String: (inflightLevel: Int, count: Int)] = [:]
+
+        private let defaultConcurrencyLimit = 3
+        private let maxConcurrencyLimit = 8
+        private let successGrowthThreshold = 20
+
+        func acquireSlot(routeHealthKey: String) -> Bool {
+            queue.sync {
+                let limit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let current = inflightCounts[routeHealthKey] ?? 0
+                guard current < limit else {
+                    return false
+                }
+                inflightCounts[routeHealthKey] = current + 1
+                return true
+            }
+        }
+
+        func releaseSlot(routeHealthKey: String) {
+            queue.sync {
+                let current = inflightCounts[routeHealthKey] ?? 0
+                inflightCounts[routeHealthKey] = max(0, current - 1)
+            }
+        }
+
+        func record429(routeHealthKey: String, inflightAtRequest: Int) {
+            queue.sync {
+                let currentLimit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+
+                // If we were at or above the limit when the 429 arrived, the limit is too high
+                if inflightAtRequest >= currentLimit {
+                    discoveredLimits[routeHealthKey] = max(1, inflightAtRequest - 1)
+                    consecutiveSuccessesAtLimit[routeHealthKey] = 0
+                    return
+                }
+
+                // Track 429s at the same inflight level — repeated hits suggest a lower limit
+                let bucket = concurrent429Buckets[routeHealthKey]
+                if let bucket, bucket.inflightLevel == inflightAtRequest {
+                    let newCount = bucket.count + 1
+                    if newCount >= 3 {
+                        discoveredLimits[routeHealthKey] = max(1, inflightAtRequest - 1)
+                        consecutiveSuccessesAtLimit[routeHealthKey] = 0
+                        concurrent429Buckets.removeValue(forKey: routeHealthKey)
+                    } else {
+                        concurrent429Buckets[routeHealthKey] = (inflightLevel: inflightAtRequest, count: newCount)
+                    }
+                } else {
+                    concurrent429Buckets[routeHealthKey] = (inflightLevel: inflightAtRequest, count: 1)
+                }
+            }
+        }
+
+        func recordSuccess(routeHealthKey: String) {
+            queue.sync {
+                let currentLimit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let currentInflight = inflightCounts[routeHealthKey] ?? 0
+
+                // Only count as "at-limit" success if we were near the limit
+                guard currentInflight >= currentLimit - 1 else { return }
+
+                let successes = (consecutiveSuccessesAtLimit[routeHealthKey] ?? 0) + 1
+                consecutiveSuccessesAtLimit[routeHealthKey] = successes
+
+                // After sustained success at current limit, try growing
+                if successes >= successGrowthThreshold, currentLimit < maxConcurrencyLimit {
+                    discoveredLimits[routeHealthKey] = currentLimit + 1
+                    consecutiveSuccessesAtLimit[routeHealthKey] = 0
+                }
+            }
+        }
+
+        func currentInflight(routeHealthKey: String) -> Int {
+            queue.sync { inflightCounts[routeHealthKey] ?? 0 }
+        }
+
+        func currentLimit(routeHealthKey: String) -> Int {
+            queue.sync { discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit }
+        }
+
+        // MARK: - Persistence
+
+        func persistLocked(into payload: inout [String: Any]) {
+            // Already on caller's queue — safe to read synchronously
+            let limits = queue.sync { discoveredLimits }
+            guard !limits.isEmpty else { return }
+            payload["discovered_concurrency_limits"] = limits
+        }
+
+        func loadLocked(from json: [String: Any]) {
+            guard let limits = json["discovered_concurrency_limits"] as? [String: Int] else { return }
+            queue.sync {
+                discoveredLimits = limits
+            }
+        }
+
+        func forceDiscoveredLimitForTesting(routeHealthKey: String, limit: Int) {
+            queue.sync {
+                discoveredLimits[routeHealthKey] = limit
+            }
+        }
+
+        func resetForTesting() {
+            queue.sync {
+                inflightCounts = [:]
+                discoveredLimits = [:]
+                consecutiveSuccessesAtLimit = [:]
+                concurrent429Buckets = [:]
+            }
+        }
+    }
+
+    private static let concurrencyRegistry = ProviderConcurrencyRegistry()
+
+    // MARK: - Route Health Write Debouncing
+
+    private static var routeHealthDirty = false
+    private static var routeHealthPersistWorkItem: DispatchWorkItem?
+    private static let routeHealthPersistDebounce: DispatchTimeInterval = .seconds(2)
+
     fileprivate enum ToolCallValidation {
         case none
         case valid
@@ -933,7 +1060,6 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
-    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -1885,6 +2011,11 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    // Concurrency-aware failure tracking: deduplicate failures within window per route
+    private static let routeFailureDedupQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-failure-dedup")
+    private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
+    private static let failureDedupWindow: TimeInterval = 5.0  // 5 second window for burst deduplication
+    
     static func recordRouteFailure(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
@@ -1895,9 +2026,43 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
+        
+        // Concurrency overshoot protection: deduplicate rapid failures on same route
+        let shouldCountAsNewFailure = routeFailureDedupQueue.sync { () -> Bool in
+            let key = route.routeHealthKey
+            let recentTimestamps = recentFailureTimestampsByRoute[key] ?? []
+            let cutoff = now.addingTimeInterval(-failureDedupWindow)
+            let stillRecent = recentTimestamps.filter { $0 > cutoff }
+            
+            // If we already have a failure within the dedup window, don't increment score again
+            // This prevents concurrent requests all hitting a failed route from each counting as separate failures
+            guard stillRecent.isEmpty else {
+                NSLog("[RouteHealth] Route failure dedup: skipping duplicate failure for %@ within %.0fs window", key, failureDedupWindow)
+                recentFailureTimestampsByRoute[key] = stillRecent
+                return false
+            }
+            
+            recentFailureTimestampsByRoute[key] = stillRecent + [now]
+            return true
+        }
+        
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
+            
+            // If this is a duplicate failure within the window, preserve current state without incrementing
+            guard shouldCountAsNewFailure else {
+                // Still log the telemetry event for observability, but don't change circuit state
+                if let telemetryEvent {
+                    let enriched = enrichTelemetryEvent(telemetryEvent, from: current?.status ?? .closed, to: current?.status ?? .closed)
+                    logNVIDIARouteTelemetry(enriched)
+                }
+                if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
+                    providerCooldownsByProviderID[route.providerID] = cooldownUntil
+                }
+                return
+            }
+            
             var nextState = nextRouteCircuitState(
                 current: current,
                 afterFailureAt: now,
@@ -2971,6 +3136,7 @@ enum OpenAICompatTemporaryShim {
                 }
             }
         }
+        concurrencyRegistry.loadLocked(from: json)
         if prunedUnknownEntries {
             persistRouteHealthLocked()
         }
@@ -2984,10 +3150,17 @@ enum OpenAICompatTemporaryShim {
                   state.status == .suspect else { continue }
             // If last event is older than threshold, this route has been idle.
             // Skip routes with no last event — we cannot determine staleness.
-            guard let lastEvent = state.lastTelemetryEvent else { continue }
+            guard let lastEvent = state.lastTelemetryEvent else {
+                NSLog("[ThinkingProxy] Self-heal: skipping route %@ - no telemetry event", key)
+                continue
+            }
             let age = now.timeIntervalSince(lastEvent.timestamp)
-            guard age > staleThreshold else { continue }
+            guard age > staleThreshold else {
+                NSLog("[ThinkingProxy] Self-heal: route %@ has recent activity (%ds < %ds threshold), keeping suspect", key, Int(age), Int(staleThreshold))
+                continue
+            }
             // Suspect with no recent failures — safe to close.
+            NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds)", key, Int(age))
             routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
                 status: .closed,
                 failureScore: 0,
@@ -2996,7 +3169,7 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: state.lastTelemetryEvent,
                 rollingMetrics: state.rollingMetrics,
-                emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                emaMetrics: state.emaMetrics,  // Preserve EMA metrics through recovery
                 recoveredAt: now
             )
             healedAny = true
@@ -3004,6 +3177,29 @@ enum OpenAICompatTemporaryShim {
         if healedAny {
             persistRouteHealthLocked()
         }
+    }
+
+    /// Schedule a debounced persist of route health state.
+    /// Called from recordRouteFailure/recordRouteSuccess paths where rapid sequential writes are common.
+    /// Must already be on routeHealthQueue.
+    private static func scheduleRouteHealthPersistLocked() {
+        routeHealthDirty = true
+        routeHealthPersistWorkItem?.cancel()
+        let workItem = DispatchWorkItem {
+            guard routeHealthDirty else { return }
+            routeHealthDirty = false
+            persistRouteHealthLocked()
+        }
+        routeHealthPersistWorkItem = workItem
+        routeHealthQueue.asyncAfter(deadline: .now() + routeHealthPersistDebounce, execute: workItem)
+    }
+
+    /// Force-persist route health state immediately (for shutdown, testing, startup self-heal).
+    private static func forcePersistRouteHealthLocked() {
+        routeHealthPersistWorkItem?.cancel()
+        routeHealthPersistWorkItem = nil
+        routeHealthDirty = false
+        persistRouteHealthLocked()
     }
 
     private static func persistRouteHealthLocked() {
@@ -3035,11 +3231,12 @@ enum OpenAICompatTemporaryShim {
             routes[routeHealthKey] = entry
         }
 
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "version": 3,
             "routes": routes,
             "provider_cooldowns": providerCooldownsByProviderID.mapValues { iso8601String(from: $0) }
         ]
+        concurrencyRegistry.persistLocked(into: &payload)
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             return
         }
@@ -3464,15 +3661,10 @@ enum OpenAICompatTemporaryShim {
             }
 
             let loadedConfiguration = loadConfiguredRouteConfiguration(from: path)
-            var routesWithManaged = loadedConfiguration.routesByRequestModel
-            routesWithManaged[proxyPoolToolWorkerPrimaryCandidate] = RouteIdentity(
-                providerID: "openai",
-                canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
-            )
             let cachedMap = CachedRouteConfiguration(
                 configPath: path,
                 modificationDate: modificationDate,
-                routesByRequestModel: routesWithManaged,
+                routesByRequestModel: loadedConfiguration.routesByRequestModel,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
                 anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
                 smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
