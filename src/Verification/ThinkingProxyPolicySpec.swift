@@ -4814,17 +4814,17 @@ struct ThinkingProxyPolicySpec {
                     OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: "glm5",
                         telemetryEvent: event,
-                        at: now
+                        at: now.addingTimeInterval(6)
                     )
                     OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: "glm5",
                         telemetryEvent: event,
-                        at: now
+                        at: now.addingTimeInterval(12)
                     )
                     OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: "glm5",
                         telemetryEvent: event,
-                        at: now
+                        at: now.addingTimeInterval(18)
                     )
 
                     guard FileManager.default.fileExists(atPath: path) else {
@@ -6503,6 +6503,39 @@ struct ThinkingProxyPolicySpec {
             let result = done.wait(timeout: .now() + 2)
             expectEqual(result == .success, true, "repeated stop() calls must not hang", recorder: recorder)
             expectEqual(proxy.isRunning, false, "isRunning must be false after stop()", recorder: recorder)
+        }
+
+        run("maintenance route health pass heals stale suspect routes without restart", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                // Simulate a suspect route with a stale event from 10 minutes ago
+                let staleDate = Date().addingTimeInterval(-600)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm-5.1-zai", at: staleDate)
+
+                // Confirm it starts as suspect
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .suspect, "route should be suspect after failure", recorder: recorder)
+
+                // Run the maintenance pass (same code the background timer uses)
+                OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
+
+                // Verify the route was healed to closed
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "maintenance pass should heal stale suspect route to closed", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "healed route should have zero failure score", recorder: recorder)
+
+                // Verify recent-suspect routes are NOT healed
+                let recentDate = Date().addingTimeInterval(-60)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm-5.1-zai", at: recentDate)
+
+                OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .suspect, "maintenance pass should not heal recent suspect routes", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
         }
 
         if recorder.failures == 0 {

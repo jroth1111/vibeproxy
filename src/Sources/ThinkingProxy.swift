@@ -848,6 +848,16 @@ enum OpenAICompatTemporaryShim {
 
     fileprivate static let concurrencyRegistry = ProviderConcurrencyRegistry()
 
+    // Public accessors for concurrency registry (used by ThinkingProxy main class)
+    static func recordConcurrency429(routeHealthKey: String) {
+        let inflight = concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+        concurrencyRegistry.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
+    }
+
+    static func recordConcurrencySuccess(routeHealthKey: String) {
+        concurrencyRegistry.recordSuccess(routeHealthKey: routeHealthKey)
+    }
+
     // MARK: - Route Health Write Debouncing
 
     private static var routeHealthDirty = false
@@ -7014,8 +7024,7 @@ class ThinkingProxy {
         if shouldFailover {
             // Record 429 in concurrency registry for auto-discovery of provider limits
             if statusCode == 429, let routeHealthKey = route?.routeHealthKey {
-                let inflight = OpenAICompatTemporaryShim.concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
-                OpenAICompatTemporaryShim.concurrencyRegistry.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
+                OpenAICompatTemporaryShim.recordConcurrency429(routeHealthKey: routeHealthKey)
             }
             let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
                 statusCode: statusCode,
@@ -7034,7 +7043,7 @@ class ThinkingProxy {
         if statusCode >= 200 && statusCode < 300 {
             // Record success in concurrency registry for auto-limit growth
             if let route {
-                OpenAICompatTemporaryShim.concurrencyRegistry.recordSuccess(routeHealthKey: route.routeHealthKey)
+                OpenAICompatTemporaryShim.recordConcurrencySuccess(routeHealthKey: route.routeHealthKey)
             }
             completion(
                 .success(
@@ -7070,7 +7079,7 @@ class ThinkingProxy {
             return (true, failureClass)
         }
         switch statusCode {
-        case 429, 403, 404:
+        case 402, 408, 429, 403, 404:
             return (true, "classified_\(statusCode)")
         case 500...599:
             return (true, "classified_\(statusCode)")
