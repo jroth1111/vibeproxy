@@ -1952,6 +1952,13 @@ enum OpenAICompatTemporaryShim {
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
                 guard state.isUnavailable(at: now) else { return nil }
                 if let match = routes.first(where: { $0.value.routeHealthKey == routeHealthKey }) {
+                    // Prefer alias keys over canonical model ID keys
+                    let canonicalModelID = match.value.canonicalModelID
+                    if let aliasMatch = routes.first(where: {
+                        $0.value.routeHealthKey == routeHealthKey && $0.key != canonicalModelID
+                    }) {
+                        return aliasMatch.key
+                    }
                     return match.key
                 }
                 return routeHealthKey.components(separatedBy: "::").last
@@ -2707,44 +2714,61 @@ enum OpenAICompatTemporaryShim {
     static func providerCooldownUntil(
         statusCode: Int,
         headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
         now: Date = Date()
     ) -> Date? {
-        guard statusCode == 429,
-              let retryAfter = headerValue("Retry-After", in: headers)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !retryAfter.isEmpty else {
-            return nil
-        }
+        guard statusCode == 429 else { return nil }
 
         let concurrencyThreshold: TimeInterval = 300
-        if let seconds = TimeInterval(retryAfter),
-           seconds > 0 {
-            // Distinguish concurrency noise from true provider rate limits:
-            // - Retry-After < 5 min: likely transient concurrency pressure, ignore
-            // - Retry-After >= 5 min: treat as provider-enforced cooldown
-            if seconds < concurrencyThreshold {
-                NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
-                return nil
+
+        // --- Retry-After header ---
+        if let retryAfter = headerValue("Retry-After", in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !retryAfter.isEmpty {
+            if let seconds = TimeInterval(retryAfter), seconds > 0 {
+                if seconds < concurrencyThreshold {
+                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
+                    return nil
+                }
+                return now.addingTimeInterval(seconds)
             }
-            return now.addingTimeInterval(seconds)
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+            if let date = formatter.date(from: retryAfter) {
+                let seconds = date.timeIntervalSince(now)
+                if seconds <= 0 { return nil }
+                if seconds < concurrencyThreshold {
+                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
+                    return nil
+                }
+                return date
+            }
         }
 
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        guard let date = formatter.date(from: retryAfter) else {
-            return nil
+        // --- Body-embedded reset time (e.g. GLM: "will reset at YYYY-MM-DD HH:mm:ss") ---
+        if let bodyData,
+           let bodyString = String(data: bodyData, encoding: .utf8),
+           let range = bodyString.range(of: #"will reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"#,
+                                        options: .regularExpression) {
+            let full = String(bodyString[range])
+            let timestamp = String(full.dropFirst("will reset at ".count))
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            // GLM timestamps are in CST (UTC+8)
+            formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+            if let resetDate = formatter.date(from: timestamp) {
+                let seconds = resetDate.timeIntervalSince(now)
+                if seconds > 0 {
+                    NSLog("[ThinkingProxy] GLM rate-limit 429: cooldown until %@ (%.0fs)", timestamp, seconds)
+                    return resetDate
+                }
+            }
         }
-        let seconds = date.timeIntervalSince(now)
-        guard seconds > 0 else {
-            return nil
-        }
-        if seconds < concurrencyThreshold {
-            NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
-            return nil
-        }
-        return date
+
+        return nil
     }
 
     private static func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
