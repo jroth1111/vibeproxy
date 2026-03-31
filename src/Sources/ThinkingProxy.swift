@@ -869,6 +869,14 @@ enum OpenAICompatTemporaryShim {
         concurrencyRegistry.recordSuccess(routeHealthKey: routeHealthKey, inflightAtRequest: inflightAtRequest)
     }
 
+    static func currentInflightConcurrency(routeHealthKey: String) -> Int {
+        concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+    }
+
+    static func currentConcurrencyLimit(routeHealthKey: String) -> Int {
+        concurrencyRegistry.currentLimit(routeHealthKey: routeHealthKey)
+    }
+
     // MARK: - Route Health Write Debouncing
 
     private static var routeHealthDirty = false
@@ -4314,7 +4322,7 @@ class ThinkingProxy {
             defer { lock.unlock() }
             guard !released else { return }
             released = true
-            OpenAICompatTemporaryShim.concurrencyRegistry.releaseSlot(routeHealthKey: routeHealthKey)
+            OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: routeHealthKey)
         }
     }
 
@@ -6949,7 +6957,7 @@ class ThinkingProxy {
             switch outcome {
             case .retry(let nextState):
                 if attempt.response?.statusCode == 429 {
-                    OpenAICompatTemporaryShim.concurrencyRegistry.record429(
+                    OpenAICompatTemporaryShim.recordConcurrency429(
                         routeHealthKey: permit.routeHealthKey,
                         inflightAtRequest: permit.inflightAtRequest
                     )
@@ -6985,7 +6993,7 @@ class ThinkingProxy {
                     path: path
                 ).shouldFailover {
                     if statusCode == 429 {
-                        OpenAICompatTemporaryShim.concurrencyRegistry.record429(
+                        OpenAICompatTemporaryShim.recordConcurrency429(
                             routeHealthKey: permit.routeHealthKey,
                             inflightAtRequest: permit.inflightAtRequest
                         )
@@ -7005,7 +7013,7 @@ class ThinkingProxy {
                 }
 
                 if statusCode >= 200 && statusCode < 300 {
-                    OpenAICompatTemporaryShim.concurrencyRegistry.recordSuccess(
+                    OpenAICompatTemporaryShim.recordConcurrencySuccess(
                         routeHealthKey: permit.routeHealthKey,
                         inflightAtRequest: permit.inflightAtRequest
                     )
@@ -7701,10 +7709,10 @@ class ThinkingProxy {
 
     private func acquireRouteConcurrencyPermit(forRequestModel requestModel: String) -> RouteConcurrencyPermit? {
         guard let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
-              OpenAICompatTemporaryShim.concurrencyRegistry.acquireSlot(routeHealthKey: route.routeHealthKey) else {
+              OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: route.routeHealthKey) else {
             return nil
         }
-        let inflightAtRequest = OpenAICompatTemporaryShim.concurrencyRegistry.currentInflight(routeHealthKey: route.routeHealthKey)
+        let inflightAtRequest = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
         return RouteConcurrencyPermit(routeHealthKey: route.routeHealthKey, inflightAtRequest: inflightAtRequest)
     }
 
@@ -9043,6 +9051,22 @@ class ThinkingProxy {
                 backendReachable: backendReachable
             )
         }
+
+        // Config drift: compare Factory's effective route model against proxy's authoritative worker candidates
+        if let factoryWorkerContract = ThinkingProxy.factoryWorkerContract(),
+           let workerCandidates = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")?.candidates {
+            let factoryRoute = factoryWorkerContract.effectiveRouteModel
+            let inPool = workerCandidates.contains(factoryRoute)
+            var drift: [String: Any] = [
+                "factory_route_model": factoryRoute,
+                "proxy_worker_candidates": workerCandidates,
+                "route_in_pool": inPool
+            ]
+            if !inPool {
+                drift["warning"] = "Factory effective route model '\(factoryRoute)' is not in proxy's worker candidate pool. Requests to this model will not use smart alias failover."
+            }
+            payload["config_drift"] = drift
+        }
         if let factoryRoleContracts = ThinkingProxy.factoryRoleContracts() {
             payload["factory_roles"] = factoryRoleContractsDictionary(
                 from: factoryRoleContracts,
@@ -9061,7 +9085,7 @@ class ThinkingProxy {
                 ]
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
                     routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.concurrencyRegistry.currentLimit(routeHealthKey: route.routeHealthKey)
-                    routePayload["inflight"] = OpenAICompatTemporaryShim.concurrencyRegistry.currentInflight(routeHealthKey: route.routeHealthKey)
+                    routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
                 }
                 result[requestModel] = routePayload
             }

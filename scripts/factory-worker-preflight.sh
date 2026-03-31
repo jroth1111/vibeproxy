@@ -21,6 +21,55 @@ health_body="$tmp_dir/health.json"
 probe_headers="$tmp_dir/probe.headers"
 probe_body="$tmp_dir/probe.json"
 
+header_value() {
+  local file="$1"
+  local header_name="$2"
+  awk -v target="$(printf '%s' "$header_name" | tr '[:upper:]' '[:lower:]')" '
+    {
+      line=$0
+      sub(/
+$/, "", line)
+      split(line, parts, ":")
+      name=tolower(parts[1])
+      if (name != target) {
+        next
+      }
+      value=substr(line, index(line, ":") + 1)
+      sub(/^[[:space:]]+/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
+assert_probe_headers() {
+  local header_file="$1"
+  local lane="$2"
+  local expected_public="$3"
+  local expected_resolved_model="$4"
+  local expected_resolved_provider="$5"
+  local actual_public
+  local actual_resolved_model
+  local actual_resolved_provider
+
+  actual_public="$(header_value "$header_file" "X-Public-Model")"
+  actual_resolved_model="$(header_value "$header_file" "X-Resolved-Model")"
+  actual_resolved_provider="$(header_value "$header_file" "X-Resolved-Provider")"
+
+  if [[ "$actual_public" != "$expected_public" ]]; then
+    echo "$lane probe returned X-Public-Model=$actual_public (want $expected_public)" >&2
+    exit 1
+  fi
+  if [[ "$actual_resolved_model" != "$expected_resolved_model" ]]; then
+    echo "$lane probe returned X-Resolved-Model=$actual_resolved_model (want $expected_resolved_model)" >&2
+    exit 1
+  fi
+  if [[ -n "$expected_resolved_provider" && "$actual_resolved_provider" != "$expected_resolved_provider" ]]; then
+    echo "$lane probe returned X-Resolved-Provider=$actual_resolved_provider (want $expected_resolved_provider)" >&2
+    exit 1
+  fi
+}
+
 if [[ ! -f "$GLOBAL_SETTINGS_PATH" ]]; then
   echo "missing global settings: $GLOBAL_SETTINGS_PATH" >&2
   exit 1
@@ -115,6 +164,13 @@ jq -e --arg validation_request_surface "$validation_request_surface" '.factory_r
 jq -e '.factory_roles.orchestration.ready == true' "$health_body" >/dev/null
 jq -e '.factory_roles.verification.ready == true' "$health_body" >/dev/null
 
+worker_effective_route_model="$(jq -r '.factory_worker.effective_route_model // empty' "$health_body")"
+worker_effective_route_provider="$(jq -r '.factory_worker.effective_route_provider // empty' "$health_body")"
+session_effective_route_model="$(jq -r '.factory_roles.orchestration.effective_route_model // empty' "$health_body")"
+session_effective_route_provider="$(jq -r '.factory_roles.orchestration.effective_route_provider // empty' "$health_body")"
+validation_effective_route_model="$(jq -r '.factory_roles.verification.effective_route_model // empty' "$health_body")"
+validation_effective_route_provider="$(jq -r '.factory_roles.verification.effective_route_provider // empty' "$health_body")"
+
 echo "==> Probing the worker lane directly"
 case "$worker_request_surface" in
   chat_completions)
@@ -127,6 +183,7 @@ case "$worker_request_surface" in
       -d "{\"model\":\"$worker_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"description\":\"No-op verification tool\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],\"tool_choice\":\"none\",\"max_tokens\":32}" \
       -o "$probe_body"
     jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
+    assert_probe_headers "$probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
     ;;
   responses)
     curl -fsS \
@@ -138,6 +195,7 @@ case "$worker_request_surface" in
       -d "{\"model\":\"$worker_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
       -o "$probe_body"
     jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
+    assert_probe_headers "$probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
     ;;
   *)
     echo "unsupported Factory worker request surface for proxy preflight: $worker_request_surface" >&2
@@ -149,6 +207,7 @@ echo "==> Probing the session/validation lane directly"
 case "$session_request_surface" in
   chat_completions)
     curl -fsS \
+      -D "$probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
@@ -156,9 +215,11 @@ case "$session_request_surface" in
       -d "{\"model\":\"$session_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
       -o "$probe_body"
     jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
+    assert_probe_headers "$probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
     ;;
   responses)
     curl -fsS \
+      -D "$probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
@@ -166,6 +227,7 @@ case "$session_request_surface" in
       -d "{\"model\":\"$session_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
       -o "$probe_body"
     jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
+    assert_probe_headers "$probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
     ;;
   *)
     echo "unsupported Factory session/orchestrator request surface for proxy preflight: $session_request_surface" >&2
@@ -178,6 +240,7 @@ if [[ "$validation_model_id" != "$session_model_id" ]]; then
   case "$validation_request_surface" in
     chat_completions)
       curl -fsS \
+        -D "$probe_headers" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         --max-time 45 \
@@ -185,9 +248,11 @@ if [[ "$validation_model_id" != "$session_model_id" ]]; then
         -d "{\"model\":\"$validation_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
         -o "$probe_body"
       jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
+      assert_probe_headers "$probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
       ;;
     responses)
       curl -fsS \
+        -D "$probe_headers" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         --max-time 45 \
@@ -195,6 +260,7 @@ if [[ "$validation_model_id" != "$session_model_id" ]]; then
         -d "{\"model\":\"$validation_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
         -o "$probe_body"
       jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
+      assert_probe_headers "$probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
       ;;
     *)
       echo "unsupported Factory validation request surface for proxy preflight: $validation_request_surface" >&2

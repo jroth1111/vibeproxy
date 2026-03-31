@@ -448,17 +448,17 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "one failure should degrade the route to suspect", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.failureScore, 1, "suspect state should retain the current failure score", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "two failures should still leave the route available while it is only suspect", recorder: recorder)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(6))
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now.addingTimeInterval(6)), false, "two failures should still leave the route available while it is only suspect", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "three failures should still avoid immediate quarantine for slow routes", recorder: recorder)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(12))
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now.addingTimeInterval(12)), false, "three failures should still avoid immediate quarantine for slow routes", recorder: recorder)
 
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), true, "four failures should finally quarantine the route", recorder: recorder)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(18))
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now.addingTimeInterval(18)), true, "four failures should finally quarantine the route", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
-                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one success should immediately close the route once a canary proves recovery", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now.addingTimeInterval(18)), false, "one success should immediately close the route once a canary proves recovery", recorder: recorder)
 
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first recovery success should restore the healthy state", recorder: recorder)
@@ -4714,11 +4714,11 @@ struct ThinkingProxyPolicySpec {
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(6))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(12))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(18))
                 OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5")
-                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(10))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(24))
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a post-recovery failure should re-enter suspect instead of immediately quarantining again", recorder: recorder)
@@ -6389,10 +6389,10 @@ struct ThinkingProxyPolicySpec {
 
                 // Quarantine all candidates except the last
                 for candidate in allCandidates.dropLast() {
-                    for _ in 0..<5 {
+                    for i in 0..<5 {
                         OpenAICompatTemporaryShim.recordRouteFailure(
                             forRequestModel: candidate,
-                            at: now
+                            at: now.addingTimeInterval(Double(i) * 6)
                         )
                     }
                 }
