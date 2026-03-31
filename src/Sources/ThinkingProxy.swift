@@ -1321,7 +1321,7 @@ enum OpenAICompatTemporaryShim {
             }
             if !forceAllowClosedModels.contains(nextCandidateModel),
                let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
-               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.providerID],
+               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
                Date() < cooldownUntil {
                 skippedReasons.append((nextCandidateModel, "provider_cooldown"))
                 continue
@@ -1360,7 +1360,7 @@ enum OpenAICompatTemporaryShim {
             }
             if !forceAllowClosedModels.contains(candidateModel),
                let route = resolveConfiguredRoute(forRequestModel: candidateModel),
-               let cooldownUntil = routeCooldownsByRouteHealthKey[route.providerID],
+               let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
                Date() < cooldownUntil {
                 return nil
             }
@@ -2131,7 +2131,7 @@ enum OpenAICompatTemporaryShim {
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
             if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
-                routeCooldownsByRouteHealthKey[route.providerID] = cooldownUntil
+                routeCooldownsByRouteHealthKey[route.routeHealthKey] = cooldownUntil
             }
             scheduleRouteHealthPersistLocked()
             if let enrichedTelemetryEvent {
@@ -3181,8 +3181,10 @@ enum OpenAICompatTemporaryShim {
         case .open:
             healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
         }
-        if healthPriority < 3, let providerID = route?.providerID,
-           let cooldownUntil = routeCooldownsByRouteHealthKey[providerID], now < cooldownUntil {
+        if healthPriority < 3,
+           let routeKey = route?.routeHealthKey,
+           let cooldownUntil = routeCooldownsByRouteHealthKey[routeKey],
+           now < cooldownUntil {
             healthPriority = 3
         }
         let tier = modelTier(forRequestModel: requestModel)
@@ -3252,13 +3254,17 @@ enum OpenAICompatTemporaryShim {
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
-        if let cooldowns = json["provider_cooldowns"] as? [String: String] {
+        // Load cooldowns — prefer new route-level key, fall back to legacy provider-level key
+        let cooldownSource: [String: String] = (json["route_cooldowns"] as? [String: String])
+            ?? (json["provider_cooldowns"] as? [String: String])
+            ?? [:]
+        if !cooldownSource.isEmpty {
             let now = Date()
             let maxLoadedCooldown: TimeInterval = 3600
-            for (providerID, dateString) in cooldowns {
+            for (routeKey, dateString) in cooldownSource {
                 if let date = parseISO8601Date(dateString), date > now {
                     let capped = min(date, now.addingTimeInterval(maxLoadedCooldown))
-                    routeCooldownsByRouteHealthKey[providerID] = capped
+                    routeCooldownsByRouteHealthKey[routeKey] = capped
                 }
             }
         }
@@ -3386,10 +3392,12 @@ enum OpenAICompatTemporaryShim {
             routes[routeHealthKey] = entry
         }
 
+        let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
             "version": 3,
             "routes": routes,
-            "provider_cooldowns": routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
+            "provider_cooldowns": activeCooldowns,
+            "route_cooldowns": activeCooldowns
         ]
         concurrencyRegistry.persistLocked(into: &payload)
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
