@@ -579,6 +579,44 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary provider GLM body-embedded reset time triggers cooldown when no Retry-After header", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                // GLM 429 body: reset 2 hours from now; format as CST wall clock (what GLM sends)
+                let resetDate = now.addingTimeInterval(2 * 3600)
+                let formatter = DateFormatter()
+                formatter.locale = Locale(identifier: "en_US_POSIX")
+                formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
+                let resetString = formatter.string(from: resetDate)
+                let glmBody = Data("""
+                {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at \(resetString)"},"request_id":"test"}
+                """.utf8)
+
+                // No Retry-After header
+                let cooldown = OpenAICompatTemporaryShim.providerCooldownUntil(
+                    statusCode: 429,
+                    headers: [:],
+                    bodyData: glmBody,
+                    now: now
+                )
+                let interval = cooldown.map { $0.timeIntervalSince(now) }
+                expectEqual(interval != nil, true, "GLM body reset time should produce a cooldown", recorder: recorder)
+                if let interval {
+                    expectEqual(abs(interval - 2 * 3600) < 5, true, "cooldown should be ~2 hours matching the GLM reset time", recorder: recorder)
+                }
+
+                // Short Retry-After should still win over body (header takes precedence, returns nil for concurrency)
+                let shortHeaderCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(
+                    statusCode: 429,
+                    headers: ["Retry-After": "30"],
+                    bodyData: glmBody,
+                    now: now
+                )
+                expectNil(shortHeaderCooldown, "short Retry-After header should suppress body parsing and return nil (concurrency)", recorder: recorder)
+            }
+        }
+
         run("temporary provider route-health reload clears stale in-memory provider cooldowns", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withRouteHealthPath { path in
