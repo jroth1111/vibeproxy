@@ -3274,9 +3274,11 @@ enum OpenAICompatTemporaryShim {
         routeCircuitStatesByRouteHealthKey = loaded
         if let cooldowns = json["provider_cooldowns"] as? [String: String] {
             let now = Date()
+            let maxLoadedCooldown: TimeInterval = 3600
             for (providerID, dateString) in cooldowns {
                 if let date = parseISO8601Date(dateString), date > now {
-                    providerCooldownsByProviderID[providerID] = date
+                    let capped = min(date, now.addingTimeInterval(maxLoadedCooldown))
+                    providerCooldownsByProviderID[providerID] = capped
                 }
             }
         }
@@ -4917,13 +4919,18 @@ class ThinkingProxy {
     func stop() {
         stateQueue.sync {
             guard isRunning else { return }
-            
+
             listener?.cancel()
             listener = nil
             stopCanaryLoopLocked()
             stopMaintenanceLoopLocked()
             isRunning = false
             OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
+            Self.clearProxiedSessionPoolForTesting()
+            nvidiaInflightQueue.sync {
+                nvidiaRaceWaiters.removeAll()
+                inflightCoalescedRequests.removeAll()
+            }
             NSLog("[ThinkingProxy] Stopped")
         }
     }
