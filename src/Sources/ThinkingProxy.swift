@@ -7208,7 +7208,8 @@ class ThinkingProxy {
                     }
                     let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
                         statusCode: statusCode,
-                        headers: responseHeaders
+                        headers: responseHeaders,
+                        bodyData: responseBody
                     )
                     completion(
                         .retryableFailure(
@@ -7402,7 +7403,8 @@ class ThinkingProxy {
             }
             let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
                 statusCode: statusCode,
-                headers: response.allHeaderFields
+                headers: response.allHeaderFields,
+                bodyData: responseData
             )
             completion(
                 .retryableFailure(
