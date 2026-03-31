@@ -716,7 +716,7 @@ enum OpenAICompatTemporaryShim {
     private static var cachedRouteConfiguration: CachedRouteConfiguration?
     private static let routeHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-health")
     private static var routeCircuitStatesByRouteHealthKey: [String: RouteCircuitState] = [:]
-    private static var providerCooldownsByProviderID: [String: Date] = [:]
+    private static var routeCooldownsByRouteHealthKey: [String: Date] = [:]
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
@@ -1321,7 +1321,7 @@ enum OpenAICompatTemporaryShim {
             }
             if !forceAllowClosedModels.contains(nextCandidateModel),
                let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
-               let cooldownUntil = providerCooldownsByProviderID[candidateRoute.providerID],
+               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.providerID],
                Date() < cooldownUntil {
                 skippedReasons.append((nextCandidateModel, "provider_cooldown"))
                 continue
@@ -1360,7 +1360,7 @@ enum OpenAICompatTemporaryShim {
             }
             if !forceAllowClosedModels.contains(candidateModel),
                let route = resolveConfiguredRoute(forRequestModel: candidateModel),
-               let cooldownUntil = providerCooldownsByProviderID[route.providerID],
+               let cooldownUntil = routeCooldownsByRouteHealthKey[route.providerID],
                Date() < cooldownUntil {
                 return nil
             }
@@ -2131,7 +2131,7 @@ enum OpenAICompatTemporaryShim {
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
             if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
-                providerCooldownsByProviderID[route.providerID] = cooldownUntil
+                routeCooldownsByRouteHealthKey[route.providerID] = cooldownUntil
             }
             scheduleRouteHealthPersistLocked()
             if let enrichedTelemetryEvent {
@@ -2180,7 +2180,7 @@ enum OpenAICompatTemporaryShim {
             routeHealthPersistWorkItem = nil
             routeHealthDirty = false
             routeCircuitStatesByRouteHealthKey = [:]
-            providerCooldownsByProviderID = [:]
+            routeCooldownsByRouteHealthKey = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
         }
@@ -2234,7 +2234,7 @@ enum OpenAICompatTemporaryShim {
             routeHealthDirty = false
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
-            providerCooldownsByProviderID = [:]
+            routeCooldownsByRouteHealthKey = [:]
             loadPersistedRouteHealthIfNeededLocked()
         }
     }
@@ -3182,7 +3182,7 @@ enum OpenAICompatTemporaryShim {
             healthPriority = state?.isUnavailable(at: now) == true ? 3 : 2
         }
         if healthPriority < 3, let providerID = route?.providerID,
-           let cooldownUntil = providerCooldownsByProviderID[providerID], now < cooldownUntil {
+           let cooldownUntil = routeCooldownsByRouteHealthKey[providerID], now < cooldownUntil {
             healthPriority = 3
         }
         let tier = modelTier(forRequestModel: requestModel)
@@ -3258,13 +3258,25 @@ enum OpenAICompatTemporaryShim {
             for (providerID, dateString) in cooldowns {
                 if let date = parseISO8601Date(dateString), date > now {
                     let capped = min(date, now.addingTimeInterval(maxLoadedCooldown))
-                    providerCooldownsByProviderID[providerID] = capped
+                    routeCooldownsByRouteHealthKey[providerID] = capped
                 }
             }
         }
         concurrencyRegistry.loadLocked(from: json)
         if prunedUnknownEntries {
             persistRouteHealthLocked()
+        }
+
+        let now = Date()
+        for (routeKey, state) in routeCircuitStatesByRouteHealthKey {
+            let lastActivity: Date? = state.lastTelemetryEvent?.timestamp ?? state.lastScoreUpdatedAt
+            let staleness = lastActivity.map { now.timeIntervalSince($0) } ?? nil
+            let statusDesc = "status=\(state.status.rawValue) failure_score=\(state.failureScore)"
+            if let staleness = staleness {
+                NSLog("[ThinkingProxy] Startup: loaded route %@: %@ (staleness: %.0fs)", routeKey, statusDesc, staleness)
+            } else {
+                NSLog("[ThinkingProxy] Startup: loaded route %@: %@ (no activity)", routeKey, statusDesc)
+            }
         }
 
         healStaleSuspectRoutesLocked()
@@ -3377,7 +3389,7 @@ enum OpenAICompatTemporaryShim {
         var payload: [String: Any] = [
             "version": 3,
             "routes": routes,
-            "provider_cooldowns": providerCooldownsByProviderID.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
+            "provider_cooldowns": routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         ]
         concurrencyRegistry.persistLocked(into: &payload)
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
@@ -9343,13 +9355,26 @@ class ThinkingProxy {
            let workerCandidates = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")?.candidates {
             let factoryRoute = factoryWorkerContract.effectiveRouteModel
             let inPool = workerCandidates.contains(factoryRoute)
+            let severity: String
+            let warning: String?
+            if inPool {
+                severity = "none"
+                warning = nil
+            } else if factoryWorkerContract.routeModel == factoryRoute {
+                severity = "critical"
+                warning = "Factory route model '\(factoryRoute)' is not in proxy worker pool. Direct requests will bypass smart failover."
+            } else {
+                severity = "warning"
+                warning = "Factory effective route '\(factoryRoute)' (resolved from '\(factoryWorkerContract.routeModel)') is not in proxy worker pool. Failover will use fallback candidates."
+            }
             var drift: [String: Any] = [
                 "factory_route_model": factoryRoute,
                 "proxy_worker_candidates": workerCandidates,
-                "route_in_pool": inPool
+                "route_in_pool": inPool,
+                "severity": severity
             ]
-            if !inPool {
-                drift["warning"] = "Factory effective route model '\(factoryRoute)' is not in proxy's worker candidate pool. Requests to this model will not use smart alias failover."
+            if let warning = warning {
+                drift["warning"] = warning
             }
             payload["config_drift"] = drift
         }

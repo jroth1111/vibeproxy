@@ -10,38 +10,16 @@ elif [[ "${1:-}" == "--write" ]]; then
   shift
 fi
 
-FACTORY_ROOT="${FACTORY_ROOT:-$HOME/.factory}"
-GLOBAL_SETTINGS_PATH="${GLOBAL_SETTINGS_PATH:-$FACTORY_ROOT/settings.json}"
-LOCAL_SETTINGS_PATH="${LOCAL_SETTINGS_PATH:-$FACTORY_ROOT/settings.local.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=factory-common.sh
+source "$SCRIPT_DIR/factory-common.sh"
 
-PROJECT_SETTINGS=(
-  "$HOME/CascadeProjects/songbird4/.factory/settings.json"
-  "$HOME/CascadeProjects/voc/.factory/settings.json"
-  "$HOME/CascadeProjects/merchant-warrior2/.factory/settings.json"
-  "$HOME/CascadeProjects/pi_agent_rust/.factory/settings.json"
-)
+require_global_settings
+load_factory_models
+make_temp_dir factory-sync
 
-if [[ ! -f "$GLOBAL_SETTINGS_PATH" ]]; then
-  echo "missing global settings: $GLOBAL_SETTINGS_PATH" >&2
-  exit 1
-fi
-
-tmp_base="${TMPDIR:-$HOME/.tmp}"
-mkdir -p "$tmp_base"
-tmp_dir="$(mktemp -d "$tmp_base/factory-worker-sync.XXXXXX")"
 mismatches=()
-cleanup() {
-  rm -rf "$tmp_dir"
-}
-trap cleanup EXIT
 
-worker_id="$(jq -r '.missionModelSettings.workerModel' "$GLOBAL_SETTINGS_PATH")"
-validation_worker_id="$(jq -r '.missionModelSettings.validationWorkerModel' "$GLOBAL_SETTINGS_PATH")"
-session_model_id="$(jq -r '.sessionDefaultSettings.model' "$GLOBAL_SETTINGS_PATH")"
-session_reasoning="$(jq -r '.sessionDefaultSettings.reasoningEffort' "$GLOBAL_SETTINGS_PATH")"
-session_autonomy="$(jq -r '.sessionDefaultSettings.autonomyMode' "$GLOBAL_SETTINGS_PATH")"
-worker_reasoning="$(jq -r '.missionModelSettings.workerReasoningEffort' "$GLOBAL_SETTINGS_PATH")"
-validation_reasoning="$(jq -r '.missionModelSettings.validationWorkerReasoningEffort' "$GLOBAL_SETTINGS_PATH")"
 managed_custom_ids="$(jq -c '
   [
     .sessionDefaultSettings.model,
@@ -51,7 +29,6 @@ managed_custom_ids="$(jq -c '
   | map(select(type == "string" and startswith("custom:")))
   | unique
 ' "$GLOBAL_SETTINGS_PATH")"
-canonical_custom_models_json="$(jq -c '(.customModels // [])' "$GLOBAL_SETTINGS_PATH")"
 managed_models_json="$(jq -c --argjson ids "$managed_custom_ids" '
   (.customModels // [])
   | map(select(.id as $id | ($ids | index($id)) != null))
@@ -75,22 +52,6 @@ managed_model_id_mismatches="$(jq -c --argjson ids "$managed_custom_ids" '
     })
   | map(select(.id != .expectedId))
 ' "$GLOBAL_SETTINGS_PATH")"
-retired_worker_ids="$(jq -cn '[]')"
-
-if [[ -z "$worker_id" || "$worker_id" == "null" ]]; then
-  echo "global settings missing missionModelSettings.workerModel" >&2
-  exit 1
-fi
-
-if [[ -z "$session_model_id" || "$session_model_id" == "null" ]]; then
-  echo "global settings missing sessionDefaultSettings.model" >&2
-  exit 1
-fi
-
-if [[ -z "$validation_worker_id" || "$validation_worker_id" == "null" ]]; then
-  echo "global settings missing missionModelSettings.validationWorkerModel" >&2
-  exit 1
-fi
 
 expected_managed_count="$(jq 'length' <<<"$managed_custom_ids")"
 actual_managed_count="$(jq 'length' <<<"$managed_models_json")"
@@ -122,19 +83,18 @@ sync_json_file() {
     fi
     return 0
   fi
-  local temp_file="$tmp_dir/$(basename "$path").tmp"
+  local temp_file="$FACTORY_TMP_DIR/$(basename "$path").tmp"
   jq \
-    --arg worker_id "$worker_id" \
-    --arg validation_worker_id "$validation_worker_id" \
-    --arg session_model_id "$session_model_id" \
-    --arg session_reasoning "$session_reasoning" \
-    --arg session_autonomy "$session_autonomy" \
-    --arg worker_reasoning "$worker_reasoning" \
-    --arg validation_reasoning "$validation_reasoning" \
-    --argjson canonical_custom_models "$canonical_custom_models_json" \
+    --arg worker_id "$FACTORY_WORKER_MODEL" \
+    --arg validation_worker_id "$FACTORY_VALIDATION_MODEL" \
+    --arg session_model_id "$FACTORY_SESSION_MODEL" \
+    --arg session_reasoning "$FACTORY_SESSION_REASONING" \
+    --arg session_autonomy "$FACTORY_SESSION_AUTONOMY" \
+    --arg worker_reasoning "$FACTORY_WORKER_REASONING" \
+    --arg validation_reasoning "$FACTORY_VALIDATION_REASONING" \
+    --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" \
     --argjson managed_custom_ids "$managed_custom_ids" \
     --argjson managed_models "$managed_models_json" \
-    --argjson retired_worker_ids "$retired_worker_ids" \
     "$jq_filter" \
     "$path" > "$temp_file"
 
@@ -189,20 +149,20 @@ done < <(find "$FACTORY_ROOT/missions" -name runtime-custom-models.json -type f 
 if [[ "$MODE" == "check" ]]; then
   if (( ${#mismatches[@]} > 0 )); then
     echo "factory role contract drift detected:" >&2
-    echo "  session/orchestrator: $session_model_id" >&2
-    echo "  worker: $worker_id" >&2
-    echo "  validation: $validation_worker_id" >&2
+    echo "  session/orchestrator: $FACTORY_SESSION_MODEL" >&2
+    echo "  worker: $FACTORY_WORKER_MODEL" >&2
+    echo "  validation: $FACTORY_VALIDATION_MODEL" >&2
     printf '  %s\n' "${mismatches[@]}" >&2
     exit 1
   fi
   echo "factory role contract is in sync"
-  echo "  session/orchestrator: $session_model_id"
-  echo "  worker: $worker_id"
-  echo "  validation: $validation_worker_id"
+  echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
+  echo "  worker: $FACTORY_WORKER_MODEL"
+  echo "  validation: $FACTORY_VALIDATION_MODEL"
   exit 0
 fi
 
 echo "synced factory role contract from $GLOBAL_SETTINGS_PATH"
-echo "  session/orchestrator: $session_model_id"
-echo "  worker: $worker_id"
-echo "  validation: $validation_worker_id"
+echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
+echo "  worker: $FACTORY_WORKER_MODEL"
+echo "  validation: $FACTORY_VALIDATION_MODEL"
