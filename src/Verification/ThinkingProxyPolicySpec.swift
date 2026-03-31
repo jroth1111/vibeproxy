@@ -5031,8 +5031,8 @@ struct ThinkingProxyPolicySpec {
                     var seenRequestModel: String?
                     proxy.nvidiaCanaryTransportForTesting = { requestModel, requestJSON, completion in
                         seenRequestModel = requestModel
-                        if !requestJSON.contains("\"model\": \"z-ai/glm5\"") {
-                            recorder.recordFailure("expected canary request JSON to target the quarantined canonical route")
+                        if !requestJSON.contains("\"model\": \"glm5\"") {
+                            recorder.recordFailure("expected canary request JSON to use the route alias so the proxy can route it correctly")
                         }
                         let body = Data("""
                         {

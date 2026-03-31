@@ -8676,10 +8676,9 @@ class ThinkingProxy {
     }
 
     private func canaryRequestJSON(forRequestModel requestModel: String) -> String {
-        let upstreamModel = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: requestModel)?.canonicalModelID ?? requestModel
         return """
         {
-          "model": "\(upstreamModel)",
+          "model": "\(requestModel)",
           "messages": [
             {"role": "user", "content": "Hi"}
           ],
