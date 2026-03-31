@@ -832,6 +832,13 @@ enum OpenAICompatTemporaryShim {
             queue.sync { inflightCounts[routeHealthKey] ?? 0 }
         }
 
+        func isAtCapacity(routeHealthKey: String) -> Bool {
+            queue.sync {
+                let limit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                return (inflightCounts[routeHealthKey] ?? 0) >= limit
+            }
+        }
+
         func currentLimit(routeHealthKey: String) -> Int {
             queue.sync { discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit }
         }
@@ -1317,6 +1324,12 @@ enum OpenAICompatTemporaryShim {
                let cooldownUntil = providerCooldownsByProviderID[candidateRoute.providerID],
                Date() < cooldownUntil {
                 skippedReasons.append((nextCandidateModel, "provider_cooldown"))
+                continue
+            }
+            if !forceAllowClosedModels.contains(nextCandidateModel),
+               let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
+               Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
+                skippedReasons.append((nextCandidateModel, "concurrency_capacity"))
                 continue
             }
             return (candidateBody, nextCandidateModel, remainingCandidateModels)
@@ -4827,7 +4840,7 @@ class ThinkingProxy {
     private static let directPoolMaxSize = 8
     private static let directPoolIdleEviction: TimeInterval = 300
 
-    private static func acquireDirectSession(key: String) -> URLSession? {
+    static func acquireDirectSession(key: String) -> URLSession? {
         directPoolQueue.sync {
             evictIdleDirectSessionsLocked()
 
@@ -8342,8 +8355,8 @@ class ThinkingProxy {
         request.setValue("close", forHTTPHeaderField: "Connection")
 
         let responseProgress = ResponseProgressDelegate()
-        let session = OpenAICompatTemporaryShim.acquireDirectSession(key: "direct:127.0.0.1:\(targetPort)") ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
-        let task = session.dataTask(with: request) { [weak self] data, response, error in
+        let session: URLSession = ThinkingProxy.acquireDirectSession(key: "direct:127.0.0.1:\(targetPort)") ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let task = session.dataTask(with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
             guard let self else { return }
             defer {
                 permit.release()
