@@ -308,10 +308,6 @@ enum OpenAICompatTemporaryShim {
             return successRate * successRate * 1000.0 - averageLatencyMs
         }
 
-        static func resetForRecovery() -> RouteEMAMetrics {
-            RouteEMAMetrics(successRate: 0.8, averageLatencyMs: 0.0, observationCount: 3)
-        }
-
         var isProvenPerfect: Bool {
             observationCount > 0 && successRate >= 0.999
         }
@@ -2828,7 +2824,7 @@ enum OpenAICompatTemporaryShim {
                     lastScoreUpdatedAt: now,
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
-                    emaMetrics: RouteEMAMetrics.resetForRecovery(),
+                    emaMetrics: nextEMA,
                     recoveredAt: now
                 )
             }
@@ -6716,7 +6712,9 @@ class ThinkingProxy {
             path: path,
             headers: effectiveHeaders,
             body: body,
-            timeoutInterval: timeoutInterval
+            timeoutInterval: timeoutInterval,
+            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             guard let self, controller?.isCancelled() != true else { return }
             controller?.clearCurrentCancel()
@@ -6769,7 +6767,9 @@ class ThinkingProxy {
             path: path,
             headers: headers,
             body: body,
-            timeoutInterval: timeoutInterval
+            timeoutInterval: timeoutInterval,
+            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             guard let self, controller?.isCancelled() != true else { return }
             controller?.clearCurrentCancel()
@@ -7156,6 +7156,8 @@ class ThinkingProxy {
         headers: [(String, String)],
         body: String,
         timeoutInterval: TimeInterval,
+        firstResponseDeadlineSeconds: TimeInterval? = nil,
+        bufferedResponseDeadlineSeconds: TimeInterval? = nil,
         completion: @escaping (BufferedProxyResponse) -> Void
     ) -> (() -> Void) {
         if let bufferedProxyCancelableTransportForTesting {
@@ -7206,6 +7208,11 @@ class ThinkingProxy {
             )
             session.finishTasksAndInvalidate()
         }
+        responseProgress.installDeadlines(
+            firstResponseSeconds: firstResponseDeadlineSeconds,
+            bufferedResponseSeconds: bufferedResponseDeadlineSeconds,
+            for: task
+        )
         task.resume()
         return {
             task.cancel()
