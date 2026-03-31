@@ -1949,17 +1949,23 @@ enum OpenAICompatTemporaryShim {
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let routes = resolvedRoutesByRequestModel()
+            let requestModelsByRouteHealthKey = Dictionary(grouping: routes.keys) { requestModel in
+                routes[requestModel]?.routeHealthKey ?? requestModel
+            }
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
                 guard state.isUnavailable(at: now) else { return nil }
-                if let match = routes.first(where: { $0.value.routeHealthKey == routeHealthKey }) {
-                    // Prefer alias keys over canonical model ID keys
-                    let canonicalModelID = match.value.canonicalModelID
-                    if let aliasMatch = routes.first(where: {
-                        $0.value.routeHealthKey == routeHealthKey && $0.key != canonicalModelID
-                    }) {
-                        return aliasMatch.key
-                    }
-                    return match.key
+                if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
+                    return candidates.sorted { lhs, rhs in
+                        let lhsIsCanonical = routes[lhs]?.canonicalModelID == lhs
+                        let rhsIsCanonical = routes[rhs]?.canonicalModelID == rhs
+                        if lhsIsCanonical != rhsIsCanonical {
+                            return !lhsIsCanonical
+                        }
+                        if lhs.count != rhs.count {
+                            return lhs.count < rhs.count
+                        }
+                        return lhs < rhs
+                    }.first
                 }
                 return routeHealthKey.components(separatedBy: "::").last
             }.sorted()
