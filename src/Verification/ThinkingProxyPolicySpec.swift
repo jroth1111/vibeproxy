@@ -1081,7 +1081,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(Int(capturedTimeout ?? 0), 200, "tool-heavy smart-router attempts should preserve the alias timeout budget instead of inheriting the rewritten GPT default", recorder: recorder)
+                expectEqual(Int(capturedTimeout ?? 0), 300, "tool-heavy smart-router attempts should use the alias timeout budget (300s, accommodating slowest candidate)", recorder: recorder)
             }
         }
 

@@ -554,7 +554,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 200,
+            attemptTimeout: 300,
             firstResponseDeadline: 60,
             bufferedResponseDeadline: 180,
             transportRetries: 2,
@@ -7048,7 +7048,7 @@ class ThinkingProxy {
         }
 
         let timeoutInterval = min(
-            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias),
+            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias, candidateModel: candidateModel),
             remainingBudget
         )
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
@@ -7155,7 +7155,7 @@ class ThinkingProxy {
         }
 
         let timeoutInterval = min(
-            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias),
+            smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias, candidateModel: candidateModel),
             remainingBudget
         )
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
@@ -7849,10 +7849,11 @@ class ThinkingProxy {
         }
     }
 
-    private func smartAliasCandidateTimeout(forRequestJSON jsonString: String, publicAlias: String? = nil) -> TimeInterval {
-        let candidateTimeout = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: jsonString) ?? 0
+    private func smartAliasCandidateTimeout(forRequestJSON jsonString: String, publicAlias: String? = nil, candidateModel: String? = nil) -> TimeInterval {
+        let bodyTimeout = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: jsonString) ?? 0
         let aliasTimeout = publicAlias.flatMap { OpenAICompatTemporaryShim.attemptTimeout(forRequestModel: $0) } ?? 0
-        let resolvedTimeout = max(candidateTimeout, aliasTimeout)
+        let candidatePolicyTimeout = candidateModel.flatMap { OpenAICompatTemporaryShim.attemptTimeout(forRequestModel: $0) } ?? 0
+        let resolvedTimeout = max(bodyTimeout, max(aliasTimeout, candidatePolicyTimeout))
         return resolvedTimeout > 0 ? resolvedTimeout : Config.defaultMitigatedAttemptTimeout
     }
 
