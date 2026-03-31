@@ -14,7 +14,7 @@ struct CustomProviderCredentialStoreSpec {
                 ) {
                     try store.save(
                         providerID: "nvidia",
-                        apiKey: "nvapi-1234567890abcdef",
+                        apiKey: "mock-api-key-value-3",
                         label: "primary-nvidia-key"
                     )
                 }
@@ -31,7 +31,7 @@ struct CustomProviderCredentialStoreSpec {
 
                 guard let record = loadResult.records.first else { return }
                 expectEqual(record.providerID, "nvidia", "provider id should round-trip", recorder: recorder)
-                expectEqual(record.apiKey, "nvapi-1234567890abcdef", "api key should round-trip", recorder: recorder)
+                expectEqual(record.apiKey, "mock-api-key-value-3", "api key should round-trip", recorder: recorder)
                 expectEqual(record.label, "primary-nvidia-key", "explicit labels should round-trip", recorder: recorder)
                 expectEqual(record.isDisabled, false, "newly saved credentials should start enabled", recorder: recorder)
                 expectEqual(
@@ -104,12 +104,12 @@ struct CustomProviderCredentialStoreSpec {
                 let store = CustomProviderCredentialStore(directoryURL: directoryURL)
                 _ = try? store.save(
                     providerID: "  nvidia  ",
-                    apiKey: "  nvapi-trimmed1234567890  "
+                    apiKey: "mock-api-key-value-4"
                 )
 
                 let loadResult = store.loadAll()
                 expectEqual(loadResult.records.first?.providerID, "nvidia", "provider ids should be normalized before persistence", recorder: recorder)
-                expectEqual(loadResult.records.first?.apiKey, "nvapi-trimmed1234567890", "API keys should be trimmed before persistence", recorder: recorder)
+                expectEqual(loadResult.records.first?.apiKey, "mock-api-key-value-4", "API keys should be trimmed before persistence", recorder: recorder)
             }
         }
 
