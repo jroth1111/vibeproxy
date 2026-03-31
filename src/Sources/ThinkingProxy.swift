@@ -675,6 +675,24 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
+        ),
+        "gpt-5.4(high)": RequestPolicy(
+            minimumMaxTokens: nil,
+            maximumMaxTokens: nil,
+            strippedFields: [],
+            attemptTimeout: 300,
+            firstResponseDeadline: 60,
+            bufferedResponseDeadline: 180,
+            transportRetries: 2,
+            semanticRetries: 0,
+            retryableFailureClasses: [.emptyBody, .emptyContent],
+            retryBackoffMilliseconds: 250,
+            stripsReasoningFieldFromSuccess: false,
+            allowsThinkLeakRepair: false,
+            salvagesBestEffortRepair: false,
+            clientStreamingMode: .preserve,
+            toolChoiceMode: .preserve,
+            forcesKimiInstantMode: false
         )
     ]
     #if DEBUG
