@@ -9094,7 +9094,7 @@ class ThinkingProxy {
                     "recovery_successes": state.recoverySuccesses
                 ]
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
-                    routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.concurrencyRegistry.currentLimit(routeHealthKey: route.routeHealthKey)
+                    routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: route.routeHealthKey)
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
                 }
                 result[requestModel] = routePayload
