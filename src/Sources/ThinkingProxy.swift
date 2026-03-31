@@ -3397,7 +3397,7 @@ enum OpenAICompatTemporaryShim {
         var payload: [String: Any] = [
             "version": 3,
             "routes": routes,
-            "provider_cooldowns": providerCooldownsByProviderID.mapValues { iso8601String(from: $0) }
+            "provider_cooldowns": providerCooldownsByProviderID.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         ]
         concurrencyRegistry.persistLocked(into: &payload)
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
