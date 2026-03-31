@@ -3084,10 +3084,10 @@ enum OpenAICompatTemporaryShim {
         }
 
         return RouteRollingMetrics(
-            requestCount: 0,
-            successCount: 0,
-            timeoutCount: 0,
-            invalidSuccessCount: 0,
+            requestCount: prior.requestCount + 1,
+            successCount: prior.successCount + (telemetryEvent.failureClass == nil ? 1 : 0),
+            timeoutCount: prior.timeoutCount + (telemetryEvent.failureClass == "transport_timeout" ? 1 : 0),
+            invalidSuccessCount: prior.invalidSuccessCount + (isInvalidSuccessFailureClass(telemetryEvent.failureClass) ? 1 : 0),
             recentOutcomes: recentOutcomes,
             recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds
         )
@@ -8676,9 +8676,10 @@ class ThinkingProxy {
     }
 
     private func canaryRequestJSON(forRequestModel requestModel: String) -> String {
-        """
+        let upstreamModel = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: requestModel)?.canonicalModelID ?? requestModel
+        return """
         {
-          "model": "\(requestModel)",
+          "model": "\(upstreamModel)",
           "messages": [
             {"role": "user", "content": "Hi"}
           ],

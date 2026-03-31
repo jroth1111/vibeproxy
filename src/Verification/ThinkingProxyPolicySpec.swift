@@ -509,7 +509,7 @@ struct ThinkingProxyPolicySpec {
 
                 var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky suspect route", recorder: recorder)
-                expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.timeoutCount, 1, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.recentOutcomes.contains(where: { $0.hasSuffix(":transport_timeout") }), true, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
@@ -525,13 +525,31 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let retryAfterFormatter = DateFormatter()
+                retryAfterFormatter.locale = Locale(identifier: "en_US_POSIX")
+                retryAfterFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+                retryAfterFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
 
-                // Short Retry-After (< 5 min) = concurrency issue: no cooldown applied
-                let shortHeaders: [AnyHashable: Any] = ["Retry-After": "2"]
-                let shortCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: shortHeaders, now: now)
-                expectNil(shortCooldown, "short Retry-After (< 5 min) should not trigger a route cooldown — it is a concurrency issue, not a rate limit", recorder: recorder)
+                let numericBoundaryBelowHeaders: [AnyHashable: Any] = ["Retry-After": "299"]
+                let numericBoundaryBelowCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: numericBoundaryBelowHeaders, now: now)
+                expectNil(numericBoundaryBelowCooldown, "Retry-After values below 5 minutes should be treated as concurrency noise", recorder: recorder)
 
-                // Long Retry-After (>= 5 min) = rate limit: cooldown enforced
+                let numericBoundaryAtHeaders: [AnyHashable: Any] = ["Retry-After": "300"]
+                let numericBoundaryAtCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: numericBoundaryAtHeaders, now: now)
+                expectEqual(numericBoundaryAtCooldown?.timeIntervalSince(now), 300, "Retry-After values at the 5 minute boundary should trigger a cooldown", recorder: recorder)
+
+                let httpDateBoundaryBelowHeaders: [AnyHashable: Any] = [
+                    "Retry-After": retryAfterFormatter.string(from: now.addingTimeInterval(299))
+                ]
+                let httpDateBoundaryBelowCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: httpDateBoundaryBelowHeaders, now: now)
+                expectNil(httpDateBoundaryBelowCooldown, "HTTP-date Retry-After values below 5 minutes should also be treated as concurrency noise", recorder: recorder)
+
+                let httpDateBoundaryAtHeaders: [AnyHashable: Any] = [
+                    "Retry-After": retryAfterFormatter.string(from: now.addingTimeInterval(300))
+                ]
+                let httpDateBoundaryAtCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: httpDateBoundaryAtHeaders, now: now)
+                expectEqual(httpDateBoundaryAtCooldown?.timeIntervalSince(now), 300, "HTTP-date Retry-After values at the 5 minute boundary should trigger a cooldown", recorder: recorder)
+
                 let longHeaders: [AnyHashable: Any] = ["Retry-After": "3600"]
                 let longCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: longHeaders, now: now)
                 expectEqual(longCooldown?.timeIntervalSince(now), 3600, "long Retry-After (>= 5 min) should be parsed into a rate-limit route cooldown", recorder: recorder)
@@ -558,6 +576,54 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(1)), true, "provider-advised rate-limit cooldown should immediately suppress the route", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(3601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary provider route-health reload clears stale in-memory provider cooldowns", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withRouteHealthPath { path in
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let now = Date(timeIntervalSince1970: 1_700_000_000)
+                    let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "mimo-v2-pro-opencode",
+                        canonicalModelID: "mimo-v2-pro-free",
+                        transportOutcome: "send_error",
+                        failureClass: "classified_429",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 429,
+                        retryCount: 0,
+                        source: "smart_alias"
+                    )
+
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "mimo-v2-pro-opencode",
+                        telemetryEvent: cooldownEvent,
+                        at: now,
+                        forcedOpenUntil: now.addingTimeInterval(3600)
+                    )
+
+                    let payload = """
+                    {
+                      "version": 1,
+                      "routes": {}
+                    }
+                    """
+                    try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+
+                    OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
+
+                    guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                        recorder.recordFailure("expected to read route-health cache file after reload")
+                        return
+                    }
+                    let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
+                    let providerCooldowns = rawJSON["provider_cooldowns"] as? [String: Any]
+                    expectEqual(providerCooldowns?.isEmpty ?? true, true, "reload should discard provider cooldowns that are not present on disk", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
             }
         }
 
@@ -4789,7 +4855,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(persisted?.isUnavailable(at: now), true, "persisted route health should remain unavailable after reload", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "persisted route health should retain the transport outcome", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "persisted route health should retain the health transition", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.timeoutCount, 4, "persisted route health should retain rolling timeout counts", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "persisted route health should retain rolling timeout counts in recent outcomes", recorder: recorder)
                     expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "persisted route health should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
@@ -4804,7 +4870,7 @@ struct ThinkingProxyPolicySpec {
                     let lastEvent = glm5?["last_event"] as? [String: Any]
                     expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "persisted route-health file should store the health transition", recorder: recorder)
                     let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
-                    expectEqual(rollingMetrics?["timeout_count"] as? Int, 4, "persisted route-health file should store rolling timeout counts", recorder: recorder)
+                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "persisted route-health file should store rolling timeout counts in recent outcomes", recorder: recorder)
                 }
             }
         }
@@ -4995,7 +5061,7 @@ struct ThinkingProxyPolicySpec {
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
-                    expectEqual(seenRequestModel, "z-ai/glm5", "canary sweep should probe the quarantined canonical route exactly once", recorder: recorder)
+                    expectEqual(seenRequestModel, "glm5", "canary sweep should probe the quarantined route alias exactly once", recorder: recorder)
                     expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "one successful canary should immediately restore the route", recorder: recorder)
                     var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first successful canary should close the route immediately", recorder: recorder)
