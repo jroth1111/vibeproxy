@@ -3673,8 +3673,19 @@ enum OpenAICompatTemporaryShim {
         return ""
     }
 
+    private static let managedResolvedRoutesByRequestModel: [String: RouteIdentity] = [
+        proxyPoolToolWorkerPrimaryCandidate: RouteIdentity(
+            providerID: "openai",
+            canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
+        )
+    ]
+
     private static func resolvedRoutesByRequestModel() -> [String: RouteIdentity] {
-        configuredRouteConfiguration().routesByRequestModel
+        var routes = configuredRouteConfiguration().routesByRequestModel
+        for (requestModel, routeIdentity) in managedResolvedRoutesByRequestModel {
+            routes[requestModel] = routeIdentity
+        }
+        return routes
     }
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
@@ -3728,15 +3739,10 @@ enum OpenAICompatTemporaryShim {
             }
 
             let loadedConfiguration = loadConfiguredRouteConfiguration(from: path)
-            var routesWithManaged = loadedConfiguration.routesByRequestModel
-            routesWithManaged[proxyPoolToolWorkerPrimaryCandidate] = RouteIdentity(
-                providerID: "openai",
-                canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
-            )
             let cachedMap = CachedRouteConfiguration(
                 configPath: path,
                 modificationDate: modificationDate,
-                routesByRequestModel: routesWithManaged,
+                routesByRequestModel: loadedConfiguration.routesByRequestModel,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
                 anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
                 smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
@@ -4815,7 +4821,7 @@ class ThinkingProxy {
             listener?.cancel()
             listener = nil
             stopCanaryLoopLocked()
-            stopMaintenanceLoop()
+            stopMaintenanceLoopLocked()
             DispatchQueue.main.async { [weak self] in
                 self?.isRunning = false
             }
@@ -8330,11 +8336,15 @@ class ThinkingProxy {
         }
     }
 
+    // Called while already holding stateQueue — must not re-enter the queue.
+    private func stopMaintenanceLoopLocked() {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        maintenanceTimer?.cancel()
+        maintenanceTimer = nil
+    }
+
     private func stopMaintenanceLoop() {
-        stateQueue.sync {
-            maintenanceTimer?.cancel()
-            maintenanceTimer = nil
-        }
+        stateQueue.sync { stopMaintenanceLoopLocked() }
     }
 
     func performCanariesOnce(completion: (() -> Void)? = nil) {
