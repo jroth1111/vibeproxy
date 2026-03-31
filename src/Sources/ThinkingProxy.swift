@@ -5160,6 +5160,11 @@ class ThinkingProxy {
         var coalescingSourceBody = bodyString
         let callerVisibleRequestedModel = OpenAICompatTemporaryShim.rawModelName(forRequestJSON: bodyString)
         var factoryModelBinding = callerVisibleRequestedModel.flatMap { Self.factoryModelBinding(forIncomingModelID: $0) }
+            ?? callerVisibleRequestedModel.flatMap { model in
+                OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: model) == nil
+                    ? Self.factoryModelBindingByRouteModel(forRouteModel: model)
+                    : nil
+            }
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -9907,6 +9912,10 @@ class ThinkingProxy {
 
     private static func factoryModelBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
         factoryModelBindings()?.bindingsByIncomingModelID[incomingModelID]
+    }
+
+    private static func factoryModelBindingByRouteModel(forRouteModel routeModel: String) -> FactoryModelBinding? {
+        factoryModelBindings()?.bindingsByIncomingModelID.values.first { $0.routeModel == routeModel }
     }
 
     private static func factoryModelBindings() -> CachedFactoryModelBindings? {
