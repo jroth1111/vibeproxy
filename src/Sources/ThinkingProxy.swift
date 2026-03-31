@@ -2711,9 +2711,9 @@ enum OpenAICompatTemporaryShim {
             // - Very short Retry-After (< 1s): likely concurrency noise, ignore
             // - Short Retry-After (1-5 min): concurrency throttle, enforce cooldown
             // - Long Retry-After (>= 5 min): rate limit, enforce cooldown
-            let noiseThreshold: TimeInterval = 1
-            if seconds < noiseThreshold {
-                NSLog("[ThinkingProxy] Noise 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, noiseThreshold)
+            let concurrencyThreshold: TimeInterval = 300
+            if seconds < concurrencyThreshold {
+                NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
                 return nil
             }
             return now.addingTimeInterval(seconds)
@@ -4396,6 +4396,7 @@ class ThinkingProxy {
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
     var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
+    var smartAliasLoopRetryLimitOverrideForTesting: Int?
     var forwardRequestInterceptorForTesting: ((String, String, String, [(String, String)], String, Bool, NWConnection, Bool) -> Bool)?
 
     var vercelConfig = VercelGatewayConfig(enabled: false, apiKey: "")
@@ -5350,8 +5351,7 @@ class ThinkingProxy {
             coalescingKey: coalescingKey,
             terminalFallbackOutcome: nil,
             deliveryMode: deliveryMode,
-            loopRetriesRemaining: smartAliasMaxLoopRetries,
-            allCandidateModels: candidateModels
+            loopRetriesRemaining: smartAliasLoopRetryLimitOverrideForTesting ?? smartAliasMaxLoopRetries
         )
     }
 
@@ -5671,8 +5671,7 @@ class ThinkingProxy {
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
-        loopRetriesRemaining: Int = 0,
-        allCandidateModels: [String]? = nil
+        loopRetriesRemaining: Int = 0
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
@@ -5728,7 +5727,8 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                loopRetriesRemaining: loopRetriesRemaining
             )
             return
         }
@@ -5750,30 +5750,7 @@ class ThinkingProxy {
                 )
                 return
             }
-            // Full-loop retry: re-evaluate candidates and retry before giving up
-            if loopRetriesRemaining > 0, Date() < deadlineAt {
-                let refreshedCandidates = allCandidateModels ?? remainingCandidateModels
-                NSLog("[ThinkingProxy] All candidates exhausted for %@, retrying loop (%d retries remaining)", publicAlias, loopRetriesRemaining)
-                attemptSmartAliasCandidate(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: currentBody,
-                    publicAlias: publicAlias,
-                    remainingCandidateModels: refreshedCandidates,
-                    forceProbeCandidateModels: forceProbeCandidateModels,
-                    primaryProbeRetriesRemaining: forceProbeCandidateModels.isEmpty ? 0 : smartAliasForcedPrimaryRetryLimit,
-                    failoverDepth: failoverDepth,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome,
-                    deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining - 1,
-                    allCandidateModels: refreshedCandidates
-                )
-                return
-            }
+
             deliverBufferedError(
                 defaultConnection: originalConnection,
                 statusCode: 503,
@@ -5805,7 +5782,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
                 )
                 return
             }
@@ -5847,7 +5825,8 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                loopRetriesRemaining: loopRetriesRemaining
             )
         }
     }
@@ -5868,7 +5847,8 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        loopRetriesRemaining: Int = 0
     ) {
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels, healthSensitivity: healthSensitivity)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
@@ -5894,7 +5874,8 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                loopRetriesRemaining: loopRetriesRemaining
             )
             return
         }
@@ -6061,7 +6042,8 @@ class ThinkingProxy {
                                 originalConnection: originalConnection,
                                 coalescingKey: coalescingKey,
                                 terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
-                                deliveryMode: deliveryMode
+                                deliveryMode: deliveryMode,
+                                loopRetriesRemaining: loopRetriesRemaining
                             )
                             return
                         }
@@ -6077,15 +6059,23 @@ class ThinkingProxy {
                             return
                         }
 
-                        let statusCode = self.remainingSmartAliasBudget(until: deadlineAt) > 0 ? 503 : 504
-                        let message = statusCode == 503
-                            ? "All configured worker backends are currently unavailable."
-                            : "Worker failover budget exhausted before any backend returned a valid response."
-                        self.deliverBufferedError(
-                            defaultConnection: originalConnection,
-                            statusCode: statusCode,
-                            message: message,
-                            coalescingKey: coalescingKey
+                        // Route through attemptSmartAliasCandidate so loop retry logic applies
+                        self.attemptSmartAliasCandidate(
+                            method: method,
+                            path: path,
+                            headers: headers,
+                            currentBody: currentBody,
+                            publicAlias: publicAlias,
+                            remainingCandidateModels: [],
+                            forceProbeCandidateModels: forceProbeCandidateModels,
+                            primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                            failoverDepth: failoverDepth + raceTransitions.count,
+                            deadlineAt: deadlineAt,
+                            originalConnection: originalConnection,
+                            coalescingKey: coalescingKey,
+                            terminalFallbackOutcome: nil,
+                            deliveryMode: deliveryMode,
+                            loopRetriesRemaining: loopRetriesRemaining
                         )
                     }
                 }
@@ -6112,7 +6102,8 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        loopRetriesRemaining: Int = 0
     ) {
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
@@ -6167,7 +6158,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
                 )
             }
         case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
@@ -6193,7 +6185,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
                 )
             }
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -6218,6 +6211,74 @@ class ThinkingProxy {
                 statusCode: statusCode,
                 message: message,
                 coalescingKey: coalescingKey
+            )
+        }
+    }
+
+    private func restartSmartAliasLoop(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        currentBody: String,
+        publicAlias: String,
+        deadlineAt: Date,
+        originalConnection: NWConnection,
+        coalescingKey: String?,
+        loopRetriesRemaining: Int,
+        deliveryMode: SmartAliasDeliveryMode
+    ) {
+        guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias) else {
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 503,
+                message: "All configured worker backends are currently unavailable.",
+                coalescingKey: coalescingKey
+            )
+            return
+        }
+        let freshCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: publicAlias,
+            method: method,
+            path: path,
+            jsonString: currentBody,
+            smartAlias: smartAlias
+        )
+        let freshForceProbe = OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+            forPublicAlias: publicAlias,
+            method: method,
+            path: path,
+            jsonString: currentBody,
+            smartAlias: smartAlias
+        )
+        guard !freshCandidates.isEmpty else {
+            deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 503,
+                message: "All configured worker backends are currently unavailable.",
+                coalescingKey: coalescingKey
+            )
+            return
+        }
+        let attempt = smartAliasMaxLoopRetries - loopRetriesRemaining + 1
+        NSLog("[ThinkingProxy] Smart alias %@ loop retry %d/%d", publicAlias, attempt, smartAliasMaxLoopRetries)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+            guard let self else { return }
+            self.attemptSmartAliasCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: currentBody,
+                publicAlias: publicAlias,
+                remainingCandidateModels: freshCandidates,
+                forceProbeCandidateModels: freshForceProbe,
+                primaryProbeRetriesRemaining: freshForceProbe.isEmpty ? 0 : self.smartAliasForcedPrimaryRetryLimit,
+                failoverDepth: 0,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: nil,
+                deliveryMode: deliveryMode,
+                loopRetriesRemaining: loopRetriesRemaining - 1
             )
         }
     }
@@ -7368,10 +7429,15 @@ class ThinkingProxy {
             break
         }
         let content = ((message["content"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let reasoning = ((message["reasoning"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if content.isEmpty {
+            // Distinguish: reasoning model that produced reasoning but no visible content
+            if !reasoning.isEmpty {
+                return "reasoning_only_content_missing"
+            }
             return "empty_content"
         }
-        if content.hasPrefix("<think>") {
+        if content.contains("<think>") {
             return "reasoning_leak_content"
         }
         return nil

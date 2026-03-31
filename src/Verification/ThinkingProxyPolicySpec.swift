@@ -525,12 +525,17 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
-                let headers: [AnyHashable: Any] = ["Retry-After": "2"]
-                let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
-                    statusCode: 429,
-                    headers: headers,
-                    now: now
-                )
+
+                // Short Retry-After (< 5 min) = concurrency issue: no cooldown applied
+                let shortHeaders: [AnyHashable: Any] = ["Retry-After": "2"]
+                let shortCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: shortHeaders, now: now)
+                expectNil(shortCooldown, "short Retry-After (< 5 min) should not trigger a route cooldown — it is a concurrency issue, not a rate limit", recorder: recorder)
+
+                // Long Retry-After (>= 5 min) = rate limit: cooldown enforced
+                let longHeaders: [AnyHashable: Any] = ["Retry-After": "3600"]
+                let longCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: longHeaders, now: now)
+                expectEqual(longCooldown?.timeIntervalSince(now), 3600, "long Retry-After (>= 5 min) should be parsed into a rate-limit route cooldown", recorder: recorder)
+
                 let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
                     requestModel: "mimo-v2-pro-opencode",
@@ -543,17 +548,15 @@ struct ThinkingProxyPolicySpec {
                     source: "smart_alias"
                 )
 
-                expectEqual(cooldownUntil?.timeIntervalSince(now), 2, "retry-after seconds should be parsed into a short-lived route cooldown", recorder: recorder)
-
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "mimo-v2-pro-opencode",
                     telemetryEvent: cooldownEvent,
                     at: now,
-                    forcedOpenUntil: cooldownUntil
+                    forcedOpenUntil: longCooldown
                 )
 
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(1)), true, "provider-advised cooldowns should immediately suppress the hot route", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(3)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(1)), true, "provider-advised rate-limit cooldown should immediately suppress the route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(3601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -4507,6 +4510,7 @@ struct ThinkingProxyPolicySpec {
         run("temporary worker smart alias returns one clean 503 when every candidate fails", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
                 let lock = NSLock()
