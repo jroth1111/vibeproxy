@@ -1304,7 +1304,6 @@ struct ThinkingProxyPolicySpec {
                     var forwardedModels: [String] = []
                     var deliveredStatus: Int?
                     var deliveredHeaders: [AnyHashable: Any]?
-                    var deliveredBody: Data?
 
                     proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
                         let json = parseJSONObject(body, recorder: recorder)
@@ -1356,10 +1355,9 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                     }
-                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, headers, _ in
                         deliveredStatus = statusCode
                         deliveredHeaders = headers
-                        deliveredBody = body
                         delivered.signal()
                     }
 
@@ -4849,7 +4847,6 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 try? payload.write(toFile: path, atomically: true, encoding: .utf8)
-                OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
                 OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
@@ -6507,6 +6504,7 @@ private final class FailureRecorder {
 
 private func run(_ name: String, recorder: FailureRecorder, _ body: () -> Void) {
     let startingFailures = recorder.failures
+    OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
     body()
     let status = recorder.failures == startingFailures ? "PASS" : "FAIL"
     print("[\(status)] \(name)")

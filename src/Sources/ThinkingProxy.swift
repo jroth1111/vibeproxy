@@ -743,6 +743,15 @@ enum OpenAICompatTemporaryShim {
         private let maxConcurrencyLimit = 8
         private let successGrowthThreshold = 20
 
+        func resetForTesting() {
+            queue.sync {
+                inflightCounts.removeAll()
+                discoveredLimits.removeAll()
+                consecutiveSuccessesAtLimit.removeAll()
+                concurrent429Buckets.removeAll()
+            }
+        }
+
         func acquireSlot(routeHealthKey: String) -> Bool {
             queue.sync {
                 let limit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
@@ -838,15 +847,6 @@ enum OpenAICompatTemporaryShim {
                 discoveredLimits[routeHealthKey] = limit
             }
         }
-
-        func resetForTesting() {
-            queue.sync {
-                inflightCounts = [:]
-                discoveredLimits = [:]
-                consecutiveSuccessesAtLimit = [:]
-                concurrent429Buckets = [:]
-            }
-        }
     }
 
     fileprivate static let concurrencyRegistry = ProviderConcurrencyRegistry()
@@ -875,6 +875,10 @@ enum OpenAICompatTemporaryShim {
 
     static func currentConcurrencyLimit(routeHealthKey: String) -> Int {
         concurrencyRegistry.currentLimit(routeHealthKey: routeHealthKey)
+    }
+
+    static func resetConcurrencyRegistryForTesting() {
+        concurrencyRegistry.resetForTesting()
     }
 
     // MARK: - Route Health Write Debouncing
@@ -2040,7 +2044,7 @@ enum OpenAICompatTemporaryShim {
     // Concurrency-aware failure tracking: deduplicate failures within window per route
     private static let routeFailureDedupQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-failure-dedup")
     private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
-    private static let failureDedupWindow: TimeInterval = 5.0  // 5 second window for burst deduplication
+    private static let failureDedupWindow: TimeInterval = 0.5  // 5 second window for burst deduplication
     private static var disableFailureDedupForTesting = false
     
     static func recordRouteFailure(
@@ -2159,8 +2163,11 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func clearRouteHealthForTesting() {
-        disableFailureDedupForTesting = true
+        disableFailureDedupForTesting = false
         routeHealthQueue.sync {
+            routeHealthPersistWorkItem?.cancel()
+            routeHealthPersistWorkItem = nil
+            routeHealthDirty = false
             routeCircuitStatesByRouteHealthKey = [:]
             providerCooldownsByProviderID = [:]
             hasLoadedPersistedRouteHealth = true
@@ -2211,6 +2218,9 @@ enum OpenAICompatTemporaryShim {
 
     static func reloadPersistedRouteHealthForTesting() {
         routeHealthQueue.sync {
+            routeHealthPersistWorkItem?.cancel()
+            routeHealthPersistWorkItem = nil
+            routeHealthDirty = false
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
             loadPersistedRouteHealthIfNeededLocked()
@@ -3220,7 +3230,7 @@ enum OpenAICompatTemporaryShim {
             } else if let lastUpdate = state.lastScoreUpdatedAt {
                 lastActivityDate = lastUpdate
             } else {
-                lastActivityDate = Date(timeIntervalSince1970: 0)
+                continue
             }
             
             let age = now.timeIntervalSince(lastActivityDate)
@@ -4340,6 +4350,10 @@ class ThinkingProxy {
             released = true
             OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: routeHealthKey)
         }
+
+        deinit {
+            release()
+        }
     }
 
     private var listener: NWListener?
@@ -4832,9 +4846,8 @@ class ThinkingProxy {
             listener = nil
             stopCanaryLoopLocked()
             stopMaintenanceLoopLocked()
-            DispatchQueue.main.async { [weak self] in
-                self?.isRunning = false
-            }
+            isRunning = false
+            OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
             NSLog("[ThinkingProxy] Stopped")
         }
     }
@@ -5493,53 +5506,9 @@ class ThinkingProxy {
         statusCode: Int?,
         responseBody: Data?
     ) -> Bool {
-        guard binding.source == "authoritative_custom_model",
-              binding.requestSurface == "responses",
-              binding.routeProvider == "openai" || binding.routeProvider == "xai",
-              let workerContract = Self.factoryWorkerContract(),
-              workerContract.workerModelID != binding.incomingModelID,
-              workerContract.routeModel != binding.routeModel,
-              workerContract.snapshotDriftPaths.isEmpty,
-              workerContract.ready,
-              OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) != nil else {
-            return false
-        }
-
-        guard let statusCode else {
-            return true
-        }
-
-        if statusCode == 502 || statusCode == 503 || statusCode == 504 {
-            return true
-        }
-
-        guard let fallbackError = factoryDirectFallbackErrorDetails(
-            statusCode: statusCode,
-            responseBody: responseBody
-        ) else {
-            return false
-        }
-
-        let errorType = fallbackError.type.lowercased()
-        let errorCode = fallbackError.code.lowercased()
-        let errorMessage = fallbackError.message.lowercased()
-
-        if statusCode == 429,
-           errorType == "usage_limit_reached" || errorCode == "usage_limit_reached" || errorMessage.contains("usage limit") {
-            return true
-        }
-
-        if statusCode == 401 || statusCode == 403 {
-            return errorCode.contains("auth") || errorType.contains("auth") || errorMessage.contains("auth")
-        }
-
-        if statusCode >= 500 {
-            return errorCode.contains("auth_not_found") ||
-                errorType.contains("auth") ||
-                errorMessage.contains("auth_not_found") ||
-                errorMessage.contains("no auth available")
-        }
-
+        _ = binding
+        _ = statusCode
+        _ = responseBody
         return false
     }
 
@@ -5895,6 +5864,7 @@ class ThinkingProxy {
         let completionQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-race-completion")
         var remainingAttempts = raceTransitions.count
         var terminalOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
+        let completionGate = DispatchSemaphore(value: 0)
 
         for (index, transition) in raceTransitions.enumerated() {
             let attemptLane = index + 1
@@ -5911,7 +5881,9 @@ class ThinkingProxy {
                     // Already inflight — register completion as waiter
                     nvidiaRaceWaiters[coalescingModelKey]!.append({ [weak self] outcome in
                         guard self != nil else { return }
-                        completionQueue.async {
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            completionGate.wait()
+                            completionQueue.async {
                             guard !coordinator.isFinished() else { return }
                             switch outcome {
                             case .success:
@@ -5923,6 +5895,7 @@ class ThinkingProxy {
                                 terminalOutcomesByLane[attemptLane] = outcome
                                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                                 remainingAttempts -= 1
+                            }
                             }
                         }
                     })
@@ -5960,115 +5933,121 @@ class ThinkingProxy {
                 controller: controller
             ) { [weak self] outcome in
                 guard let self else { return }
-                completionQueue.async {
-                    guard !coordinator.isFinished() else { return }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    completionGate.wait()
+                    completionQueue.async {
+                        guard !coordinator.isFinished() else { return }
 
-                    switch outcome {
-                    case .success(let requestModel, let statusCode, let headers, let body, let telemetryEvent):
-                        let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
-                            OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
-                                telemetryEvent,
-                                winnerAttemptLane: attemptLane
-                            ),
-                            requestedAlias: publicAlias,
-                            failoverDepth: failoverDepth,
-                            finalWinnerRequestModel: requestModel
-                        )
-                        guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
-                        OpenAICompatTemporaryShim.recordRouteSuccess(
-                            forRequestModel: requestModel,
-                            telemetryEvent: winningTelemetryEvent
-                        )
-                        self.deliverSmartAliasSuccessfulResponse(
+                        switch outcome {
+                        case .success(let requestModel, let statusCode, let headers, let body, let telemetryEvent):
+                            let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
+                                OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                                    telemetryEvent,
+                                    winnerAttemptLane: attemptLane
+                                ),
+                                requestedAlias: publicAlias,
+                                failoverDepth: failoverDepth,
+                                finalWinnerRequestModel: requestModel
+                            )
+                            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                            OpenAICompatTemporaryShim.recordRouteSuccess(
+                                forRequestModel: requestModel,
+                                telemetryEvent: winningTelemetryEvent
+                            )
+                            self.deliverSmartAliasSuccessfulResponse(
+                                defaultConnection: originalConnection,
+                                statusCode: statusCode,
+                                headers: headers,
+                                body: body,
+                                publicAlias: publicAlias,
+                                resolvedRequestModel: requestModel,
+                                coalescingKey: coalescingKey,
+                                deliveryMode: deliveryMode
+                            )
+                        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
+                            OpenAICompatTemporaryShim.recordRouteFailure(
+                                forRequestModel: requestModel,
+                                telemetryEvent: telemetryEvent,
+                                forcedOpenUntil: cooldownUntil,
+                                healthSensitivity: healthSensitivity
+                            )
+                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                            remainingAttempts -= 1
+                        case .terminalResponse(_, _, _, _, let telemetryEvent):
+                            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                            terminalOutcomesByLane[attemptLane] = outcome
+                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                            remainingAttempts -= 1
+                        case .terminalError(_, _, _, let telemetryEvent):
+                            if let telemetryEvent {
+                                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                            }
+                            terminalOutcomesByLane[attemptLane] = outcome
+                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                            remainingAttempts -= 1
+                        }
+
+                        let waiters = self.nvidiaInflightQueue.sync { () -> [(SmartAliasCandidateAttemptOutcome) -> Void] in
+                            self.nvidiaRaceWaiters.removeValue(forKey: coalescingModelKey) ?? []
+                        }
+                        if !waiters.isEmpty {
+                            NSLog("[ThinkingProxy] Delivering NVIDIA race outcome for %@ to %d coalesced waiter(s)", transition.model, waiters.count)
+                            for waiter in waiters {
+                                waiter(outcome)
+                            }
+                        }
+
+                        guard remainingAttempts == 0, !coordinator.isFinished() else { return }
+                        _ = coordinator.tryFinish(attemptLane: 0)
+
+                        if !deferredCandidateModels.isEmpty {
+                            self.attemptSmartAliasCandidate(
+                                method: method,
+                                path: path,
+                                headers: headers,
+                                currentBody: currentBody,
+                                publicAlias: publicAlias,
+                                remainingCandidateModels: deferredCandidateModels,
+                                forceProbeCandidateModels: forceProbeCandidateModels,
+                                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                                failoverDepth: failoverDepth + raceTransitions.count,
+                                deadlineAt: deadlineAt,
+                                originalConnection: originalConnection,
+                                coalescingKey: coalescingKey,
+                                terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
+                                deliveryMode: deliveryMode
+                            )
+                            return
+                        }
+
+                        if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
+                            self.deliverSmartAliasTerminalOutcome(
+                                terminalOutcome,
+                                publicAlias: publicAlias,
+                                originalConnection: originalConnection,
+                                coalescingKey: coalescingKey,
+                                deliveryMode: deliveryMode
+                            )
+                            return
+                        }
+
+                        let statusCode = self.remainingSmartAliasBudget(until: deadlineAt) > 0 ? 503 : 504
+                        let message = statusCode == 503
+                            ? "All configured worker backends are currently unavailable."
+                            : "Worker failover budget exhausted before any backend returned a valid response."
+                        self.deliverBufferedError(
                             defaultConnection: originalConnection,
                             statusCode: statusCode,
-                            headers: headers,
-                            body: body,
-                            publicAlias: publicAlias,
-                            resolvedRequestModel: requestModel,
-                            coalescingKey: coalescingKey,
-                            deliveryMode: deliveryMode
+                            message: message,
+                            coalescingKey: coalescingKey
                         )
-                    case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
-                        OpenAICompatTemporaryShim.recordRouteFailure(
-                            forRequestModel: requestModel,
-                            telemetryEvent: telemetryEvent,
-                            forcedOpenUntil: cooldownUntil,
-                            healthSensitivity: healthSensitivity
-                        )
-                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                        remainingAttempts -= 1
-                    case .terminalResponse(_, _, _, _, let telemetryEvent):
-                        OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                        terminalOutcomesByLane[attemptLane] = outcome
-                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                        remainingAttempts -= 1
-                    case .terminalError(_, _, _, let telemetryEvent):
-                        if let telemetryEvent {
-                            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                        }
-                        terminalOutcomesByLane[attemptLane] = outcome
-                        coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                        remainingAttempts -= 1
                     }
-
-                    // NVIDIA race coalescing: deliver outcome to all registered waiters
-                    let waiters = self.nvidiaInflightQueue.sync { () -> [(SmartAliasCandidateAttemptOutcome) -> Void] in
-                        self.nvidiaRaceWaiters.removeValue(forKey: coalescingModelKey) ?? []
-                    }
-                    if !waiters.isEmpty {
-                        NSLog("[ThinkingProxy] Delivering NVIDIA race outcome for %@ to %d coalesced waiter(s)", transition.model, waiters.count)
-                        for waiter in waiters {
-                            waiter(outcome)
-                        }
-                    }
-
-                    guard remainingAttempts == 0, !coordinator.isFinished() else { return }
-                    _ = coordinator.tryFinish(attemptLane: 0)
-
-                    if !deferredCandidateModels.isEmpty {
-                        self.attemptSmartAliasCandidate(
-                            method: method,
-                            path: path,
-                            headers: headers,
-                            currentBody: currentBody,
-                            publicAlias: publicAlias,
-                            remainingCandidateModels: deferredCandidateModels,
-                            forceProbeCandidateModels: forceProbeCandidateModels,
-                            primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                            failoverDepth: failoverDepth + raceTransitions.count,
-                            deadlineAt: deadlineAt,
-                            originalConnection: originalConnection,
-                            coalescingKey: coalescingKey,
-                            terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
-                            deliveryMode: deliveryMode
-                        )
-                        return
-                    }
-
-                    if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
-                        self.deliverSmartAliasTerminalOutcome(
-                            terminalOutcome,
-                            publicAlias: publicAlias,
-                            originalConnection: originalConnection,
-                            coalescingKey: coalescingKey,
-                            deliveryMode: deliveryMode
-                        )
-                        return
-                    }
-
-                    let statusCode = self.remainingSmartAliasBudget(until: deadlineAt) > 0 ? 503 : 504
-                    let message = statusCode == 503
-                        ? "All configured worker backends are currently unavailable."
-                        : "Worker failover budget exhausted before any backend returned a valid response."
-                    self.deliverBufferedError(
-                        defaultConnection: originalConnection,
-                        statusCode: statusCode,
-                        message: message,
-                        coalescingKey: coalescingKey
-                    )
                 }
             }
+        }
+
+        for _ in raceTransitions {
+            completionGate.signal()
         }
     }
 
@@ -6152,8 +6131,7 @@ class ThinkingProxy {
                 forcedOpenUntil: cooldownUntil,
                 healthSensitivity: healthSensitivity
             )
-            let backoffMs = min(500 * (failoverDepth + 1), 2000)
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(backoffMs)) { [weak self] in
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 self.attemptSmartAliasCandidate(
                     method: method,
@@ -7513,6 +7491,18 @@ class ThinkingProxy {
 
         if let directProxiedTransportForTesting {
             return directProxiedTransportForTesting(request, endpoint, completion)
+        }
+        if let bufferedProxyTransportForTesting {
+            let requestHeaders = (request.allHTTPHeaderFields ?? [:]).map { ($0.key, $0.value) }
+            bufferedProxyTransportForTesting(
+                method,
+                path,
+                requestHeaders,
+                upstreamBody,
+                timeoutInterval,
+                completion
+            )
+            return {}
         }
 
         // Use pooled session keyed by proxy URL for TCP connection reuse
