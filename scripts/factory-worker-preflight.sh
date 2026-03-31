@@ -18,8 +18,12 @@ cleanup() {
 trap cleanup EXIT
 
 health_body="$tmp_dir/health.json"
-probe_headers="$tmp_dir/probe.headers"
-probe_body="$tmp_dir/probe.json"
+worker_probe_headers="$tmp_dir/worker-probe.headers"
+worker_probe_body="$tmp_dir/worker-probe.json"
+session_probe_headers="$tmp_dir/session-probe.headers"
+session_probe_body="$tmp_dir/session-probe.json"
+validation_probe_headers="$tmp_dir/validation-probe.headers"
+validation_probe_body="$tmp_dir/validation-probe.json"
 
 header_value() {
   local file="$1"
@@ -27,8 +31,7 @@ header_value() {
   awk -v target="$(printf '%s' "$header_name" | tr '[:upper:]' '[:lower:]')" '
     {
       line=$0
-      sub(/
-$/, "", line)
+      sub(/$/, "", line)
       split(line, parts, ":")
       name=tolower(parts[1])
       if (name != target) {
@@ -85,53 +88,29 @@ validation_route_provider="$(jq -r --arg id "$validation_model_id" '.customModel
 session_route_model="$(jq -r --arg id "$session_model_id" '.customModels[] | select(.id == $id) | .model' "$GLOBAL_SETTINGS_PATH")"
 session_route_provider="$(jq -r --arg id "$session_model_id" '.customModels[] | select(.id == $id) | .provider' "$GLOBAL_SETTINGS_PATH")"
 
-case "$worker_route_provider" in
-  generic-chat-completion-api)
-    worker_request_surface="chat_completions"
-    ;;
-  openai|xai)
-    worker_request_surface="responses"
-    ;;
-  anthropic)
-    worker_request_surface="messages"
-    ;;
-  *)
-    echo "unsupported Factory worker provider in $GLOBAL_SETTINGS_PATH: $worker_route_provider" >&2
-    exit 1
-    ;;
-esac
+provider_to_surface() {
+  local provider="$1"
+  local role="$2"
+  case "$provider" in
+    generic-chat-completion-api)
+      printf 'chat_completions'
+      ;;
+    openai|xai)
+      printf 'responses'
+      ;;
+    anthropic)
+      printf 'messages'
+      ;;
+    *)
+      echo "unsupported Factory $role provider in $GLOBAL_SETTINGS_PATH: $provider" >&2
+      exit 1
+      ;;
+  esac
+}
 
-case "$session_route_provider" in
-  generic-chat-completion-api)
-    session_request_surface="chat_completions"
-    ;;
-  openai|xai)
-    session_request_surface="responses"
-    ;;
-  anthropic)
-    session_request_surface="messages"
-    ;;
-  *)
-    echo "unsupported Factory session/orchestrator provider in $GLOBAL_SETTINGS_PATH: $session_route_provider" >&2
-    exit 1
-    ;;
-esac
-
-case "$validation_route_provider" in
-  generic-chat-completion-api)
-    validation_request_surface="chat_completions"
-    ;;
-  openai|xai)
-    validation_request_surface="responses"
-    ;;
-  anthropic)
-    validation_request_surface="messages"
-    ;;
-  *)
-    echo "unsupported Factory validation provider in $GLOBAL_SETTINGS_PATH: $validation_route_provider" >&2
-    exit 1
-    ;;
-esac
+worker_request_surface="$(provider_to_surface "$worker_route_provider" "worker")"
+session_request_surface="$(provider_to_surface "$session_route_provider" "session/orchestrator")"
+validation_request_surface="$(provider_to_surface "$validation_route_provider" "validation")"
 
 echo "==> Checking proxy health endpoint"
 curl -fsS "$HEALTH_URL" -o "$health_body"
@@ -175,27 +154,40 @@ echo "==> Probing the worker lane directly"
 case "$worker_request_surface" in
   chat_completions)
     curl -fsS \
-      -D "$probe_headers" \
+      -D "$worker_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
       "$FRONTEND_URL/v1/chat/completions" \
       -d "{\"model\":\"$worker_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"description\":\"No-op verification tool\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],\"tool_choice\":\"none\",\"max_tokens\":32}" \
-      -o "$probe_body"
-    jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
-    assert_probe_headers "$probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
+      -o "$worker_probe_body"
+    jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$worker_probe_body" >/dev/null
+    assert_probe_headers "$worker_probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
     ;;
   responses)
     curl -fsS \
-      -D "$probe_headers" \
+      -D "$worker_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
       "$FRONTEND_URL/v1/responses" \
       -d "{\"model\":\"$worker_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
-      -o "$probe_body"
-    jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
-    assert_probe_headers "$probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
+      -o "$worker_probe_body"
+    jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$worker_probe_body" >/dev/null
+    assert_probe_headers "$worker_probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
+    ;;
+  messages)
+    curl -fsS \
+      -D "$worker_probe_headers" \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: $API_KEY" \
+      -H "anthropic-version: 2023-06-01" \
+      --max-time 45 \
+      "$FRONTEND_URL/v1/messages" \
+      -d "{\"model\":\"$worker_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
+      -o "$worker_probe_body"
+    jq -e '((.content[0].text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$worker_probe_body" >/dev/null
+    assert_probe_headers "$worker_probe_headers" "worker" "$worker_model_id" "$worker_effective_route_model" "$worker_effective_route_provider"
     ;;
   *)
     echo "unsupported Factory worker request surface for proxy preflight: $worker_request_surface" >&2
@@ -207,27 +199,40 @@ echo "==> Probing the session/validation lane directly"
 case "$session_request_surface" in
   chat_completions)
     curl -fsS \
-      -D "$probe_headers" \
+      -D "$session_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
       "$FRONTEND_URL/v1/chat/completions" \
       -d "{\"model\":\"$session_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
-      -o "$probe_body"
-    jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
-    assert_probe_headers "$probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
+      -o "$session_probe_body"
+    jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$session_probe_body" >/dev/null
+    assert_probe_headers "$session_probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
     ;;
   responses)
     curl -fsS \
-      -D "$probe_headers" \
+      -D "$session_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       --max-time 45 \
       "$FRONTEND_URL/v1/responses" \
       -d "{\"model\":\"$session_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
-      -o "$probe_body"
-    jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
-    assert_probe_headers "$probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
+      -o "$session_probe_body"
+    jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$session_probe_body" >/dev/null
+    assert_probe_headers "$session_probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
+    ;;
+  messages)
+    curl -fsS \
+      -D "$session_probe_headers" \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: $API_KEY" \
+      -H "anthropic-version: 2023-06-01" \
+      --max-time 45 \
+      "$FRONTEND_URL/v1/messages" \
+      -d "{\"model\":\"$session_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
+      -o "$session_probe_body"
+    jq -e '((.content[0].text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$session_probe_body" >/dev/null
+    assert_probe_headers "$session_probe_headers" "session" "$session_model_id" "$session_effective_route_model" "$session_effective_route_provider"
     ;;
   *)
     echo "unsupported Factory session/orchestrator request surface for proxy preflight: $session_request_surface" >&2
@@ -240,27 +245,40 @@ if [[ "$validation_model_id" != "$session_model_id" ]]; then
   case "$validation_request_surface" in
     chat_completions)
       curl -fsS \
-        -D "$probe_headers" \
+        -D "$validation_probe_headers" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         --max-time 45 \
         "$FRONTEND_URL/v1/chat/completions" \
         -d "{\"model\":\"$validation_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
-        -o "$probe_body"
-      jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$probe_body" >/dev/null
-      assert_probe_headers "$probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
+        -o "$validation_probe_body"
+      jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$validation_probe_body" >/dev/null
+      assert_probe_headers "$validation_probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
       ;;
     responses)
       curl -fsS \
-        -D "$probe_headers" \
+        -D "$validation_probe_headers" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         --max-time 45 \
         "$FRONTEND_URL/v1/responses" \
         -d "{\"model\":\"$validation_model_id\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
-        -o "$probe_body"
-      jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$probe_body" >/dev/null
-      assert_probe_headers "$probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
+        -o "$validation_probe_body"
+      jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$validation_probe_body" >/dev/null
+      assert_probe_headers "$validation_probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
+      ;;
+    messages)
+      curl -fsS \
+        -D "$validation_probe_headers" \
+        -H "Content-Type: application/json" \
+        -H "x-api-key: $API_KEY" \
+        -H "anthropic-version: 2023-06-01" \
+        --max-time 45 \
+        "$FRONTEND_URL/v1/messages" \
+        -d "{\"model\":\"$validation_model_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
+        -o "$validation_probe_body"
+      jq -e '((.content[0].text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$validation_probe_body" >/dev/null
+      assert_probe_headers "$validation_probe_headers" "validation" "$validation_model_id" "$validation_effective_route_model" "$validation_effective_route_provider"
       ;;
     *)
       echo "unsupported Factory validation request surface for proxy preflight: $validation_request_surface" >&2

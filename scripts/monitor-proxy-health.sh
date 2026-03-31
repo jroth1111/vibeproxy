@@ -14,7 +14,6 @@ PROXY_PORTS=(8317 8318)
 PROXY_NAMES=("VibeProxy" "CLIProxyAPIPlus")
 LOG_FILE="${HOME}/Library/Logs/vibeproxy-health.log"
 CHECK_INTERVAL=60
-MAX_RESTART_ATTEMPTS=3
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
@@ -65,16 +64,17 @@ health_check() {
             log "ERROR: $name (port $port) is DOWN (connection refused)"
             all_healthy=false
             
-            # Try restart (with rate limiting)
+            # Try restart (with rate limiting via timestamp file)
             local restart_file="/tmp/vibeproxy-restart-${port}.lock"
-            if [[ ! -f "$restart_file" ]]; then
-                touch "$restart_file"
+            local now cooldown_remaining
+            now=$(date +%s)
+            if [[ ! -f "$restart_file" ]] || \
+               (( now - $(cat "$restart_file" 2>/dev/null || echo 0) > 300 )); then
                 restart_proxy "$name" || true
-                # Cooldown: don't restart again for 5 minutes
-                sleep 300
-                rm -f "$restart_file"
+                echo "$now" > "$restart_file"
             else
-                log "SKIP: Recent restart attempted for $name, cooldown active"
+                cooldown_remaining=$(( 300 - (now - $(cat "$restart_file")) ))
+                log "SKIP: Recent restart attempted for $name, cooldown ${cooldown_remaining}s remaining"
             fi
         elif [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
             log "OK: $name (port $port) responding with HTTP $http_code"

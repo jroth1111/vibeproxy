@@ -2089,44 +2089,11 @@ enum OpenAICompatTemporaryShim {
             return
         }
         
-        // Concurrency overshoot protection: deduplicate rapid failures on same route
-        let shouldCountAsNewFailure = routeFailureDedupQueue.sync { () -> Bool in
-            if disableFailureDedupForTesting {
-                return true
-            }
-            let key = route.routeHealthKey
-            let recentTimestamps = recentFailureTimestampsByRoute[key] ?? []
-            let cutoff = now.addingTimeInterval(-failureDedupWindow)
-            let stillRecent = recentTimestamps.filter { $0 > cutoff }
-            
-            // If we already have a failure within the dedup window, don't increment score again
-            // This prevents concurrent requests all hitting a failed route from each counting as separate failures
-            guard stillRecent.isEmpty else {
-                NSLog("[RouteHealth] Route failure dedup: skipping duplicate failure for %@ within %.0fs window", key, failureDedupWindow)
-                recentFailureTimestampsByRoute[key] = stillRecent
-                return false
-            }
-            
-            recentFailureTimestampsByRoute[key] = stillRecent + [now]
-            return true
-        }
-        
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
             
-            // If this is a duplicate failure within the window, preserve current state without incrementing
-            guard shouldCountAsNewFailure else {
-                // Still log the telemetry event for observability, but don't change circuit state
-                if let telemetryEvent {
-                    let enriched = enrichTelemetryEvent(telemetryEvent, from: current?.status ?? .closed, to: current?.status ?? .closed)
-                    logNVIDIARouteTelemetry(enriched)
-                }
-                if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
-                    providerCooldownsByProviderID[route.providerID] = cooldownUntil
-                }
-                return
-            }
+            // Always count failures — the circuit breaker threshold dampens rapid failures naturally
             
             // Feed concurrency registry for 429 responses
             if let fc = telemetryEvent?.failureClass, fc == "classified_429",
@@ -4853,6 +4820,55 @@ class ThinkingProxy {
 
     static func acquireProxiedSessionForTesting(proxyURL: String) -> URLSession? {
         acquireProxiedSession(proxyURL: proxyURL)?.0
+    }
+
+    private static let directPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.direct-session-pool")
+    private static var directSessionPool: [String: (session: URLSession, lastUsed: Date)] = [:]
+    private static let directPoolMaxSize = 8
+    private static let directPoolIdleEviction: TimeInterval = 300
+
+    private static func acquireDirectSession(key: String) -> URLSession? {
+        directPoolQueue.sync {
+            evictIdleDirectSessionsLocked()
+
+            if let existing = directSessionPool[key] {
+                directSessionPool[key] = (existing.session, lastUsed: Date())
+                return existing.session
+            }
+
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 120
+            configuration.timeoutIntervalForResource = 300
+            let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: nil)
+
+            if directSessionPool.count >= directPoolMaxSize {
+                if let oldestKey = directSessionPool.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
+                    directSessionPool[oldestKey]?.session.finishTasksAndInvalidate()
+                    directSessionPool.removeValue(forKey: oldestKey)
+                }
+            }
+
+            directSessionPool[key] = (session, lastUsed: Date())
+            return session
+        }
+    }
+
+    private static func evictIdleDirectSessionsLocked() {
+        let now = Date()
+        let stale = directSessionPool.filter { now.timeIntervalSince($0.value.lastUsed) > directPoolIdleEviction }
+        for (key, entry) in stale {
+            entry.session.finishTasksAndInvalidate()
+            directSessionPool.removeValue(forKey: key)
+        }
+    }
+
+    static func clearDirectSessionPoolForTesting() {
+        directPoolQueue.sync {
+            for (_, entry) in directSessionPool {
+                entry.session.finishTasksAndInvalidate()
+            }
+            directSessionPool = [:]
+        }
     }
 
     func setIsRunningForTesting(_ value: Bool) {
@@ -8326,7 +8342,7 @@ class ThinkingProxy {
         request.setValue("close", forHTTPHeaderField: "Connection")
 
         let responseProgress = ResponseProgressDelegate()
-        let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let session = OpenAICompatTemporaryShim.acquireDirectSession(key: "direct:127.0.0.1:\(targetPort)") ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             defer {

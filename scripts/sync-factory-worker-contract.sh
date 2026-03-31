@@ -75,10 +75,7 @@ managed_model_id_mismatches="$(jq -c --argjson ids "$managed_custom_ids" '
     })
   | map(select(.id != .expectedId))
 ' "$GLOBAL_SETTINGS_PATH")"
-retired_worker_ids="$(jq -cn --argjson managed_ids "$managed_custom_ids" '[
-  "custom:Proxy-WorkerPool-8",
-  "custom:Factory-Worker-GPT-5.4-High-8"
-] | map(select(($managed_ids | index(.)) == null))')"
+retired_worker_ids="$(jq -cn '[]')"
 
 if [[ -z "$worker_id" || "$worker_id" == "null" ]]; then
   echo "global settings missing missionModelSettings.workerModel" >&2
@@ -87,6 +84,11 @@ fi
 
 if [[ -z "$session_model_id" || "$session_model_id" == "null" ]]; then
   echo "global settings missing sessionDefaultSettings.model" >&2
+  exit 1
+fi
+
+if [[ -z "$validation_worker_id" || "$validation_worker_id" == "null" ]]; then
+  echo "global settings missing missionModelSettings.validationWorkerModel" >&2
   exit 1
 fi
 

@@ -41,6 +41,11 @@ if ! mkdir "$lock_dir" 2>/dev/null; then
 fi
 lock_acquired=1
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "rg (ripgrep) is required but not found in PATH" >&2
+  exit 1
+fi
+
 if [[ ! -f "$GLOBAL_SETTINGS_PATH" ]]; then
   echo "missing global settings: $GLOBAL_SETTINGS_PATH" >&2
   exit 1
