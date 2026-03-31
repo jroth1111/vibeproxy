@@ -465,6 +465,12 @@ enum OpenAICompatTemporaryShim {
             forcesKimiInstantMode: false
         )
     ]
+    #if DEBUG
+    private static let _assertKnownNVIDIARoutesHaveNoDuplicates: Void = {
+        let keys = Array(knownNVIDIARoutePoliciesByCanonicalModelID.keys)
+        Swift.assert(Set(keys).count == keys.count, "Duplicate key in knownNVIDIARoutePoliciesByCanonicalModelID")
+    }()
+    #endif
     private static let modelTierByCanonicalModelID: [String: ModelTier] = [
         "z-ai/glm5": .standard,
         "moonshotai/kimi-k2.5": .reasoning,
@@ -473,6 +479,12 @@ enum OpenAICompatTemporaryShim {
         "xiaomi/mimo-v2-pro:free": .economy,
         "minimax-m2.5-free": .standard,
     ]
+    #if DEBUG
+    private static let _assertModelTiersHaveNoDuplicates: Void = {
+        let keys = Array(modelTierByCanonicalModelID.keys)
+        Swift.assert(Set(keys).count == keys.count, "Duplicate key in modelTierByCanonicalModelID")
+    }()
+    #endif
     static let canaryDisabledCanonicalModelIDs: Set<String> = []
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
@@ -656,6 +668,12 @@ enum OpenAICompatTemporaryShim {
             forcesKimiInstantMode: false
         )
     ]
+    #if DEBUG
+    private static let _assertNonNVIDIAPoliciesHaveNoDuplicates: Void = {
+        let keys = Array(nonNVIDIAMitigationPoliciesByRequestModel.keys)
+        Swift.assert(Set(keys).count == keys.count, "Duplicate key in nonNVIDIAMitigationPoliciesByRequestModel")
+    }()
+    #endif
 
     private struct RequestPolicy {
         let minimumMaxTokens: Int?
@@ -706,6 +724,12 @@ enum OpenAICompatTemporaryShim {
         "glm-5": "glm-5.1",
         "glm-5-turbo": "glm-5.1"
     ]
+    #if DEBUG
+    private static let _assertLegacyRewritesHaveNoDuplicates: Void = {
+        let keys = Array(legacyRequestModelRewrites.keys)
+        Swift.assert(Set(keys).count == keys.count, "Duplicate key in legacyRequestModelRewrites")
+    }()
+    #endif
 
     fileprivate enum ToolCallValidation {
         case none
@@ -4320,7 +4344,121 @@ class ThinkingProxy {
             markPayloadReceived()
         }
     }
-    
+
+    private static let proxiedPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.proxied-session-pool")
+    private static var proxiedSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
+    private static let proxiedPoolMaxSize = 8
+    private static let proxiedPoolIdleEviction: TimeInterval = 300
+
+    private final class TaskIdHolder: @unchecked Sendable {
+        var taskIdentifier: Int = 0
+    }
+
+    private final class MultiplexedSessionDelegate: NSObject, URLSessionDataDelegate {
+        private let lock = NSLock()
+        private var delegates: [Int: ResponseProgressDelegate] = [:]
+
+        func register(task: URLSessionTask, delegate: ResponseProgressDelegate) {
+            lock.lock()
+            delegates[task.taskIdentifier] = delegate
+            lock.unlock()
+        }
+
+        func unregister(taskIdentifier: Int) -> ResponseProgressDelegate? {
+            lock.lock()
+            let delegate = delegates.removeValue(forKey: taskIdentifier)
+            lock.unlock()
+            return delegate
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+        ) {
+            lock.lock()
+            let delegate = delegates[dataTask.taskIdentifier]
+            lock.unlock()
+            delegate?.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: completionHandler)
+                ?? completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            guard !data.isEmpty else { return }
+            lock.lock()
+            let delegate = delegates[dataTask.taskIdentifier]
+            lock.unlock()
+            delegate?.urlSession(session, dataTask: dataTask, didReceive: data)
+        }
+    }
+
+    private static func acquireProxiedSession(proxyURL: String) -> (URLSession, MultiplexedSessionDelegate)? {
+        proxiedPoolQueue.sync {
+            evictIdleSessionsLocked()
+
+            if let existing = proxiedSessionPool[proxyURL] {
+                proxiedSessionPool[proxyURL] = (existing.session, existing.delegate, lastUsed: Date())
+                return (existing.session, existing.delegate)
+            }
+
+            guard let proxyComponents = URLComponents(string: proxyURL),
+                  let proxyHost = proxyComponents.host,
+                  let proxyPort = proxyComponents.port else {
+                return nil
+            }
+
+            let configuration = URLSessionConfiguration.ephemeral
+            var proxyDict: [AnyHashable: Any] = [
+                kCFStreamPropertySOCKSProxyHost as String: proxyHost,
+                kCFStreamPropertySOCKSProxyPort as String: proxyPort,
+                kCFStreamPropertySOCKSVersion as String: kCFStreamSocketSOCKSVersion5 as String
+            ]
+            if let user = proxyComponents.user, !user.isEmpty {
+                proxyDict[kCFStreamPropertySOCKSUser as String] = user
+            }
+            if let password = proxyComponents.password, !password.isEmpty {
+                proxyDict[kCFStreamPropertySOCKSPassword as String] = password
+            }
+            configuration.connectionProxyDictionary = proxyDict
+
+            let delegate = MultiplexedSessionDelegate()
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+
+            if proxiedSessionPool.count >= proxiedPoolMaxSize {
+                if let oldestKey = proxiedSessionPool.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
+                    proxiedSessionPool[oldestKey]?.session.finishTasksAndInvalidate()
+                    proxiedSessionPool.removeValue(forKey: oldestKey)
+                }
+            }
+
+            proxiedSessionPool[proxyURL] = (session, delegate, lastUsed: Date())
+            return (session, delegate)
+        }
+    }
+
+    private static func evictIdleSessionsLocked() {
+        let now = Date()
+        let stale = proxiedSessionPool.filter { now.timeIntervalSince($0.value.lastUsed) > proxiedPoolIdleEviction }
+        for (key, entry) in stale {
+            entry.session.finishTasksAndInvalidate()
+            proxiedSessionPool.removeValue(forKey: key)
+        }
+    }
+
+    static func clearProxiedSessionPoolForTesting() {
+        proxiedPoolQueue.sync {
+            for (_, entry) in proxiedSessionPool {
+                entry.session.finishTasksAndInvalidate()
+            }
+            proxiedSessionPool = [:]
+        }
+    }
+
+    static func acquireProxiedSessionForTesting(proxyURL: String) -> URLSession? {
+        acquireProxiedSession(proxyURL: proxyURL)?.0
+    }
+
     /**
      Starts the thinking proxy server on port 8317
      */
@@ -6879,31 +7017,16 @@ class ThinkingProxy {
         let bearerToken = endpoint.apiKey ?? ""
         request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
 
-        // Configure SOCKS5 proxy
-        let configuration = URLSessionConfiguration.ephemeral
-        guard let proxyComponents = URLComponents(string: endpoint.proxyURL),
-              let proxyHost = proxyComponents.host,
-              let proxyPort = proxyComponents.port else {
+        // Use pooled session keyed by proxy URL for TCP connection reuse
+        guard let (session, poolDelegate) = Self.acquireProxiedSession(proxyURL: endpoint.proxyURL) else {
             completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.badURL), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
             return {}
         }
 
-        var proxyDict: [AnyHashable: Any] = [
-            kCFStreamPropertySOCKSProxyHost as String: proxyHost,
-            kCFStreamPropertySOCKSProxyPort as String: proxyPort,
-            kCFStreamPropertySOCKSVersion as String: kCFStreamSocketSOCKSVersion5 as String
-        ]
-        if let user = proxyComponents.user, !user.isEmpty {
-            proxyDict[kCFStreamPropertySOCKSUser as String] = user
-        }
-        if let password = proxyComponents.password, !password.isEmpty {
-            proxyDict[kCFStreamPropertySOCKSPassword as String] = password
-        }
-        configuration.connectionProxyDictionary = proxyDict
-
         let responseProgress = ResponseProgressDelegate()
-        let session = URLSession(configuration: configuration, delegate: responseProgress, delegateQueue: nil)
+        let taskHolder = TaskIdHolder()
         let task = session.dataTask(with: request) { data, response, error in
+            _ = poolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
             responseProgress.finish()
             completion(
                 BufferedProxyResponse(
@@ -6914,11 +7037,12 @@ class ThinkingProxy {
                     totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
                 )
             )
-            session.finishTasksAndInvalidate()
         }
+        poolDelegate.register(task: task, delegate: responseProgress)
+        taskHolder.taskIdentifier = task.taskIdentifier
         task.resume()
         return {
-            session.invalidateAndCancel()
+            task.cancel()
         }
     }
 

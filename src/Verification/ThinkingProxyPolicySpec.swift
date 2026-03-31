@@ -6326,6 +6326,155 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("stale suspect route health auto-heals on reload", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                // Simulate a suspect route with a stale event from 10 minutes ago
+                let staleDate = Date().addingTimeInterval(-600)
+                let staleEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: staleDate,
+                    requestModel: "mimo-v2-pro-opencode",
+                    canonicalModelID: "mimo-v2-pro-free",
+                    transportOutcome: "send_error",
+                    failureClass: "classified_429",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 429,
+                    retryCount: 0,
+                    source: "smart_alias"
+                )
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "mimo-v2-pro-opencode",
+                    telemetryEvent: staleEvent,
+                    at: staleDate
+                )
+
+                // Verify it starts as suspect
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["mimo-v2-pro-free"]?.status, .suspect, "route should start as suspect after failure", recorder: recorder)
+
+                // Simulate startup reload — the self-healing logic should close stale suspects
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["mimo-v2-pro-free"]?.status, .closed, "stale suspect routes should auto-heal to closed on startup reload", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.failureScore, 0, "healed routes should have zero failure score", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("smart alias candidate ordering puts zai first, free-tier before nvidia", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let candidates = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
+                )
+
+                expectEqual(candidates.first, "glm-5.1-zai", "z.ai should be the primary candidate", recorder: recorder)
+
+                // Free-tier providers should appear before NVIDIA providers
+                let nvidiaIndex = candidates.firstIndex(where: { $0.contains("-nvidia") }) ?? candidates.count
+                let freeTierLast = candidates.prefix(nvidiaIndex).last(where: { !$0.contains("zai") })
+                expectEqual(freeTierLast != nil, true, "free-tier providers should appear before NVIDIA in candidate ordering", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("smart alias fails over through all candidates when each fails", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                let allCandidates = ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
+
+                // Quarantine all candidates except the last
+                for candidate in allCandidates.dropLast() {
+                    for _ in 0..<5 {
+                        OpenAICompatTemporaryShim.recordRouteFailure(
+                            forRequestModel: candidate,
+                            at: now
+                        )
+                    }
+                }
+
+                // Force all routes open
+                for candidate in allCandidates.dropLast() {
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: candidate,
+                        until: now.addingTimeInterval(300)
+                    )
+                }
+
+                let request = """
+                {"model": "worker", "messages": [{"role": "user", "content": "test"}], "stream": false}
+                """
+
+                // The last candidate should still be available
+                let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: request,
+                    candidateModelsRemaining: allCandidates
+                )
+
+                expectEqual(transition?.model, "kimi-k2.5-nvidia", "when all other candidates are quarantined, the last should still be available", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("smart alias route recovers from suspect to closed on success", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+
+                // Put route into suspect state
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm-5.1-zai", at: now)
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .suspect, "route should be suspect after one failure", recorder: recorder)
+
+                // Route should not be open yet
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-zai"), false, "suspect routes should remain available", recorder: recorder)
+
+                // Record success to close the circuit
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm-5.1-zai", at: now.addingTimeInterval(1))
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "suspect route should recover to closed after success", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("proxied session pool evicts idle sessions", recorder: recorder) {
+            ThinkingProxy.clearProxiedSessionPoolForTesting()
+
+            // Acquire a session — this populates the pool
+            let result1 = ThinkingProxy.acquireProxiedSessionForTesting(proxyURL: "socks5://user:pass@proxy.test:1080")
+            expectEqual(result1 != nil, true, "pool should return a valid session for a valid proxy URL", recorder: recorder)
+
+            // Acquiring the same proxy URL should reuse the session
+            let result2 = ThinkingProxy.acquireProxiedSessionForTesting(proxyURL: "socks5://user:pass@proxy.test:1080")
+            expectEqual(result2 != nil, true, "pool should reuse the cached session for the same proxy URL", recorder: recorder)
+
+            // Different proxy URL should get a different session
+            let result3 = ThinkingProxy.acquireProxiedSessionForTesting(proxyURL: "socks5://other@proxy2.test:1080")
+            expectEqual(result3 != nil, true, "pool should create a new session for a different proxy URL", recorder: recorder)
+
+            ThinkingProxy.clearProxiedSessionPoolForTesting()
+        }
+
+        run("binary path is used for NVIDIA routes without proxy-url", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                // NVIDIA providers should NOT have a provider endpoint (proxy-url)
+                let nvidiaEndpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "nvidia")
+                expectNil(nvidiaEndpoint, "nvidia provider should not have a proxy endpoint, ensuring binary path is used", recorder: recorder)
+
+                // The route should still be resolvable through the binary path
+                let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5")
+                expectEqual(route?.providerID, "nvidia", "nvidia-hosted glm5 should resolve to nvidia provider", recorder: recorder)
+                expectEqual(route?.canonicalModelID, "z-ai/glm5", "glm5 should resolve to canonical z-ai/glm5", recorder: recorder)
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
