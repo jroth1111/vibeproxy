@@ -552,7 +552,7 @@ struct ThinkingProxyPolicySpec {
 
                 let longHeaders: [AnyHashable: Any] = ["Retry-After": "3600"]
                 let longCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: longHeaders, now: now)
-                expectEqual(longCooldown?.timeIntervalSince(now), 3600, "long Retry-After (>= 5 min) should be parsed into a rate-limit route cooldown", recorder: recorder)
+                expectEqual(longCooldown?.timeIntervalSince(now), 600, "long Retry-After (>= 5 min) should be capped to the max provider cooldown window", recorder: recorder)
 
                 let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
@@ -574,7 +574,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(1)), true, "provider-advised rate-limit cooldown should immediately suppress the route", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(3601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "mimo-v2-pro-opencode", at: now.addingTimeInterval(601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }

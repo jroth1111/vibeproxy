@@ -2726,6 +2726,7 @@ enum OpenAICompatTemporaryShim {
         guard statusCode == 429 else { return nil }
 
         let concurrencyThreshold: TimeInterval = 300
+        let maxProviderCooldown: TimeInterval = 600
 
         // --- Retry-After header ---
         if let retryAfter = headerValue("Retry-After", in: headers)?
@@ -2736,7 +2737,9 @@ enum OpenAICompatTemporaryShim {
                     NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
                     return nil
                 }
-                return now.addingTimeInterval(seconds)
+                let capped = min(seconds, maxProviderCooldown)
+                NSLog("[ThinkingProxy] Provider 429 Retry-After: %.0fs — capping cooldown to %.0fs", seconds, capped)
+                return now.addingTimeInterval(capped)
             }
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -2749,7 +2752,9 @@ enum OpenAICompatTemporaryShim {
                     NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
                     return nil
                 }
-                return date
+                let cappedSeconds = min(seconds, maxProviderCooldown)
+                NSLog("[ThinkingProxy] Provider 429 Retry-After HTTP-date: %.0fs — capping cooldown to %.0fs", seconds, cappedSeconds)
+                return now.addingTimeInterval(cappedSeconds)
             }
         }
 
