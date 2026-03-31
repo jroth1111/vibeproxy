@@ -2707,6 +2707,15 @@ enum OpenAICompatTemporaryShim {
 
         if let seconds = TimeInterval(retryAfter),
            seconds > 0 {
+            // Distinguish noise from real rate limits:
+            // - Very short Retry-After (< 1s): likely concurrency noise, ignore
+            // - Short Retry-After (1-5 min): concurrency throttle, enforce cooldown
+            // - Long Retry-After (>= 5 min): rate limit, enforce cooldown
+            let noiseThreshold: TimeInterval = 1
+            if seconds < noiseThreshold {
+                NSLog("[ThinkingProxy] Noise 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, noiseThreshold)
+                return nil
+            }
             return now.addingTimeInterval(seconds)
         }
 
@@ -4378,6 +4387,7 @@ class ThinkingProxy {
     private let canaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.canary")
     private var canarySweepInFlight = false
     private let smartAliasForcedPrimaryRetryLimit = 2
+    private let smartAliasMaxLoopRetries = 4
     private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
@@ -5339,7 +5349,9 @@ class ThinkingProxy {
             originalConnection: originalConnection,
             coalescingKey: coalescingKey,
             terminalFallbackOutcome: nil,
-            deliveryMode: deliveryMode
+            deliveryMode: deliveryMode,
+            loopRetriesRemaining: smartAliasMaxLoopRetries,
+            allCandidateModels: candidateModels
         )
     }
 
@@ -5658,7 +5670,9 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        loopRetriesRemaining: Int = 0,
+        allCandidateModels: [String]? = nil
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
@@ -5733,6 +5747,30 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode
+                )
+                return
+            }
+            // Full-loop retry: re-evaluate candidates and retry before giving up
+            if loopRetriesRemaining > 0, Date() < deadlineAt {
+                let refreshedCandidates = allCandidateModels ?? remainingCandidateModels
+                NSLog("[ThinkingProxy] All candidates exhausted for %@, retrying loop (%d retries remaining)", publicAlias, loopRetriesRemaining)
+                attemptSmartAliasCandidate(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: currentBody,
+                    publicAlias: publicAlias,
+                    remainingCandidateModels: refreshedCandidates,
+                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    primaryProbeRetriesRemaining: forceProbeCandidateModels.isEmpty ? 0 : smartAliasForcedPrimaryRetryLimit,
+                    failoverDepth: failoverDepth,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalFallbackOutcome,
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining - 1,
+                    allCandidateModels: refreshedCandidates
                 )
                 return
             }
