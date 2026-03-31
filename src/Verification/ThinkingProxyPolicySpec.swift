@@ -603,7 +603,7 @@ struct ThinkingProxyPolicySpec {
                 let interval = cooldown.map { $0.timeIntervalSince(now) }
                 expectEqual(interval != nil, true, "GLM body reset time should produce a cooldown", recorder: recorder)
                 if let interval {
-                    expectEqual(abs(interval - 2 * 3600) < 5, true, "cooldown should be ~2 hours matching the GLM reset time", recorder: recorder)
+                    expectEqual(abs(interval - 600) < 5, true, "cooldown should be capped to max provider cooldown (600s) even when GLM reset time is further out", recorder: recorder)
                 }
 
                 // Short Retry-After should still win over body (header takes precedence, returns nil for concurrency)
