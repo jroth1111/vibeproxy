@@ -355,6 +355,14 @@ report_json="$(
 printf '%s\n' "$report_json" >"$AUDIT_LATEST_PATH"
 printf '%s\n' "$report_json" >>"$AUDIT_HISTORY_PATH"
 
+# Rotate proxy error log if it exceeds 10MB
+ERR_LOG="${ERR_LOG:-$HOME/.cli-proxy-api/launchd-vibeproxy.err.log}"
+if [[ -f "$ERR_LOG" ]] && [[ "$(stat -f%z "$ERR_LOG" 2>/dev/null)" -gt $((10 * 1024 * 1024)) ]]; then
+  ROTATED="${ERR_LOG}.$(date -u +%Y%m%dT%H%M%SZ)"
+  mv "$ERR_LOG" "$ROTATED"
+  record_action "log_rotated" "Rotated proxy error log to $(basename "$ROTATED") (exceeded 10MB)."
+fi
+
 if [[ "$suspect_route_health_count" -gt 0 ]]; then
   echo "suspect/open route health persists after audit repairs" >&2
   echo "$report_json" >&2
