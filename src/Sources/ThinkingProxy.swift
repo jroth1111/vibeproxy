@@ -546,8 +546,8 @@ enum OpenAICompatTemporaryShim {
             maximumMaxTokens: nil,
             strippedFields: [],
             attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
+            firstResponseDeadline: 60,
+            bufferedResponseDeadline: 180,
             transportRetries: 2,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -850,7 +850,7 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    private static let concurrencyRegistry = ProviderConcurrencyRegistry()
+    fileprivate static let concurrencyRegistry = ProviderConcurrencyRegistry()
 
     // MARK: - Route Health Write Debouncing
 
@@ -1060,6 +1060,7 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
+    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -2082,7 +2083,7 @@ enum OpenAICompatTemporaryShim {
             if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
                 providerCooldownsByProviderID[route.providerID] = cooldownUntil
             }
-            persistRouteHealthLocked()
+            scheduleRouteHealthPersistLocked()
             if let enrichedTelemetryEvent {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
@@ -2114,7 +2115,7 @@ enum OpenAICompatTemporaryShim {
                 replacingLastTelemetryEvent: enrichedTelemetryEvent
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
-            persistRouteHealthLocked()
+            scheduleRouteHealthPersistLocked()
             if let enrichedTelemetryEvent {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
@@ -2127,6 +2128,9 @@ enum OpenAICompatTemporaryShim {
             providerCooldownsByProviderID = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
+        }
+        routeFailureDedupQueue.sync {
+            recentFailureTimestampsByRoute = [:]
         }
     }
 
@@ -2922,6 +2926,12 @@ enum OpenAICompatTemporaryShim {
             return 1
         }
 
+        // 429 rate-limit responses indicate concurrency oversubscription, not route health issues.
+        // The concurrency registry handles backing off; the circuit breaker should not penalize.
+        if failureClass == "classified_429" {
+            return 0
+        }
+
         if failureClass == "transport_error" ||
             failureClass == "missing_response_material" ||
             failureClass.hasPrefix("classified_5") {
@@ -3081,8 +3091,15 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func loadPersistedRouteHealthIfNeededLocked() {
+        dispatchPrecondition(condition: .onQueue(routeHealthQueue))
         guard !hasLoadedPersistedRouteHealth else { return }
         hasLoadedPersistedRouteHealth = true
+        #if DEBUG
+        _ = _assertKnownNVIDIARoutesHaveNoDuplicates
+        _ = _assertModelTiersHaveNoDuplicates
+        _ = _assertNonNVIDIAPoliciesHaveNoDuplicates
+        _ = _assertLegacyRewritesHaveNoDuplicates
+        #endif
         guard let path = routeHealthStatePath(),
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -3141,25 +3158,33 @@ enum OpenAICompatTemporaryShim {
             persistRouteHealthLocked()
         }
 
-        // Self-heal: suspect routes with stale metrics auto-recover to closed.
+        healStaleSuspectRoutesLocked()
+    }
+
+    /// Heal suspect routes whose last telemetry event is older than the stale threshold.
+    /// Must be called on routeHealthQueue. Used by both startup load and background maintenance.
+    private static func healStaleSuspectRoutesLocked() {
         let staleThreshold: TimeInterval = 5 * 60  // 5 minutes
         let now = Date()
         var healedAny = false
         for key in routeCircuitStatesByRouteHealthKey.keys {
             guard let state = routeCircuitStatesByRouteHealthKey[key],
                   state.status == .suspect else { continue }
-            // If last event is older than threshold, this route has been idle.
-            // Skip routes with no last event — we cannot determine staleness.
-            guard let lastEvent = state.lastTelemetryEvent else {
-                NSLog("[ThinkingProxy] Self-heal: skipping route %@ - no telemetry event", key)
-                continue
+            
+            let lastActivityDate: Date
+            if let lastEvent = state.lastTelemetryEvent {
+                lastActivityDate = lastEvent.timestamp
+            } else if let lastUpdate = state.lastScoreUpdatedAt {
+                lastActivityDate = lastUpdate
+            } else {
+                lastActivityDate = Date(timeIntervalSince1970: 0)
             }
-            let age = now.timeIntervalSince(lastEvent.timestamp)
+            
+            let age = now.timeIntervalSince(lastActivityDate)
             guard age > staleThreshold else {
                 NSLog("[ThinkingProxy] Self-heal: route %@ has recent activity (%ds < %ds threshold), keeping suspect", key, Int(age), Int(staleThreshold))
                 continue
             }
-            // Suspect with no recent failures — safe to close.
             NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds)", key, Int(age))
             routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
                 status: .closed,
@@ -3169,13 +3194,21 @@ enum OpenAICompatTemporaryShim {
                 lastScoreUpdatedAt: now,
                 lastTelemetryEvent: state.lastTelemetryEvent,
                 rollingMetrics: state.rollingMetrics,
-                emaMetrics: state.emaMetrics,  // Preserve EMA metrics through recovery
+                emaMetrics: state.emaMetrics,
                 recoveredAt: now
             )
             healedAny = true
         }
         if healedAny {
             persistRouteHealthLocked()
+        }
+    }
+
+    /// Public entry point for maintenance timer to heal stale suspect routes.
+    static func maintenanceRouteHealthPass() {
+        routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            healStaleSuspectRoutesLocked()
         }
     }
 
@@ -3203,6 +3236,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func persistRouteHealthLocked() {
+        dispatchPrecondition(condition: .onQueue(routeHealthQueue))
         guard let path = routeHealthStatePath() else { return }
         let directory = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
@@ -3661,10 +3695,15 @@ enum OpenAICompatTemporaryShim {
             }
 
             let loadedConfiguration = loadConfiguredRouteConfiguration(from: path)
+            var routesWithManaged = loadedConfiguration.routesByRequestModel
+            routesWithManaged[proxyPoolToolWorkerPrimaryCandidate] = RouteIdentity(
+                providerID: "openai",
+                canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
+            )
             let cachedMap = CachedRouteConfiguration(
                 configPath: path,
                 modificationDate: modificationDate,
-                routesByRequestModel: loadedConfiguration.routesByRequestModel,
+                routesByRequestModel: routesWithManaged,
                 nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
                 anthropicRequestModels: loadedConfiguration.anthropicRequestModels,
                 smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
@@ -4242,6 +4281,7 @@ class ThinkingProxy {
     private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.thinking-proxy-state")
     private let nvidiaInflightQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-inflight")
     private var canaryTimer: DispatchSourceTimer?
+    private var maintenanceTimer: DispatchSourceTimer?
     private let canaryQueue = DispatchQueue(label: "io.automaze.vibeproxy.canary")
     private var canarySweepInFlight = false
     private let smartAliasForcedPrimaryRetryLimit = 2
@@ -4651,6 +4691,10 @@ class ThinkingProxy {
         acquireProxiedSession(proxyURL: proxyURL)?.0
     }
 
+    func setIsRunningForTesting(_ value: Bool) {
+        stateQueue.sync { isRunning = value }
+    }
+
     /**
      Starts the thinking proxy server on port 8317
      */
@@ -4698,6 +4742,7 @@ class ThinkingProxy {
             
             listener?.start(queue: .global(qos: .userInitiated))
             startCanaryLoop()
+            startMaintenanceLoop()
             
         } catch {
             NSLog("[ThinkingProxy] Failed to start: \(error)")
@@ -4713,7 +4758,8 @@ class ThinkingProxy {
             
             listener?.cancel()
             listener = nil
-            stopCanaryLoop()
+            stopCanaryLoopLocked()
+            stopMaintenanceLoop()
             DispatchQueue.main.async { [weak self] in
                 self?.isRunning = false
             }
@@ -6966,6 +7012,11 @@ class ThinkingProxy {
         )
 
         if shouldFailover {
+            // Record 429 in concurrency registry for auto-discovery of provider limits
+            if statusCode == 429, let routeHealthKey = route?.routeHealthKey {
+                let inflight = OpenAICompatTemporaryShim.concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+                OpenAICompatTemporaryShim.concurrencyRegistry.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
+            }
             let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
                 statusCode: statusCode,
                 headers: response.allHeaderFields
@@ -6981,6 +7032,10 @@ class ThinkingProxy {
         }
 
         if statusCode >= 200 && statusCode < 300 {
+            // Record success in concurrency registry for auto-limit growth
+            if let route {
+                OpenAICompatTemporaryShim.concurrencyRegistry.recordSuccess(routeHealthKey: route.routeHealthKey)
+            }
             completion(
                 .success(
                     requestModel: candidateModel,
@@ -7992,11 +8047,36 @@ class ThinkingProxy {
         timer.resume()
     }
 
+    // Called while already holding stateQueue — must not re-enter the queue.
+    private func stopCanaryLoopLocked() {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        canaryTimer?.cancel()
+        canaryTimer = nil
+        canarySweepInFlight = false
+    }
+
     private func stopCanaryLoop() {
+        stateQueue.sync { stopCanaryLoopLocked() }
+    }
+
+    private func startMaintenanceLoop() {
         stateQueue.sync {
-            canaryTimer?.cancel()
-            canaryTimer = nil
-            canarySweepInFlight = false
+            guard maintenanceTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: canaryQueue)
+            timer.schedule(deadline: .now() + 300, repeating: 300)
+            timer.setEventHandler { [weak self] in
+                guard let self, self.isRunning else { return }
+                OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
+            }
+            maintenanceTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func stopMaintenanceLoop() {
+        stateQueue.sync {
+            maintenanceTimer?.cancel()
+            maintenanceTimer = nil
         }
     }
 

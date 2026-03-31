@@ -6475,6 +6475,36 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("ThinkingProxy stop does not deadlock when canary state is active", recorder: recorder) {
+            // Regression test for: stop() calling stopCanaryLoop() which re-entered stateQueue.sync,
+            // causing __DISPATCH_WAIT_FOR_QUEUE__ → SIGTRAP crash loop on every failed startup.
+            let proxy = ThinkingProxy()
+            proxy.setIsRunningForTesting(true)
+
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                proxy.stop()
+                done.signal()
+            }
+            let result = done.wait(timeout: .now() + 2)
+            expectEqual(result == .success, true, "stop() must complete without deadlocking", recorder: recorder)
+        }
+
+        run("ThinkingProxy stop is idempotent and does not crash on repeated calls", recorder: recorder) {
+            let proxy = ThinkingProxy()
+            proxy.setIsRunningForTesting(true)
+
+            let done = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                proxy.stop()
+                proxy.stop()
+                done.signal()
+            }
+            let result = done.wait(timeout: .now() + 2)
+            expectEqual(result == .success, true, "repeated stop() calls must not hang", recorder: recorder)
+            expectEqual(proxy.isRunning, false, "isRunning must be false after stop()", recorder: recorder)
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
