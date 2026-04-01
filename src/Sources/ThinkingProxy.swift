@@ -3812,7 +3812,19 @@ enum OpenAICompatTemporaryShim {
 
     private static func normalizedRequestModel(_ model: String) -> String {
         let legacyNormalized = legacyRequestModelRewrites[model] ?? model
-        return ThinkingProxy.factoryResolvedRouteModel(forIncomingModelID: legacyNormalized) ?? legacyNormalized
+        if let resolved = ThinkingProxy.factoryResolvedRouteModel(forIncomingModelID: legacyNormalized) {
+            return resolved
+        }
+        // Reverse-map bare route model names (e.g. "proxy-worker-smart-router") that
+        // the Factory Droid sometimes sends instead of the custom model ID
+        // (e.g. "custom:Proxy-Worker-Smart-Router-8").  When the bare name matches a
+        // known factory binding's route model, use that binding's route model so the
+        // request gets the correct provider, timeout policy, and health tracking.
+        if let binding = ThinkingProxy.factoryModelBindingByRouteModel(forRouteModel: legacyNormalized) {
+            NSLog("[ModelResolution] Reverse-mapped bare model name %@ → %@ (provider: %@)", legacyNormalized, binding.routeModel, binding.routeProvider)
+            return binding.routeModel
+        }
+        return legacyNormalized
     }
 
     private static func resolveNVIDIAHostedRoute(forRequestModel model: String) -> RouteIdentity? {
@@ -4342,7 +4354,7 @@ class ThinkingProxy {
         }
     }
 
-    private struct FactoryModelBinding {
+    fileprivate struct FactoryModelBinding {
         let incomingModelID: String
         let authoritativeModelID: String
         let routeModel: String
@@ -5183,6 +5195,11 @@ class ThinkingProxy {
                     ? Self.factoryModelBindingByRouteModel(forRouteModel: model)
                     : nil
             }
+
+        // Telemetry: log model resolution path for factory-bound requests
+        if let binding = factoryModelBinding, let incoming = callerVisibleRequestedModel {
+            NSLog("[ModelResolution] incoming=%@ → routeModel=%@ provider=%@ source=%@", incoming, binding.routeModel, binding.routeProvider, binding.source)
+        }
         
         if method == "POST" && !bodyString.isEmpty {
             if let result = processThinkingParameter(jsonString: bodyString) {
@@ -5604,10 +5621,22 @@ class ThinkingProxy {
             }
 
             if !(200...299).contains(response.statusCode) || deliveryMode == .bufferedJSON {
+                // Masquerade billing/quota errors as rate-limit so the Droid client retries
+                // without switching models.  402/403 from upstream look like "provider dead"
+                // to the Droid, but 429 triggers its built-in retry logic.
+                let effectiveStatusCode: Int
+                var effectiveHeaders: [AnyHashable: Any] = response.allHeaderFields
+                if response.statusCode == 402 || response.statusCode == 403 {
+                    NSLog("[ThinkingProxy] Masquerading upstream %d as 429 for factory-bound model %@", response.statusCode, binding.incomingModelID)
+                    effectiveStatusCode = 429
+                    effectiveHeaders["Retry-After"] = "30"
+                } else {
+                    effectiveStatusCode = response.statusCode
+                }
                 self.deliverBufferedHTTPResponse(
                     defaultConnection: originalConnection,
-                    statusCode: response.statusCode,
-                    headers: response.allHeaderFields,
+                    statusCode: effectiveStatusCode,
+                    headers: effectiveHeaders,
                     body: responseData,
                     coalescingKey: nil,
                     overridingModel: binding.incomingModelID,
@@ -6489,12 +6518,27 @@ class ThinkingProxy {
                 forcedOpenUntil: cooldownUntil,
                 healthSensitivity: healthSensitivity
             )
-            deliverBufferedError(
-                defaultConnection: originalConnection,
-                statusCode: 503,
-                message: "All configured worker backends are currently unavailable.",
-                coalescingKey: coalescingKey
-            )
+            // Masquerade billing/quota exhaustion as rate-limit so the Droid client
+            // retries without switching models.  402 from upstream looks like
+            // "provider billing exhausted" → Droid switches to bare built-in model.
+            // 429 tells Droid "temporary rate limit" → retry with same model.
+            if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
+               upstreamStatus == 402 || upstreamStatus == 403 {
+                NSLog("[ThinkingProxy] Masquerading upstream %d as 429 for smart alias %@", upstreamStatus, publicAlias)
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 429,
+                    message: "Rate limit exceeded. Please retry after 30 seconds.",
+                    coalescingKey: coalescingKey
+                )
+            } else {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 503,
+                    message: "All configured worker backends are currently unavailable.",
+                    coalescingKey: coalescingKey
+                )
+            }
         }
     }
 
@@ -9932,7 +9976,7 @@ class ThinkingProxy {
         factoryModelBindings()?.bindingsByIncomingModelID[incomingModelID]
     }
 
-    private static func factoryModelBindingByRouteModel(forRouteModel routeModel: String) -> FactoryModelBinding? {
+    fileprivate static func factoryModelBindingByRouteModel(forRouteModel routeModel: String) -> FactoryModelBinding? {
         factoryModelBindings()?.bindingsByIncomingModelID.values.first { $0.routeModel == routeModel }
     }
 
