@@ -2705,7 +2705,9 @@ enum OpenAICompatTemporaryShim {
                     "function": function
                 ])
             default:
-                return nil
+                // Skip Responses API-specific tool types (web_search, code_interpreter, etc.)
+                // that don't have a Chat Completions equivalent.
+                continue
             }
         }
 
@@ -5430,6 +5432,7 @@ class ThinkingProxy {
             path: rewrittenPath,
             body: modifiedBody
            ) {
+            NSLog("[ThinkingProxy] Factory-bound dispatch: model=%@ path=%@ deliveryMode=%@", factoryModelBinding.routeModel, rewrittenPath, String(describing: factoryBoundExecutionPlan.deliveryMode))
             forwardBufferedFactoryBoundRequest(
                 method: method,
                 path: rewrittenPath,
@@ -5683,20 +5686,26 @@ class ThinkingProxy {
         body: String
     ) -> (body: String, deliveryMode: FactoryBoundDeliveryMode)? {
         // Responses API path: convert to chat completions for upstream,
-        // then synthesize back to Responses SSE on the way down.
+        // then synthesize back to Responses format on the way down.
         if OpenAICompatTemporaryShim.isResponsesPath(path) {
-            guard OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body) else {
-                return nil
-            }
             guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(
                 fromResponsesRequestJSON: body
             ) else {
+                let bodyPreview = String(body.prefix(500))
+                NSLog("[ThinkingProxy] factoryBoundExecutionPlan: failed to convert /v1/responses body (first 500 chars): %@", bodyPreview)
                 return nil
             }
-            guard let bufferedBody = forcingNonStreamChatRequestBody(from: chatBody) else {
-                return nil
+            let clientStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+            let finalBody: String
+            if clientStream {
+                guard let bufferedBody = forcingNonStreamChatRequestBody(from: chatBody) else {
+                    return nil
+                }
+                finalBody = bufferedBody
+            } else {
+                finalBody = chatBody
             }
-            return (body: bufferedBody, deliveryMode: .syntheticResponsesSSE)
+            return (body: finalBody, deliveryMode: clientStream ? .syntheticResponsesSSE : .bufferedJSON)
         }
 
         guard OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body) else {
