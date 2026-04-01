@@ -5547,6 +5547,12 @@ class ThinkingProxy {
         )
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: resolvedRequestModel)
         let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: body)
+
+        // Rewrite model name for upstream: strip reasoning-effort suffix like "(high)".
+        // The proxy tracks models with effort qualifiers (e.g. "gpt-5.4(high)"), but
+        // the upstream backend only knows the base model name (e.g. "gpt-5.4").
+        let upstreamBody = Self.rewriteModelForUpstream(body: body, routeModel: binding.routeModel)
+
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: resolvedRequestModel) else {
             var limitHeaders = resolutionHeaders
             limitHeaders["Retry-After"] = "1"
@@ -5563,7 +5569,7 @@ class ThinkingProxy {
             method: method,
             path: path,
             headers: effectiveHeaders,
-            body: body,
+            body: upstreamBody,
             timeoutInterval: timeoutInterval
         ) { [weak self] bufferedResponse in
             permit.release()
@@ -6532,6 +6538,36 @@ class ThinkingProxy {
         }
     }
 
+    /// Rewrites the model name in the request body for upstream consumption.
+    /// Factory bindings may carry reasoning-effort annotations like "gpt-5.4(high)"
+    /// that the upstream backend does not recognise.  Strips the parenthesised
+    /// suffix so the upstream only sees the base model name (e.g. "gpt-5.4").
+    private static func rewriteModelForUpstream(body: String, routeModel: String) -> String {
+        // Derive base model name by stripping reasoning-effort suffix like "(high)"
+        let baseModel: String
+        if let parenOpen = routeModel.firstIndex(of: "("),
+           parenOpen > routeModel.startIndex,
+           routeModel.last == ")" {
+            baseModel = String(routeModel[..<parenOpen])
+        } else {
+            return body  // no suffix to strip
+        }
+
+        guard let data = body.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let requestModel = json["model"] as? String,
+              requestModel == routeModel else {
+            return body
+        }
+
+        json["model"] = baseModel
+        guard let normalized = try? JSONSerialization.data(withJSONObject: json),
+              let result = String(data: normalized, encoding: .utf8) else {
+            return body
+        }
+        return result
+    }
+
     private func forcingNonStreamChatRequestBody(from jsonString: String) -> String? {
         guard let data = jsonString.data(using: .utf8),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -6757,6 +6793,24 @@ class ThinkingProxy {
                     lines.append(deltaLine)
                     lines.append(doneArgumentsLine)
                 }
+
+                guard let doneItemLine = sseDataLine(for: [
+                    "type": "response.output_item.done",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(doneItemLine)
+            case "reasoning":
+                guard let addedLine = sseDataLine(for: [
+                    "type": "response.output_item.added",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(addedLine)
 
                 guard let doneItemLine = sseDataLine(for: [
                     "type": "response.output_item.done",
