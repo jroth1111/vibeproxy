@@ -5568,6 +5568,9 @@ class ThinkingProxy {
             ? OpenAICompatTemporaryShim.chatCompletionsPath(matching: path)
             : path
 
+        let upstreamModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: upstreamBody) ?? "?"
+        NSLog("[ThinkingProxy] Factory-bound upstream: path=%@ model=%@ (binding.routeModel=%@)", upstreamPath, upstreamModel, binding.routeModel)
+
         // Paid subscription providers (openai) manage their own upstream rate limits;
         // skip the proxy-level concurrency gate to avoid artificial throttling.
         let permit: RouteConcurrencyPermit?
@@ -5621,7 +5624,7 @@ class ThinkingProxy {
                 return
             }
 
-            if !(200...299).contains(response.statusCode) || deliveryMode == .bufferedJSON {
+            if !(200...299).contains(response.statusCode) {
                 // Masquerade billing/quota errors as rate-limit so the Droid client retries
                 // without switching models.  402/403 from upstream look like "provider dead"
                 // to the Droid, but 429 triggers its built-in retry logic.
@@ -5646,6 +5649,32 @@ class ThinkingProxy {
                 return
             }
 
+            // Successful buffered response.  When the original request was Responses API,
+            // translate the Chat Completions response back to Responses format.
+            if deliveryMode == .bufferedJSON {
+                let deliveryData: Data
+                if OpenAICompatTemporaryShim.isResponsesPath(path),
+                   let translated = self.translatedResponsesObject(
+                    fromChatCompletionsResponseBody: responseData,
+                    publicAlias: binding.incomingModelID
+                   ),
+                   let translatedData = try? JSONSerialization.data(withJSONObject: translated) {
+                    deliveryData = translatedData
+                } else {
+                    deliveryData = responseData
+                }
+                self.deliverBufferedHTTPResponse(
+                    defaultConnection: originalConnection,
+                    statusCode: response.statusCode,
+                    headers: response.allHeaderFields,
+                    body: deliveryData,
+                    coalescingKey: nil,
+                    overridingModel: binding.incomingModelID,
+                    overridingHeaders: resolutionHeaders
+                )
+                return
+            }
+
             let syntheticBody: Data?
             switch deliveryMode {
             case .bufferedJSON:
@@ -5656,8 +5685,11 @@ class ThinkingProxy {
                     publicAlias: binding.incomingModelID
                 )
             case .syntheticResponsesSSE:
+                // The upstream returned Chat Completions format (because we converted
+                // /v1/responses → /v1/chat/completions).  Translate it to Responses API
+                // format, then wrap in SSE events.
                 syntheticBody = self.syntheticResponsesStreamBody(
-                    fromResponsesResponseBody: responseData,
+                    fromChatCompletionsResponseBody: responseData,
                     publicAlias: binding.incomingModelID
                 )
             }
