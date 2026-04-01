@@ -5028,6 +5028,7 @@ class ThinkingProxy {
             isRunning = false
             OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
             Self.clearProxiedSessionPoolForTesting()
+            Self.clearDirectSessionPoolForTesting()
             nvidiaInflightQueue.sync {
                 nvidiaRaceWaiters.removeAll()
                 inflightCoalescedRequests.removeAll()
@@ -5569,22 +5570,6 @@ class ThinkingProxy {
             guard let self else { return }
 
             if let error = bufferedResponse.error {
-                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
-                    binding: binding,
-                    statusCode: nil,
-                    responseBody: nil
-                ),
-                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    body: body,
-                    binding: binding,
-                    deliveryMode: deliveryMode,
-                    originalConnection: originalConnection
-                   ) {
-                    return
-                }
                 let nsError = error as NSError
                 let statusCode = (nsError.domain == NSURLErrorDomain && nsError.code == URLError.timedOut.rawValue) ? 504 : 502
                 self.sendError(
@@ -5598,22 +5583,6 @@ class ThinkingProxy {
 
             guard let response = bufferedResponse.response,
                   let responseData = bufferedResponse.data else {
-                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
-                    binding: binding,
-                    statusCode: nil,
-                    responseBody: nil
-                ),
-                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    body: body,
-                    binding: binding,
-                    deliveryMode: deliveryMode,
-                    originalConnection: originalConnection
-                   ) {
-                    return
-                }
                 self.sendError(
                     to: originalConnection,
                     statusCode: 502,
@@ -5621,25 +5590,6 @@ class ThinkingProxy {
                     overridingHeaders: resolutionHeaders
                 )
                 return
-            }
-
-            if !(200...299).contains(response.statusCode) {
-                if self.shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
-                    binding: binding,
-                    statusCode: response.statusCode,
-                    responseBody: responseData
-                ),
-                   self.forwardFactoryDirectBindingViaWorkerSmartAlias(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    body: body,
-                    binding: binding,
-                    deliveryMode: deliveryMode,
-                    originalConnection: originalConnection
-                   ) {
-                    return
-                }
             }
 
             if !(200...299).contains(response.statusCode) || deliveryMode == .bufferedJSON {
@@ -5706,91 +5656,6 @@ class ThinkingProxy {
                 overridingHeaders: resolutionHeaders
             )
         }
-    }
-
-    private func shouldFallbackFactoryDirectBindingToWorkerSmartAlias(
-        binding: FactoryModelBinding,
-        statusCode: Int?,
-        responseBody: Data?
-    ) -> Bool {
-        _ = binding
-        _ = statusCode
-        _ = responseBody
-        return false
-    }
-
-    private func factoryDirectFallbackErrorDetails(
-        statusCode: Int,
-        responseBody: Data?
-    ) -> (type: String, code: String, message: String)? {
-        _ = statusCode
-        guard let responseBody,
-              let root = try? JSONSerialization.jsonObject(with: responseBody) as? [String: Any],
-              let error = root["error"] as? [String: Any] else {
-            return nil
-        }
-
-        return (
-            (error["type"] as? String) ?? "",
-            (error["code"] as? String) ?? "",
-            (error["message"] as? String) ?? ""
-        )
-    }
-
-    private func forwardFactoryDirectBindingViaWorkerSmartAlias(
-        method: String,
-        path: String,
-        headers: [(String, String)],
-        body: String,
-        binding: FactoryModelBinding,
-        deliveryMode: FactoryBoundDeliveryMode,
-        originalConnection: NWConnection
-    ) -> Bool {
-        guard let workerContract = Self.factoryWorkerContract(),
-              let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: workerContract.routeModel) else {
-            return false
-        }
-
-        let clientRequestedStream = deliveryMode != .bufferedJSON
-        guard let executionPlan = smartAliasExecutionPlan(
-            path: path,
-            body: body,
-            clientRequestedStream: clientRequestedStream
-        ) else {
-            return false
-        }
-
-        let failoverBody = clientRequestedStream
-            ? (forcingNonStreamChatRequestBody(from: executionPlan.body) ?? executionPlan.body)
-            : executionPlan.body
-        let candidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
-            forPublicAlias: workerContract.routeModel,
-            method: method,
-            path: executionPlan.path,
-            jsonString: failoverBody,
-            smartAlias: smartAlias
-        )
-        let forceProbeCandidateModels = OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
-            forPublicAlias: workerContract.routeModel,
-            method: method,
-            path: executionPlan.path,
-            jsonString: failoverBody,
-            smartAlias: smartAlias
-        )
-
-        forwardSmartAliasRequest(
-            method: method,
-            path: executionPlan.path,
-            headers: headers,
-            body: failoverBody,
-            publicAlias: binding.incomingModelID,
-            candidateModels: candidateModels,
-            forceProbeCandidateModels: forceProbeCandidateModels,
-            originalConnection: originalConnection,
-            coalescingKey: nil,
-            deliveryMode: executionPlan.deliveryMode
-        )
-        return true
     }
 
     private func factoryBoundExecutionPlan(
@@ -7741,7 +7606,6 @@ class ThinkingProxy {
         for (name, value) in headers where !excludedHeaders.contains(name.lowercased()) {
             request.setValue(value, forHTTPHeaderField: name)
         }
-        request.setValue("close", forHTTPHeaderField: "Connection")
 
         let responseProgress = ResponseProgressDelegate()
         let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
