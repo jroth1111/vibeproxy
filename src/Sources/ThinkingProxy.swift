@@ -7738,7 +7738,7 @@ class ThinkingProxy {
 
         let responseProgress = ResponseProgressDelegate()
         let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
-        let task = session.dataTask(with: request) { data, response, error in
+        let (task, exception) = SafeDataTask.create(on: session, with: request) { data, response, error in
             responseProgress.finish()
             completion(
                 BufferedProxyResponse(
@@ -7750,6 +7750,12 @@ class ThinkingProxy {
                 )
             )
             session.finishTasksAndInvalidate()
+        }
+        guard let task else {
+            NSLog("[SafeDataTask] sendBufferedProxyRequest: session invalidated during dataTask creation — \(exception?.reason ?? "unknown")")
+            completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.cancelled), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
+            session.finishTasksAndInvalidate()
+            return {}
         }
         responseProgress.installDeadlines(
             firstResponseSeconds: firstResponseDeadlineSeconds,
@@ -7838,7 +7844,7 @@ class ThinkingProxy {
 
         let responseProgress = ResponseProgressDelegate()
         let taskHolder = TaskIdHolder()
-        let task = session.dataTask(with: request) { data, response, error in
+        let (task, exception) = SafeDataTask.create(on: session, with: request) { data, response, error in
             _ = poolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
             responseProgress.finish()
             completion(
@@ -7850,6 +7856,12 @@ class ThinkingProxy {
                     totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
                 )
             )
+        }
+        guard let task else {
+            NSLog("[SafeDataTask] sendDirectProxiedRequest: pooled proxied session invalidated — evicting from pool. \(exception?.reason ?? "unknown")")
+            Self.clearProxiedSessionPoolForTesting()
+            completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.cancelled), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
+            return {}
         }
         poolDelegate.register(task: task, delegate: responseProgress)
         taskHolder.taskIdentifier = task.taskIdentifier
@@ -8461,7 +8473,7 @@ class ThinkingProxy {
         let pooledSession = ThinkingProxy.acquireDirectSession(key: sessionKey)
         let responseProgress = ResponseProgressDelegate()
         let session: URLSession = pooledSession ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
-        let task = session.dataTask(with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
+        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
             guard let self else { return }
             defer {
                 permit.release()
@@ -8587,6 +8599,24 @@ class ThinkingProxy {
                     coalescingKey: state.coalescingKey
                 )
             }
+        }
+        guard let task else {
+            NSLog("[SafeDataTask] forwardNvidiaReasoningRequestWithRetry: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
+            if pooledSession != nil {
+                ThinkingProxy.removeDirectSession(key: sessionKey, session: session)
+            } else {
+                session.finishTasksAndInvalidate()
+            }
+            permit.release()
+            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+            self.deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 502,
+                message: "upstream session invalidated",
+                coalescingKey: state.coalescingKey
+            )
+            return
         }
         coordinator.registerAttempt(attemptLane: attemptLane) {
             permit.release()
