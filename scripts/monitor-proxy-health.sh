@@ -27,25 +27,25 @@ check_port() {
 restart_proxy() {
     local name=$1
     local pid
-    pid=$(pgrep -f "$name" 2>/dev/null | head -1)
-    
+    pid=$(pgrep -x "$name" 2>/dev/null | head -1)
+
     if [[ -n "$pid" ]]; then
         log "WARNING: $name appears to be running (PID $pid) but port is not responding"
         log "Attempting to restart $name..."
         kill "$pid" 2>/dev/null || true
         sleep 2
     fi
-    
+
     # Try to find and restart the app
     local app_path
-    app_path=$(find /Users/gwizz/CascadeProjects/vibeproxy-nvidia/src/.build/debug -name "CLIProxyMenuBar" -type f 2>/dev/null | head -1)
-    
-    if [[ -n "$app_path" && -x "$app_path" ]]; then
+    app_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/.build/debug/CLIProxyMenuBar"
+
+    if [[ -x "$app_path" ]]; then
         log "Starting $name..."
         nohup "$app_path" > /dev/null 2>&1 &
         sleep 3
     else
-        log "ERROR: Could not find executable to restart $name"
+        log "ERROR: Could not find executable to restart $name (looked at $app_path)"
         return 1
     fi
 }

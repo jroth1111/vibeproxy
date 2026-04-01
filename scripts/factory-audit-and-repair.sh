@@ -263,6 +263,45 @@ if [[ "$suspect_route_health_count" -gt 0 ]]; then
   )"
 fi
 
+# --- Codex token health ---
+codex_token_dir="${FACTORY_ROOT}/../.cli-proxy-api"
+codex_valid_count=0
+codex_expiring_count=0
+codex_expired_count=0
+codex_expired_details=""
+now_epoch="$(date +%s)"
+
+for codex_file in "$codex_token_dir"/codex-*.json; do
+  [[ -f "$codex_file" ]] || continue
+  expired_iso="$(jq -r '.expired // empty' "$codex_file" 2>/dev/null)" || continue
+  email="$(jq -r '.email // "unknown"' "$codex_file" 2>/dev/null)"
+  disabled="$(jq -r '.disabled // false' "$codex_file" 2>/dev/null)"
+
+  [[ "$disabled" == "true" ]] && continue
+
+  if [[ -n "$expired_iso" ]]; then
+    expired_epoch="$(date -j -f '%Y-%m-%dT%H:%M:%S%z' "${expired_iso}" '+%s' 2>/dev/null || date -d "${expired_iso}" '+%s' 2>/dev/null || echo 0)"
+    if [[ "$expired_epoch" -eq 0 ]]; then
+      continue
+    fi
+    remaining=$(( expired_epoch - now_epoch ))
+    if [[ "$remaining" -le 0 ]]; then
+      codex_expired_count=$(( codex_expired_count + 1 ))
+      codex_expired_details="${codex_expired_details:+$codex_expired_details, }${email} (expired $(date -r "$expired_epoch" '+%Y-%m-%d' 2>/dev/null || date -d "@$expired_epoch" '+%Y-%m-%d' 2>/dev/null))"
+    elif [[ "$remaining" -lt 86400 ]]; then
+      codex_expiring_count=$(( codex_expiring_count + 1 ))
+    else
+      codex_valid_count=$(( codex_valid_count + 1 ))
+    fi
+  else
+    codex_valid_count=$(( codex_valid_count + 1 ))
+  fi
+done
+
+if [[ "$codex_expired_count" -gt 0 ]]; then
+  record_action "codex_tokens_expired" "Codex tokens expired: $codex_expired_details"
+fi
+
 root_causes_json="$(
   jq -cn \
     --argjson unknown_model_fallback_count "$unknown_model_fallback_count" \
@@ -270,6 +309,10 @@ root_causes_json="$(
     --argjson backend_unavailable_count "$backend_unavailable_count" \
     --argjson claude_alias_count "$claude_alias_count" \
     --argjson route_statuses "$route_statuses_json" \
+    --argjson codex_valid "$codex_valid_count" \
+    --argjson codex_expiring "$codex_expiring_count" \
+    --argjson codex_expired "$codex_expired_count" \
+    --arg codex_expired_details "$codex_expired_details" \
     '[
       {
         key: "droid_model_fallback",
@@ -303,6 +346,19 @@ root_causes_json="$(
               ) | join(", ")
             )
         )
+      },
+      {
+        key: "codex_token_health",
+        present: ($codex_expired > 0),
+        detail: (
+          "Codex tokens — valid: \($codex_valid), expiring<24h: \($codex_expiring), expired: \($codex_expired)"
+          + (if $codex_expired_details != "" then " (" + $codex_expired_details + ")" else "" end)
+        )
+      },
+      {
+        key: "codex_tokens_all_expired",
+        present: ($codex_valid + $codex_expiring == 0 and $codex_expired > 0),
+        detail: "ALL codex OAuth tokens are expired — GPT-5.4 requests will fail"
       }
     ]'
 )"

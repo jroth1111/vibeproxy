@@ -71,7 +71,11 @@ session_request_surface="$(provider_to_surface "$FACTORY_SESSION_ROUTE_PROVIDER"
 validation_request_surface="$(provider_to_surface "$FACTORY_VALIDATION_ROUTE_PROVIDER" "validation")"
 
 echo "==> Checking proxy health endpoint"
-curl -fsS "$HEALTH_URL" -o "$health_body"
+health_http_code="$(curl -sS -o "$health_body" -w '%{http_code}' --connect-timeout 10 --max-time 15 "$HEALTH_URL")"
+if [[ "$health_http_code" != "200" ]]; then
+  echo "healthz returned HTTP $health_http_code" >&2
+  exit 1
+fi
 
 echo "==> Checking Factory worker snapshot sync"
 "$SCRIPT_DIR/sync-factory-worker-contract.sh" --check >/dev/null
