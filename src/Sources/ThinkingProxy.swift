@@ -2499,7 +2499,8 @@ enum OpenAICompatTemporaryShim {
 
             guard let inputDictionary = inputItem as? [String: Any],
                   let convertedMessages = chatMessages(fromResponsesInputItem: inputDictionary) else {
-                return nil
+                // Skip unrecognized input items instead of failing the entire conversion.
+                continue
             }
             messages.append(contentsOf: convertedMessages)
         }
@@ -2592,7 +2593,9 @@ enum OpenAICompatTemporaryShim {
 
             guard let content = flattenedResponseInputText(from: item["content"])
                 ?? stringValue(fromJSONValue: item["content"]) else {
-                return nil
+                // Skip items with unextractable content (e.g., image-only messages)
+                // instead of failing the entire conversion.
+                return []
             }
             return [[
                 "role": chatRole,
@@ -2600,7 +2603,9 @@ enum OpenAICompatTemporaryShim {
             ]]
         }
 
-        return nil
+        // Skip unrecognized Responses API item types (web_search_call, file_search_call, etc.)
+        // instead of failing the entire conversion.
+        return []
     }
 
     private static func flattenedResponseInputText(from content: Any?) -> String? {
@@ -2635,7 +2640,8 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
-            return nil
+            // Skip non-text segments (input_image, etc.) instead of failing
+            continue
         }
 
         guard !collectedSegments.isEmpty else {
