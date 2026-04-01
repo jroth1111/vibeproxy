@@ -5553,26 +5553,40 @@ class ThinkingProxy {
         // the upstream backend only knows the base model name (e.g. "gpt-5.4").
         let upstreamBody = Self.rewriteModelForUpstream(body: body, routeModel: binding.routeModel)
 
-        guard let permit = acquireRouteConcurrencyPermit(forRequestModel: resolvedRequestModel) else {
-            var limitHeaders = resolutionHeaders
-            limitHeaders["Retry-After"] = "1"
-            sendError(
-                to: originalConnection,
-                statusCode: 429,
-                message: concurrencyLimitErrorMessage(forRequestModel: resolvedRequestModel),
-                overridingHeaders: limitHeaders
-            )
-            return
+        // Convert /v1/responses → /v1/chat/completions for upstream.
+        // The body was already converted by factoryBoundExecutionPlan.
+        let upstreamPath = OpenAICompatTemporaryShim.isResponsesPath(path)
+            ? OpenAICompatTemporaryShim.chatCompletionsPath(matching: path)
+            : path
+
+        // Paid subscription providers (openai) manage their own upstream rate limits;
+        // skip the proxy-level concurrency gate to avoid artificial throttling.
+        let permit: RouteConcurrencyPermit?
+        if binding.routeProvider == "openai" {
+            permit = nil
+        } else {
+            guard let p = acquireRouteConcurrencyPermit(forRequestModel: resolvedRequestModel) else {
+                var limitHeaders = resolutionHeaders
+                limitHeaders["Retry-After"] = "1"
+                sendError(
+                    to: originalConnection,
+                    statusCode: 429,
+                    message: concurrencyLimitErrorMessage(forRequestModel: resolvedRequestModel),
+                    overridingHeaders: limitHeaders
+                )
+                return
+            }
+            permit = p
         }
 
         sendBufferedProxyRequest(
             method: method,
-            path: path,
+            path: upstreamPath,
             headers: effectiveHeaders,
             body: upstreamBody,
             timeoutInterval: timeoutInterval
         ) { [weak self] bufferedResponse in
-            permit.release()
+            permit?.release()
             guard let self else { return }
 
             if let error = bufferedResponse.error {
@@ -5668,6 +5682,23 @@ class ThinkingProxy {
         path: String,
         body: String
     ) -> (body: String, deliveryMode: FactoryBoundDeliveryMode)? {
+        // Responses API path: convert to chat completions for upstream,
+        // then synthesize back to Responses SSE on the way down.
+        if OpenAICompatTemporaryShim.isResponsesPath(path) {
+            guard OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body) else {
+                return nil
+            }
+            guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(
+                fromResponsesRequestJSON: body
+            ) else {
+                return nil
+            }
+            guard let bufferedBody = forcingNonStreamChatRequestBody(from: chatBody) else {
+                return nil
+            }
+            return (body: bufferedBody, deliveryMode: .syntheticResponsesSSE)
+        }
+
         guard OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body) else {
             return (body: body, deliveryMode: .bufferedJSON)
         }
@@ -5678,9 +5709,6 @@ class ThinkingProxy {
 
         if OpenAICompatTemporaryShim.isChatCompletionsPath(path) {
             return (body: bufferedBody, deliveryMode: .syntheticChatCompletionsSSE)
-        }
-        if OpenAICompatTemporaryShim.isResponsesPath(path) {
-            return (body: bufferedBody, deliveryMode: .syntheticResponsesSSE)
         }
         return nil
     }
