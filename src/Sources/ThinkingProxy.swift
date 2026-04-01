@@ -3324,14 +3324,18 @@ enum OpenAICompatTemporaryShim {
 
     /// Heal suspect routes whose last telemetry event is older than the stale threshold.
     /// Must be called on routeHealthQueue. Used by both startup load and background maintenance.
+    /// Routes with strong EMA success rates (>80%) get a shorter threshold (60s) since a single
+    /// transient failure is unlikely to indicate a sustained outage.
     private static func healStaleSuspectRoutesLocked() {
-        let staleThreshold: TimeInterval = 5 * 60  // 5 minutes
+        let defaultStaleThreshold: TimeInterval = 5 * 60  // 5 minutes
+        let healthyEmaStaleThreshold: TimeInterval = 60    // 1 minute for historically healthy routes
+        let healthyEmaThreshold: Double = 0.8
         let now = Date()
         var healedAny = false
         for key in routeCircuitStatesByRouteHealthKey.keys {
             guard let state = routeCircuitStatesByRouteHealthKey[key],
                   state.status == .suspect else { continue }
-            
+
             let lastActivityDate: Date
             if let lastEvent = state.lastTelemetryEvent {
                 lastActivityDate = lastEvent.timestamp
@@ -3340,13 +3344,15 @@ enum OpenAICompatTemporaryShim {
             } else {
                 continue
             }
-            
+
+            let emaSuccessRate = state.emaMetrics.successRate
+            let staleThreshold = emaSuccessRate >= healthyEmaThreshold ? healthyEmaStaleThreshold : defaultStaleThreshold
+
             let age = now.timeIntervalSince(lastActivityDate)
             guard age > staleThreshold else {
-                NSLog("[ThinkingProxy] Self-heal: route %@ has recent activity (%ds < %ds threshold), keeping suspect", key, Int(age), Int(staleThreshold))
                 continue
             }
-            NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds)", key, Int(age))
+            NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds, EMA success rate: %.2f)", key, Int(age), emaSuccessRate)
             routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
                 status: .closed,
                 failureScore: 0,
@@ -3837,7 +3843,6 @@ enum OpenAICompatTemporaryShim {
         // known factory binding's route model, use that binding's route model so the
         // request gets the correct provider, timeout policy, and health tracking.
         if let binding = ThinkingProxy.factoryModelBindingByRouteModel(forRouteModel: legacyNormalized) {
-            NSLog("[ModelResolution] Reverse-mapped bare model name %@ → %@ (provider: %@)", legacyNormalized, binding.routeModel, binding.routeProvider)
             return binding.routeModel
         }
         return legacyNormalized

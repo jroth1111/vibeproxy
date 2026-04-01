@@ -474,7 +474,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
                 self?.postObservedConfigInputsChanged(reason: "Auth directory changed")
             }
             self?.pendingAuthRefresh = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
         }
 
         monitor.resume()
