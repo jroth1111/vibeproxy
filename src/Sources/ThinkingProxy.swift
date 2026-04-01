@@ -5424,6 +5424,24 @@ class ThinkingProxy {
             return
         }
 
+        if method == "POST",
+           let factoryModelBinding,
+           let factoryBoundExecutionPlan = factoryBoundExecutionPlan(
+            path: rewrittenPath,
+            body: modifiedBody
+           ) {
+            forwardBufferedFactoryBoundRequest(
+                method: method,
+                path: rewrittenPath,
+                headers: headers,
+                body: factoryBoundExecutionPlan.body,
+                binding: factoryModelBinding,
+                deliveryMode: factoryBoundExecutionPlan.deliveryMode,
+                originalConnection: connection
+            )
+            return
+        }
+
         if OpenAICompatTemporaryShim.isNvidiaReasoningChatRequest(
             method: method,
             path: rewrittenPath,
@@ -5461,24 +5479,6 @@ class ThinkingProxy {
                     bestEffortRepairedBodyData: nil,
                     coalescingKey: coalescingKey
                 )
-            )
-            return
-        }
-
-        if method == "POST",
-           let factoryModelBinding,
-           let factoryBoundExecutionPlan = factoryBoundExecutionPlan(
-            path: rewrittenPath,
-            body: modifiedBody
-           ) {
-            forwardBufferedFactoryBoundRequest(
-                method: method,
-                path: rewrittenPath,
-                headers: headers,
-                body: factoryBoundExecutionPlan.body,
-                binding: factoryModelBinding,
-                deliveryMode: factoryBoundExecutionPlan.deliveryMode,
-                originalConnection: connection
             )
             return
         }
