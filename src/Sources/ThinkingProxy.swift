@@ -1509,6 +1509,14 @@ enum OpenAICompatTemporaryShim {
             return false
         }
 
+        // Only NVIDIA-hosted routes enter the NVIDIA reasoning path.
+        // Non-NVIDIA models (e.g. gpt-5.4(high)) may have retryableFailureClasses
+        // in their policy but must NOT enter this path — the NVIDIA path delivers
+        // buffered responses and cannot synthesize SSE for streaming clients.
+        guard resolveNVIDIAHostedRoute(forRequestModel: normalizedRequestModel(model)) != nil else {
+            return false
+        }
+
         guard let policy = policy(forModel: model) else {
             return false
         }
@@ -4914,6 +4922,20 @@ class ThinkingProxy {
             directSessionPool[key] = (session, lastUsed: Date())
             return session
         }
+    }
+
+    /// Remove a session from the pool and invalidate it.  Call this in the
+    /// completion handler of a data task that was obtained from
+    /// ``acquireDirectSession(key:)`` so that a subsequent request never
+    /// picks up an already-invalidated session from the pool.
+    static func removeDirectSession(key: String, session: URLSession) {
+        directPoolQueue.sync {
+            // Only remove if the pooled entry is the exact same session instance.
+            if directSessionPool[key]?.session === session {
+                directSessionPool.removeValue(forKey: key)
+            }
+        }
+        session.finishTasksAndInvalidate()
     }
 
     private static func evictIdleDirectSessionsLocked() {
@@ -8442,15 +8464,21 @@ class ThinkingProxy {
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
+        let sessionKey = "direct:127.0.0.1:\(targetPort)"
+        let pooledSession = ThinkingProxy.acquireDirectSession(key: sessionKey)
         let responseProgress = ResponseProgressDelegate()
-        let session: URLSession = ThinkingProxy.acquireDirectSession(key: "direct:127.0.0.1:\(targetPort)") ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let session: URLSession = pooledSession ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
         let task = session.dataTask(with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
             guard let self else { return }
             defer {
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                 responseProgress.finish()
-                session.finishTasksAndInvalidate()
+                if pooledSession != nil {
+                    ThinkingProxy.removeDirectSession(key: sessionKey, session: session)
+                } else {
+                    session.finishTasksAndInvalidate()
+                }
             }
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
                 data: data,
