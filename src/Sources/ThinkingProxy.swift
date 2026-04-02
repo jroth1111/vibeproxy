@@ -3320,6 +3320,45 @@ enum OpenAICompatTemporaryShim {
         }
 
         healStaleSuspectRoutesLocked()
+        healStaleOpenRoutesLocked()
+    }
+
+    /// On startup, promote stale `open` routes to `suspect` so they can be
+    /// re-evaluated by the self-heal pass instead of remaining permanently
+    /// circuit-broken from a prior proxy lifecycle.
+    private static func healStaleOpenRoutesLocked() {
+        let cooldownThreshold: TimeInterval = 120  // match RouteCircuitBreakerPolicy.cooldown
+        let now = Date()
+        var healedAny = false
+        for key in routeCircuitStatesByRouteHealthKey.keys {
+            guard let state = routeCircuitStatesByRouteHealthKey[key],
+                  state.status == .open else { continue }
+
+            // If the open-until deadline has already passed, or the route has
+            // been stale longer than the cooldown, demote to suspect so the
+            // normal self-heal logic can evaluate it.
+            let openExpired = state.openUntil.map { now >= $0 } ?? true
+            let lastActivity = state.lastTelemetryEvent?.timestamp ?? state.lastScoreUpdatedAt
+            let staleness = lastActivity.map { now.timeIntervalSince($0) } ?? 0
+            guard openExpired || staleness > cooldownThreshold else { continue }
+
+            NSLog("[ThinkingProxy] Startup heal: demoting stale open route %@ to suspect (staleness: %.0fs, openExpired: %@)", key, staleness, String(describing: openExpired))
+            routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
+                status: .suspect,
+                failureScore: min(state.failureScore, 2),  // cap so it can recover quickly
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastScoreUpdatedAt: now,
+                lastTelemetryEvent: state.lastTelemetryEvent,
+                rollingMetrics: state.rollingMetrics,
+                emaMetrics: state.emaMetrics,
+                recoveredAt: nil
+            )
+            healedAny = true
+        }
+        if healedAny {
+            healStaleSuspectRoutesLocked()  // immediately evaluate the freshly demoted routes
+        }
     }
 
     /// Heal suspect routes whose last telemetry event is older than the stale threshold.
