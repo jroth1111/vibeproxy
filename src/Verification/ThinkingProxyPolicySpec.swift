@@ -1019,6 +1019,89 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("tool-heavy proxy worker requests keep glm primary despite slow latency until glm is quarantined", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
+                    recorder.recordFailure("proxy-worker-smart-router should inherit the worker pool definition")
+                    return
+                }
+
+                let now = Date()
+                let glmSlowSuccess = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm-5.1-zai",
+                    canonicalModelID: "glm-5.1",
+                    transportOutcome: "send_response",
+                    failureClass: nil,
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 200,
+                    retryCount: 0,
+                    source: "smart_alias",
+                    firstByteLatencyMilliseconds: 15_000,
+                    totalLatencyMilliseconds: 60_000
+                )
+                let mimoFastSuccess = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now.addingTimeInterval(1),
+                    requestModel: "mimo-v2-pro-opencode",
+                    canonicalModelID: "mimo-v2-pro-free",
+                    transportOutcome: "send_response",
+                    failureClass: nil,
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 200,
+                    retryCount: 0,
+                    source: "smart_alias",
+                    firstByteLatencyMilliseconds: 80,
+                    totalLatencyMilliseconds: 300
+                )
+
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: glmSlowSuccess
+                )
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "mimo-v2-pro-opencode",
+                    telemetryEvent: mimoFastSuccess
+                )
+
+                let requestJSON = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                let stickyCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "proxy-worker-smart-router",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(stickyCandidates.first, "glm-5.1-zai", "tool-heavy worker requests should keep glm primary even when another lane is much faster", recorder: recorder)
+
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: now.addingTimeInterval(300)
+                )
+
+                let failedOverCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "proxy-worker-smart-router",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(failedOverCandidates.first, "mimo-v2-pro-opencode", "tool-heavy worker requests should fail over once glm is actually quarantined", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("provider endpoint parsing captures per-provider proxy-url when set", recorder: recorder) {
             withMergedConfig(workerWithProxyMergedConfigYAML()) {
                 guard let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "opencode") else {

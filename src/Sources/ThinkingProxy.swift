@@ -1212,7 +1212,11 @@ enum OpenAICompatTemporaryShim {
         // now carry the full tool-heavy workload with health-ranked failover.
         if isToolHeavyWorkerRequest {
             if toolHeavyWorkerPublicAliases.contains(publicAlias) {
-                let rankedCandidates = rankedSmartAliasFallbackCandidateModels(smartAlias.candidates, healthSensitivity: smartAlias.healthSensitivity)
+                let rankedCandidates = rankedSmartAliasFallbackCandidateModels(
+                    smartAlias.candidates,
+                    healthSensitivity: smartAlias.healthSensitivity,
+                    stickyPrimaryCandidate: primaryCandidate
+                )
                 if !rankedCandidates.isEmpty {
                     return rankedCandidates
                 }
@@ -1386,14 +1390,33 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    private static func candidateIsAvailableForStickyPrimaryPreference(_ requestModel: String) -> Bool {
+        let now = Date()
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return true
+        }
+
+        if let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
+           now < cooldownUntil {
+            return false
+        }
+
+        guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else {
+            return true
+        }
+
+        return !state.isUnavailable(at: now)
+    }
+
     static func rankedSmartAliasFallbackCandidateModels(
         _ candidateModels: [String],
-        healthSensitivity: HealthSensitivity = .balanced
+        healthSensitivity: HealthSensitivity = .balanced,
+        stickyPrimaryCandidate: String? = nil
     ) -> [String] {
         let indexedModels = Array(candidateModels.enumerated())
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            return indexedModels.sorted { lhs, rhs in
+            var rankedModels = indexedModels.sorted { lhs, rhs in
                 let lhsScore = smartAliasFallbackRankingScore(forRequestModel: lhs.element, originalIndex: lhs.offset)
                 let rhsScore = smartAliasFallbackRankingScore(forRequestModel: rhs.element, originalIndex: rhs.offset)
                 if lhsScore.healthPriority != rhsScore.healthPriority {
@@ -1411,6 +1434,15 @@ enum OpenAICompatTemporaryShim {
                 }
                 return lhsScore.originalIndex < rhsScore.originalIndex
             }.map(\.element)
+
+            if let stickyPrimaryCandidate,
+               rankedModels.contains(stickyPrimaryCandidate),
+               candidateIsAvailableForStickyPrimaryPreference(stickyPrimaryCandidate) {
+                rankedModels.removeAll { $0 == stickyPrimaryCandidate }
+                rankedModels.insert(stickyPrimaryCandidate, at: 0)
+            }
+
+            return rankedModels
         }
     }
 
