@@ -73,6 +73,41 @@ if [[ "$(jq 'length' <<<"$managed_model_id_mismatches")" != "0" ]]; then
   exit 1
 fi
 
+if [[ ! -f "$MERGED_CONFIG_PATH" ]]; then
+  echo "missing merged proxy config: $MERGED_CONFIG_PATH" >&2
+  exit 1
+fi
+
+self_routed_managed_ids="$(
+  jq -cn \
+    --argjson managed_models "$managed_models_json" '
+      $managed_models
+      | map(select((.id // "") != "" and (.model // "") == (.id // "")))
+      | map(.id)
+    '
+)"
+
+required_alias_mismatches="$(
+  jq -cn \
+    --argjson required_ids "$self_routed_managed_ids" \
+    --argjson merged_root "$(ruby -e 'require "yaml"; require "json"; puts((YAML.load_file(ARGV[0]) || {}).to_json)' "$MERGED_CONFIG_PATH")" '
+      ($merged_root["smart-aliases"] // {}) as $smartAliases
+      | $required_ids
+      | map(
+          select(
+            (($smartAliases[.] // null) == null)
+            or (((($smartAliases[.] // {})["candidates"] // []) | length) == 0)
+          )
+        )
+    '
+)"
+
+if [[ "$(jq 'length' <<<"$required_alias_mismatches")" != "0" ]]; then
+  echo "merged proxy config is missing exact smart-alias entries for self-routed managed custom ids:" >&2
+  jq -r '.[] | "  \(.)"' <<<"$required_alias_mismatches" >&2
+  exit 1
+fi
+
 sync_json_file() {
   local path="$1"
   local jq_filter="$2"
@@ -159,6 +194,10 @@ if [[ "$MODE" == "check" ]]; then
   echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
   echo "  worker: $FACTORY_WORKER_MODEL"
   echo "  validation: $FACTORY_VALIDATION_MODEL"
+  if [[ "$(jq 'length' <<<"$self_routed_managed_ids")" != "0" ]]; then
+    echo "  exact proxy smart-aliases:"
+    jq -r '.[] | "    " + .' <<<"$self_routed_managed_ids"
+  fi
   exit 0
 fi
 
@@ -166,3 +205,7 @@ echo "synced factory role contract from $GLOBAL_SETTINGS_PATH"
 echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
 echo "  worker: $FACTORY_WORKER_MODEL"
 echo "  validation: $FACTORY_VALIDATION_MODEL"
+if [[ "$(jq 'length' <<<"$self_routed_managed_ids")" != "0" ]]; then
+  echo "  exact proxy smart-aliases:"
+  jq -r '.[] | "    " + .' <<<"$self_routed_managed_ids"
+fi

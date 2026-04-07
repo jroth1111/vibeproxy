@@ -12,6 +12,7 @@ API_KEY="${FACTORY_PROXY_API_KEY:-factory-local-proxy}"
 DROID_LOG_PATH="${DROID_LOG_PATH:-$FACTORY_ROOT/logs/droid-log-single.log}"
 MISSIONS_ROOT="${MISSIONS_ROOT:-$FACTORY_ROOT/missions}"
 ROUTE_HEALTH_PATH="${ROUTE_HEALTH_PATH:-$HOME/.cli-proxy-api/route-health.json}"
+MERGED_CONFIG_PATH="${MERGED_CONFIG_PATH:-${VIBEPROXY_MERGED_CONFIG_PATH:-$HOME/.cli-proxy-api/merged-config.yaml}}"
 
 PROJECT_SETTINGS=(
   "$HOME/CascadeProjects/songbird4/.factory/settings.json"
@@ -42,12 +43,12 @@ require_global_settings() {
 #   FACTORY_WORKER_REASONING       .missionModelSettings.workerReasoningEffort
 #   FACTORY_VALIDATION_MODEL       .missionModelSettings.validationWorkerModel
 #   FACTORY_VALIDATION_REASONING   .missionModelSettings.validationWorkerReasoningEffort
-#   FACTORY_WORKER_ROUTE_MODEL     resolved from customModels
-#   FACTORY_WORKER_ROUTE_PROVIDER  resolved from customModels
-#   FACTORY_SESSION_ROUTE_MODEL    resolved from customModels
-#   FACTORY_SESSION_ROUTE_PROVIDER resolved from customModels
-#   FACTORY_VALIDATION_ROUTE_MODEL    resolved from customModels
-#   FACTORY_VALIDATION_ROUTE_PROVIDER resolved from customModels
+#   FACTORY_WORKER_ROUTE_MODEL     wire model resolved from Factory customModels
+#   FACTORY_WORKER_ROUTE_PROVIDER  wire provider resolved from Factory customModels
+#   FACTORY_SESSION_ROUTE_MODEL    wire model resolved from Factory customModels
+#   FACTORY_SESSION_ROUTE_PROVIDER wire provider resolved from Factory customModels
+#   FACTORY_VALIDATION_ROUTE_MODEL    wire model resolved from Factory customModels
+#   FACTORY_VALIDATION_ROUTE_PROVIDER wire provider resolved from Factory customModels
 #   FACTORY_CANONICAL_CUSTOM_MODELS   full customModels array (JSON)
 
 load_factory_models() {
