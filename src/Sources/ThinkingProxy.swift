@@ -5480,7 +5480,8 @@ class ThinkingProxy {
            let factoryModelBinding,
            let factoryBoundExecutionPlan = factoryBoundExecutionPlan(
             path: rewrittenPath,
-            body: modifiedBody
+            body: modifiedBody,
+            binding: factoryModelBinding
            ) {
             NSLog("[ThinkingProxy] Factory-bound dispatch: model=%@ path=%@ deliveryMode=%@", factoryModelBinding.routeModel, rewrittenPath, String(describing: factoryBoundExecutionPlan.deliveryMode))
             forwardBufferedFactoryBoundRequest(
@@ -5601,16 +5602,22 @@ class ThinkingProxy {
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: resolvedRequestModel)
         let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: body)
 
-        // Rewrite model name for upstream: strip reasoning-effort suffix like "(high)".
-        // The proxy tracks models with effort qualifiers (e.g. "gpt-5.4(high)"), but
-        // the upstream backend only knows the base model name (e.g. "gpt-5.4").
-        let upstreamBody = Self.rewriteModelForUpstream(body: body, routeModel: binding.routeModel)
+        let preservesNativeResponsesSurface =
+            binding.requestSurface == "responses" && OpenAICompatTemporaryShim.isResponsesPath(path)
 
-        // Convert /v1/responses → /v1/chat/completions for upstream.
-        // The body was already converted by factoryBoundExecutionPlan.
-        let upstreamPath = OpenAICompatTemporaryShim.isResponsesPath(path)
-            ? OpenAICompatTemporaryShim.chatCompletionsPath(matching: path)
-            : path
+        // Only strip reasoning-effort suffixes when bridging onto a chat-completions
+        // execution core. Native responses routes own their qualified model IDs.
+        let upstreamBody = Self.rewriteModelForUpstream(
+            body: body,
+            routeModel: binding.routeModel,
+            preserveQualifiedRouteModel: preservesNativeResponsesSurface
+        )
+
+        let upstreamPath = preservesNativeResponsesSurface
+            ? path
+            : (OpenAICompatTemporaryShim.isResponsesPath(path)
+                ? OpenAICompatTemporaryShim.chatCompletionsPath(matching: path)
+                : path)
 
         let upstreamModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: upstreamBody) ?? "?"
         NSLog("[ThinkingProxy] Factory-bound upstream: path=%@ model=%@ (binding.routeModel=%@)", upstreamPath, upstreamModel, binding.routeModel)
@@ -5729,13 +5736,20 @@ class ThinkingProxy {
                     publicAlias: binding.incomingModelID
                 )
             case .syntheticResponsesSSE:
-                // The upstream returned Chat Completions format (because we converted
-                // /v1/responses → /v1/chat/completions).  Translate it to Responses API
-                // format, then wrap in SSE events.
-                syntheticBody = self.syntheticResponsesStreamBody(
-                    fromChatCompletionsResponseBody: responseData,
-                    publicAlias: binding.incomingModelID
-                )
+                if binding.requestSurface == "responses" {
+                    syntheticBody = self.syntheticResponsesStreamBody(
+                        fromResponsesResponseBody: responseData,
+                        publicAlias: binding.incomingModelID
+                    )
+                } else {
+                    // The upstream returned Chat Completions format (because we converted
+                    // /v1/responses → /v1/chat/completions). Translate it to Responses API
+                    // format, then wrap in SSE events.
+                    syntheticBody = self.syntheticResponsesStreamBody(
+                        fromChatCompletionsResponseBody: responseData,
+                        publicAlias: binding.incomingModelID
+                    )
+                }
             }
 
             guard let syntheticBody else {
@@ -5765,11 +5779,26 @@ class ThinkingProxy {
 
     private func factoryBoundExecutionPlan(
         path: String,
-        body: String
+        body: String,
+        binding: FactoryModelBinding
     ) -> (body: String, deliveryMode: FactoryBoundDeliveryMode)? {
         // Responses API path: convert to chat completions for upstream,
         // then synthesize back to Responses format on the way down.
         if OpenAICompatTemporaryShim.isResponsesPath(path) {
+            if binding.requestSurface == "responses" {
+                let clientStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+                let finalBody: String
+                if clientStream {
+                    guard let bufferedBody = forcingNonStreamChatRequestBody(from: body) else {
+                        return nil
+                    }
+                    finalBody = bufferedBody
+                } else {
+                    finalBody = body
+                }
+                return (body: finalBody, deliveryMode: clientStream ? .syntheticResponsesSSE : .bufferedJSON)
+            }
+
             guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(
                 fromResponsesRequestJSON: body
             ) else {
@@ -6661,7 +6690,15 @@ class ThinkingProxy {
     /// Factory bindings may carry reasoning-effort annotations like "gpt-5.4(high)"
     /// that the upstream backend does not recognise.  Strips the parenthesised
     /// suffix so the upstream only sees the base model name (e.g. "gpt-5.4").
-    private static func rewriteModelForUpstream(body: String, routeModel: String) -> String {
+    private static func rewriteModelForUpstream(
+        body: String,
+        routeModel: String,
+        preserveQualifiedRouteModel: Bool = false
+    ) -> String {
+        if preserveQualifiedRouteModel {
+            return body
+        }
+
         // Derive base model name by stripping reasoning-effort suffix like "(high)"
         let baseModel: String
         if let parenOpen = routeModel.firstIndex(of: "("),
