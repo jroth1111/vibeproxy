@@ -21,3 +21,6 @@ jobs:
 
       - name: Run build and verification checks
         run: make test
+
+      - name: Build app bundle and verify runtime packaging
+        run: ./create-app-bundle.sh

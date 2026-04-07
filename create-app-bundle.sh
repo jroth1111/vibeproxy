@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
 echo "📦 Creating .app bundle..."
 
@@ -16,6 +16,18 @@ APP_NAME="VibeProxy"
 BUNDLE_ID="com.cliproxyapi.menubar"
 BUILD_DIR="$SRC_DIR/.build/release"
 APP_DIR="$PROJECT_DIR/$APP_NAME.app"
+VERIFY_APP_BUNDLE_SCRIPT="$PROJECT_DIR/scripts/verify-app-bundle.sh"
+
+ensure_rpath() {
+    local binary_path="$1"
+    local required_rpath="$2"
+
+    if otool -l "$binary_path" | awk '/LC_RPATH/{show=1;next} show&&/path /{print $2;show=0}' | grep -Fxq "$required_rpath"; then
+        return 0
+    fi
+
+    install_name_tool -add_rpath "$required_rpath" "$binary_path"
+}
 
 # Build the Swift executable first
 echo -e "${BLUE}Building Swift executable (release)...${NC}"
@@ -42,7 +54,7 @@ cp "$BUILD_DIR/CLIProxyMenuBar" "$APP_DIR/Contents/MacOS/"
 chmod +x "$APP_DIR/Contents/MacOS/CLIProxyMenuBar"
 
 # Add rpath for Frameworks directory (needed for Sparkle)
-install_name_tool -add_rpath "@loader_path/../Frameworks" "$APP_DIR/Contents/MacOS/CLIProxyMenuBar" 2>/dev/null || true
+ensure_rpath "$APP_DIR/Contents/MacOS/CLIProxyMenuBar" "@loader_path/../Frameworks"
 
 # Copy resources (copy contents, not the folder itself)
 echo -e "${BLUE}Copying resources...${NC}"
@@ -88,7 +100,9 @@ if [ -d "$SPARKLE_FRAMEWORK" ]; then
     cp -R "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/"
     echo -e "${GREEN}✅ Sparkle.framework bundled${NC}"
 else
-    echo -e "${YELLOW}⚠️ Sparkle.framework not found at $SPARKLE_FRAMEWORK${NC}"
+    echo -e "${RED}❌ Sparkle.framework not found at $SPARKLE_FRAMEWORK${NC}"
+    echo "The app links Sparkle at launch time, so shipping without the framework produces an immediate dyld crash."
+    exit 1
 fi
 
 # Copy Info.plist and inject version
@@ -199,6 +213,9 @@ else
     echo -e "${YELLOW}⚠️ No Developer ID found, using ad-hoc signature${NC}"
     codesign --force --deep --sign - "$APP_DIR"
 fi
+
+echo -e "${BLUE}Verifying app bundle runtime dependencies...${NC}"
+"$VERIFY_APP_BUNDLE_SCRIPT" "$APP_DIR"
 
 echo -e "${GREEN}✅ App bundle created successfully!${NC}"
 echo ""
