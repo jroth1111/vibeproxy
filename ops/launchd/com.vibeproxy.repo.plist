@@ -6,7 +6,8 @@
     <string>com.vibeproxy.repo</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/gwizz/CascadeProjects/vibeproxy-nvidia/VibeProxy.app/Contents/MacOS/CLIProxyMenuBar</string>
+        <string>/bin/bash</string>
+        <string>/Users/gwizz/CascadeProjects/vibeproxy-nvidia/scripts/run-vibeproxy-launchd.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/gwizz/CascadeProjects/vibeproxy-nvidia</string>

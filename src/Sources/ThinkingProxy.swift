@@ -7684,6 +7684,10 @@ class ThinkingProxy {
         bodyData: Data?,
         path: String
     ) -> (shouldFailover: Bool, failureClass: String?) {
+        if let bodyData,
+           let failureClass = classifyRetryableSmartAliasErrorBody(statusCode: statusCode, path: path, bodyData: bodyData) {
+            return (true, failureClass)
+        }
         if statusCode >= 200 && statusCode < 300,
            let bodyData,
            let failureClass = classifySmartAliasSuccessBodyFailure(path: path, bodyData: bodyData) {
@@ -7697,6 +7701,24 @@ class ThinkingProxy {
         default:
             return (false, nil)
         }
+    }
+
+    private func classifyRetryableSmartAliasErrorBody(statusCode: Int, path: String, bodyData: Data) -> String? {
+        guard statusCode == 400,
+              path == "/v1/chat/completions" || path == "/api/v1/chat/completions" else {
+            return nil
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let error = json["error"] as? [String: Any] else {
+            return nil
+        }
+
+        let message = ((error["message"] as? String) ?? "").lowercased()
+        let code = String(describing: error["code"] ?? "").lowercased()
+        let looksLikeRetryableNetworkMask = message.contains("network error")
+            && (message.contains("please contact customer service") || message.contains("error id:") || code == "1234")
+        return looksLikeRetryableNetworkMask ? "classified_retryable_400_network_error" : nil
     }
 
     private func classifySmartAliasSuccessBodyFailure(path: String, bodyData: Data) -> String? {

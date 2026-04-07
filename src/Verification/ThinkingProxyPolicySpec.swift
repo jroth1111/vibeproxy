@@ -3744,6 +3744,111 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias silently fails over when z.ai masks a network error as 400", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "type": "error",
+                                  "error": {
+                                    "message": "Network error, error id: 20260408053603cba1fa9060364a9d, please contact customer service",
+                                    "code": "1234"
+                                  }
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 400),
+                                error: nil
+                            )
+                        )
+                    case "mimo-v2-pro-kilocode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-zai-400-fallback",
+                                  "object": "chat.completion",
+                                  "model": "xiaomi/mimo-v2-pro:free",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should fail over after a z.ai masked network-error 400")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode"], "worker should treat z.ai synthetic network-error 400 bodies as retryable candidate failures", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should still succeed after failing over from a z.ai synthetic network-error 400", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias after a z.ai synthetic network-error 400 fallback", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "mimo-v2-pro-kilocode", "worker should expose the MiMo fallback backend model after the z.ai synthetic network-error 400", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "kilocode", "worker should expose the MiMo fallback backend provider after the z.ai synthetic network-error 400", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "route health should penalize z.ai synthetic network-error 400 failures", recorder: recorder)
+            }
+        }
+
         run("temporary worker smart alias ranks raced nvidia fallbacks by live route health", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
