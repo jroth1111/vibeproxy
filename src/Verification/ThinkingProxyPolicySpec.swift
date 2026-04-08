@@ -351,16 +351,34 @@ struct ThinkingProxyPolicySpec {
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
+                let workerRequest = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+                let gptRequest = """
+                {
+                  "model": "gpt-5.4(high)",
+                  "input": "Return exactly: OK"
+                }
+                """
 
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 300, "glm5 should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 300, "all routed attempts should now floor to the global 300-second minimum even when the model-specific budget is lower", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 300, "minimax should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 240, "glm5 should allow long first-byte latency before failing", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 120, "kimi should use a reasonable first-byte deadline for NVIDIA-hosted model", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 240, "minimax should also allow long first-byte latency before failing", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 285, "glm5 should bound the full buffered response with a long latency budget", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: kimiRequest), 150, "kimi should bound the full buffered response appropriately", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 285, "minimax should also keep a long buffered-response budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 900, "glm5 should keep the tripled per-attempt timeout budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 900, "all routed attempts should now floor to the global 900-second minimum even when the model-specific budget is lower", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 900, "minimax should keep the tripled per-attempt timeout budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: workerRequest), 900, "worker smart-router requests should inherit the tripled per-attempt timeout budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: gptRequest), 900, "direct GPT requests should inherit the tripled per-attempt timeout budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 720, "glm5 should allow a tripled first-byte latency budget before failing", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 360, "kimi should use the tripled first-byte deadline for NVIDIA-hosted model", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: minimaxRequest), 720, "minimax should also allow the tripled first-byte latency budget before failing", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: workerRequest), 180, "worker smart-router requests should use the tripled first-byte deadline", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: gptRequest), 180, "direct GPT requests should use the tripled first-byte deadline", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: glm5Request), 855, "glm5 should bound the full buffered response with the tripled latency budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: kimiRequest), 450, "kimi should use the tripled buffered-response deadline", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: minimaxRequest), 855, "minimax should also keep the tripled buffered-response budget", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: workerRequest), 540, "worker smart-router requests should use the tripled buffered-response deadline", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: gptRequest), 540, "direct GPT requests should use the tripled buffered-response deadline", recorder: recorder)
 
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
                 let kimiBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: kimiRequest)
@@ -390,7 +408,7 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .closed
                     ),
-                    240,
+                    720,
                     "healthy routes should keep the baseline first-byte deadline",
                     recorder: recorder
                 )
@@ -399,7 +417,7 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .suspect
                     ),
-                    240,
+                    720,
                     "suspect routes should not shrink the first-byte deadline for slow NVIDIA models",
                     recorder: recorder
                 )
@@ -1150,7 +1168,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(Int(capturedTimeout ?? 0), 300, "tool-heavy smart-router attempts should use the alias timeout budget (300s, accommodating slowest candidate)", recorder: recorder)
+                expectEqual(Int(capturedTimeout ?? 0), 900, "tool-heavy smart-router attempts should use the tripled alias timeout budget (900s, accommodating slow inference)", recorder: recorder)
             }
         }
 
@@ -1958,7 +1976,7 @@ struct ThinkingProxyPolicySpec {
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
                 expectEqual(forwardedPath, "/v1/responses", "openai Factory custom IDs should preserve the responses API path", recorder: recorder)
                 expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "openai Factory custom IDs should be rewritten to their configured route model before proxy forwarding", recorder: recorder)
-                expectEqual(Int(forwardedTimeout ?? 0), 300, "direct Factory OpenAI attempts should also respect the 300-second per-attempt minimum", recorder: recorder)
+                expectEqual(Int(forwardedTimeout ?? 0), 900, "direct Factory OpenAI attempts should also respect the 900-second per-attempt minimum", recorder: recorder)
 
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should stay caller-visible on the way out", recorder: recorder)
@@ -1970,7 +1988,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("Factory self-routed worker custom model IDs keep the 300-second minimum attempt timeout", recorder: recorder) {
+        run("Factory self-routed worker custom model IDs keep the 900-second minimum attempt timeout", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     let proxy = ThinkingProxy()
@@ -2015,7 +2033,7 @@ struct ThinkingProxyPolicySpec {
                         return
                     }
 
-                    expectEqual(Int(forwardedTimeout ?? 0), 300, "self-routed worker custom IDs should not fall back below the 300-second per-attempt minimum", recorder: recorder)
+                    expectEqual(Int(forwardedTimeout ?? 0), 900, "self-routed worker custom IDs should not fall back below the 900-second per-attempt minimum", recorder: recorder)
                 }
             }
         }

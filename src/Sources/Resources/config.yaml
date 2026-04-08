@@ -31,9 +31,9 @@ proxy-url: ""
 request-retry: 3
 
 # Timeout for upstream provider requests
-# Default: 10m. Set to "0" to disable timeout.
+# Default: 30m. Set to "0" to disable timeout.
 # Important for Extended Thinking requests which may take 5-10+ minutes.
-request-timeout: "10m"
+request-timeout: "30m"
 
 # Quota management
 quota-exceeded:

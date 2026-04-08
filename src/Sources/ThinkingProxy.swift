@@ -418,14 +418,20 @@ enum OpenAICompatTemporaryShim {
         case missingChoices = "missing_choices"
     }
 
+    static let requestTimeoutScale: TimeInterval = 3
+
+    static func scaledRequestTimeout(_ seconds: TimeInterval) -> TimeInterval {
+        seconds * requestTimeoutScale
+    }
+
     private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = [
         "z-ai/glm5": RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 300,
-            firstResponseDeadline: 240,
-            bufferedResponseDeadline: 285,
+            attemptTimeout: scaledRequestTimeout(300),
+            firstResponseDeadline: scaledRequestTimeout(240),
+            bufferedResponseDeadline: scaledRequestTimeout(285),
             transportRetries: 0,
             semanticRetries: 1,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -441,9 +447,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 180,
-            firstResponseDeadline: 120,
-            bufferedResponseDeadline: 150,
+            attemptTimeout: scaledRequestTimeout(180),
+            firstResponseDeadline: scaledRequestTimeout(120),
+            bufferedResponseDeadline: scaledRequestTimeout(150),
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -459,9 +465,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: 128,
             maximumMaxTokens: 65536,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
-            attemptTimeout: 300,
-            firstResponseDeadline: 240,
-            bufferedResponseDeadline: 285,
+            attemptTimeout: scaledRequestTimeout(300),
+            firstResponseDeadline: scaledRequestTimeout(240),
+            bufferedResponseDeadline: scaledRequestTimeout(285),
             transportRetries: 0,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -497,7 +503,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 200,
+            attemptTimeout: scaledRequestTimeout(200),
             firstResponseDeadline: nil,
             bufferedResponseDeadline: nil,
             transportRetries: 2,
@@ -515,7 +521,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 200,
+            attemptTimeout: scaledRequestTimeout(200),
             firstResponseDeadline: nil,
             bufferedResponseDeadline: nil,
             transportRetries: 2,
@@ -533,7 +539,7 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 200,
+            attemptTimeout: scaledRequestTimeout(200),
             firstResponseDeadline: nil,
             bufferedResponseDeadline: nil,
             transportRetries: 2,
@@ -551,9 +557,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 300,
-            firstResponseDeadline: 60,
-            bufferedResponseDeadline: 180,
+            attemptTimeout: scaledRequestTimeout(300),
+            firstResponseDeadline: scaledRequestTimeout(60),
+            bufferedResponseDeadline: scaledRequestTimeout(180),
             transportRetries: 2,
             semanticRetries: 2,
             retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
@@ -569,9 +575,9 @@ enum OpenAICompatTemporaryShim {
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
-            attemptTimeout: 300,
-            firstResponseDeadline: 60,
-            bufferedResponseDeadline: 180,
+            attemptTimeout: scaledRequestTimeout(300),
+            firstResponseDeadline: scaledRequestTimeout(60),
+            bufferedResponseDeadline: scaledRequestTimeout(180),
             transportRetries: 2,
             semanticRetries: 0,
             retryableFailureClasses: [.emptyBody, .emptyContent],
@@ -1523,7 +1529,7 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
-    private static let minimumAttemptTimeout: TimeInterval = 300
+    private static let minimumAttemptTimeout: TimeInterval = scaledRequestTimeout(300)
 
     private static func enforcedAttemptTimeout(_ timeout: TimeInterval?) -> TimeInterval? {
         guard let timeout else {
@@ -4499,8 +4505,8 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let nvidiaReasoningTransportRetries = 2
-        static let defaultMitigatedAttemptTimeout: TimeInterval = 300
-        static let nvidiaCanaryTimeout: TimeInterval = 300
+        static let defaultMitigatedAttemptTimeout: TimeInterval = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
+        static let nvidiaCanaryTimeout: TimeInterval = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         static let healthcheckTimeout: TimeInterval = 0.5
     }
 
@@ -4901,8 +4907,8 @@ class ThinkingProxy {
             }
 
             let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 120
-            configuration.timeoutIntervalForResource = 300
+            configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(120)
+            configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
             let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: nil)
 
             if directSessionPool.count >= directPoolMaxSize {
@@ -8019,7 +8025,10 @@ class ThinkingProxy {
         if let smartAliasTotalTimeoutOverrideForTesting {
             return smartAliasTotalTimeoutOverrideForTesting
         }
-        return min(smartAliasCandidateTimeout(forRequestJSON: jsonString) + 60, 360)
+        return min(
+            smartAliasCandidateTimeout(forRequestJSON: jsonString) + OpenAICompatTemporaryShim.scaledRequestTimeout(60),
+            OpenAICompatTemporaryShim.scaledRequestTimeout(360)
+        )
     }
 
     private func remainingSmartAliasBudget(until deadlineAt: Date) -> TimeInterval {
