@@ -1141,11 +1141,38 @@ enum OpenAICompatTemporaryShim {
         smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
     }
 
+    private static func selfRoutedFactoryWorkerPoolModelID() -> String? {
+        guard let bindings = ThinkingProxy.factoryModelBindings(),
+              let workerModelID = bindings.authoritativeWorkerModelID,
+              let binding = bindings.bindingsByIncomingModelID[workerModelID],
+              binding.requestSurface == "chat_completions",
+              binding.routeProvider == "generic-chat-completion-api",
+              binding.routeModel == workerModelID else {
+            return nil
+        }
+        return workerModelID
+    }
+
+    private static func isWorkerPoolPublicAlias(_ requestModel: String) -> Bool {
+        if publicWorkerPoolAliases.contains(requestModel) {
+            return true
+        }
+        return selfRoutedFactoryWorkerPoolModelID() == requestModel
+    }
+
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
         let requestModel = normalizedRequestModel(requestModel)
         let smartAliases = configuredRouteConfiguration().smartAliasesByAlias
         if let exact = smartAliases[requestModel] {
             return exact
+        }
+
+        // Factory's current worker contract can be self-routed, meaning the custom model ID is both
+        // the caller-visible identity and the inner wire model. VibeProxy still owns worker routing,
+        // so that self-routed custom ID must inherit the proxy's worker pool even when the merged
+        // config only declares the canonical `worker` alias.
+        if selfRoutedFactoryWorkerPoolModelID() == requestModel {
+            return smartAliases["worker"]
         }
 
         // `worker` is a proxy-internal pool alias. It is useful inside VibeProxy for policy, failover,
@@ -1161,10 +1188,10 @@ enum OpenAICompatTemporaryShim {
         // - `proxy-worker-smart-router` is the Droid-safe public entrypoint for Factory workers
         // - `glm-5.1` remains a legacy direct public pooled entrypoint for existing proxy callers
         //
-        // Factory mission workers now use the neutral `proxy-worker-smart-router` public alias so the
-        // user-facing worker contract stays stable while VibeProxy can still choose the best runtime
-        // lane per request class. That alias must therefore behave like a real smart router, not a
-        // single hard-coded backend with a friendlier name.
+        // Factory can also self-route the current worker custom model ID onto the worker pool. In
+        // both cases the user-facing worker contract stays stable while VibeProxy still chooses the
+        // best runtime lane per request class. These aliases must therefore behave like real smart
+        // routers, not single hard-coded backends with friendlier names.
         //
         // Important: callers hitting this branch still see their original public alias on the way out.
         // The internal `worker` alias remains a proxy concern, not an external runtime contract.
@@ -1182,7 +1209,7 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> [String] {
-        guard publicWorkerPoolAliases.contains(publicAlias),
+        guard isWorkerPoolPublicAlias(publicAlias),
               method == "POST" else {
             return smartAlias.candidates
         }
@@ -1242,7 +1269,7 @@ enum OpenAICompatTemporaryShim {
             smartAlias: smartAlias
         )
 
-        guard publicWorkerPoolAliases.contains(publicAlias),
+        guard isWorkerPoolPublicAlias(publicAlias),
               method == "POST",
               isChatCompletionsPath(path),
               effectiveCandidates.count == 1,
@@ -1261,7 +1288,7 @@ enum OpenAICompatTemporaryShim {
         // Validate the internal alias and the one explicit public pooled entrypoint against the same
         // underlying pool contract. `worker` stays proxy-internal; `glm-5.1` is the only remaining
         // external pooled alias.
-        guard publicWorkerPoolAliases.contains(requestModel),
+        guard isWorkerPoolPublicAlias(requestModel),
               let smartAlias = smartAliasDefinition(forRequestModel: requestModel) else {
             return nil
         }
@@ -2043,7 +2070,7 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    private static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
+    fileprivate static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
         if let route = resolveConfiguredRoute(forRequestModel: requestModel) {
             return route
         }
@@ -4458,10 +4485,11 @@ class ThinkingProxy {
         let source: String
     }
 
-    private struct CachedFactoryModelBindings {
+    fileprivate struct CachedFactoryModelBindings {
         let settingsPath: String
         let settingsFingerprint: String?
         let bindingsByIncomingModelID: [String: FactoryModelBinding]
+        let authoritativeWorkerModelID: String?
     }
 
     private static let factoryBindingsCacheQueue = DispatchQueue(label: "io.automaze.vibeproxy.factory-bindings-cache")
@@ -8240,7 +8268,7 @@ class ThinkingProxy {
     }
 
     private func acquireRouteConcurrencyPermit(forRequestModel requestModel: String) -> RouteConcurrencyPermit? {
-        guard let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
+        guard let route = OpenAICompatTemporaryShim.routeIdentityForHealthTracking(forRequestModel: requestModel),
               OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: route.routeHealthKey) else {
             return nil
         }
@@ -10166,7 +10194,7 @@ class ThinkingProxy {
         factoryModelBindings()?.bindingsByIncomingModelID.values.first { $0.routeModel == routeModel }
     }
 
-    private static func factoryModelBindings() -> CachedFactoryModelBindings? {
+    fileprivate static func factoryModelBindings() -> CachedFactoryModelBindings? {
         guard let settingsPath = ThinkingProxy.factorySettingsPath() else {
             return nil
         }
@@ -10250,7 +10278,8 @@ class ThinkingProxy {
         let cached = CachedFactoryModelBindings(
             settingsPath: settingsPath,
             settingsFingerprint: settingsFingerprint,
-            bindingsByIncomingModelID: bindingsByIncomingModelID
+            bindingsByIncomingModelID: bindingsByIncomingModelID,
+            authoritativeWorkerModelID: (root["missionModelSettings"] as? [String: Any])?["workerModel"] as? String
         )
         factoryBindingsCacheQueue.sync {
             cachedFactoryModelBindings = cached
