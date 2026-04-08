@@ -1239,6 +1239,64 @@ enum OpenAICompatTemporaryShim {
         return smartAlias.candidates
     }
 
+    static func pinnedToolHeavyWorkerPrimaryCandidate(
+        forPublicAlias publicAlias: String,
+        method: String,
+        path: String,
+        jsonString: String,
+        smartAlias: SmartAliasDefinition? = nil
+    ) -> String? {
+        guard isWorkerPoolPublicAlias(publicAlias),
+              method == "POST",
+              isChatCompletionsPath(path),
+              let resolvedSmartAlias = smartAlias ?? smartAliasDefinition(forRequestModel: publicAlias),
+              let primaryCandidate = resolvedSmartAlias.candidates.first,
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return nil
+        }
+
+        let hasTools = (json["tools"] as? [Any])?.isEmpty == false
+        let hasStructuredOutput = json["response_format"] != nil
+        let isOversizedExecPayload = jsonString.utf8.count >= 65536
+        let isToolHeavyWorkerRequest = hasTools || hasStructuredOutput || isOversizedExecPayload
+        guard isToolHeavyWorkerRequest else {
+            return nil
+        }
+
+        let effectiveCandidates = effectiveSmartAliasCandidateModels(
+            forPublicAlias: publicAlias,
+            method: method,
+            path: path,
+            jsonString: jsonString,
+            smartAlias: resolvedSmartAlias
+        )
+        guard effectiveCandidates.count == 1,
+              effectiveCandidates.first == primaryCandidate else {
+            return nil
+        }
+        return primaryCandidate
+    }
+
+    static func pinnedWorkerPrimaryIsConcurrencyLimited(
+        forRequestModel requestModel: String,
+        at now: Date = Date()
+    ) -> Bool {
+        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+            return false
+        }
+
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let atCapacity = Self.concurrencyRegistry.isAtCapacity(routeHealthKey: route.routeHealthKey)
+            let cooldownActive =
+                routeCooldownsByRouteHealthKey[route.routeHealthKey].map { now < $0 } ?? false
+            let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
+            let recentConcurrencyFailure = state?.lastTelemetryEvent?.failureClass == "classified_429"
+            return atCapacity || cooldownActive || recentConcurrencyFailure
+        }
+    }
+
     static func forcedSmartAliasProbeCandidateModels(
         forPublicAlias publicAlias: String,
         method: String,
@@ -2095,7 +2153,7 @@ enum OpenAICompatTemporaryShim {
             // halfOpen routes are probeable — allow them through for candidate selection
             // so the circuit breaker recovery mechanism can test the route.
             if state.status == .halfOpen { return nil }
-            return state.isUnavailable(at: now) ? state.status : nil
+            return state.status == .closed ? nil : state.status
         }
     }
 
@@ -4405,8 +4463,7 @@ class ThinkingProxy {
         }
 
         var ready: Bool {
-            blockingSnapshotDriftPaths.isEmpty &&
-                routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
+            blockingSnapshotDriftPaths.isEmpty && routeHealthStatus == nil
         }
     }
 
@@ -4423,7 +4480,7 @@ class ThinkingProxy {
         let routeHealthStatus: String?
 
         var ready: Bool {
-            routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
+            routeHealthStatus == nil
         }
     }
 
@@ -5972,6 +6029,32 @@ class ThinkingProxy {
                 return
             }
 
+            if let pinnedPrimaryCandidate = OpenAICompatTemporaryShim.pinnedToolHeavyWorkerPrimaryCandidate(
+                forPublicAlias: publicAlias,
+                method: method,
+                path: path,
+                jsonString: currentBody
+            ) {
+                if OpenAICompatTemporaryShim.pinnedWorkerPrimaryIsConcurrencyLimited(
+                    forRequestModel: pinnedPrimaryCandidate
+                ) {
+                    deliverBufferedError(
+                        defaultConnection: originalConnection,
+                        statusCode: 429,
+                        message: concurrencyLimitErrorMessage(forRequestModel: publicAlias),
+                        coalescingKey: coalescingKey
+                    )
+                } else {
+                    deliverBufferedError(
+                        defaultConnection: originalConnection,
+                        statusCode: 503,
+                        message: "The contract-safe GLM worker backend is currently unavailable.",
+                        coalescingKey: coalescingKey
+                    )
+                }
+                return
+            }
+
             if loopRetriesRemaining > 0, remainingSmartAliasBudget(until: deadlineAt) > 0 {
                 restartSmartAliasLoop(
                     method: method,
@@ -6371,7 +6454,8 @@ class ThinkingProxy {
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where remainingCandidateModels.isEmpty &&
                 primaryProbeRetriesRemaining > 0 &&
-                forceProbeCandidateModels.contains(requestModel):
+                forceProbeCandidateModels.contains(requestModel) &&
+                telemetryEvent.failureClass != "classified_429":
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
@@ -9932,6 +10016,16 @@ class ThinkingProxy {
         effectiveRouteModel: String
     ) -> String? {
         let workerPrimaryCandidate = OpenAICompatTemporaryShim.workerPrimaryCandidateModel()
+        let workerCandidateModels = effectiveFactoryWorkerCandidateModels(
+            routeModel: routeModel,
+            requestSurface: requestSurface
+        )
+        if requestSurface == "chat_completions",
+           OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil,
+           workerCandidateModels == [workerPrimaryCandidate] {
+            return OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: workerPrimaryCandidate)?.rawValue
+        }
+
         guard requestSurface == "chat_completions",
               OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil,
               OpenAICompatTemporaryShim.routeHealthStatus(

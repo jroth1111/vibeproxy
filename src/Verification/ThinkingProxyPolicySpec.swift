@@ -6436,7 +6436,7 @@ struct ThinkingProxyPolicySpec {
                     let backendReachable = backend?["reachable"] as? Bool ?? false
                     let expectedReady = backendReachable &&
                         ((factoryWorker?["snapshot_sync_ok"] as? Bool) == true) &&
-                        ((factoryWorker?["route_health_status"] as? String) != "open")
+                        ((factoryWorker?["route_health_status"] as? String) == nil)
 
                     expectEqual(deliveredStatus, 200, "healthz should succeed", recorder: recorder)
                     expectEqual(frontend?["port"] as? Int, 8317, "healthz should report the frontend port", recorder: recorder)
@@ -6510,7 +6510,7 @@ struct ThinkingProxyPolicySpec {
                     let backendReachable = backend?["reachable"] as? Bool ?? false
                     let expectedReady = backendReachable &&
                         ((factoryWorker?["snapshot_sync_ok"] as? Bool) == true) &&
-                        ((factoryWorker?["route_health_status"] as? String) != "open")
+                        ((factoryWorker?["route_health_status"] as? String) == nil)
                     let acceptedRequestModelIDs = factoryWorker?["accepted_request_model_ids"] as? [String]
                     let rescuedRequestModelIDs = factoryWorker?["rescued_request_model_ids"] as? [String]
 
@@ -6628,6 +6628,49 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz marks self-routed smart-router workers unready when pinned GLM traffic is only suspect", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm-5.1-zai",
+                        at: Date()
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("self-routed generic-compatible suspect healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep the pinned worker effective route on GLM while it is only suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should keep the pinned worker provider on Z.AI while GLM is suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, "suspect", "healthz should expose suspect worker health for pinned GLM traffic", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark self-routed smart-router workers unready when pinned GLM traffic is suspect", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz keeps the smart-router worker ready but marks direct GPT roles unready when the preferred GPT lane is open", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
@@ -6676,6 +6719,68 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should keep verification pinned to the direct GPT provider", recorder: recorder)
                     expectEqual(verification?["route_health_status"] as? String, "open", "healthz should expose the direct GPT lane as unhealthy for verification", recorder: recorder)
                     expectEqual(verification?["ready"] as? Bool, false, "healthz should mark verification unready when the direct GPT lane is quarantined", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("pinned self-routed tool-heavy worker requests surface GLM saturation as 429 instead of looping into generic unavailability", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let proxy = ThinkingProxy()
+                    proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    let lock = NSLock()
+                    var seenModels: [String] = []
+                    var deliveredStatus: Int?
+                    var deliveredMessage: String?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        let model = json["model"] as? String ?? ""
+                        lock.lock()
+                        seenModels.append(model)
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredErrorForTesting = { statusCode, message in
+                        deliveredStatus = statusCode
+                        deliveredMessage = message
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "tools": [
+                            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                          ],
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 2) == .success else {
+                        recorder.recordFailure("pinned self-routed worker request should return a saturation error")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    expectEqual(seenModels, ["glm-5.1-zai"], "pinned self-routed worker requests should only attempt the GLM primary before surfacing saturation", recorder: recorder)
+                    expectEqual(deliveredStatus, 429, "pinned self-routed worker saturation should surface as a rate-limit error", recorder: recorder)
+                    expectEqual(deliveredMessage, "Upstream concurrency limit reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry shortly.", "pinned self-routed worker saturation should name the caller-visible worker contract", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
