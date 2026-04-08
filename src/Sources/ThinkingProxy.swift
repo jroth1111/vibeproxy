@@ -418,6 +418,12 @@ enum OpenAICompatTemporaryShim {
         case missingChoices = "missing_choices"
     }
 
+    enum Provider429Disposition: Equatable {
+        case overload(retryDelaySeconds: TimeInterval)
+        case concurrency(retryAfterSeconds: TimeInterval?)
+        case quotaWindow(cooldownUntil: Date)
+    }
+
     static let requestTimeoutScale: TimeInterval = 3
 
     static func scaledRequestTimeout(_ seconds: TimeInterval) -> TimeInterval {
@@ -2086,7 +2092,7 @@ enum OpenAICompatTemporaryShim {
             // Always count failures — the circuit breaker threshold dampens rapid failures naturally
             
             // Feed concurrency registry for 429 responses
-            if let fc = telemetryEvent?.failureClass, fc == "classified_429",
+            if let fc = telemetryEvent?.failureClass, (fc == "classified_429" || fc == "classified_429_concurrency"),
                let inflight = telemetryEvent?.inflightAtRequest {
                 concurrencyRegistry.record429(routeHealthKey: route.routeHealthKey, inflightAtRequest: inflight)
             }
@@ -2682,16 +2688,15 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func providerCooldownUntil(
+    static func classifyProvider429Disposition(
         statusCode: Int,
         headers: [AnyHashable: Any],
         bodyData: Data? = nil,
         now: Date = Date()
-    ) -> Date? {
+    ) -> Provider429Disposition? {
         guard statusCode == 429 else { return nil }
 
         let concurrencyThreshold: TimeInterval = 300
-        let maxProviderCooldown: TimeInterval = 600
 
         // --- Retry-After header ---
         if let retryAfter = headerValue("Retry-After", in: headers)?
@@ -2700,11 +2705,10 @@ enum OpenAICompatTemporaryShim {
             if let seconds = TimeInterval(retryAfter), seconds > 0 {
                 if seconds < concurrencyThreshold {
                     NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
-                    return nil
+                    return .concurrency(retryAfterSeconds: seconds)
                 }
-                let capped = min(seconds, maxProviderCooldown)
-                NSLog("[ThinkingProxy] Provider 429 Retry-After: %.0fs — capping cooldown to %.0fs", seconds, capped)
-                return now.addingTimeInterval(capped)
+                NSLog("[ThinkingProxy] Provider 429 Retry-After: %.0fs — honoring full provider reset window", seconds)
+                return .quotaWindow(cooldownUntil: now.addingTimeInterval(seconds))
             }
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -2712,21 +2716,37 @@ enum OpenAICompatTemporaryShim {
             formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
             if let date = formatter.date(from: retryAfter) {
                 let seconds = date.timeIntervalSince(now)
-                if seconds <= 0 { return nil }
+                if seconds <= 0 { return .concurrency(retryAfterSeconds: nil) }
                 if seconds < concurrencyThreshold {
                     NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
-                    return nil
+                    return .concurrency(retryAfterSeconds: seconds)
                 }
-                let cappedSeconds = min(seconds, maxProviderCooldown)
-                NSLog("[ThinkingProxy] Provider 429 Retry-After HTTP-date: %.0fs — capping cooldown to %.0fs", seconds, cappedSeconds)
-                return now.addingTimeInterval(cappedSeconds)
+                NSLog("[ThinkingProxy] Provider 429 Retry-After HTTP-date: %.0fs — honoring full provider reset window", seconds)
+                return .quotaWindow(cooldownUntil: date)
             }
         }
 
+        guard let bodyData,
+              let bodyString = String(data: bodyData, encoding: .utf8) else {
+            return .concurrency(retryAfterSeconds: nil)
+        }
+
+        let normalizedBody = bodyString.lowercased()
+        if normalizedBody.contains("temporarily overloaded") ||
+            normalizedBody.contains("service may be temporarily overloaded") ||
+            normalizedBody.contains("\"code\":\"1305\"") ||
+            normalizedBody.contains("\"code\":1305") {
+            return .overload(retryDelaySeconds: 1)
+        }
+
+        if normalizedBody.contains("too many concurrent") ||
+            normalizedBody.contains("too many connections") ||
+            normalizedBody.contains("too many concurrent connections") {
+            return .concurrency(retryAfterSeconds: nil)
+        }
+
         // --- Body-embedded reset time (e.g. GLM: "will reset at YYYY-MM-DD HH:mm:ss") ---
-        if let bodyData,
-           let bodyString = String(data: bodyData, encoding: .utf8),
-           let range = bodyString.range(of: #"will reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"#,
+        if let range = bodyString.range(of: #"will reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"#,
                                         options: .regularExpression) {
             let full = String(bodyString[range])
             let timestamp = String(full.dropFirst("will reset at ".count))
@@ -2735,17 +2755,56 @@ enum OpenAICompatTemporaryShim {
             formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
             // GLM timestamps are in CST (UTC+8)
             formatter.timeZone = TimeZone(secondsFromGMT: 8 * 3600)
-            if let resetDate = formatter.date(from: timestamp) {
-                let seconds = resetDate.timeIntervalSince(now)
-                if seconds > 0 {
-                    let cappedSeconds = min(seconds, maxProviderCooldown)
-                    NSLog("[ThinkingProxy] GLM rate-limit 429: cooldown until %@ (%.0fs — capping to %.0fs)", timestamp, seconds, cappedSeconds)
-                    return now.addingTimeInterval(cappedSeconds)
-                }
+            if let resetDate = formatter.date(from: timestamp),
+               resetDate > now {
+                NSLog("[ThinkingProxy] GLM rate-limit 429: honoring cooldown until %@", timestamp)
+                return .quotaWindow(cooldownUntil: resetDate)
             }
         }
 
+        return .concurrency(retryAfterSeconds: nil)
+    }
+
+    static func providerCooldownUntil(
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) -> Date? {
+        guard let disposition = classifyProvider429Disposition(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        ) else {
+            return nil
+        }
+        if case .quotaWindow(let cooldownUntil) = disposition {
+            return cooldownUntil
+        }
         return nil
+    }
+
+    static func failureClassFor429(
+        headers: [AnyHashable: Any],
+        bodyData: Data?,
+        now: Date = Date()
+    ) -> String {
+        switch classifyProvider429Disposition(
+            statusCode: 429,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        ) {
+        case .overload:
+            return "classified_429_overload"
+        case .concurrency:
+            return "classified_429_concurrency"
+        case .quotaWindow:
+            return "classified_429_window"
+        case nil:
+            return "classified_429"
+        }
     }
 
     private static func headerValue(_ name: String, in headers: [AnyHashable: Any]) -> String? {
@@ -3020,7 +3079,7 @@ enum OpenAICompatTemporaryShim {
 
         // 429 rate-limit responses indicate concurrency oversubscription, not route health issues.
         // The concurrency registry handles backing off; the circuit breaker should not penalize.
-        if failureClass == "classified_429" {
+        if failureClass.hasPrefix("classified_429") {
             return 0
         }
 
@@ -6340,6 +6399,51 @@ class ThinkingProxy {
                 deliveryMode: deliveryMode
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
+            where telemetryEvent.failureClass == "classified_429_overload":
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: telemetryEvent.requestModel,
+                telemetryEvent: telemetryEvent,
+                forcedOpenUntil: cooldownUntil,
+                healthSensitivity: healthSensitivity
+            )
+            let retryDelay: TimeInterval = 1
+            let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
+            guard remainingBudget > retryDelay else {
+                deliverSmartAliasTerminalOutcome(
+                    .retryableFailure(
+                        requestModel: requestModel,
+                        telemetryEvent: telemetryEvent,
+                        cooldownUntil: cooldownUntil
+                    ),
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+                guard let self else { return }
+                self.attemptSmartAliasCandidate(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: candidateBody,
+                    publicAlias: publicAlias,
+                    remainingCandidateModels: [requestModel] + remainingCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                    failoverDepth: failoverDepth,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
+                )
+            }
+        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where remainingCandidateModels.isEmpty &&
                 primaryProbeRetriesRemaining > 0 &&
                 forceProbeCandidateModels.contains(requestModel) &&
@@ -6560,7 +6664,24 @@ class ThinkingProxy {
             // retries without switching models.  402 from upstream looks like
             // "provider billing exhausted" → Droid switches to bare built-in model.
             // 429 tells Droid "temporary rate limit" → retry with same model.
-            if telemetryEvent.failureClass == "classified_429" ||
+            if telemetryEvent.failureClass == "classified_429_window" {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 429,
+                    message: quotaWindowErrorMessage(forRequestModel: publicAlias),
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 300)]
+                )
+            } else if telemetryEvent.failureClass == "classified_429_overload" {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 429,
+                    message: overloadErrorMessage(forRequestModel: publicAlias),
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: ["Retry-After": "1"]
+                )
+            } else if telemetryEvent.failureClass == "classified_429" ||
+                telemetryEvent.failureClass == "classified_429_concurrency" ||
                 telemetryEvent.upstreamHTTPStatus == 429 {
                 deliverBufferedError(
                     defaultConnection: originalConnection,
@@ -7455,6 +7576,7 @@ class ThinkingProxy {
             case .sendResponse(let statusCode, let responseHeaders, let responseBody):
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
+                    headers: responseHeaders,
                     bodyData: responseBody,
                     path: path
                 ).shouldFailover {
@@ -7508,6 +7630,7 @@ class ThinkingProxy {
             case .sendError(let statusCode, let message):
                 if self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
+                    headers: attempt.response?.allHeaderFields ?? [:],
                     bodyData: nil,
                     path: path
                 ).shouldFailover {
@@ -7623,6 +7746,7 @@ class ThinkingProxy {
         let statusCode = response.statusCode
         let failureClassification = classifySmartAliasCandidateFailure(
             statusCode: statusCode,
+            headers: response.allHeaderFields,
             bodyData: responseData,
             path: path
         )
@@ -7707,6 +7831,7 @@ class ThinkingProxy {
 
     private func classifySmartAliasCandidateFailure(
         statusCode: Int,
+        headers: [AnyHashable: Any],
         bodyData: Data?,
         path: String
     ) -> (shouldFailover: Bool, failureClass: String?) {
@@ -7720,8 +7845,16 @@ class ThinkingProxy {
             return (true, failureClass)
         }
         switch statusCode {
-        case 402, 408, 429, 403, 404:
+        case 402, 408, 403, 404:
             return (true, "classified_\(statusCode)")
+        case 429:
+            return (
+                true,
+                OpenAICompatTemporaryShim.failureClassFor429(
+                    headers: headers,
+                    bodyData: bodyData
+                )
+            )
         case 500...599:
             return (true, "classified_\(statusCode)")
         default:
@@ -8247,6 +8380,22 @@ class ThinkingProxy {
 
     private func concurrencyLimitErrorMessage(forRequestModel requestModel: String) -> String {
         "Upstream concurrency limit reached for \(requestModel); retry shortly."
+    }
+
+    private func overloadErrorMessage(forRequestModel requestModel: String) -> String {
+        "Upstream provider is temporarily overloaded for \(requestModel); retry shortly."
+    }
+
+    private func quotaWindowErrorMessage(forRequestModel requestModel: String) -> String {
+        "Upstream rate-limit window reached for \(requestModel); retry when the provider window resets."
+    }
+
+    private func retryAfterHeaderValue(until cooldownUntil: Date?, fallbackSeconds: Int) -> String {
+        guard let cooldownUntil else {
+            return String(fallbackSeconds)
+        }
+        let seconds = max(1, Int(ceil(cooldownUntil.timeIntervalSinceNow)))
+        return String(seconds)
     }
 
     private func deliverBufferedError(

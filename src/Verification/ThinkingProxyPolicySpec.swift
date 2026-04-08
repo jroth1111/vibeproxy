@@ -585,7 +585,7 @@ struct ThinkingProxyPolicySpec {
 
                 let longHeaders: [AnyHashable: Any] = ["Retry-After": "3600"]
                 let longCooldown = OpenAICompatTemporaryShim.providerCooldownUntil(statusCode: 429, headers: longHeaders, now: now)
-                expectEqual(longCooldown?.timeIntervalSince(now), 600, "long Retry-After (>= 5 min) should be capped to the max provider cooldown window", recorder: recorder)
+                expectEqual(longCooldown?.timeIntervalSince(now), 3600, "long Retry-After windows should be honored in full", recorder: recorder)
 
                 let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
@@ -607,7 +607,8 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-ollama-pro", at: now.addingTimeInterval(1)), true, "provider-advised rate-limit cooldown should immediately suppress the route", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-ollama-pro", at: now.addingTimeInterval(601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-ollama-pro", at: now.addingTimeInterval(3599)), true, "worker candidates should remain suppressed until the provider retry window expires", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-ollama-pro", at: now.addingTimeInterval(3601)), false, "worker candidates should become eligible again once the provider cooldown expires", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -636,7 +637,7 @@ struct ThinkingProxyPolicySpec {
                 let interval = cooldown.map { $0.timeIntervalSince(now) }
                 expectEqual(interval != nil, true, "GLM body reset time should produce a cooldown", recorder: recorder)
                 if let interval {
-                    expectEqual(abs(interval - 600) < 5, true, "cooldown should be capped to max provider cooldown (600s) even when GLM reset time is further out", recorder: recorder)
+                    expectEqual(abs(interval - (2 * 3600)) < 5, true, "GLM reset windows should be honored until the provider reset time", recorder: recorder)
                 }
 
                 // Short Retry-After should still win over body (header takes precedence, returns nil for concurrency)
@@ -647,6 +648,48 @@ struct ThinkingProxyPolicySpec {
                     now: now
                 )
                 expectNil(shortHeaderCooldown, "short Retry-After header should suppress body parsing and return nil (concurrency)", recorder: recorder)
+            }
+        }
+
+        run("temporary provider 429 classification distinguishes overload, concurrency, and quota-window exhaustion", recorder: recorder) {
+            let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+            switch OpenAICompatTemporaryShim.classifyProvider429Disposition(
+                statusCode: 429,
+                headers: [:],
+                bodyData: Data("""
+                {"error":{"code":"1305","message":"The service may be temporarily overloaded, please try again later"}}
+                """.utf8),
+                now: now
+            ) {
+            case .overload(let retryDelaySeconds):
+                expectEqual(Int(retryDelaySeconds), 1, "overload 429s should trigger short same-route retries", recorder: recorder)
+            default:
+                recorder.recordFailure("expected overload 429 classification for ZAI service-overloaded response")
+            }
+
+            switch OpenAICompatTemporaryShim.classifyProvider429Disposition(
+                statusCode: 429,
+                headers: ["Retry-After": "2"],
+                bodyData: nil,
+                now: now
+            ) {
+            case .concurrency(let retryAfterSeconds):
+                expectEqual(Int(retryAfterSeconds ?? -1), 2, "short Retry-After should classify as concurrency saturation", recorder: recorder)
+            default:
+                recorder.recordFailure("expected concurrency 429 classification for short Retry-After")
+            }
+
+            switch OpenAICompatTemporaryShim.classifyProvider429Disposition(
+                statusCode: 429,
+                headers: ["Retry-After": "3600"],
+                bodyData: nil,
+                now: now
+            ) {
+            case .quotaWindow(let cooldownUntil):
+                expectEqual(Int(cooldownUntil.timeIntervalSince(now)), 3600, "long Retry-After should classify as a quota/reset window", recorder: recorder)
+            default:
+                recorder.recordFailure("expected quota-window 429 classification for long Retry-After")
             }
         }
 
@@ -7211,6 +7254,99 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
                     expectEqual(deliveredStatus, 429, "shared-pool saturation should surface as a retryable concurrency limit once every candidate is exhausted", recorder: recorder)
                     expectEqual(deliveredMessage, "Upstream concurrency limit reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry shortly.", "shared-pool saturation should preserve the caller-visible worker model identity in the retryable error", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("self-routed worker requests keep retrying the ZAI primary on overload before falling through to sibling routes", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let proxy = ThinkingProxy()
+                    proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                    proxy.smartAliasTotalTimeoutOverrideForTesting = 5
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    let lock = NSLock()
+                    var seenModels: [String] = []
+                    var zaiAttempts = 0
+                    var deliveredStatus: Int?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        let model = json["model"] as? String ?? ""
+                        lock.lock()
+                        seenModels.append(model)
+                        if model == "glm-5.1-zai" {
+                            zaiAttempts += 1
+                        }
+                        let currentZaiAttempts = zaiAttempts
+                        lock.unlock()
+
+                        if model == "glm-5.1-zai", currentZaiAttempts < 3 {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {"error":{"code":"1305","message":"The service may be temporarily overloaded, please try again later"}}
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 429),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        if model == "glm-5.1-zai" {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {"id":"ok","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                            return
+                        }
+
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected fallback\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                        deliveredStatus = statusCode
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 4) == .success else {
+                        recorder.recordFailure("self-routed worker overload retries should eventually succeed on the recovered ZAI primary")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-zai"], "overload 429s should stay on the preferred ZAI lane instead of falling through to sibling backends", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "recovered overload retries should eventually deliver success", recorder: recorder)
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    expectEqual(deliveredJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.workerModelID, "successful overload retries should preserve the caller-visible worker model identity", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
