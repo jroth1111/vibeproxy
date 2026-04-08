@@ -90,6 +90,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
         // Initialize managers
         serverManager = ServerManager()
         thinkingProxy = ThinkingProxy()
+        ProxyPaths.ensureAuthDirectoryLayout()
 
         // Sync Vercel AI Gateway config from ServerManager to ThinkingProxy
         syncVercelConfig()
@@ -456,29 +457,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     // MARK: - Auth Directory Monitoring
 
     private func startMonitoringAuthDirectory() {
-        let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
-        try? FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
-
-        guard let monitor = FileSystemMonitor(
-            path: authDir.path,
-            eventMask: [.write, .delete, .rename],
-            queue: DispatchQueue.main
-        ) else {
-            return
-        }
-
-        monitor.source.setEventHandler { [weak self] in
-            self?.refreshUserConfigFileMonitor()
-            self?.pendingAuthRefresh?.cancel()
-            let workItem = DispatchWorkItem {
-                self?.postObservedConfigInputsChanged(reason: "Auth directory changed")
-            }
-            self?.pendingAuthRefresh = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
-        }
-
-        monitor.resume()
-        authFileMonitor = monitor
+        ProxyPaths.ensureAuthDirectoryLayout()
         refreshUserConfigFileMonitor()
         startPollingConfigInputs()
     }
@@ -554,10 +533,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNoti
     }
 
     private func currentConfigInputsFingerprint() -> String {
-        ConfigInputFingerprint.compute(
-            in: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api"),
+        let configFingerprint = ConfigInputFingerprint.compute(
+            in: ProxyPaths.rootDirectoryURL(),
             userConfigFilename: "config.yaml"
         )
+        let authFingerprint = ConfigInputFingerprint.computeAuthDirectoryFingerprint(
+            in: ProxyPaths.authDirectoryURL()
+        )
+        return [configFingerprint, authFingerprint]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n===\n")
     }
 
     // MARK: - Vercel Config Sync

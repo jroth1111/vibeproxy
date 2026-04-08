@@ -498,6 +498,25 @@ enum OpenAICompatTemporaryShim {
     }()
     #endif
     static let canaryDisabledCanonicalModelIDs: Set<String> = []
+    private static let workerSmartRouteRequestPolicy = RequestPolicy(
+        minimumMaxTokens: 128,
+        maximumMaxTokens: nil,
+        strippedFields: [],
+        attemptTimeout: scaledRequestTimeout(300),
+        firstResponseDeadline: scaledRequestTimeout(60),
+        bufferedResponseDeadline: scaledRequestTimeout(180),
+        transportRetries: 2,
+        semanticRetries: 2,
+        retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
+        retryBackoffMilliseconds: 250,
+        stripsReasoningFieldFromSuccess: false,
+        allowsThinkLeakRepair: false,
+        salvagesBestEffortRepair: false,
+        clientStreamingMode: .preserve,
+        toolChoiceMode: .preserve,
+        forcesKimiInstantMode: false
+    )
+
     private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
         "glm-4.7": RequestPolicy(
             minimumMaxTokens: nil,
@@ -553,24 +572,7 @@ enum OpenAICompatTemporaryShim {
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
         ),
-        "proxy-worker-smart-router": RequestPolicy(
-            minimumMaxTokens: nil,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: scaledRequestTimeout(300),
-            firstResponseDeadline: scaledRequestTimeout(60),
-            bufferedResponseDeadline: scaledRequestTimeout(180),
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: false,
-            allowsThinkLeakRepair: false,
-            salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
+        "proxy-worker-smart-router": workerSmartRouteRequestPolicy,
         "gpt-5.4(high)": RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
@@ -3724,6 +3726,9 @@ enum OpenAICompatTemporaryShim {
 
     private static func policy(forModel model: String) -> RequestPolicy? {
         let model = normalizedRequestModel(model)
+        if isWorkerPoolPublicAlias(model) {
+            return workerSmartRouteRequestPolicy
+        }
         if let policy = nonNVIDIAMitigationPoliciesByRequestModel[model] {
             return policy
         }

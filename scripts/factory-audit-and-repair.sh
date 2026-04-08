@@ -264,7 +264,7 @@ if [[ "$suspect_route_health_count" -gt 0 ]]; then
 fi
 
 # --- Codex token health ---
-codex_token_dir="${FACTORY_ROOT}/../.cli-proxy-api"
+codex_token_dir="${FACTORY_ROOT}/../.cli-proxy-api/auth"
 codex_valid_count=0
 codex_expiring_count=0
 codex_expired_count=0

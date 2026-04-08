@@ -128,7 +128,7 @@ VibeProxy/
 - **AppDelegate**: Manages the menu bar item and settings window lifecycle
 - **ServerManager**: Controls the cli-proxy-api server process and OAuth authentication
 - **SettingsView**: SwiftUI interface with native macOS design
-- **AuthStatus**: Monitors `~/.cli-proxy-api/` for authentication files
+- **AuthStatus**: Monitors `~/.cli-proxy-api/auth/` for authentication files
 - **File Monitoring**: Real-time updates when auth files are added/removed
 
 ## Credits

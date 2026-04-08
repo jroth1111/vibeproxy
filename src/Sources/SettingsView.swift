@@ -905,7 +905,7 @@ struct SettingsView: View {
     }
     
     private func openAuthFolder() {
-        let authDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
+        let authDir = ProxyPaths.authDirectoryURL()
         NSWorkspace.shared.open(authDir)
     }
 

@@ -86,6 +86,50 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("worker-pool entrypoints floor tiny max_tokens budgets before fallback", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let publicAliasRequest = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "max_tokens": 32
+                }
+                """
+
+                let transformedPublicAlias = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: publicAliasRequest
+                )
+                let publicAliasJSON = parseJSONObject(transformedPublicAlias, recorder: recorder)
+                expectEqual(publicAliasJSON["max_tokens"] as? Int, 128, "worker smart-router requests should floor tiny max_tokens budgets before GLM/Ollama fallback", recorder: recorder)
+            }
+
+            withMergedConfig(defaultMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    let selfRoutedWorkerRequest = """
+                    {
+                      "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                      "messages": [
+                        {"role": "user", "content": "Return exactly: OK"}
+                      ],
+                      "max_tokens": 32
+                    }
+                    """
+
+                    let transformedSelfRoutedWorker = OpenAICompatTemporaryShim.transformRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: selfRoutedWorkerRequest
+                    )
+                    let selfRoutedWorkerJSON = parseJSONObject(transformedSelfRoutedWorker, recorder: recorder)
+                    expectEqual(selfRoutedWorkerJSON["max_tokens"] as? Int, 128, "self-routed Factory worker IDs should inherit the same max_tokens floor as the public worker smart route", recorder: recorder)
+                }
+            }
+        }
+
         run("canonical nvidia route identity preserves mitigation when aliases are renamed", recorder: recorder) {
             withMergedConfig(renamedAliasMergedConfigYAML()) {
                 let request = """
@@ -2849,7 +2893,7 @@ struct ThinkingProxyPolicySpec {
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
                 expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "glm-5.1 responses requests should enter the real worker failover chain at the ZAI GLM primary lane", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "glm-5.1 responses requests should preserve explicit non-streaming semantics toward chat completions", recorder: recorder)
-                expectEqual(forwardedJSON["max_tokens"] as? Int, 32, "glm-5.1 responses requests should translate max_output_tokens onto max_tokens for chat completions", recorder: recorder)
+                expectEqual(forwardedJSON["max_tokens"] as? Int, 128, "glm-5.1 responses requests should floor translated chat max_tokens to the shared worker minimum before fallback", recorder: recorder)
                 let forwardedMessages = forwardedJSON["messages"] as? [[String: Any]]
                 expectEqual(forwardedMessages?.count, 1, "glm-5.1 responses requests should translate input into a chat messages array", recorder: recorder)
                 expectEqual(forwardedMessages?.first?["role"] as? String, "user", "glm-5.1 responses requests should preserve the user role", recorder: recorder)

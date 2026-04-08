@@ -90,8 +90,8 @@ class ServerManager: ObservableObject {
     private let credentialMutationQueue = DispatchQueue(label: "io.automaze.vibeproxy.credential-mutations", qos: .userInitiated)
     private let configInputStateQueue = DispatchQueue(label: "io.automaze.vibeproxy.config-input-state", qos: .userInitiated)
     private let configResolutionQueue = DispatchQueue(label: "io.automaze.vibeproxy.config-resolution", qos: .userInitiated)
-    private lazy var zaiAPIKeyStore = ZAIAPIKeyStore(directoryURL: authDirectoryURL())
-    private lazy var customProviderCredentialStore = CustomProviderCredentialStore(directoryURL: authDirectoryURL())
+    private lazy var zaiAPIKeyStore = ZAIAPIKeyStore(directoryURL: proxyDataDirectoryURL())
+    private lazy var customProviderCredentialStore = CustomProviderCredentialStore(directoryURL: proxyDataDirectoryURL())
     private var activeConfigPath = ""
     private var isRestartingForConfigUpdate = false
     private var isResolvingConfigUpdate = false
@@ -766,7 +766,7 @@ class ServerManager: ObservableObject {
             return .failure(ConfigResolutionFailure(message: "Could not load the base configuration."))
         }
         
-        let authDir = authDirectoryURL()
+        let authDir = proxyDataDirectoryURL()
         let zaiApiKeys = loadZaiAPIKeys()
         let customAuthRecords = loadCustomProviderCredentialRecords()
         let managedCustomProviders = ConfigComposer.parseCustomProviders(
@@ -890,8 +890,8 @@ class ServerManager: ObservableObject {
         return (resourcePath as NSString).appendingPathComponent("config.yaml")
     }
     
-    private func authDirectoryURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cli-proxy-api")
+    private func proxyDataDirectoryURL() -> URL {
+        ProxyPaths.rootDirectoryURL()
     }
     
     private func loadBaseConfigRoot() -> Result<LoadedBaseConfig, ConfigResolutionFailure> {
@@ -905,7 +905,7 @@ class ServerManager: ObservableObject {
             }
             return .failure(ConfigResolutionFailure(message: "Could not load the bundled config at \(bundledConfigPath)."))
         }
-        let userConfigPath = authDirectoryURL()
+        let userConfigPath = proxyDataDirectoryURL()
             .appendingPathComponent(CustomProviderConstants.userConfigFilename)
             .path
         guard FileManager.default.fileExists(atPath: userConfigPath) else {
@@ -990,7 +990,7 @@ class ServerManager: ObservableObject {
 
     private func currentObservedConfigInputsFingerprint() -> String {
         ConfigInputFingerprint.compute(
-            in: authDirectoryURL(),
+            in: proxyDataDirectoryURL(),
             userConfigFilename: CustomProviderConstants.userConfigFilename
         )
     }

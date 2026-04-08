@@ -14,7 +14,7 @@ remote-management:
   secret-key: ""  # Leave empty to disable management API
 
 # Authentication directory (stores OAuth tokens)
-auth-dir: "~/.cli-proxy-api"
+auth-dir: "~/.cli-proxy-api/auth"
 
 # Logging configuration
 debug: false
@@ -41,7 +41,7 @@ quota-exceeded:
   switch-preview-model: true
 
 # OAuth providers for local subscriptions
-# Claude, Codex (GPT), Gemini tokens in ~/.cli-proxy-api/ will be used
+# Claude, Codex (GPT), Gemini tokens in ~/.cli-proxy-api/auth/ will be used
 # No fallback - users must authenticate providers they want to use
 
 # No API keys needed for OAuth-based providers

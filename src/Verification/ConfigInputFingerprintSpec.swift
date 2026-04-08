@@ -73,6 +73,44 @@ struct ConfigInputFingerprintSpec {
             }
         }
 
+        run("auth fingerprint includes only top-level auth json files", recorder: recorder) {
+            withTemporaryDirectory(recorder: recorder) { directoryURL in
+                let authDir = directoryURL.appendingPathComponent("auth", isDirectory: true)
+                try? FileManager.default.createDirectory(at: authDir, withIntermediateDirectories: true)
+                writeText("{\"type\":\"codex\",\"email\":\"a@example.com\"}\n", to: authDir.appendingPathComponent("codex-a.json"), recorder: recorder)
+                writeText("{\"type\":\"claude\",\"email\":\"b@example.com\"}\n", to: authDir.appendingPathComponent("claude-b.json"), recorder: recorder)
+                let logsDir = authDir.appendingPathComponent("logs", isDirectory: true)
+                try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+                writeText("{\"error\":\"ignored\"}\n", to: logsDir.appendingPathComponent("error.json"), recorder: recorder)
+                writeText("{\"not\":\"auth\"}\n", to: authDir.appendingPathComponent("random.json"), recorder: recorder)
+
+                let names = ConfigInputFingerprint.relevantAuthFileURLs(in: authDir).map(\.lastPathComponent)
+                expectEqual(
+                    names,
+                    ["claude-b.json", "codex-a.json"],
+                    "auth fingerprint should ignore nested log files and non-auth json files",
+                    recorder: recorder
+                )
+            }
+        }
+
+        run("auth fingerprint ignores churn under auth logs directory", recorder: recorder) {
+            withTemporaryDirectory(recorder: recorder) { directoryURL in
+                let authDir = directoryURL.appendingPathComponent("auth", isDirectory: true)
+                let logsDir = authDir.appendingPathComponent("logs", isDirectory: true)
+                try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+                writeText("{\"type\":\"codex\",\"email\":\"a@example.com\"}\n", to: authDir.appendingPathComponent("codex-a.json"), recorder: recorder)
+                let before = ConfigInputFingerprint.computeAuthDirectoryFingerprint(in: authDir)
+                writeText("{\"error\":\"one\"}\n", to: logsDir.appendingPathComponent("error-a.json"), recorder: recorder)
+                let afterWrite = ConfigInputFingerprint.computeAuthDirectoryFingerprint(in: authDir)
+                writeText("{\"error\":\"two\"}\n", to: logsDir.appendingPathComponent("error-a.json"), recorder: recorder)
+                let afterRewrite = ConfigInputFingerprint.computeAuthDirectoryFingerprint(in: authDir)
+
+                expectEqual(before, afterWrite, "writing auth/logs should not affect the auth fingerprint", recorder: recorder)
+                expectEqual(before, afterRewrite, "rewriting auth/logs should still be ignored", recorder: recorder)
+            }
+        }
+
         if recorder.failures == 0 {
             print("ConfigInputFingerprintSpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
