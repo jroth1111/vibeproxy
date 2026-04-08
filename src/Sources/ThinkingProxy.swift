@@ -1523,12 +1523,21 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    private static let minimumAttemptTimeout: TimeInterval = 300
+
+    private static func enforcedAttemptTimeout(_ timeout: TimeInterval?) -> TimeInterval? {
+        guard let timeout else {
+            return nil
+        }
+        return max(timeout, minimumAttemptTimeout)
+    }
+
     static func attemptTimeout(forRequestJSON jsonString: String) -> TimeInterval? {
-        policy(forRequestJSON: jsonString)?.attemptTimeout
+        enforcedAttemptTimeout(policy(forRequestJSON: jsonString)?.attemptTimeout)
     }
 
     static func attemptTimeout(forRequestModel requestModel: String) -> TimeInterval? {
-        policy(forModel: requestModel)?.attemptTimeout
+        enforcedAttemptTimeout(policy(forModel: requestModel)?.attemptTimeout)
     }
 
     static func firstResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -4490,7 +4499,7 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let nvidiaReasoningTransportRetries = 2
-        static let defaultMitigatedAttemptTimeout: TimeInterval = 30
+        static let defaultMitigatedAttemptTimeout: TimeInterval = 300
         static let nvidiaCanaryTimeout: TimeInterval = 300
         static let healthcheckTimeout: TimeInterval = 0.5
     }

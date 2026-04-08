@@ -353,7 +353,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: glm5Request), 300, "glm5 should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 180, "kimi should have sufficient timeout for first-byte latency", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: kimiRequest), 300, "all routed attempts should now floor to the global 300-second minimum even when the model-specific budget is lower", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: minimaxRequest), 300, "minimax should keep a long per-attempt timeout that matches real NVIDIA latency", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: glm5Request), 240, "glm5 should allow long first-byte latency before failing", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: kimiRequest), 120, "kimi should use a reasonable first-byte deadline for NVIDIA-hosted model", recorder: recorder)
@@ -1898,12 +1898,14 @@ struct ThinkingProxyPolicySpec {
                 let delivered = DispatchSemaphore(value: 0)
                 var forwardedPath: String?
                 var forwardedBody: String?
+                var forwardedTimeout: TimeInterval?
                 var deliveredHeaders: [AnyHashable: Any]?
                 var deliveredBody: Data?
 
-                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, timeoutInterval, completion in
                     forwardedPath = path
                     forwardedBody = body
+                    forwardedTimeout = timeoutInterval
                     completion(
                         ThinkingProxy.BufferedProxyResponse(
                             data: Data("""
@@ -1956,6 +1958,7 @@ struct ThinkingProxyPolicySpec {
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
                 expectEqual(forwardedPath, "/v1/responses", "openai Factory custom IDs should preserve the responses API path", recorder: recorder)
                 expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "openai Factory custom IDs should be rewritten to their configured route model before proxy forwarding", recorder: recorder)
+                expectEqual(Int(forwardedTimeout ?? 0), 300, "direct Factory OpenAI attempts should also respect the 300-second per-attempt minimum", recorder: recorder)
 
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should stay caller-visible on the way out", recorder: recorder)
@@ -1964,6 +1967,56 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "openai Factory custom IDs should expose the direct provider", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "openai Factory custom IDs should expose the authoritative Factory model id", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "openai Factory custom IDs should expose the binding source", recorder: recorder)
+            }
+        }
+
+        run("Factory self-routed worker custom model IDs keep the 300-second minimum attempt timeout", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedTimeout: TimeInterval?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, _, timeoutInterval, completion in
+                        forwardedTimeout = timeoutInterval
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-self-routed-timeout-floor",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("self-routed worker custom model ID should return a response")
+                        return
+                    }
+
+                    expectEqual(Int(forwardedTimeout ?? 0), 300, "self-routed worker custom IDs should not fall back below the 300-second per-attempt minimum", recorder: recorder)
+                }
             }
         }
 
