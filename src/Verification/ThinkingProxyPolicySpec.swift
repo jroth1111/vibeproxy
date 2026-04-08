@@ -693,6 +693,38 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("concurrency-classified 429s do not degrade route health status", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm-5.1-zai",
+                    requestedAlias: "worker",
+                    canonicalModelID: "glm-5.1",
+                    transportOutcome: "send_error",
+                    failureClass: "classified_429_concurrency",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 429,
+                    retryCount: 0,
+                    source: "smart_alias",
+                    inflightAtRequest: 1
+                )
+
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: event,
+                    at: now
+                )
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "concurrency 429s should not poison route health", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "concurrency 429s should not increase failure score", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary provider route-health reload clears stale in-memory provider cooldowns", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withRouteHealthPath { path in
@@ -5370,7 +5402,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary worker smart alias returns one retryable 429 when every candidate is concurrency-limited", recorder: recorder) {
+        run("temporary worker smart alias returns one retryable 429 when every candidate is concurrency-limited and loop retries are exhausted", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -5380,6 +5412,7 @@ struct ThinkingProxyPolicySpec {
                 var deliveredStatus: Int?
                 var deliveredMessage: String?
 
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
                     let json = parseJSONObject(body, recorder: recorder)
                     let model = json["model"] as? String ?? ""
@@ -5425,6 +5458,86 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should return one retryable 429 when every configured candidate is concurrency-limited", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream concurrency limit reached for worker; retry shortly.", "worker should emit a stable retryable concurrency message after exhausting the pool", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias waits through short concurrency Retry-After windows before failing the request", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: String?
+                var deliveredError: String?
+                var attemptsByModel: [String: Int] = [:]
+
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 2
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    attemptsByModel[model, default: 0] += 1
+                    let attempt = attemptsByModel[model] ?? 0
+                    lock.unlock()
+
+                    if attempt == 1 {
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"busy\"}".utf8),
+                                response: httpURLResponse(statusCode: 429, headerFields: ["Retry-After": "0.1"]),
+                                error: nil
+                            )
+                        )
+                        return
+                    }
+
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"id\":\"chatcmpl-test\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"model\":\"\(model)\"}".utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = String(data: body, encoding: .utf8)
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("worker should wait through short concurrency deferrals and eventually succeed")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should not surface a terminal 429 when all lanes are only briefly concurrency-limited", recorder: recorder)
+                expectEqual(deliveredError, nil, "worker should succeed instead of surfacing a terminal concurrency error", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm-5.1-zai"], "worker should retry the pool after short deferrals and return to the preferred primary first", recorder: recorder)
+                expectEqual(deliveredBody?.contains("\"content\":\"OK\""), true, "worker retry should eventually return a successful completion body", recorder: recorder)
             }
         }
 
@@ -7573,9 +7686,9 @@ struct ThinkingProxyPolicySpec {
                     requestModel: "glm-5.1-ollama-pro",
                     canonicalModelID: "glm-5.1",
                     transportOutcome: "send_error",
-                    failureClass: "classified_429",
-                    timeoutStage: .none,
-                    upstreamHTTPStatus: 429,
+                    failureClass: "transport_timeout",
+                    timeoutStage: .firstResponse,
+                    upstreamHTTPStatus: nil,
                     retryCount: 0,
                     source: "smart_alias"
                 )

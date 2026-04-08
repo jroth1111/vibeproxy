@@ -1277,6 +1277,32 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    static func nextSmartAliasRetryDelay(
+        forCandidateModels candidateModels: [String],
+        forceAllowClosedModels: Set<String> = [],
+        now: Date = Date()
+    ) -> TimeInterval? {
+        var retryDelays: [TimeInterval] = []
+
+        for candidateModel in candidateModels {
+            guard let candidateRoute = resolveConfiguredRoute(forRequestModel: candidateModel) else {
+                continue
+            }
+            if !forceAllowClosedModels.contains(candidateModel),
+               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
+               now < cooldownUntil {
+                retryDelays.append(max(0.05, cooldownUntil.timeIntervalSince(now)))
+                continue
+            }
+            if !forceAllowClosedModels.contains(candidateModel),
+               Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
+                retryDelays.append(1)
+            }
+        }
+
+        return retryDelays.min()
+    }
+
     static func availableSmartAliasCandidateTransitions(
         method: String,
         path: String,
@@ -2123,6 +2149,25 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func recordRouteAvailabilityDeferral(
+        forRequestModel requestModel: String,
+        until deferredUntil: Date,
+        at now: Date = Date()
+    ) {
+        guard deferredUntil > now,
+              let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return
+        }
+        routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let current = routeCooldownsByRouteHealthKey[route.routeHealthKey]
+            if current == nil || deferredUntil > current! {
+                routeCooldownsByRouteHealthKey[route.routeHealthKey] = deferredUntil
+                scheduleRouteHealthPersistLocked()
+            }
+        }
+    }
+
     static func recordRouteSuccess(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
@@ -2785,6 +2830,31 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    static func providerDeferralUntil(
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) -> Date? {
+        guard let disposition = classifyProvider429Disposition(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        ) else {
+            return nil
+        }
+        switch disposition {
+        case .overload(let retryDelaySeconds):
+            return now.addingTimeInterval(retryDelaySeconds)
+        case .concurrency(let retryAfterSeconds):
+            guard let retryAfterSeconds else { return now.addingTimeInterval(1) }
+            return now.addingTimeInterval(retryAfterSeconds)
+        case .quotaWindow(let cooldownUntil):
+            return cooldownUntil
+        }
+    }
+
     static func failureClassFor429(
         headers: [AnyHashable: Any],
         bodyData: Data?,
@@ -2865,6 +2935,19 @@ enum OpenAICompatTemporaryShim {
 
         switch current?.status ?? .closed {
         case .closed, .suspect:
+            if failurePenalty == 0 {
+                return RouteCircuitState(
+                    status: current?.status ?? .closed,
+                    failureScore: decayedFailureScore,
+                    recoverySuccesses: 0,
+                    openUntil: nil,
+                    lastScoreUpdatedAt: now,
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA,
+                    recoveredAt: current?.recoveredAt
+                )
+            }
             let nextFailureScore = min(
                 failureThreshold,
                 decayedFailureScore + failurePenalty
@@ -2894,6 +2977,19 @@ enum OpenAICompatTemporaryShim {
                 recoveredAt: nil
             )
         case .open, .halfOpen:
+            if failurePenalty == 0 {
+                return RouteCircuitState(
+                    status: current?.status ?? .closed,
+                    failureScore: current?.failureScore ?? 0,
+                    recoverySuccesses: current?.recoverySuccesses ?? 0,
+                    openUntil: current?.openUntil,
+                    lastScoreUpdatedAt: now,
+                    lastTelemetryEvent: lastTelemetryEvent,
+                    rollingMetrics: nextRollingMetrics,
+                    emaMetrics: nextEMA,
+                    recoveredAt: current?.recoveredAt
+                )
+            }
             return RouteCircuitState(
                 status: .open,
                 failureScore: failureThreshold,
@@ -5952,6 +6048,16 @@ class ThinkingProxy {
             return
         }
 
+        let effectiveCandidateModels = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias).map {
+            OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                forPublicAlias: publicAlias,
+                method: method,
+                path: path,
+                jsonString: currentBody,
+                smartAlias: $0
+            )
+        }
+
         guard let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
             method: method,
             path: path,
@@ -5959,17 +6065,64 @@ class ThinkingProxy {
             candidateModelsRemaining: remainingCandidateModels,
             forceAllowClosedModels: forceProbeCandidateModels
         ) else {
-            if let exhaustedRetryableOutcome,
-               case .retryableFailure(_, let telemetryEvent, _) = exhaustedRetryableOutcome,
-               telemetryEvent.failureClass == "classified_429" || telemetryEvent.upstreamHTTPStatus == 429 {
-                deliverSmartAliasTerminalOutcome(
-                    exhaustedRetryableOutcome,
-                    publicAlias: publicAlias,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+            let poolRetryDelay = effectiveCandidateModels.flatMap {
+                OpenAICompatTemporaryShim.nextSmartAliasRetryDelay(
+                    forCandidateModels: $0,
+                    forceAllowClosedModels: forceProbeCandidateModels
                 )
-                return
+            }
+            if let exhaustedRetryableOutcome,
+               case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil) = exhaustedRetryableOutcome {
+                let isImmediateRetryClass =
+                    telemetryEvent.failureClass == "classified_429_overload" ||
+                    telemetryEvent.failureClass == "classified_429_concurrency" ||
+                    telemetryEvent.failureClass == "classified_429"
+                let nextRetryDelay = poolRetryDelay ?? cooldownUntil.map({ max(0.05, $0.timeIntervalSinceNow) })
+                if isImmediateRetryClass,
+                   loopRetriesRemaining > 0,
+                   let retryDelay = nextRetryDelay,
+                   remainingSmartAliasBudget(until: deadlineAt) > retryDelay {
+                    restartSmartAliasLoop(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        currentBody: currentBody,
+                        publicAlias: publicAlias,
+                        deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        loopRetriesRemaining: loopRetriesRemaining,
+                        retryDelaySeconds: retryDelay,
+                        exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                        deliveryMode: deliveryMode
+                    )
+                    return
+                }
+
+                if telemetryEvent.failureClass == "classified_429_window" ||
+                    telemetryEvent.failureClass == "classified_429_overload" ||
+                    telemetryEvent.failureClass == "classified_429_concurrency" ||
+                    telemetryEvent.failureClass == "classified_429" ||
+                    telemetryEvent.upstreamHTTPStatus == 429 {
+                    let terminalOutcome: SmartAliasCandidateAttemptOutcome
+                    if let nextRetryDelay {
+                        terminalOutcome = .retryableFailure(
+                            requestModel: requestModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: Date().addingTimeInterval(nextRetryDelay)
+                        )
+                    } else {
+                        terminalOutcome = exhaustedRetryableOutcome
+                    }
+                    deliverSmartAliasTerminalOutcome(
+                        terminalOutcome,
+                        publicAlias: publicAlias,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        deliveryMode: deliveryMode
+                    )
+                    return
+                }
             }
 
             if loopRetriesRemaining > 0, remainingSmartAliasBudget(until: deadlineAt) > 0 {
@@ -6007,6 +6160,26 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode
+                )
+                return
+            }
+
+            if let nextRetryDelay = poolRetryDelay {
+                let retryUntil = Date().addingTimeInterval(nextRetryDelay)
+                let isQuotaWindowDelay = nextRetryDelay >= 300
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 429,
+                    message: isQuotaWindowDelay
+                        ? quotaWindowErrorMessage(forRequestModel: publicAlias)
+                        : concurrencyLimitErrorMessage(forRequestModel: publicAlias),
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: [
+                        "Retry-After": retryAfterHeaderValue(
+                            until: retryUntil,
+                            fallbackSeconds: max(1, Int(ceil(nextRetryDelay)))
+                        )
+                    ]
                 )
                 return
             }
@@ -6546,6 +6719,7 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         loopRetriesRemaining: Int,
+        retryDelaySeconds: TimeInterval = 1,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
@@ -6583,7 +6757,7 @@ class ThinkingProxy {
         }
         let attempt = smartAliasMaxLoopRetries - loopRetriesRemaining + 1
         NSLog("[ThinkingProxy] Smart alias %@ loop retry %d/%d", publicAlias, attempt, smartAliasMaxLoopRetries)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelaySeconds) { [weak self] in
             guard let self else { return }
             self.attemptSmartAliasCandidate(
                 method: method,
@@ -6678,7 +6852,7 @@ class ThinkingProxy {
                     statusCode: 429,
                     message: overloadErrorMessage(forRequestModel: publicAlias),
                     coalescingKey: coalescingKey,
-                    overridingHeaders: ["Retry-After": "1"]
+                    overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 1)]
                 )
             } else if telemetryEvent.failureClass == "classified_429" ||
                 telemetryEvent.failureClass == "classified_429_concurrency" ||
@@ -6688,7 +6862,7 @@ class ThinkingProxy {
                     statusCode: 429,
                     message: concurrencyLimitErrorMessage(forRequestModel: publicAlias),
                     coalescingKey: coalescingKey,
-                    overridingHeaders: ["Retry-After": "30"]
+                    overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 30)]
                 )
             } else if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
                upstreamStatus == 402 || upstreamStatus == 403 {
@@ -7591,6 +7765,16 @@ class ThinkingProxy {
                         headers: responseHeaders,
                         bodyData: responseBody
                     )
+                    if let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                        statusCode: statusCode,
+                        headers: responseHeaders,
+                        bodyData: responseBody
+                    ) {
+                        OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                            forRequestModel: candidateModel,
+                            until: deferredUntil
+                        )
+                    }
                     completion(
                         .retryableFailure(
                             requestModel: candidateModel,
@@ -7640,6 +7824,16 @@ class ThinkingProxy {
                             headers: $0.allHeaderFields
                         )
                     } ?? nil
+                    if let response = attempt.response,
+                       let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                        statusCode: statusCode,
+                        headers: response.allHeaderFields
+                       ) {
+                        OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                            forRequestModel: candidateModel,
+                            until: deferredUntil
+                        )
+                    }
                     completion(
                         .retryableFailure(
                             requestModel: candidateModel,
@@ -7788,6 +7982,16 @@ class ThinkingProxy {
                 headers: response.allHeaderFields,
                 bodyData: responseData
             )
+            if let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                statusCode: statusCode,
+                headers: response.allHeaderFields,
+                bodyData: responseData
+            ) {
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: candidateModel,
+                    until: deferredUntil
+                )
+            }
             completion(
                 .retryableFailure(
                     requestModel: candidateModel,
