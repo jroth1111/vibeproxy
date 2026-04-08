@@ -1348,6 +1348,33 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("Factory self-routed smart-router custom model IDs use health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                        forPublicAlias: selfRoutedGenericCompatFactoryWorkerContract.workerModelID,
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: """
+                        {
+                          "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "tools": [
+                            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                          ],
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """,
+                        smartAlias: OpenAICompatTemporaryShim.smartAliasDefinition(
+                            forRequestModel: selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+                        )!
+                    )
+
+                    expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy self-routed smart-router requests should use the full health-ranked worker pool", recorder: recorder)
+                }
+            }
+        }
+
         run("Factory GPT orchestration alias surfaces direct auth failures without worker-chain rescue", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
@@ -6552,6 +6579,49 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, selfRoutedGenericCompatFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the real upstream provider for self-routed worker IDs", recorder: recorder)
                     expectEqual(configDrift?["route_in_pool"] as? Bool, true, "self-routed worker IDs should not trip critical config drift when proxy source of truth owns the worker pool", recorder: recorder)
                     expectEqual(configDrift?["severity"] as? String, "none", "self-routed worker IDs should be treated as in-pool by healthz", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz keeps self-routed smart-router workers ready when GLM is open but a pooled fallback remains available", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm-5.1-zai",
+                        until: Date().addingTimeInterval(300)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("self-routed generic-compatible fallback healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "mimo-v2-pro-opencode", "healthz should expose the first available pooled fallback for self-routed worker IDs when GLM is open", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "opencode", "healthz should expose the fallback provider for self-routed worker IDs when GLM is open", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should not report the self-routed worker contract as open when a pooled fallback remains available", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep self-routed smart-router workers ready when a fallback lane remains available", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

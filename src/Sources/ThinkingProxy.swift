@@ -1131,12 +1131,6 @@ enum OpenAICompatTemporaryShim {
         "glm-5.1",
         publicFactoryWorkerSmartRouterAlias
     ]
-    private static let toolHeavyWorkerPublicAliases: Set<String> = [
-        "worker",
-        "glm-5.1",
-        publicFactoryWorkerSmartRouterAlias
-    ]
-
     static func workerPrimaryCandidateModel() -> String {
         smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
     }
@@ -1238,15 +1232,17 @@ enum OpenAICompatTemporaryShim {
         // with no reliability upside — the pool candidates (glm-5.1-zai, minimax, kimi, mimo)
         // now carry the full tool-heavy workload with health-ranked failover.
         if isToolHeavyWorkerRequest {
-            if toolHeavyWorkerPublicAliases.contains(publicAlias) {
-                let rankedCandidates = rankedSmartAliasFallbackCandidateModels(
-                    smartAlias.candidates,
-                    healthSensitivity: smartAlias.healthSensitivity,
-                    stickyPrimaryCandidate: primaryCandidate
-                )
-                if !rankedCandidates.isEmpty {
-                    return rankedCandidates
-                }
+            // Self-routed Factory worker IDs (for example `custom:Proxy-Worker-Smart-Router-8`)
+            // must inherit the exact same health-ranked worker pool behavior as the public pooled
+            // aliases. If this path falls back to `[primaryCandidate]`, tool-heavy mission workers
+            // get pinned back onto GLM even after the route is already quarantined.
+            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(
+                smartAlias.candidates,
+                healthSensitivity: smartAlias.healthSensitivity,
+                stickyPrimaryCandidate: primaryCandidate
+            )
+            if !rankedCandidates.isEmpty {
+                return rankedCandidates
             }
             return [primaryCandidate]
         }
