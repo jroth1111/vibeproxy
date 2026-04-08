@@ -1,4 +1,4 @@
-.PHONY: build release app install clean run help test verify info open factory-worker-sync factory-worker-check factory-worker-doctor factory-audit-once factory-audit-install proxy-binary
+.PHONY: build release app install clean run help test verify info open factory-worker-sync factory-worker-check factory-worker-doctor factory-audit-once factory-audit-install factory-contract-guard-install proxy-binary
 
 help: ## Show this help message
 	@echo "VibeProxy - macOS Menu Bar App"
@@ -79,6 +79,13 @@ factory-audit-install: ## Install and load the 30-minute Factory audit launch ag
 	@launchctl bootout "gui/$$(id -u)/com.vibeproxy.factory-audit" >/dev/null 2>&1 || true
 	@launchctl bootstrap "gui/$$(id -u)" "$$HOME/Library/LaunchAgents/com.vibeproxy.factory-audit.plist"
 	@launchctl kickstart -k "gui/$$(id -u)/com.vibeproxy.factory-audit"
+
+factory-contract-guard-install: ## Install and load the 15-second Factory contract guard
+	@mkdir -p "$$HOME/Library/LaunchAgents"
+	@cp ops/launchd/com.vibeproxy.factory-contract-guard.plist "$$HOME/Library/LaunchAgents/com.vibeproxy.factory-contract-guard.plist"
+	@launchctl bootout "gui/$$(id -u)/com.vibeproxy.factory-contract-guard" >/dev/null 2>&1 || true
+	@launchctl bootstrap "gui/$$(id -u)" "$$HOME/Library/LaunchAgents/com.vibeproxy.factory-contract-guard.plist"
+	@launchctl kickstart -k "gui/$$(id -u)/com.vibeproxy.factory-contract-guard"
 
 info: ## Show project information
 	@echo "Project: VibeProxy - macOS Menu Bar App"
