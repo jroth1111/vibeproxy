@@ -177,7 +177,9 @@ done
 
 while IFS= read -r mission_settings; do
   sync_json_file "$mission_settings" "
-    .workerModel = \$worker_id
+    .sessionModel = \$session_model_id
+    | .sessionReasoningEffort = \$session_reasoning
+    | .workerModel = \$worker_id
     | .workerReasoningEffort = \$worker_reasoning
     | .validationWorkerModel = \$validation_worker_id
     | .validationWorkerReasoningEffort = \$validation_reasoning

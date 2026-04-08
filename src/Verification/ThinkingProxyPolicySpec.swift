@@ -654,7 +654,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 withRouteHealthPath { path in
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-                    let now = Date(timeIntervalSince1970: 1_700_000_000)
+                    let now = Date()
                     let cooldownEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: now,
                         requestModel: "glm-5.1-ollama-pro",
@@ -5327,10 +5327,9 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary worker smart alias returns one clean 503 when every candidate fails", recorder: recorder) {
+        run("temporary worker smart alias returns one retryable 429 when every candidate is concurrency-limited", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
-                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
                 let lock = NSLock()
@@ -5381,8 +5380,8 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
-                expectEqual(deliveredStatus, 503, "worker should return one clean 503 when no configured candidate is usable", recorder: recorder)
-                expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "worker should emit a stable final failure message after exhausting the pool", recorder: recorder)
+                expectEqual(deliveredStatus, 429, "worker should return one retryable 429 when every configured candidate is concurrency-limited", recorder: recorder)
+                expectEqual(deliveredMessage, "Upstream concurrency limit reached for worker; retry shortly.", "worker should emit a stable retryable concurrency message after exhausting the pool", recorder: recorder)
             }
         }
 
@@ -5556,11 +5555,11 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia route health persists quarantine state and telemetry across reload", recorder: recorder) {
+        run("temporary nvidia route health reload keeps failure evidence without hard-quarantining startup", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { path in
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-                    let now = Date(timeIntervalSince1970: 1_700_000_000)
+                    let now = Date()
                     let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: now,
                         requestModel: "glm5",
@@ -5604,13 +5603,13 @@ struct ThinkingProxyPolicySpec {
 
                     let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     let persisted = snapshot["z-ai/glm5"]
-                    expectEqual(persisted?.status, .open, "persisted route health should retain open-circuit state", recorder: recorder)
-                    expectEqual(persisted?.failureScore ?? 0, 4, "persisted route health should retain the failure score", recorder: recorder)
-                    expectEqual(persisted?.isUnavailable(at: now), true, "persisted route health should remain unavailable after reload", recorder: recorder)
-                    expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "persisted route health should retain the transport outcome", recorder: recorder)
-                    expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "persisted route health should retain the health transition", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "persisted route health should retain rolling timeout counts in recent outcomes", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "persisted route health should retain recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.status, .suspect, "startup reload should downgrade persisted open state to suspect so live traffic can re-probe the route", recorder: recorder)
+                    expectEqual(persisted?.failureScore ?? 0, 4, "startup reload should retain the failure score", recorder: recorder)
+                    expectEqual(persisted?.isUnavailable(at: now), false, "startup reload should not keep the route unavailable purely from persisted state", recorder: recorder)
+                    expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "startup reload should retain the transport outcome", recorder: recorder)
+                    expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "startup reload should retain the original health transition evidence", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "startup reload should retain rolling timeout counts in recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "startup reload should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                         recorder.recordFailure("expected to read persisted route-health cache file")
@@ -5619,12 +5618,13 @@ struct ThinkingProxyPolicySpec {
                     let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
                     let routes = rawJSON["routes"] as? [String: Any]
                     let glm5 = routes?["nvidia::z-ai/glm5"] as? [String: Any]
-                    expectEqual(glm5?["status"] as? String, "open", "persisted route-health file should store route status", recorder: recorder)
-                    expectEqual(glm5?["failure_score"] as? Int, 4, "persisted route-health file should store the failure score", recorder: recorder)
+                    expectEqual(glm5?["status"] as? String, "suspect", "startup normalization should rewrite persisted route-health state to suspect", recorder: recorder)
+                    expectEqual(glm5?["failure_score"] as? Int, 4, "startup normalization should retain the failure score on disk", recorder: recorder)
                     let lastEvent = glm5?["last_event"] as? [String: Any]
-                    expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "persisted route-health file should store the health transition", recorder: recorder)
+                    expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "startup normalization should preserve the original health transition evidence on disk", recorder: recorder)
                     let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
-                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "persisted route-health file should store rolling timeout counts in recent outcomes", recorder: recorder)
+                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "startup normalization should preserve rolling timeout counts in recent outcomes", recorder: recorder)
+                    expectEqual(glm5?["open_until"] == nil, true, "startup normalization should drop persisted open-until timestamps so restart does not inherit unavailability", recorder: recorder)
                 }
             }
         }
@@ -7155,7 +7155,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("self-routed tool-heavy worker requests exhaust the shared worker pool before surfacing generic unavailability", recorder: recorder) {
+        run("self-routed tool-heavy worker requests exhaust the shared worker pool before surfacing a retryable concurrency limit", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -7209,8 +7209,8 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
-                    expectEqual(deliveredStatus, 503, "shared-pool saturation should surface as a generic availability error once every candidate is exhausted", recorder: recorder)
-                    expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "shared-pool saturation should report that every worker backend is currently unavailable", recorder: recorder)
+                    expectEqual(deliveredStatus, 429, "shared-pool saturation should surface as a retryable concurrency limit once every candidate is exhausted", recorder: recorder)
+                    expectEqual(deliveredMessage, "Upstream concurrency limit reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry shortly.", "shared-pool saturation should preserve the caller-visible worker model identity in the retryable error", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

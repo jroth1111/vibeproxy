@@ -45,11 +45,13 @@ enum ProxyPaths {
 
             let destinationURL = authDirectory.appendingPathComponent(sourceURL.lastPathComponent)
             do {
-                let sourceData = try Data(contentsOf: sourceURL)
-                let destinationData = try? Data(contentsOf: destinationURL)
-                guard destinationData != sourceData else {
+                if fileManager.fileExists(atPath: destinationURL.path) {
+                    // The dedicated auth directory is authoritative once a file exists there.
+                    // Do not keep re-overwriting it from legacy root-level auth files, because
+                    // that turns startup migration into runtime config churn.
                     continue
                 }
+                let sourceData = try Data(contentsOf: sourceURL)
                 try sourceData.write(to: destinationURL, options: .atomic)
             } catch {
                 NSLog(

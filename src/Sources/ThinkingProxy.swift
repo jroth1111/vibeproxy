@@ -3208,6 +3208,7 @@ enum OpenAICompatTemporaryShim {
         let configuredRouteHealthKeys = Set(resolvedRoutesByRequestModel().values.map(\.routeHealthKey))
         let oauthProviderIDs = Set(ProviderCatalog.oauthPassthroughPrefixes.map(\.providerID))
         var prunedUnknownEntries = false
+        var normalizedPersistedAvailability = false
         for (routeHealthKey, entry) in routes {
             let components = routeHealthKey.components(separatedBy: "::")
             let providerID = components.first
@@ -3217,15 +3218,25 @@ enum OpenAICompatTemporaryShim {
                 prunedUnknownEntries = true
                 continue
             }
-            let status = (entry["status"] as? String)
+            let persistedStatus = (entry["status"] as? String)
                 .flatMap(RouteHealthStatus.init(rawValue:))
                 ?? ((parseISO8601Date(entry["open_until"]) != nil) ? .open : .closed)
+            var status = persistedStatus
             let failureScore = entry["failure_score"] as? Int ?? entry["consecutive_failures"] as? Int ?? 0
             let recoverySuccesses = entry["recovery_successes"] as? Int ?? 0
-            let openUntil = parseISO8601Date(entry["open_until"])
+            var openUntil = parseISO8601Date(entry["open_until"])
             let lastScoreUpdatedAt = parseISO8601Date(entry["last_score_updated_at"])
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
             let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
+
+            if status == .open {
+                // Persisted open circuits are useful evidence, but they should not hard-quarantine
+                // the proxy after restart before live traffic or canaries get a chance to re-probe.
+                status = .suspect
+                openUntil = nil
+                normalizedPersistedAvailability = true
+            }
+
             loaded[routeHealthKey] = RouteCircuitState(
                 status: status,
                 failureScore: failureScore,
@@ -3239,22 +3250,11 @@ enum OpenAICompatTemporaryShim {
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
-        // Load cooldowns — prefer new route-level key, fall back to legacy provider-level key
-        let cooldownSource: [String: String] = (json["route_cooldowns"] as? [String: String])
-            ?? (json["provider_cooldowns"] as? [String: String])
-            ?? [:]
-        if !cooldownSource.isEmpty {
-            let now = Date()
-            let maxLoadedCooldown: TimeInterval = 3600
-            for (routeKey, dateString) in cooldownSource {
-                if let date = parseISO8601Date(dateString), date > now {
-                    let capped = min(date, now.addingTimeInterval(maxLoadedCooldown))
-                    routeCooldownsByRouteHealthKey[routeKey] = capped
-                }
-            }
-        }
+        // Route cooldowns are runtime-only backpressure hints. Replaying them across restart can
+        // blackhole the worker pool before the new process has observed any live failures.
+        routeCooldownsByRouteHealthKey = [:]
         concurrencyRegistry.loadLocked(from: json)
-        if prunedUnknownEntries {
+        if prunedUnknownEntries || normalizedPersistedAvailability {
             persistRouteHealthLocked()
         }
 
@@ -3270,9 +3270,8 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
-        // Preserve persisted `open` circuits exactly as written. Startup reload should restore the
-        // observed quarantine state; canaries and live traffic are responsible for closing routes
-        // again, not the act of reading the persisted file.
+        // Startup keeps historical failure evidence but does not let persisted unavailability alone
+        // define live routing authority for the new process.
         healStaleSuspectRoutesLocked()
     }
 
@@ -5532,6 +5531,7 @@ class ThinkingProxy {
             originalConnection: originalConnection,
             coalescingKey: coalescingKey,
             terminalFallbackOutcome: nil,
+            exhaustedRetryableOutcome: nil,
             deliveryMode: deliveryMode,
             loopRetriesRemaining: smartAliasLoopRetryLimitOverrideForTesting ?? smartAliasMaxLoopRetries
         )
@@ -5829,6 +5829,7 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0
     ) {
@@ -5885,6 +5886,7 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
+                exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining
             )
@@ -5898,9 +5900,11 @@ class ThinkingProxy {
             candidateModelsRemaining: remainingCandidateModels,
             forceAllowClosedModels: forceProbeCandidateModels
         ) else {
-            if let terminalFallbackOutcome {
+            if let exhaustedRetryableOutcome,
+               case .retryableFailure(_, let telemetryEvent, _) = exhaustedRetryableOutcome,
+               telemetryEvent.failureClass == "classified_429" || telemetryEvent.upstreamHTTPStatus == 429 {
                 deliverSmartAliasTerminalOutcome(
-                    terminalFallbackOutcome,
+                    exhaustedRetryableOutcome,
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
@@ -5920,6 +5924,29 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     loopRetriesRemaining: loopRetriesRemaining,
+                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+
+            if let terminalFallbackOutcome {
+                deliverSmartAliasTerminalOutcome(
+                    terminalFallbackOutcome,
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+
+            if let exhaustedRetryableOutcome {
+                deliverSmartAliasTerminalOutcome(
+                    exhaustedRetryableOutcome,
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode
                 )
                 return
@@ -5956,6 +5983,7 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining
                 )
@@ -5999,6 +6027,7 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
+                exhaustedRetryableOutcome: nil,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining
             )
@@ -6021,6 +6050,7 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0
     ) {
@@ -6048,6 +6078,7 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: terminalFallbackOutcome,
+                exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining
             )
@@ -6216,6 +6247,7 @@ class ThinkingProxy {
                                 originalConnection: originalConnection,
                                 coalescingKey: coalescingKey,
                                 terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
+                                exhaustedRetryableOutcome: nil,
                                 deliveryMode: deliveryMode,
                                 loopRetriesRemaining: loopRetriesRemaining
                             )
@@ -6248,6 +6280,7 @@ class ThinkingProxy {
                             originalConnection: originalConnection,
                             coalescingKey: coalescingKey,
                             terminalFallbackOutcome: nil,
+                            exhaustedRetryableOutcome: nil,
                             deliveryMode: deliveryMode,
                             loopRetriesRemaining: loopRetriesRemaining
                         )
@@ -6276,6 +6309,7 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
+        exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0
     ) {
@@ -6333,11 +6367,12 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining
                 )
             }
-        case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
+        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
@@ -6360,6 +6395,13 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     terminalFallbackOutcome: terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: remainingCandidateModels.isEmpty
+                        ? .retryableFailure(
+                            requestModel: requestModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: cooldownUntil
+                        )
+                        : exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining
                 )
@@ -6400,6 +6442,7 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         loopRetriesRemaining: Int,
+        exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
         guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias) else {
@@ -6452,6 +6495,7 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 terminalFallbackOutcome: nil,
+                exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining - 1
             )
@@ -6516,14 +6560,24 @@ class ThinkingProxy {
             // retries without switching models.  402 from upstream looks like
             // "provider billing exhausted" → Droid switches to bare built-in model.
             // 429 tells Droid "temporary rate limit" → retry with same model.
-            if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
+            if telemetryEvent.failureClass == "classified_429" ||
+                telemetryEvent.upstreamHTTPStatus == 429 {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 429,
+                    message: concurrencyLimitErrorMessage(forRequestModel: publicAlias),
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: ["Retry-After": "30"]
+                )
+            } else if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
                upstreamStatus == 402 || upstreamStatus == 403 {
                 NSLog("[ThinkingProxy] Masquerading upstream %d as 429 for smart alias %@", upstreamStatus, publicAlias)
                 deliverBufferedError(
                     defaultConnection: originalConnection,
                     statusCode: 429,
                     message: "Rate limit exceeded. Please retry after 30 seconds.",
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: ["Retry-After": "30"]
                 )
             } else {
                 deliverBufferedError(
@@ -8199,14 +8253,16 @@ class ThinkingProxy {
         defaultConnection: NWConnection,
         statusCode: Int,
         message: String,
-        coalescingKey: String?
+        coalescingKey: String?,
+        overridingHeaders: [String: String] = [:]
     ) {
         let connections = takeInflightRequestConnections(for: coalescingKey) ?? [defaultConnection]
         for connection in connections {
             sendError(
                 to: connection,
                 statusCode: statusCode,
-                message: message
+                message: message,
+                overridingHeaders: overridingHeaders
             )
         }
     }
