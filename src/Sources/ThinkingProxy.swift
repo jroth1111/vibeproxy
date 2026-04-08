@@ -1021,7 +1021,7 @@ enum OpenAICompatTemporaryShim {
         publicFactoryWorkerSmartRouterAlias
     ]
     static func workerPrimaryCandidateModel() -> String {
-        smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-ollama-pro"
+        smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
     }
 
     private static func selfRoutedFactoryWorkerPoolModelID() -> String? {
@@ -1119,17 +1119,20 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        let expectedCandidates = ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
+        let expectedCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
         guard smartAlias.candidates == expectedCandidates,
               let primaryRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[0]),
-              primaryRoute.providerID == "ollama-pro",
+              primaryRoute.providerID == "zai",
               primaryRoute.canonicalModelID == "glm-5.1",
-              let fallbackRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[1]),
+              let secondaryRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[1]),
+              secondaryRoute.providerID == "ollama-pro",
+              secondaryRoute.canonicalModelID == "glm-5.1",
+              let fallbackRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[2]),
               fallbackRoute.providerID == "ollama-pro",
               fallbackRoute.canonicalModelID == "minimax-m2.7" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-ollama-pro then minimax-m2.7-ollama-pro."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro."
             )
         }
 

@@ -57,7 +57,7 @@ struct ConfigComposerSpec {
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "managed worker alias should prefer Ollama GLM first and Ollama MiniMax second", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -140,8 +140,8 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
-                "managed worker ordering should replace stale user-defined fallback candidates with the managed Ollama pair",
+                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama worker chain",
                 recorder: recorder
             )
         }

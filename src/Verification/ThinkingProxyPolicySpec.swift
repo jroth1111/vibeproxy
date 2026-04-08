@@ -889,7 +889,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
-                expectEqual(smartAlias?.candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should load its candidate order from merged config", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
@@ -908,7 +908,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "glm-5.1 should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -917,7 +917,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "proxy-worker-smart-router should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "proxy-worker-smart-router should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -954,7 +954,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy glm-5.1 requests should keep the same two-leg worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy glm-5.1 requests should keep the same two-leg worker pool", recorder: recorder)
             }
         }
 
@@ -984,7 +984,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy proxy-worker-smart-router requests should keep the same two-leg worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy proxy-worker-smart-router requests should keep the same two-leg worker pool", recorder: recorder)
             }
         }
 
@@ -1051,7 +1051,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stickyCandidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
+                expectEqual(stickyCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
 
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "glm-5.1-ollama-pro",
@@ -1065,7 +1065,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stillPinnedCandidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy worker requests should reuse the plain-chat pool even when the primary lane is degraded", recorder: recorder)
+                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy worker requests should reuse the plain-chat pool even when the primary lane is degraded", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -1172,7 +1172,7 @@ struct ThinkingProxyPolicySpec {
                                 {
                                   "id": "chatcmpl-factory-smart-router",
                                   "object": "chat.completion",
-                                  "model": "glm-5.1-ollama-pro",
+                                  "model": "glm-5.1-zai",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -1216,12 +1216,12 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "Factory smart-router custom IDs should route to the worker pool primary", recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "Factory smart-router custom IDs should route to the worker pool primary", recorder: recorder)
 
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     expectEqual(deliveredJSON["model"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should stay caller-visible on the way out", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should be preserved in proxy audit headers", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "smart-router custom IDs should expose the pool primary candidate", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "smart-router custom IDs should expose the pool primary candidate", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should expose the authoritative Factory model id", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "smart-router custom IDs should expose the binding source", recorder: recorder)
                 }
@@ -1232,7 +1232,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
-                    let primaryRouteHealthKey = "ollama-pro::glm-5.1"
+                    let primaryRouteHealthKey = "zai::glm-5.1"
                     _ = OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: primaryRouteHealthKey)
                     _ = OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: primaryRouteHealthKey)
                     _ = OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: primaryRouteHealthKey)
@@ -1312,9 +1312,9 @@ struct ThinkingProxyPolicySpec {
 
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     expectEqual(deliveredStatus, 200, "self-routed smart-router request should fall over to the next worker candidate when the learned GLM route is saturated", recorder: recorder)
-                    expectEqual(forwardedModel, "minimax-m2.7-ollama-pro", "self-routed smart-router requests should skip the saturated GLM lane and learn concurrency from the primary upstream route", recorder: recorder)
+                    expectEqual(forwardedModel, "glm-5.1-ollama-pro", "self-routed smart-router requests should fail over from saturated ZAI GLM onto the Ollama GLM sibling before the rest of the chain", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.workerModelID, "fallback responses should preserve the caller-visible custom worker model id", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "minimax-m2.7-ollama-pro", "fallback responses should expose the actual fallback winner after GLM saturation", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "fallback responses should expose the actual fallback winner after GLM saturation", recorder: recorder)
                     expectEqual(deliveredJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.workerModelID, "fallback responses should stay caller-visible on the way out", recorder: recorder)
                 }
             }
@@ -1329,7 +1329,7 @@ struct ThinkingProxyPolicySpec {
 
                     expectEqual(smartAlias?.requestClass, "plain-chat", "self-routed smart-router worker IDs should inherit the worker request class from proxy source of truth", recorder: recorder)
                     expectEqual(smartAlias?.failover, "silent", "self-routed smart-router worker IDs should inherit worker failover from proxy source of truth", recorder: recorder)
-                    expectEqual(smartAlias?.candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
+                    expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
                 }
             }
         }
@@ -1356,7 +1356,7 @@ struct ThinkingProxyPolicySpec {
                         )!
                     )
 
-                    expectEqual(candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy self-routed smart-router requests should keep the same two-leg worker pool", recorder: recorder)
+                    expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy self-routed smart-router requests should keep the same two-leg worker pool", recorder: recorder)
                 }
             }
         }
@@ -1754,12 +1754,12 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "retired Factory worker IDs should be rerouted through the current worker smart-router primary", recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "retired Factory worker IDs should be rerouted through the current worker smart-router primary", recorder: recorder)
 
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     expectEqual(deliveredJSON["model"] as? String, "custom:Factory-Worker-GPT-5.4-High-8", "retired Factory worker IDs should stay caller-visible after proxy rescue", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "custom:Factory-Worker-GPT-5.4-High-8", "retired Factory worker IDs should be preserved in audit headers", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "retired Factory worker IDs should expose the authoritative current worker route", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "retired Factory worker IDs should expose the authoritative current worker route", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, genericCompatFactoryWorkerContract.workerModelID, "retired Factory worker IDs should expose the current authoritative Factory worker id", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "retired_worker_alias_rescue", "retired Factory worker IDs should expose that they were proxy-rescued", recorder: recorder)
                 }
@@ -1878,7 +1878,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "worker rich requests should target the health-ranked pool primary", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker rich requests should target the health-ranked pool primary", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "worker rich requests should preserve explicit non-streaming semantics", recorder: recorder)
                 let forwardedTools = forwardedJSON["tools"] as? [[String: Any]]
                 expectEqual(forwardedTools?.count, 1, "worker rich requests should preserve tool definitions toward the primary backend", recorder: recorder)
@@ -1886,8 +1886,8 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "worker rich requests should succeed through the primary backend path", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker rich-request responses should still surface the public alias", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker rich-request responses should expose the pool primary candidate", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker rich-request responses should expose the pool primary provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker rich-request responses should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker rich-request responses should expose the pool primary provider", recorder: recorder)
             }
         }
 
@@ -2617,7 +2617,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "worker structured-output requests should target the health-ranked pool primary", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker structured-output requests should target the health-ranked pool primary", recorder: recorder)
                 expectEqual((forwardedJSON["response_format"] as? [String: Any])?["type"] as? String, "json_object", "worker structured-output requests should preserve response_format toward the worker primary", recorder: recorder)
             }
         }
@@ -2697,7 +2697,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(forwardedPath, "/v1/chat/completions", "glm-5.1 responses requests should normalize onto the chat-completions execution core upstream", recorder: recorder)
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "glm-5.1 responses requests should enter the real worker failover chain at the Ollama GLM primary lane", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "glm-5.1 responses requests should enter the real worker failover chain at the ZAI GLM primary lane", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "glm-5.1 responses requests should preserve explicit non-streaming semantics toward chat completions", recorder: recorder)
                 expectEqual(forwardedJSON["max_tokens"] as? Int, 32, "glm-5.1 responses requests should translate max_output_tokens onto max_tokens for chat completions", recorder: recorder)
                 let forwardedMessages = forwardedJSON["messages"] as? [[String: Any]]
@@ -2717,8 +2717,8 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(outputContent?["text"] as? String, "OK", "glm-5.1 responses requests should preserve assistant text inside the Responses envelope", recorder: recorder)
                 expectEqual((deliveredJSON["usage"] as? [String: Any])?["input_tokens"] as? Int, 11, "glm-5.1 responses requests should translate prompt token usage onto Responses input_tokens", recorder: recorder)
                 expectEqual((deliveredJSON["usage"] as? [String: Any])?["output_tokens"] as? Int, 2, "glm-5.1 responses requests should translate completion token usage onto Responses output_tokens", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "glm-5.1 responses requests should expose the winning worker route model", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "glm-5.1 responses requests should expose the winning worker route provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 responses requests should expose the winning worker route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 responses requests should expose the winning worker route provider", recorder: recorder)
             }
         }
 
@@ -2794,13 +2794,13 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(forwardedPath, "/v1/chat/completions", "glm-5.1 streaming responses should normalize onto the chat-completions execution core upstream", recorder: recorder)
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "glm-5.1 streaming responses should enter the real worker failover chain at the Ollama GLM primary lane", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "glm-5.1 streaming responses should enter the real worker failover chain at the ZAI GLM primary lane", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "glm-5.1 streaming responses should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
 
                 expectEqual(deliveredStatus, 200, "glm-5.1 streaming responses should succeed through the worker failover core", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "glm-5.1 streaming responses should surface an SSE content type", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "glm-5.1 streaming responses should expose the winning worker route model", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "glm-5.1 streaming responses should expose the winning worker route provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 streaming responses should expose the winning worker route model", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 streaming responses should expose the winning worker route provider", recorder: recorder)
                 let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
                 expectEqual(deliveredText.contains("\"type\":\"response.output_text.delta\""), true, "glm-5.1 streaming responses should emit Responses text delta events", recorder: recorder)
                 expectEqual(deliveredText.contains("\"type\":\"response.completed\""), true, "glm-5.1 streaming responses should emit a terminal Responses completion event", recorder: recorder)
@@ -2831,14 +2831,14 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(path, "/v1/chat/completions", "glm-5.1 tool-bearing responses should normalize onto the chat-completions execution core upstream", recorder: recorder)
 
                     switch model {
-                    case "glm-5.1-ollama-pro":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-glm-responses-tools",
                                   "object": "chat.completion",
-                                  "model": "glm-5.1-ollama-pro",
+                                  "model": "glm-5.1-zai",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -2909,11 +2909,11 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro"], "tool-bearing glm-5.1 responses requests should use the healthy worker primary", recorder: recorder)
-                expectEqual((bodiesByModel["glm-5.1-ollama-pro"]?["stream"] as? Bool) ?? true, false, "glm-5.1 tool-bearing responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
-                let forwardedMessages = bodiesByModel["glm-5.1-ollama-pro"]?["messages"] as? [[String: Any]]
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing glm-5.1 responses requests should use the healthy worker primary", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "glm-5.1 tool-bearing responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
+                let forwardedMessages = bodiesByModel["glm-5.1-zai"]?["messages"] as? [[String: Any]]
                 expectEqual(forwardedMessages?.last?["content"] as? String, "Find the weather", "glm-5.1 tool-bearing responses requests should translate input onto a chat messages array", recorder: recorder)
-                let forwardedTools = bodiesByModel["glm-5.1-ollama-pro"]?["tools"] as? [[String: Any]]
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
                 expectEqual(forwardedTools?.count, 1, "glm-5.1 tool-bearing responses requests should preserve tool definitions toward the pool primary", recorder: recorder)
                 let forwardedFunction = forwardedTools?.first?["function"] as? [String: Any]
                 expectEqual(forwardedFunction?["name"] as? String, "lookup", "glm-5.1 tool-bearing responses requests should normalize Responses tool definitions onto chat-completions function objects", recorder: recorder)
@@ -2921,8 +2921,8 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "glm-5.1 tool-bearing responses requests should still succeed through the pool primary", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "glm-5.1 tool-bearing responses requests should surface a Responses SSE content type", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "glm-5.1 tool-bearing responses requests should expose the pool primary candidate", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "glm-5.1 tool-bearing responses requests should expose the pool primary provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "glm-5.1 tool-bearing responses requests should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "glm-5.1 tool-bearing responses requests should expose the pool primary provider", recorder: recorder)
                 let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
                 expectEqual(deliveredText.contains("\"type\":\"response.function_call_arguments.delta\""), true, "glm-5.1 tool-bearing responses requests should emit function-call argument deltas in the synthetic Responses stream", recorder: recorder)
                 expectEqual(deliveredText.contains("\"call_id\":\"call_lookup_glm_1\""), true, "glm-5.1 tool-bearing responses requests should preserve the winning tool call id in the synthetic Responses stream", recorder: recorder)
@@ -2953,14 +2953,14 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(path, "/v1/chat/completions", "worker responses requests should normalize onto the chat-completions execution core upstream", recorder: recorder)
 
                     switch model {
-                    case "glm-5.1-ollama-pro":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-worker-responses-tools",
                                   "object": "chat.completion",
-                                  "model": "glm-5.1-ollama-pro",
+                                  "model": "glm-5.1-zai",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -3031,11 +3031,11 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro"], "tool-bearing worker responses requests should use the healthy worker primary", recorder: recorder)
-                expectEqual((bodiesByModel["glm-5.1-ollama-pro"]?["stream"] as? Bool) ?? true, false, "worker responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
-                let forwardedMessages = bodiesByModel["glm-5.1-ollama-pro"]?["messages"] as? [[String: Any]]
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing worker responses requests should use the healthy worker primary", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "worker responses requests should buffer upstream chat completions before synthesizing Responses SSE", recorder: recorder)
+                let forwardedMessages = bodiesByModel["glm-5.1-zai"]?["messages"] as? [[String: Any]]
                 expectEqual(forwardedMessages?.last?["content"] as? String, "Find the weather", "worker responses requests should translate input onto a chat messages array", recorder: recorder)
-                let forwardedTools = bodiesByModel["glm-5.1-ollama-pro"]?["tools"] as? [[String: Any]]
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
                 expectEqual(forwardedTools?.count, 1, "worker responses requests should preserve tool definitions toward the pool primary", recorder: recorder)
                 let forwardedFunction = forwardedTools?.first?["function"] as? [String: Any]
                 expectEqual(forwardedFunction?["name"] as? String, "lookup", "worker responses requests should normalize Responses tool definitions onto chat-completions function objects", recorder: recorder)
@@ -3043,8 +3043,8 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "worker responses requests should still succeed through the pool primary", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker responses requests should surface a Responses SSE content type", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker responses requests should expose the pool primary candidate", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker responses requests should expose the pool primary provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker responses requests should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker responses requests should expose the pool primary provider", recorder: recorder)
                 let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
                 expectEqual(deliveredText.contains("\"type\":\"response.function_call_arguments.delta\""), true, "worker responses requests should emit function-call argument deltas in the synthetic Responses stream", recorder: recorder)
                 expectEqual(deliveredText.contains("\"call_id\":\"call_lookup_1\""), true, "worker responses requests should preserve the winning tool call id in the synthetic Responses stream", recorder: recorder)
@@ -3078,14 +3078,14 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5.1-ollama-pro":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-stream-primary",
                                   "object": "chat.completion",
-                                  "model": "glm-5.1-ollama-pro",
+                                  "model": "glm-5.1-zai",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -3142,15 +3142,15 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro"], "tool-bearing worker streaming requests should use the healthy worker primary", recorder: recorder)
-                expectEqual((bodiesByModel["glm-5.1-ollama-pro"]?["stream"] as? Bool) ?? true, false, "worker streaming requests should buffer the upstream alias transport with stream=false", recorder: recorder)
-                let forwardedTools = bodiesByModel["glm-5.1-ollama-pro"]?["tools"] as? [[String: Any]]
+                expectEqual(seenModels, ["glm-5.1-zai"], "tool-bearing worker streaming requests should use the healthy worker primary", recorder: recorder)
+                expectEqual((bodiesByModel["glm-5.1-zai"]?["stream"] as? Bool) ?? true, false, "worker streaming requests should buffer the upstream alias transport with stream=false", recorder: recorder)
+                let forwardedTools = bodiesByModel["glm-5.1-zai"]?["tools"] as? [[String: Any]]
                 expectEqual(forwardedTools?.count, 1, "worker streaming requests should preserve tool definitions toward the pool primary", recorder: recorder)
 
                 expectEqual(deliveredStatus, 200, "worker streaming requests should still succeed through the pool primary", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker streaming responses should surface an SSE content type to Factory", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker streaming responses should expose the pool primary candidate", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker streaming responses should expose the pool primary provider", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker streaming responses should expose the pool primary candidate", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker streaming responses should expose the pool primary provider", recorder: recorder)
                 let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
                 expectEqual(deliveredText.contains("\"model\":\"worker\""), true, "worker streaming responses should preserve the outward alias inside the synthetic SSE chunks", recorder: recorder)
                 expectEqual(deliveredText.contains("data: [DONE]"), true, "worker streaming responses should terminate with the OpenAI SSE sentinel", recorder: recorder)
@@ -3197,7 +3197,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 500, "worker should fail closed when its primary route contract is violated", recorder: recorder)
                 expectEqual(
                     deliveredMessage,
-                    "The worker pooled alias is misconfigured: candidates must be glm-5.1-ollama-pro then minimax-m2.7-ollama-pro.",
+                    "The worker pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro.",
                     "worker should emit a stable misconfiguration error",
                     recorder: recorder
                 )
@@ -3296,7 +3296,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(forwardedHeaderMap["content-type"], "application/json", "worker should preserve the OpenAI JSON content type toward 8318", recorder: recorder)
 
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-ollama-pro", "worker should rewrite the outbound model to the primary candidate before forwarding to 8318", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "worker should rewrite the outbound model to the primary candidate before forwarding to 8318", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "worker should preserve explicit non-streaming chat semantics toward 8318", recorder: recorder)
                 expectEqual(forwardedJSON["temperature"] as? Int, 0, "worker should preserve unrelated OpenAI chat parameters toward 8318", recorder: recorder)
                 let forwardedMessages = forwardedJSON["messages"] as? [[String: Any]]
@@ -3309,8 +3309,8 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker should rewrite the response model back to the public alias", recorder: recorder)
                 expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String), "stop", "worker should preserve the OpenAI finish_reason from the winning backend", recorder: recorder)
                 expectEqual((((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String), "OK", "worker should preserve the assistant content from the winning backend", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker should expose the resolved primary model on the client response", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker should expose the resolved primary provider on the client response", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "worker should expose the resolved primary model on the client response", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "worker should expose the resolved primary provider on the client response", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Upstream-Hop"] as? String, "stub-8318", "worker should preserve unrelated upstream response headers when returning to the caller", recorder: recorder)
             }
         }
@@ -4688,7 +4688,7 @@ struct ThinkingProxyPolicySpec {
 
         */
 
-        run("temporary worker smart alias fails over from glm to minimax and preserves the outward alias", recorder: recorder) {
+        run("temporary worker smart alias fails over from z.ai glm to ollama glm before the rest of the chain", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -4715,7 +4715,7 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "glm-5.1-ollama-pro":
+                    case "glm-5.1-zai":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"rate limited\"}".utf8),
@@ -4723,14 +4723,14 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.7-ollama-pro":
+                    case "glm-5.1-ollama-pro":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-ollama-fallback",
+                                  "id": "chatcmpl-zai-ollama-fallback",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.7",
+                                  "model": "glm-5.1",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -4781,19 +4781,19 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should try the Ollama GLM primary and then the Ollama MiniMax fallback", recorder: recorder)
-                expectEqual(deliveredStatus, 200, "worker should return the MiniMax fallback response", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro"], "worker should try the ZAI GLM primary and then the Ollama GLM sibling before the rest of the chain", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should return the Ollama GLM fallback response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "worker responses should preserve the outward alias instead of leaking the winner model", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "worker", "worker should expose the public alias in response headers for auditability", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "minimax-m2.7-ollama-pro", "worker should expose the winning fallback model in response headers", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker should expose the winning fallback model in response headers", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker should expose the winning fallback provider in response headers", recorder: recorder)
-                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "minimax-m2.7", "worker should expose the winning fallback canonical model in response headers", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .suspect, "route health should penalize the failed worker primary", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "glm-5.1", "worker should expose the winning fallback canonical model in response headers", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .closed, "route health should close the shared canonical glm-5.1 view once the sibling fallback succeeds", recorder: recorder)
 
                 let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-ollama-pro" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
-                expectEqual(workerEvents.contains(where: { $0.requestModel == "minimax-m2.7-ollama-pro" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "minimax-m2.7-ollama-pro" }), true, "worker telemetry should record the winning fallback candidate and final winner", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
+                expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-ollama-pro" && $0.failoverDepth == 1 && $0.finalWinnerRequestModel == "glm-5.1-ollama-pro" }), true, "worker telemetry should record the winning sibling fallback candidate and final winner", recorder: recorder)
             }
         }
 
@@ -4892,7 +4892,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should retry on the fallback after a malformed primary success body", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should retry on the fallback after a malformed primary success body", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still return a successful fallback response after a malformed primary 200", recorder: recorder)
                 expectNil(deliveredMessage, "worker should not surface an error when a later fallback returns a valid response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -5187,7 +5187,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 503, "worker should return one clean 503 when no configured candidate is usable", recorder: recorder)
                 expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "worker should emit a stable final failure message after exhausting the pool", recorder: recorder)
             }
@@ -6754,7 +6754,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     OpenAICompatTemporaryShim.forceOpenRouteForTesting(
-                        requestModel: "glm-5.1-ollama-pro",
+                        requestModel: "glm-5.1-zai",
                         until: Date().addingTimeInterval(300)
                     )
 
@@ -6782,8 +6782,8 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "minimax-m2.7-ollama-pro", "healthz should expose the fallback worker candidate when the primary lane is quarantined", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "ollama-pro", "healthz should preserve the worker provider while a fallback remains available", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-ollama-pro", "healthz should expose the next GLM worker candidate when the ZAI primary lane is quarantined", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "ollama-pro", "healthz should preserve the fallback worker provider while a viable lane remains available", recorder: recorder)
                     expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should suppress unhealthy worker route status when the pool still has a viable fallback", recorder: recorder)
                     expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep self-routed smart-router workers ready when a fallback remains available", recorder: recorder)
 
@@ -6797,7 +6797,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: "glm-5.1-ollama-pro",
+                        forRequestModel: "glm-5.1-zai",
                         at: Date()
                     )
 
@@ -6825,10 +6825,10 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-ollama-pro", "healthz should keep the worker effective route on the primary lane while it is only suspect", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "ollama-pro", "healthz should keep the worker provider on Ollama while the primary is suspect", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "suspect", "healthz should expose suspect worker health while the primary lane is degraded", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark self-routed smart-router workers unready when the primary lane is suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep the worker effective route on the ZAI primary lane while it is only suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should keep the worker provider on ZAI while the primary is suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, "suspect", "healthz should expose suspect worker health while the ZAI primary lane is degraded", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark self-routed smart-router workers unready when the primary lane is only suspect", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -6871,8 +6871,8 @@ struct ThinkingProxyPolicySpec {
                     let orchestration = factoryRoles?["orchestration"] as? [String: Any]
                     let verification = factoryRoles?["verification"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-ollama-pro", "healthz should expose the worker primary when the preferred GPT lane is open", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "ollama-pro", "healthz should expose the worker provider when GPT is quarantined", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should expose the worker primary when the preferred GPT lane is open", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should expose the worker provider when GPT is quarantined", recorder: recorder)
                     expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should stop reporting the worker contract as open when a fallback lane remains available", recorder: recorder)
                     expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the smart-router worker ready when a fallback lane remains available", recorder: recorder)
                     expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should keep orchestration pinned to the direct GPT lane", recorder: recorder)
@@ -6942,7 +6942,7 @@ struct ThinkingProxyPolicySpec {
                         return
                     }
 
-                    expectEqual(seenModels, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
+                    expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
                     expectEqual(deliveredStatus, 503, "shared-pool saturation should surface as a generic availability error once every candidate is exhausted", recorder: recorder)
                     expectEqual(deliveredMessage, "All configured worker backends are currently unavailable.", "shared-pool saturation should report that every worker backend is currently unavailable", recorder: recorder)
 
@@ -7197,15 +7197,15 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("worker smart alias candidate ordering keeps ollama glm primary ahead of the ollama minimax fallback", recorder: recorder) {
+        run("worker smart alias candidate ordering keeps z.ai glm primary ahead of the ollama sibling and minimax fallback", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
                 let candidates = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
-                    ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
                 )
 
-                expectEqual(candidates, ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -7215,7 +7215,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
-                let allCandidates = ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
+                let allCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
 
                 for candidate in allCandidates.dropLast() {
                     OpenAICompatTemporaryShim.forceOpenRouteForTesting(
@@ -7598,8 +7598,8 @@ private let genericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
     routeModel: "proxy-worker-smart-router",
     routeProvider: "generic-chat-completion-api",
     requestSurface: "chat_completions",
-    effectiveRouteModel: "glm-5.1-ollama-pro",
-    effectiveRouteProvider: "ollama-pro"
+    effectiveRouteModel: "glm-5.1-zai",
+    effectiveRouteProvider: "zai"
 )
 
 private let selfRoutedGenericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
@@ -7608,8 +7608,8 @@ private let selfRoutedGenericCompatFactoryWorkerContract = FactoryWorkerSpecCont
     routeModel: "custom:Proxy-Worker-Smart-Router-8",
     routeProvider: "generic-chat-completion-api",
     requestSurface: "chat_completions",
-    effectiveRouteModel: "glm-5.1-ollama-pro",
-    effectiveRouteProvider: "ollama-pro"
+    effectiveRouteModel: "glm-5.1-zai",
+    effectiveRouteProvider: "zai"
 )
 
 private let directChatFactoryWorkerContract = FactoryWorkerSpecContract(
@@ -7666,6 +7666,7 @@ private func workerMergedConfigYAML() -> String {
         "    request-class: plain-chat",
         "    failover: silent",
         "    candidates:",
+        "    - glm-5.1-zai",
         "    - glm-5.1-ollama-pro",
         "    - minimax-m2.7-ollama-pro"
     ].joined(separator: "\n")
