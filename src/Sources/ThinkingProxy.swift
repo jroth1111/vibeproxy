@@ -1092,98 +1092,10 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> [String] {
-        guard isWorkerPoolPublicAlias(publicAlias),
-              method == "POST" else {
-            return smartAlias.candidates
-        }
-
-        guard isChatCompletionsPath(path),
-              let primaryCandidate = smartAlias.candidates.first else {
-            return smartAlias.candidates
-        }
-
-        guard let jsonData = jsonString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return [primaryCandidate]
-        }
-
-        let hasTools = (json["tools"] as? [Any])?.isEmpty == false
-        let hasStructuredOutput = json["response_format"] != nil
-        let isOversizedExecPayload = jsonString.utf8.count >= 65536
-        let isToolHeavyWorkerRequest = hasTools || hasStructuredOutput || isOversizedExecPayload
-
-        // Factory mission workers send large tool-bearing Exec payloads. Those requests need a
-        // behaviorally compatible agentic backend, not merely a transport that can return 200.
-        //
-        // Recent incidents showed the broader worker pool can fail over onto lanes that return
-        // superficially successful assistant text but do not sustain the Droid mission-worker
-        // contract, leading to exit-code-0 worker deaths after the proxy already reported success.
-        //
-        // Correctness beats availability here: tool-heavy worker/smart-router requests stay pinned
-        // to the contract-safe GLM primary. Plain chat keeps the broader health-ranked pool.
-        if isToolHeavyWorkerRequest {
-            return [primaryCandidate]
-        }
-
+        // Worker entrypoints intentionally share one execution policy. Plain chat, tool-bearing
+        // chat, structured-output chat, and large Factory worker payloads all traverse the same
+        // smart-alias candidate list so routing semantics stay coherent across request shapes.
         return smartAlias.candidates
-    }
-
-    static func pinnedToolHeavyWorkerPrimaryCandidate(
-        forPublicAlias publicAlias: String,
-        method: String,
-        path: String,
-        jsonString: String,
-        smartAlias: SmartAliasDefinition? = nil
-    ) -> String? {
-        guard isWorkerPoolPublicAlias(publicAlias),
-              method == "POST",
-              isChatCompletionsPath(path),
-              let resolvedSmartAlias = smartAlias ?? smartAliasDefinition(forRequestModel: publicAlias),
-              let primaryCandidate = resolvedSmartAlias.candidates.first,
-              let jsonData = jsonString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-            return nil
-        }
-
-        let hasTools = (json["tools"] as? [Any])?.isEmpty == false
-        let hasStructuredOutput = json["response_format"] != nil
-        let isOversizedExecPayload = jsonString.utf8.count >= 65536
-        let isToolHeavyWorkerRequest = hasTools || hasStructuredOutput || isOversizedExecPayload
-        guard isToolHeavyWorkerRequest else {
-            return nil
-        }
-
-        let effectiveCandidates = effectiveSmartAliasCandidateModels(
-            forPublicAlias: publicAlias,
-            method: method,
-            path: path,
-            jsonString: jsonString,
-            smartAlias: resolvedSmartAlias
-        )
-        guard effectiveCandidates.count == 1,
-              effectiveCandidates.first == primaryCandidate else {
-            return nil
-        }
-        return primaryCandidate
-    }
-
-    static func pinnedWorkerPrimaryIsConcurrencyLimited(
-        forRequestModel requestModel: String,
-        at now: Date = Date()
-    ) -> Bool {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
-            return false
-        }
-
-        return routeHealthQueue.sync {
-            loadPersistedRouteHealthIfNeededLocked()
-            let atCapacity = Self.concurrencyRegistry.isAtCapacity(routeHealthKey: route.routeHealthKey)
-            let cooldownActive =
-                routeCooldownsByRouteHealthKey[route.routeHealthKey].map { now < $0 } ?? false
-            let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
-            let recentConcurrencyFailure = state?.lastTelemetryEvent?.failureClass == "classified_429"
-            return atCapacity || cooldownActive || recentConcurrencyFailure
-        }
     }
 
     static func forcedSmartAliasProbeCandidateModels(
@@ -1193,27 +1105,9 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> Set<String> {
-        let effectiveCandidates = effectiveSmartAliasCandidateModels(
-            forPublicAlias: publicAlias,
-            method: method,
-            path: path,
-            jsonString: jsonString,
-            smartAlias: smartAlias
-        )
-
-        guard isWorkerPoolPublicAlias(publicAlias),
-              method == "POST",
-              isChatCompletionsPath(path),
-              effectiveCandidates.count == 1,
-              let validatedCandidate = effectiveCandidates.first else {
-            return []
-        }
-
-        // When a Factory-style worker request is pinned to a single validated lane because the
-        // broader pool is not a valid contract for that request class, stale circuit state must
-        // not suppress that only safe backend entirely. Probe it directly and let the live attempt
-        // decide whether the route is still bad; a success will close the circuit immediately.
-        return [validatedCandidate]
+        // No request class gets a hidden worker-specific probe lane. Candidate selection and
+        // recovery policy are shared across plain and tool-heavy worker traffic.
+        return []
     }
 
     static func smartAliasContractError(forRequestModel requestModel: String) -> ClientFacingNVIDIAFailure? {
@@ -5946,32 +5840,6 @@ class ThinkingProxy {
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode
                 )
-                return
-            }
-
-            if let pinnedPrimaryCandidate = OpenAICompatTemporaryShim.pinnedToolHeavyWorkerPrimaryCandidate(
-                forPublicAlias: publicAlias,
-                method: method,
-                path: path,
-                jsonString: currentBody
-            ) {
-                if OpenAICompatTemporaryShim.pinnedWorkerPrimaryIsConcurrencyLimited(
-                    forRequestModel: pinnedPrimaryCandidate
-                ) {
-                    deliverBufferedError(
-                        defaultConnection: originalConnection,
-                        statusCode: 429,
-                        message: concurrencyLimitErrorMessage(forRequestModel: publicAlias),
-                        coalescingKey: coalescingKey
-                    )
-                } else {
-                    deliverBufferedError(
-                        defaultConnection: originalConnection,
-                        statusCode: 503,
-                        message: "The contract-safe GLM worker backend is currently unavailable.",
-                        coalescingKey: coalescingKey
-                    )
-                }
                 return
             }
 
