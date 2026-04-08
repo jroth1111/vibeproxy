@@ -725,27 +725,6 @@ enum ConfigComposer {
                 "models": [
                     ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
                 ]
-            ],
-            [
-                "name": "opencode",
-                "display-name": "OpenCode",
-                "help-text": "OpenCode free MiMo-V2-Pro & MiniMax M2.5 via opencode.ai/zen.",
-                "icon-system": "network",
-                "base-url": "https://opencode.ai/zen/v1",
-                "models": [
-                    ["name": "mimo-v2-pro-free", "alias": "mimo-v2-pro-opencode"],
-                    ["name": "minimax-m2.5-free", "alias": "minimax-m2.5-opencode"]
-                ]
-            ],
-            [
-                "name": "kilocode",
-                "display-name": "KiloCode",
-                "help-text": "KiloCode free MiMo-V2-Pro via api.kilo.ai.",
-                "icon-system": "network",
-                "base-url": "https://api.kilo.ai/api/openrouter/v1",
-                "models": [
-                    ["name": "xiaomi/mimo-v2-pro:free", "alias": "mimo-v2-pro-kilocode"]
-                ]
             ]
         ]
     }
@@ -755,7 +734,7 @@ enum ConfigComposer {
             "worker": [
                 "request-class": "plain-chat",
                 "failover": "silent",
-                "candidates": ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
+                "candidates": ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
             ]
         ]
     }

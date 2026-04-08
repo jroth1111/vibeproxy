@@ -57,7 +57,7 @@ struct ConfigComposerSpec {
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose glm5 and kimi-k2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "managed worker alias should serial through ZAI and free-tier first, then race NVIDIA models as last resort", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "managed worker alias should prefer Ollama GLM first and Ollama MiniMax second", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -140,8 +140,8 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"],
-                "managed worker ordering should replace stale user-defined fallback candidates with serial-first then NVIDIA-race order",
+                ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                "managed worker ordering should replace stale user-defined fallback candidates with the managed Ollama pair",
                 recorder: recorder
             )
         }
@@ -512,18 +512,6 @@ struct ConfigComposerSpec {
                                 ["api-key": "inline-b"]
                             ]
                         ],
-                        [
-                            "name": "opencode",
-                            "api-key-entries": [
-                                ["api-key": "opencode-key"]
-                            ]
-                        ],
-                        [
-                            "name": "kilocode",
-                            "api-key-entries": [
-                                ["api-key": "kilocode-key"]
-                            ]
-                        ]
                     ]
                 ]
             )
@@ -538,30 +526,8 @@ struct ConfigComposerSpec {
                 includeManagedZAIProvider: true
             )
 
-            expectEqual(
-                modelAliases(in: provider(named: "opencode", in: runtime) ?? [:]),
-                ["mimo-v2-pro-opencode", "minimax-m2.5-opencode"],
-                "managed opencode providers with configured auth should survive runtime composition",
-                recorder: recorder
-            )
-            expectEqual(
-                apiKeys(in: provider(named: "opencode", in: runtime) ?? [:]),
-                ["opencode-key"],
-                "managed opencode providers should emit the configured runtime api-key entry",
-                recorder: recorder
-            )
-            expectEqual(
-                apiKeys(in: provider(named: "kilocode", in: runtime) ?? [:]),
-                ["kilocode-key"],
-                "managed kilocode providers should emit only the configured runtime api-key entry",
-                recorder: recorder
-            )
-            expectEqual(
-                apiKeys(in: provider(named: "kilocode", in: runtime) ?? [:]).count,
-                1,
-                "managed kilocode providers should no longer inherit extra inline secrets from source",
-                recorder: recorder
-            )
+            expectNil(provider(named: "opencode", in: runtime), "managed runtime composition should no longer inject the removed opencode provider", recorder: recorder)
+            expectNil(provider(named: "kilocode", in: runtime), "managed runtime composition should no longer inject the removed kilocode provider", recorder: recorder)
             expectEqual(
                 modelAliases(in: managedZAIClaudeEntries(in: runtime).first ?? [:]),
                 ["glm-4.7", "glm-5.1-zai"],

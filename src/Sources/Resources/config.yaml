@@ -24,10 +24,7 @@ logging-to-file: false
 usage-statistics-enabled: true
 
 # Network proxy (if needed for corporate networks)
-# Use SOCKS5 for residential proxy access (e.g., dataimpulse for opencode.ai)
 # Format: socks5://username:password@host:port
-# Note: This applies globally to all providers. For opencode.ai specifically,
-# add this to your ~/.cli-proxy-api/config.yaml to enable proxy only when needed.
 proxy-url: ""
 
 # Retry configuration
@@ -52,18 +49,3 @@ generative-language-api-key: []
 
 # OpenAI-compatible providers
 # These connect to OpenAI-compatible APIs (OpenAI, Anthropic, custom endpoints)
-openai-compatibility:
-  # OpenCode.ai - Free Xiaomi MiMo-V2-Pro and MiniMax models
-  # No API key required - uses empty bearer token
-  # Requires SOCKS5 proxy for connectivity (set proxy-url in user config overlay)
-  - name: opencode
-    base-url: https://opencode.ai/zen/v1
-    proxy-url: ""
-    display-name: OpenCode (MiMo)
-    help-text: Free Xiaomi MiMo-V2-Pro and MiniMax models. No API key required. Requires proxy.
-    icon-system: brain
-    models:
-      - alias: mimo-v2-pro-opencode
-        name: mimo-v2-pro-free
-      - alias: minimax-m2.5-opencode
-        name: minimax-m2.5-free

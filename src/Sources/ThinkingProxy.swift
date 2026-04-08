@@ -484,9 +484,6 @@ enum OpenAICompatTemporaryShim {
         "z-ai/glm5": .standard,
         "moonshotai/kimi-k2.5": .reasoning,
         "minimaxai/minimax-m2.5": .standard,
-        "mimo-v2-pro-free": .economy,
-        "xiaomi/mimo-v2-pro:free": .economy,
-        "minimax-m2.5-free": .standard,
     ]
     #if DEBUG
     private static let _assertModelTiersHaveNoDuplicates: Void = {
@@ -564,114 +561,6 @@ enum OpenAICompatTemporaryShim {
             stripsReasoningFieldFromSuccess: false,
             allowsThinkLeakRepair: false,
             salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "mimo-v2-pro-kilocode": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: false,
-            salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "xiaomi/mimo-v2-pro:free": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: false,
-            salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "mimo-v2-pro-opencode": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: false,
-            salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "mimo-v2-pro-free": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: false,
-            salvagesBestEffortRepair: false,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "minimax-m2.5-free": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: true,
-            salvagesBestEffortRepair: true,
-            clientStreamingMode: .preserve,
-            toolChoiceMode: .preserve,
-            forcesKimiInstantMode: false
-        ),
-        "minimax-m2.5-opencode": RequestPolicy(
-            minimumMaxTokens: 128,
-            maximumMaxTokens: nil,
-            strippedFields: [],
-            attemptTimeout: 200,
-            firstResponseDeadline: nil,
-            bufferedResponseDeadline: nil,
-            transportRetries: 2,
-            semanticRetries: 2,
-            retryableFailureClasses: [.emptyBody, .emptyContent, .reasoningOnlyContentMissing, .reasoningLeakLength, .malformedToolArguments],
-            retryBackoffMilliseconds: 250,
-            stripsReasoningFieldFromSuccess: true,
-            allowsThinkLeakRepair: true,
-            salvagesBestEffortRepair: true,
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
@@ -1132,7 +1021,7 @@ enum OpenAICompatTemporaryShim {
         publicFactoryWorkerSmartRouterAlias
     ]
     static func workerPrimaryCandidateModel() -> String {
-        smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
+        smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-ollama-pro"
     }
 
     private static func selfRoutedFactoryWorkerPoolModelID() -> String? {
@@ -1336,14 +1225,17 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        guard smartAlias.candidates.first == "glm-5.1-zai",
-              let primaryRoute = resolveConfiguredRoute(forRequestModel: "glm-5.1-zai"),
-              primaryRoute.providerID == "zai",
+        let expectedCandidates = ["glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"]
+        guard smartAlias.candidates == expectedCandidates,
+              let primaryRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[0]),
+              primaryRoute.providerID == "ollama-pro",
               primaryRoute.canonicalModelID == "glm-5.1",
-              isAnthropicConfiguredRoute(forRequestModel: "glm-5.1-zai") else {
+              let fallbackRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[1]),
+              fallbackRoute.providerID == "ollama-pro",
+              fallbackRoute.canonicalModelID == "minimax-m2.7" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: primary candidate must resolve to Anthropic-backed Z.AI glm-5.1."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-ollama-pro then minimax-m2.7-ollama-pro."
             )
         }
 
@@ -5557,8 +5449,8 @@ class ThinkingProxy {
             }
         }
 
-        // Direct proxied path for providers with per-provider proxy-url (e.g., opencode via SOCKS5)
-        // Must be checked before NVIDIA reasoning path to intercept proxied provider requests
+        // Direct proxied path for providers with per-provider proxy-url.
+        // Must be checked before NVIDIA reasoning path to intercept proxied provider requests.
         if method == "POST",
            let directProxyModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody),
            let directProxyRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: directProxyModel),
@@ -5991,10 +5883,9 @@ class ThinkingProxy {
             return
         }
 
-        // Non-NVIDIA candidates (glm-5.1-zai, mimo-v2-pro-*, minimax-m2.5-opencode) are tried
-        // serially. NVIDIA candidates (minimax-m2.5-nvidia, kimi-k2.5-nvidia) are raced against
-        // each other for lowest latency. The prefix scan walks candidates until it finds a
-        // contiguous run of NVIDIA reasoning models at the front of the remaining list.
+        // Non-NVIDIA candidates are tried serially. NVIDIA candidates are raced against each other
+        // for lowest latency. The prefix scan walks candidates until it finds a contiguous run of
+        // NVIDIA reasoning models at the front of the remaining list.
         // NOTE: This races at all failover depths (including depth 0). The health-based ranking
         // ensures only healthy candidates reach the front, so depth-0 racing is safe and avoids
         // serial latency penalties when multiple NVIDIA routes are available.
@@ -8370,19 +8261,11 @@ class ThinkingProxy {
         }
     }
 
-    // Injects provider-specific headers required by certain free-tier upstream services.
-    // Currently adds HTTP-Referer for opencode and kilocode candidate routes.
     private func headersInjectingRouteSpecific(
         _ headers: [(String, String)],
         forCandidateModel candidateModel: String
     ) -> [(String, String)] {
-        guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel),
-              (route.providerID == "opencode" || route.providerID == "kilocode") else {
-            return headers
-        }
-        let alreadyHasReferer = headers.contains { $0.0.lowercased() == "http-referer" }
-        guard !alreadyHasReferer else { return headers }
-        return headers + [("HTTP-Referer", "https://openclaw.ai")]
+        headers
     }
 
     private func rewrittenResponseBody(
