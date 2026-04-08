@@ -4020,6 +4020,7 @@ enum OpenAICompatTemporaryShim {
         struct ParsedModel {
             var alias: String?
             var name: String?
+            var registerCanonicalName: Bool = true
         }
 
         struct ParsedProvider {
@@ -4067,6 +4068,17 @@ enum OpenAICompatTemporaryShim {
             return rawValue.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
         }
 
+        func booleanValue(from line: String) -> Bool? {
+            guard let scalar = scalarValue(from: line)?.lowercased() else {
+                return nil
+            }
+            switch scalar {
+            case "true": return true
+            case "false": return false
+            default: return nil
+            }
+        }
+
         func finalizeCurrentModel() {
             guard currentProvider != nil else {
                 currentModel = ParsedModel()
@@ -4080,8 +4092,16 @@ enum OpenAICompatTemporaryShim {
                 return
             }
 
+            let shouldRegisterCanonicalName = currentModel.registerCanonicalName || trimmedAlias == nil
+
             var provider = currentProvider ?? ParsedProvider()
-            provider.models.append(ParsedModel(alias: trimmedAlias, name: canonicalModelID))
+            provider.models.append(
+                ParsedModel(
+                    alias: trimmedAlias,
+                    name: canonicalModelID,
+                    registerCanonicalName: shouldRegisterCanonicalName
+                )
+            )
             currentProvider = provider
             currentModel = ParsedModel()
         }
@@ -4145,12 +4165,14 @@ enum OpenAICompatTemporaryShim {
                         anthropicRequestModels.insert(alias)
                     }
                 }
-                routesByRequestModel[canonicalModelID] = routeIdentity
-                if isNVIDIAProvider {
-                    nvidiaRoutesByRequestModel[canonicalModelID] = routeIdentity
-                }
-                if section == .claudeAPIKey {
-                    anthropicRequestModels.insert(canonicalModelID)
+                if model.registerCanonicalName {
+                    routesByRequestModel[canonicalModelID] = routeIdentity
+                    if isNVIDIAProvider {
+                        nvidiaRoutesByRequestModel[canonicalModelID] = routeIdentity
+                    }
+                    if section == .claudeAPIKey {
+                        anthropicRequestModels.insert(canonicalModelID)
+                    }
                 }
             }
             if let proxyURL = provider.proxyURL?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -4347,6 +4369,13 @@ enum OpenAICompatTemporaryShim {
                trimmed.hasPrefix("name: "),
                let value = scalarValue(from: trimmed) {
                 currentModel.name = value
+                continue
+            }
+
+            if indent >= 4,
+               trimmed.hasPrefix("register-canonical-name: "),
+               let value = booleanValue(from: trimmed) {
+                currentModel.registerCanonicalName = value
             }
         }
 

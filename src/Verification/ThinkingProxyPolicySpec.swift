@@ -115,6 +115,27 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("provider models can hide raw canonical names while preserving aliased upstream routing", recorder: recorder) {
+            withMergedConfig(
+                [
+                    "openai-compatibility:",
+                    "- name: ollama-pro",
+                    "  base-url: https://ollama.com/api",
+                    "  models:",
+                    "  - alias: glm-5.1-ollama-pro",
+                    "    name: glm-5.1",
+                    "    register-canonical-name: false"
+                ].joined(separator: "\n")
+            ) {
+                let aliasedRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm-5.1-ollama-pro")
+                expectEqual(aliasedRoute?.providerID, "ollama-pro", "aliased ollama provider route should resolve", recorder: recorder)
+                expectEqual(aliasedRoute?.canonicalModelID, "glm-5.1", "aliased ollama route should still forward the real upstream model name", recorder: recorder)
+
+                let rawRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm-5.1")
+                expectNil(rawRoute, "raw upstream model name should stay unregistered when register-canonical-name=false", recorder: recorder)
+            }
+        }
+
         run("canonical nvidia route identity preserves mitigation when aliases are renamed", recorder: recorder) {
             withMergedConfig(renamedAliasMergedConfigYAML()) {
                 let request = """

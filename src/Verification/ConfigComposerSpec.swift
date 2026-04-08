@@ -852,6 +852,38 @@ struct ConfigComposerSpec {
             )
         }
 
+        run("validateSmartAliases does not expose hidden canonical provider model names", recorder: recorder) {
+            let root: [String: Any] = [
+                "openai-compatibility": [
+                    [
+                        "name": "ollama-pro",
+                        "base-url": "https://ollama.com/api",
+                        "models": [
+                            [
+                                "name": "glm-5.1",
+                                "alias": "glm-5.1-ollama-pro",
+                                "register-canonical-name": false
+                            ]
+                        ]
+                    ]
+                ],
+                "smart-aliases": [
+                    "worker": [
+                        "request-class": "plain-chat",
+                        "failover": "silent",
+                        "candidates": ["glm-5.1-ollama-pro", "glm-5.1"]
+                    ]
+                ]
+            ]
+
+            expectEqual(
+                ConfigComposer.validateSmartAliases(in: root),
+                ["smart-aliases.worker.candidates contains unknown model alias 'glm-5.1'."],
+                "hidden canonical names should not be treated as valid smart-alias candidates",
+                recorder: recorder
+            )
+        }
+
         if recorder.failures == 0 {
             print("ConfigComposerSpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)

@@ -647,19 +647,46 @@ enum ConfigComposer {
         var aliases = Set(defaultZAIModels().compactMap { $0["alias"] })
         for entry in stringKeyedDictionaryArray(root["openai-compatibility"]) {
             for modelEntry in stringKeyedDictionaryArray(entry["models"]) {
-                if let alias = normalizedString(modelEntry["alias"]) ?? normalizedString(modelEntry["name"]) {
+                if let alias = normalizedString(modelEntry["alias"]) {
                     aliases.insert(alias)
+                }
+                if modelEntryExposesCanonicalName(modelEntry),
+                   let name = normalizedString(modelEntry["name"]) {
+                    aliases.insert(name)
                 }
             }
         }
         for entry in stringKeyedDictionaryArray(root["claude-api-key"]) {
             for modelEntry in stringKeyedDictionaryArray(entry["models"]) {
-                if let alias = normalizedString(modelEntry["alias"]) ?? normalizedString(modelEntry["name"]) {
+                if let alias = normalizedString(modelEntry["alias"]) {
                     aliases.insert(alias)
+                }
+                if modelEntryExposesCanonicalName(modelEntry),
+                   let name = normalizedString(modelEntry["name"]) {
+                    aliases.insert(name)
                 }
             }
         }
         return aliases
+    }
+
+    private static func modelEntryExposesCanonicalName(_ modelEntry: [String: Any]) -> Bool {
+        if let raw = modelEntry["register-canonical-name"] {
+            if let value = raw as? Bool {
+                return value
+            }
+            if let string = normalizedString(raw)?.lowercased() {
+                switch string {
+                case "true":
+                    return true
+                case "false":
+                    return false
+                default:
+                    break
+                }
+            }
+        }
+        return normalizedString(modelEntry["alias"]) == nil
     }
 
     private static func isManagedZAIClaudeEntry(_ entry: [String: Any]) -> Bool {
