@@ -1095,7 +1095,50 @@ enum OpenAICompatTemporaryShim {
         // Worker entrypoints intentionally share one execution policy. Plain chat, tool-bearing
         // chat, structured-output chat, and large Factory worker payloads all traverse the same
         // smart-alias candidate list so routing semantics stay coherent across request shapes.
-        return smartAlias.candidates
+        //
+        // The worker contract must keep its configured business ordering while all candidates are
+        // healthy: ZAI GLM first, then Ollama GLM, then the MiniMax fallback. When a lane degrades,
+        // only health bucket ordering may move it back; latency/EMA scoring must not leapfrog a
+        // lower-priority backend ahead of a healthy preferred sibling.
+        return availabilityRankedSmartAliasCandidateModels(smartAlias.candidates)
+    }
+
+    private static func availabilityRankedSmartAliasCandidateModels(_ candidateModels: [String]) -> [String] {
+        let indexedModels = Array(candidateModels.enumerated())
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return indexedModels.sorted { lhs, rhs in
+                let lhsPriority = candidateAvailabilityPriority(forRequestModel: lhs.element)
+                let rhsPriority = candidateAvailabilityPriority(forRequestModel: rhs.element)
+                if lhsPriority != rhsPriority {
+                    return lhsPriority < rhsPriority
+                }
+                return lhs.offset < rhs.offset
+            }.map(\.element)
+        }
+    }
+
+    private static func candidateAvailabilityPriority(forRequestModel requestModel: String) -> Int {
+        let now = Date()
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return 0
+        }
+
+        if let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
+           now < cooldownUntil {
+            return 4
+        }
+
+        switch routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.status ?? .closed {
+        case .closed:
+            return 0
+        case .suspect:
+            return 1
+        case .halfOpen:
+            return 2
+        case .open:
+            return 3
+        }
     }
 
     static func forcedSmartAliasProbeCandidateModels(
@@ -6867,7 +6910,26 @@ class ThinkingProxy {
                 }
                 lines.append(doneItemLine)
             default:
-                return nil
+                // Preserve newer Responses output-item variants without forcing
+                // the caller through a synthetic 502 just because this proxy
+                // does not yet have bespoke delta events for that item type.
+                guard let addedLine = sseDataLine(for: [
+                    "type": "response.output_item.added",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(addedLine)
+
+                guard let doneItemLine = sseDataLine(for: [
+                    "type": "response.output_item.done",
+                    "output_index": outputIndex,
+                    "item": outputItem
+                ]) else {
+                    return nil
+                }
+                lines.append(doneItemLine)
             }
         }
 

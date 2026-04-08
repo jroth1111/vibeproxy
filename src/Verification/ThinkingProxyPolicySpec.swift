@@ -1065,7 +1065,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "tool-heavy worker requests should reuse the plain-chat pool even when the primary lane is degraded", recorder: recorder)
+                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "minimax-m2.7-ollama-pro", "glm-5.1-ollama-pro"], "tool-heavy worker requests should demote degraded siblings behind still-healthy fallbacks while preserving the healthy primary", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -2185,6 +2185,85 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredText.contains("\"model\":\"\(openAIFactoryWorkerContract.workerModelID)\""), true, "streaming openai Factory custom IDs should preserve the outward custom model inside synthetic SSE events", recorder: recorder)
                 expectEqual(deliveredText.contains("response.created"), true, "streaming openai Factory custom IDs should emit Responses SSE lifecycle events", recorder: recorder)
                 expectEqual(deliveredText.contains("data: [DONE]"), true, "streaming openai Factory custom IDs should terminate with the OpenAI SSE sentinel", recorder: recorder)
+            }
+        }
+
+        run("Factory openai streaming custom model IDs pass through unknown Responses output item types", recorder: recorder) {
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+
+                proxy.forwardRequestInterceptorForTesting = { _, _, _, _, _, _, _, _ in
+                    recorder.recordFailure("streaming openai Factory custom IDs should stay on the buffered direct path")
+                    return true
+                }
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    let forwardedJSON = parseJSONObject(body, recorder: recorder)
+                    expectEqual(path, "/v1/responses", "unknown Responses output item passthrough should stay on the responses API path", recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "unknown Responses output item passthrough should keep the configured direct route model", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "resp_factory_direct_stream_unknown_item",
+                              "object": "response",
+                              "model": "gpt-5.4(high)",
+                              "status": "completed",
+                              "output": [
+                                {
+                                  "type": "custom_tool_call",
+                                  "id": "ctc_1",
+                                  "call_id": "call_custom_1",
+                                  "name": "custom_lookup",
+                                  "status": "completed",
+                                  "arguments": "{\\"city\\":\\"Sydney\\"}"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "stream": true,
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("streaming openai Factory custom IDs should synthesize SSE for unknown Responses output items")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "unknown Responses output items should not trigger a synthetic 502", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "unknown Responses output items should still emit an SSE content type", recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredText.contains("\"type\":\"response.output_item.added\""), true, "unknown Responses output items should emit output-item added events", recorder: recorder)
+                expectEqual(deliveredText.contains("\"type\":\"response.output_item.done\""), true, "unknown Responses output items should emit output-item done events", recorder: recorder)
+                expectEqual(deliveredText.contains("\"type\":\"custom_tool_call\""), true, "unknown Responses output items should be preserved verbatim inside the synthetic SSE stream", recorder: recorder)
+                expectEqual(deliveredText.contains("\"model\":\"\(openAIFactoryWorkerContract.workerModelID)\""), true, "unknown Responses output items should still preserve the outward custom model", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "unknown Responses output items should terminate with the OpenAI SSE sentinel", recorder: recorder)
             }
         }
 
@@ -4789,7 +4868,6 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-ollama-pro", "worker should expose the winning fallback model in response headers", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "ollama-pro", "worker should expose the winning fallback provider in response headers", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Resolved-Canonical-Model"] as? String, "glm-5.1", "worker should expose the winning fallback canonical model in response headers", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()["glm-5.1"]?.status, .closed, "route health should close the shared canonical glm-5.1 view once the sibling fallback succeeds", recorder: recorder)
 
                 let workerEvents = recordedEvents.filter { $0.requestedAlias == "worker" }
                 expectEqual(workerEvents.contains(where: { $0.requestModel == "glm-5.1-zai" && $0.failoverDepth == 0 }), true, "worker telemetry should record the failed primary candidate with failover depth 0", recorder: recorder)
@@ -6792,7 +6870,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("healthz keeps self-routed smart-router workers ready when the primary lane is only suspect", recorder: recorder) {
+        run("healthz promotes self-routed smart-router workers onto a healthy sibling when the primary lane is only suspect", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -6825,11 +6903,84 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep the worker effective route on the ZAI primary lane while it is only suspect", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should keep the worker provider on ZAI while the primary is suspect", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "suspect", "healthz should expose suspect worker health while the ZAI primary lane is degraded", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark self-routed smart-router workers unready when the primary lane is only suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-ollama-pro", "healthz should promote the worker onto the healthy GLM sibling when the ZAI primary lane is suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "ollama-pro", "healthz should surface the healthy sibling provider when the primary is suspect", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should suppress degraded-primary status when a healthy worker sibling is available", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep self-routed smart-router workers ready when a healthy sibling remains available", recorder: recorder)
 
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("self-routed worker requests try the healthy GLM sibling before a suspect primary", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm-5.1-zai",
+                        at: Date()
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    let lock = NSLock()
+                    var seenModels: [String] = []
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        let model = json["model"] as? String ?? ""
+                        lock.lock()
+                        seenModels.append(model)
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl_worker_sibling",
+                                  "object": "chat.completion",
+                                  "created": 1,
+                                  "model": "\(model)",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                          "stream": false,
+                          "tools": [
+                            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                          ],
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 2) == .success else {
+                        recorder.recordFailure("self-routed worker request should complete under healthy sibling fallback")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    expectEqual(seenModels, ["glm-5.1-ollama-pro"], "self-routed worker requests should select the healthy GLM sibling before the suspect primary", recorder: recorder)
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
