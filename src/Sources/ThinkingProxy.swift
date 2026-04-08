@@ -4451,8 +4451,13 @@ class ThinkingProxy {
         let authoritativeSettingsPath: String
         let snapshotDriftPaths: [String]
 
+        var blockingSnapshotDriftPaths: [String] {
+            ThinkingProxy.blockingFactoryWorkerSnapshotDriftPaths(snapshotDriftPaths)
+        }
+
         var ready: Bool {
-            snapshotDriftPaths.isEmpty && routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
+            blockingSnapshotDriftPaths.isEmpty &&
+                routeHealthStatus != OpenAICompatTemporaryShim.RouteHealthStatus.open.rawValue
         }
     }
 
@@ -9775,6 +9780,8 @@ class ThinkingProxy {
             "authoritative_settings_path": contract.authoritativeSettingsPath,
             "snapshot_sync_ok": contract.snapshotDriftPaths.isEmpty,
             "snapshot_drift_count": contract.snapshotDriftPaths.count,
+            "snapshot_blocking_sync_ok": contract.blockingSnapshotDriftPaths.isEmpty,
+            "snapshot_blocking_drift_count": contract.blockingSnapshotDriftPaths.count,
             "ready": backendReachable && contract.ready
         ]
         dict["effective_route_model"] = contract.effectiveRouteModel
@@ -9819,6 +9826,9 @@ class ThinkingProxy {
         }
         if !contract.snapshotDriftPaths.isEmpty {
             dict["snapshot_drift_paths"] = contract.snapshotDriftPaths
+        }
+        if !contract.blockingSnapshotDriftPaths.isEmpty {
+            dict["snapshot_blocking_drift_paths"] = contract.blockingSnapshotDriftPaths
         }
         return dict
     }
@@ -10177,12 +10187,22 @@ class ThinkingProxy {
 
     private static func factoryWorkerBindingContractError(for binding: FactoryModelBinding) -> String? {
         guard let contract = factoryWorkerContract(),
-              binding.authoritativeModelID == contract.workerModelID,
-              !contract.snapshotDriftPaths.isEmpty else {
+              binding.authoritativeModelID == contract.workerModelID else {
             return nil
         }
 
-        let driftedPaths = contract.snapshotDriftPaths.joined(separator: ", ")
+        let blockingDriftPaths: [String]
+        if binding.incomingModelID == contract.workerModelID {
+            blockingDriftPaths = contract.blockingSnapshotDriftPaths
+        } else {
+            blockingDriftPaths = contract.snapshotDriftPaths
+        }
+
+        guard !blockingDriftPaths.isEmpty else {
+            return nil
+        }
+
+        let driftedPaths = blockingDriftPaths.joined(separator: ", ")
         return "Factory worker snapshot drift detected for \(binding.incomingModelID) against authoritative worker model \(contract.workerModelID). Refusing to proxy the request until Factory settings are resynced. Drifted paths: \(driftedPaths)"
     }
 
@@ -10420,6 +10440,17 @@ class ThinkingProxy {
         }
 
         return Array(Set(driftedPaths)).sorted()
+    }
+
+    private static func isMissionModelSettingsSnapshotPath(_ path: String) -> Bool {
+        let standardizedPath = (path as NSString).standardizingPath
+        let pathComponents = standardizedPath.split(separator: "/")
+        return pathComponents.contains("missions") &&
+            (standardizedPath as NSString).lastPathComponent == "model-settings.json"
+    }
+
+    private static func blockingFactoryWorkerSnapshotDriftPaths(_ paths: [String]) -> [String] {
+        paths.filter { !isMissionModelSettingsSnapshotPath($0) }
     }
 
     private static func fileFingerprint(at path: String?) -> String? {

@@ -89,14 +89,21 @@ self_routed_managed_ids="$(
 
 required_alias_mismatches="$(
   jq -cn \
+    --arg worker_id "$FACTORY_WORKER_MODEL" \
     --argjson required_ids "$self_routed_managed_ids" \
     --argjson merged_root "$(ruby -e 'require "yaml"; require "json"; puts((YAML.load_file(ARGV[0]) || {}).to_json)' "$MERGED_CONFIG_PATH")" '
       ($merged_root["smart-aliases"] // {}) as $smartAliases
       | $required_ids
       | map(
           select(
-            (($smartAliases[.] // null) == null)
-            or (((($smartAliases[.] // {})["candidates"] // []) | length) == 0)
+            (
+              ((($smartAliases[.] // {})["candidates"] // []) | length) == 0
+            )
+            and
+            (
+              (. != $worker_id)
+              or (((($smartAliases["worker"] // {})["candidates"] // []) | length) == 0)
+            )
           )
         )
     '

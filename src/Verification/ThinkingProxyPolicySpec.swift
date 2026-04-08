@@ -6712,6 +6712,115 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("Factory worker-bound requests ignore advisory mission model-settings drift on authoritative worker IDs", recorder: recorder) {
+            let driftedMissionSettings = """
+            {
+              "workerModel": "\(openAIFactoryWorkerContract.validationWorkerModelID)",
+              "workerReasoningEffort": "high",
+              "validationWorkerModel": "\(openAIFactoryWorkerContract.validationWorkerModelID)",
+              "validationWorkerReasoningEffort": "high"
+            }
+            """
+
+            withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract), extraFiles: [
+                "missions/test/model-settings.json": driftedMissionSettings
+            ]) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var forwardedPath: String?
+                var forwardedBody: String?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+                var healthzBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    forwardedPath = path
+                    forwardedBody = body
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "resp_factory_drift_advisory",
+                              "object": "response",
+                              "model": "gpt-5.4(high)",
+                              "status": "completed",
+                              "output": [
+                                {
+                                  "type": "message",
+                                  "role": "assistant",
+                                  "status": "completed",
+                                  "content": [
+                                    {"type": "output_text", "text": "OK", "annotations": []}
+                                  ]
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(
+                                statusCode: 200,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, headers, body in
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("authoritative worker requests should not fail on advisory mission model-settings drift: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/responses", body: """
+                    {
+                      "model": "\(openAIFactoryWorkerContract.workerModelID)",
+                      "input": "Return exactly: OK"
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("authoritative worker requests should still complete when only mission model-settings drift")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+
+                expectEqual(forwardedPath, "/v1/responses", "authoritative worker requests should keep their direct path under advisory drift", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "authoritative worker requests should still be rewritten to the configured route model under advisory drift", recorder: recorder)
+                expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "authoritative worker responses should preserve the authoritative worker ID header under advisory drift", recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, openAIFactoryWorkerContract.workerModelID, "authoritative worker responses should preserve caller-visible identity under advisory drift", recorder: recorder)
+
+                let healthDelivered = DispatchSemaphore(value: 0)
+                proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                    healthzBody = body
+                    healthDelivered.signal()
+                }
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                    connection: connection
+                )
+
+                guard healthDelivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("healthz should return after advisory mission model-settings drift")
+                    return
+                }
+
+                let healthzPayload = parseDataJSONObject(healthzBody ?? Data(), recorder: recorder)
+                let factoryWorker = healthzPayload["factory_worker"] as? [String: Any]
+                expectEqual(factoryWorker?["snapshot_drift_count"] as? Int, 1, "advisory mission model-settings drift should still be reported", recorder: recorder)
+                expectEqual(factoryWorker?["snapshot_blocking_drift_count"] as? Int, 0, "mission model-settings drift should not be treated as blocking for authoritative worker requests", recorder: recorder)
+                expectEqual(factoryWorker?["ready"] as? Bool, true, "advisory mission model-settings drift should keep the worker contract ready", recorder: recorder)
+            }
+        }
+
         run("stale suspect route health auto-heals on reload", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
