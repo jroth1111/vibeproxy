@@ -959,7 +959,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("glm-5.1 public entrypoint uses health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+        run("glm-5.1 public entrypoint pins tool-heavy requests to the GLM primary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1") else {
                     recorder.recordFailure("glm-5.1 should still inherit the worker pool definition")
@@ -985,11 +985,11 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy glm-5.1 requests should use health-ranked pool candidates", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai"], "tool-heavy glm-5.1 requests should stay pinned to the contract-safe GLM primary", recorder: recorder)
             }
         }
 
-        run("neutral proxy worker smart router alias uses health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+        run("neutral proxy worker smart router alias pins tool-heavy requests to the GLM primary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
                     recorder.recordFailure("proxy-worker-smart-router should inherit the worker pool definition")
@@ -1015,11 +1015,11 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy proxy-worker-smart-router requests should use health-ranked pool candidates", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai"], "tool-heavy proxy-worker-smart-router requests should stay pinned to the contract-safe GLM primary", recorder: recorder)
             }
         }
 
-        run("tool-heavy proxy worker requests keep glm primary despite slow latency until glm is quarantined", recorder: recorder) {
+        run("tool-heavy proxy worker requests stay pinned to glm even when latency or health would reorder the plain-chat pool", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
@@ -1089,14 +1089,14 @@ struct ThinkingProxyPolicySpec {
                     until: now.addingTimeInterval(300)
                 )
 
-                let failedOverCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                let stillPinnedCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
                     forPublicAlias: "proxy-worker-smart-router",
                     method: "POST",
                     path: "/v1/chat/completions",
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(failedOverCandidates.first, "mimo-v2-pro-opencode", "tool-heavy worker requests should fail over once glm is actually quarantined", recorder: recorder)
+                expectEqual(stillPinnedCandidates, ["glm-5.1-zai"], "tool-heavy worker requests should remain pinned to GLM even when the plain-chat pool would otherwise fail over", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -1348,7 +1348,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("Factory self-routed smart-router custom model IDs use health-ranked pool candidates for tool-heavy requests", recorder: recorder) {
+        run("Factory self-routed smart-router custom model IDs pin tool-heavy requests to the GLM primary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
@@ -1370,7 +1370,7 @@ struct ThinkingProxyPolicySpec {
                         )!
                     )
 
-                    expectEqual(candidates, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy self-routed smart-router requests should use the full health-ranked worker pool", recorder: recorder)
+                    expectEqual(candidates, ["glm-5.1-zai"], "tool-heavy self-routed smart-router requests should stay pinned to the contract-safe GLM primary", recorder: recorder)
                 }
             }
         }
@@ -6585,7 +6585,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("healthz keeps self-routed smart-router workers ready when GLM is open but a pooled fallback remains available", recorder: recorder) {
+        run("healthz marks self-routed smart-router workers unready when tool-heavy GLM traffic is quarantined", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -6618,10 +6618,10 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "mimo-v2-pro-opencode", "healthz should expose the first available pooled fallback for self-routed worker IDs when GLM is open", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "opencode", "healthz should expose the fallback provider for self-routed worker IDs when GLM is open", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should not report the self-routed worker contract as open when a pooled fallback remains available", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep self-routed smart-router workers ready when a fallback lane remains available", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep self-routed worker contracts pinned to the GLM primary for tool-heavy traffic", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should keep self-routed worker contracts pinned to the GLM provider for tool-heavy traffic", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, "open", "healthz should expose the worker contract as unhealthy when the GLM primary is quarantined", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark self-routed smart-router workers unready when tool-heavy GLM traffic is quarantined", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

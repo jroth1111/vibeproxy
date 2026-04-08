@@ -1223,27 +1223,16 @@ enum OpenAICompatTemporaryShim {
         let isOversizedExecPayload = jsonString.utf8.count >= 65536
         let isToolHeavyWorkerRequest = hasTools || hasStructuredOutput || isOversizedExecPayload
 
-        // Factory mission workers send large tool-bearing Exec payloads. Those requests have
-        // repeatedly produced success-shaped 200s with empty assistant content from the GLM lane,
-        // which breaks the worker contract even though the transport technically succeeded.
+        // Factory mission workers send large tool-bearing Exec payloads. Those requests need a
+        // behaviorally compatible agentic backend, not merely a transport that can return 200.
         //
-        // Tool-heavy worker/smart-router requests use the same health-ranked pool as plain chat.
-        // The GPT-5.4 lane was removed after sustained 402/500 failures made it a latency penalty
-        // with no reliability upside — the pool candidates (glm-5.1-zai, minimax, kimi, mimo)
-        // now carry the full tool-heavy workload with health-ranked failover.
+        // Recent incidents showed the broader worker pool can fail over onto lanes that return
+        // superficially successful assistant text but do not sustain the Droid mission-worker
+        // contract, leading to exit-code-0 worker deaths after the proxy already reported success.
+        //
+        // Correctness beats availability here: tool-heavy worker/smart-router requests stay pinned
+        // to the contract-safe GLM primary. Plain chat keeps the broader health-ranked pool.
         if isToolHeavyWorkerRequest {
-            // Self-routed Factory worker IDs (for example `custom:Proxy-Worker-Smart-Router-8`)
-            // must inherit the exact same health-ranked worker pool behavior as the public pooled
-            // aliases. If this path falls back to `[primaryCandidate]`, tool-heavy mission workers
-            // get pinned back onto GLM even after the route is already quarantined.
-            let rankedCandidates = rankedSmartAliasFallbackCandidateModels(
-                smartAlias.candidates,
-                healthSensitivity: smartAlias.healthSensitivity,
-                stickyPrimaryCandidate: primaryCandidate
-            )
-            if !rankedCandidates.isEmpty {
-                return rankedCandidates
-            }
             return [primaryCandidate]
         }
 
