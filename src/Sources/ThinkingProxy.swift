@@ -2154,21 +2154,44 @@ enum OpenAICompatTemporaryShim {
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
                 guard state.isUnavailable(at: now) else { return nil }
                 if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
-                    return candidates.sorted { lhs, rhs in
-                        let lhsIsCanonical = routes[lhs]?.canonicalModelID == lhs
-                        let rhsIsCanonical = routes[rhs]?.canonicalModelID == rhs
-                        if lhsIsCanonical != rhsIsCanonical {
-                            return !lhsIsCanonical
-                        }
-                        if lhs.count != rhs.count {
-                            return lhs.count < rhs.count
-                        }
-                        return lhs < rhs
-                    }.first
+                    return preferredRouteHealthDisplayRequestModel(
+                        from: candidates,
+                        routes: routes
+                    )
                 }
                 return routeHealthKey.components(separatedBy: "::").last
             }.sorted()
         }
+    }
+
+    private static func preferredRouteHealthDisplayRequestModel(
+        from candidates: [String],
+        routes: [String: RouteIdentity]
+    ) -> String? {
+        candidates.sorted { lhs, rhs in
+            let lhsIsSmartAlias = smartAliasDefinition(forRequestModel: lhs) != nil
+            let rhsIsSmartAlias = smartAliasDefinition(forRequestModel: rhs) != nil
+            if lhsIsSmartAlias != rhsIsSmartAlias {
+                return !lhsIsSmartAlias
+            }
+
+            let lhsIsCanonical = routes[lhs]?.canonicalModelID == lhs
+            let rhsIsCanonical = routes[rhs]?.canonicalModelID == rhs
+            if lhsIsCanonical != rhsIsCanonical {
+                return !lhsIsCanonical
+            }
+
+            let lhsIsCustom = lhs.hasPrefix("custom:")
+            let rhsIsCustom = rhs.hasPrefix("custom:")
+            if lhsIsCustom != rhsIsCustom {
+                return !lhsIsCustom
+            }
+
+            if lhs.count != rhs.count {
+                return lhs.count > rhs.count
+            }
+            return lhs < rhs
+        }.first
     }
 
     fileprivate static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
@@ -2533,6 +2556,53 @@ enum OpenAICompatTemporaryShim {
                 recoveredAt: nil
             )
             persistRouteHealthLocked()
+        }
+    }
+
+    static func routeHealthSnapshotByRequestModel() -> [String: RouteCircuitState] {
+        routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let routes = resolvedRoutesByRequestModel()
+            let requestModelsByRouteHealthKey = Dictionary(grouping: routes.keys) { requestModel in
+                routes[requestModel]?.routeHealthKey ?? requestModel
+            }
+            return requestModelsByRouteHealthKey.reduce(into: [String: RouteCircuitState]()) { snapshot, entry in
+                let routeHealthKey = entry.key
+                let candidates = entry.value
+                guard let requestModel = preferredRouteHealthDisplayRequestModel(
+                    from: candidates,
+                    routes: routes
+                ),
+                let state = routeCircuitStatesByRouteHealthKey[routeHealthKey] else {
+                    return
+                }
+                snapshot[requestModel] = state
+            }
+        }
+    }
+
+    static func latestObservedSmartAliasResolvedModel(
+        forRequestedAlias requestedAlias: String,
+        maxAge: TimeInterval = 30,
+        at now: Date = Date()
+    ) -> String? {
+        routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let freshestEvent = routeCircuitStatesByRouteHealthKey.values
+                .compactMap(\.lastTelemetryEvent)
+                .filter { event in
+                    event.requestedAlias == requestedAlias &&
+                        event.source == "smart_alias" &&
+                        now.timeIntervalSince(event.timestamp) <= maxAge
+                }
+                .max { lhs, rhs in
+                    lhs.timestamp < rhs.timestamp
+                }
+
+            guard let freshestEvent else {
+                return nil
+            }
+            return freshestEvent.finalWinnerRequestModel ?? freshestEvent.requestModel
         }
     }
 
@@ -7287,7 +7357,7 @@ class ThinkingProxy {
             publicAlias: publicAlias,
             remainingCandidateModels: candidateModels,
             forceProbeCandidateModels: forceProbeCandidateModels,
-            primaryProbeRetriesRemaining: forceProbeCandidateModels.isEmpty ? 0 : smartAliasForcedPrimaryRetryLimit,
+            primaryProbeRetriesRemaining: smartAliasForcedPrimaryRetryLimit,
             failoverDepth: 0,
             deadlineAt: Date().addingTimeInterval(smartAliasTotalTimeout(forRequestJSON: body)),
             originalConnection: originalConnection,
@@ -8188,41 +8258,71 @@ class ThinkingProxy {
             )
             let retryDelay: TimeInterval = 1
             let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
-            guard remainingBudget > retryDelay else {
-                deliverSmartAliasTerminalOutcome(
-                    .retryableFailure(
-                        requestModel: requestModel,
-                        telemetryEvent: telemetryEvent,
-                        cooldownUntil: cooldownUntil
-                    ),
-                    publicAlias: publicAlias,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
-                )
+            if primaryProbeRetriesRemaining > 0,
+               remainingBudget > retryDelay {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+                    guard let self else { return }
+                    self.attemptSmartAliasCandidate(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        currentBody: candidateBody,
+                        publicAlias: publicAlias,
+                        remainingCandidateModels: [requestModel] + remainingCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
+                        primaryProbeRetriesRemaining: primaryProbeRetriesRemaining - 1,
+                        failoverDepth: failoverDepth,
+                        deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        terminalFallbackOutcome: terminalFallbackOutcome,
+                        exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                        deliveryMode: deliveryMode,
+                        loopRetriesRemaining: loopRetriesRemaining
+                    )
+                }
                 return
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
-                guard let self else { return }
-                self.attemptSmartAliasCandidate(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: candidateBody,
-                    publicAlias: publicAlias,
-                    remainingCandidateModels: [requestModel] + remainingCandidateModels,
-                    forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
-                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                    failoverDepth: failoverDepth,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome,
-                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
-                    deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
-                )
+            if !remainingCandidateModels.isEmpty {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    self.attemptSmartAliasCandidate(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        currentBody: candidateBody,
+                        publicAlias: publicAlias,
+                        remainingCandidateModels: remainingCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels,
+                        primaryProbeRetriesRemaining: 0,
+                        failoverDepth: failoverDepth + 1,
+                        deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        terminalFallbackOutcome: terminalFallbackOutcome,
+                        exhaustedRetryableOutcome: .retryableFailure(
+                            requestModel: requestModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: cooldownUntil
+                        ),
+                        deliveryMode: deliveryMode,
+                        loopRetriesRemaining: loopRetriesRemaining
+                    )
+                }
+                return
             }
+            deliverSmartAliasTerminalOutcome(
+                .retryableFailure(
+                    requestModel: requestModel,
+                    telemetryEvent: telemetryEvent,
+                    cooldownUntil: cooldownUntil
+                ),
+                publicAlias: publicAlias,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                deliveryMode: deliveryMode
+            )
+            return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where telemetryEvent.failureClass == "classified_429_concurrency":
             OpenAICompatTemporaryShim.recordRouteFailure(
@@ -8233,10 +8333,63 @@ class ThinkingProxy {
             )
             let retryDelay = max(
                 0.25,
-                min(1.0, cooldownUntil?.timeIntervalSinceNow ?? 1.0)
+                min(1.0, cooldownUntil?.timeIntervalSinceNow ?? 0.25)
             )
             let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
-            guard remainingBudget > retryDelay else {
+            if primaryProbeRetriesRemaining > 0,
+               remainingBudget > retryDelay {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                    guard let self else { return }
+                    self.attemptSmartAliasCandidate(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        currentBody: candidateBody,
+                        publicAlias: publicAlias,
+                        remainingCandidateModels: [requestModel] + remainingCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
+                        primaryProbeRetriesRemaining: 0,
+                        failoverDepth: failoverDepth,
+                        deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        terminalFallbackOutcome: terminalFallbackOutcome,
+                        exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                        deliveryMode: deliveryMode,
+                        loopRetriesRemaining: loopRetriesRemaining
+                    )
+                }
+                return
+            }
+            if !remainingCandidateModels.isEmpty {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    self.attemptSmartAliasCandidate(
+                        method: method,
+                        path: path,
+                        headers: headers,
+                        currentBody: candidateBody,
+                        publicAlias: publicAlias,
+                        remainingCandidateModels: remainingCandidateModels,
+                        forceProbeCandidateModels: forceProbeCandidateModels,
+                        primaryProbeRetriesRemaining: 0,
+                        failoverDepth: failoverDepth + 1,
+                        deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        coalescingKey: coalescingKey,
+                        terminalFallbackOutcome: terminalFallbackOutcome,
+                        exhaustedRetryableOutcome: .retryableFailure(
+                            requestModel: requestModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: cooldownUntil
+                        ),
+                        deliveryMode: deliveryMode,
+                        loopRetriesRemaining: loopRetriesRemaining
+                    )
+                }
+                return
+            }
+            if remainingBudget <= 0 {
                 deliverSmartAliasTerminalOutcome(
                     .retryableFailure(
                         requestModel: requestModel,
@@ -8250,27 +8403,18 @@ class ThinkingProxy {
                 )
                 return
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelay) { [weak self] in
-                guard let self else { return }
-                self.attemptSmartAliasCandidate(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: candidateBody,
-                    publicAlias: publicAlias,
-                    remainingCandidateModels: [requestModel] + remainingCandidateModels,
-                    forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
-                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                    failoverDepth: failoverDepth,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome,
-                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
-                    deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
-                )
-            }
+            deliverSmartAliasTerminalOutcome(
+                .retryableFailure(
+                    requestModel: requestModel,
+                    telemetryEvent: telemetryEvent,
+                    cooldownUntil: cooldownUntil
+                ),
+                publicAlias: publicAlias,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                deliveryMode: deliveryMode
+            )
+            return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where remainingCandidateModels.isEmpty &&
                 primaryProbeRetriesRemaining > 0 &&
@@ -8422,7 +8566,7 @@ class ThinkingProxy {
                 publicAlias: publicAlias,
                 remainingCandidateModels: freshCandidates,
                 forceProbeCandidateModels: freshForceProbe,
-                primaryProbeRetriesRemaining: freshForceProbe.isEmpty ? 0 : self.smartAliasForcedPrimaryRetryLimit,
+                primaryProbeRetriesRemaining: self.smartAliasForcedPrimaryRetryLimit,
                 failoverDepth: 0,
                 deadlineAt: deadlineAt,
                 originalConnection: originalConnection,
@@ -11769,7 +11913,7 @@ class ThinkingProxy {
             )
         }
 
-        let routeHealthSnapshot = OpenAICompatTemporaryShim.routeHealthSnapshot()
+        let routeHealthSnapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
         if !routeHealthSnapshot.isEmpty {
             let routes = routeHealthSnapshot.keys.sorted().reduce(into: [String: [String: Any]]()) { result, requestModel in
                 guard let state = routeHealthSnapshot[requestModel] else { return }
@@ -11779,6 +11923,9 @@ class ThinkingProxy {
                     "recovery_successes": state.recoverySuccesses
                 ]
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
+                    routePayload["provider"] = route.providerID
+                    routePayload["canonical_model_id"] = route.canonicalModelID
+                    routePayload["route_health_key"] = route.routeHealthKey
                     routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: route.routeHealthKey)
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
                 }
@@ -11786,7 +11933,8 @@ class ThinkingProxy {
             }
             payload["route_health"] = [
                 "routes": routes,
-                "quarantined_models": OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
+                "quarantined_models": OpenAICompatTemporaryShim.quarantinedRequestModels(),
+                "quarantined_canonical_models": OpenAICompatTemporaryShim.quarantinedNVIDIAHostedRequestModels()
             ]
         }
 
@@ -12065,6 +12213,61 @@ class ThinkingProxy {
         )
     }
 
+    private static func dispatchableFactoryWorkerCandidateModel(
+        routeModel: String,
+        requestSurface: String
+    ) -> String? {
+        guard requestSurface == "chat_completions",
+              let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) else {
+            return routeModel
+        }
+
+        let syntheticWorkerRequest = """
+        {
+          "model": "\(routeModel)",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return exactly: OK"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        }
+        """
+
+        let orderedCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: routeModel,
+            method: "POST",
+            path: "/v1/chat/completions",
+            jsonString: syntheticWorkerRequest,
+            smartAlias: smartAlias
+        )
+
+        if let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+            method: "POST",
+            path: "/v1/chat/completions",
+            currentBody: syntheticWorkerRequest,
+            candidateModelsRemaining: orderedCandidateModels
+        ) {
+            return transition.model
+        }
+
+        return OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
+            forRequestedAlias: routeModel
+        )
+    }
+
     private static func effectiveFactoryContractHealthStatus(
         routeModel: String,
         requestSurface: String,
@@ -12112,6 +12315,21 @@ class ThinkingProxy {
         routeProvider: String,
         requestSurface: String
     ) -> String {
+        if requestSurface == "chat_completions",
+           let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) {
+            if let dispatchableCandidate = dispatchableFactoryWorkerCandidateModel(
+                routeModel: routeModel,
+                requestSurface: requestSurface
+            ) {
+                return dispatchableCandidate
+            }
+            if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
+                forRequestedAlias: routeModel
+            ) {
+                return recentObservedCandidate
+            }
+            return smartAlias.candidates.first ?? routeModel
+        }
         let candidateModels = effectiveFactoryCandidateModels(
             routeModel: routeModel,
             routeProvider: routeProvider,
