@@ -2336,11 +2336,27 @@ enum OpenAICompatTemporaryShim {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
-        
+
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
-            
+
+            if telemetryEvent?.failureClass?.lowercased() == "classified_429_overload" {
+                // Overload 429s are transient provider pressure, not evidence that
+                // the route itself is unhealthy. Preserve telemetry, but do not
+                // change circuit state, cooldowns, or ranking inputs.
+                if let telemetryEvent {
+                    let currentStatus = current?.status ?? .closed
+                    let enrichedTelemetryEvent = enrichTelemetryEvent(
+                        telemetryEvent,
+                        from: currentStatus,
+                        to: currentStatus
+                    )
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
             // Always count failures — the circuit breaker threshold dampens rapid failures naturally
 
             var nextState = nextRouteCircuitState(
@@ -3084,7 +3100,11 @@ enum OpenAICompatTemporaryShim {
         }
         switch disposition {
         case .overload(let retryDelaySeconds):
-            return now.addingTimeInterval(retryDelaySeconds)
+            // Provider overload should stay on the same lane without poisoning
+            // route-level availability. The caller can still retry the request
+            // immediately on the same provider using the provider hint.
+            _ = retryDelaySeconds
+            return nil
         case .concurrency(let retryAfterSeconds):
             guard let retryAfterSeconds else { return now.addingTimeInterval(1) }
             return now.addingTimeInterval(retryAfterSeconds)

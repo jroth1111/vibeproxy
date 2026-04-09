@@ -801,6 +801,63 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary provider overload 429s do not create route penalties or cooldowns", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_100)
+                let overloadBody = Data("""
+                {"error":{"code":"1305","message":"The service may be temporarily overloaded, please try again later"}}
+                """.utf8)
+                let providerRetryUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                    statusCode: 429,
+                    headers: [:],
+                    bodyData: overloadBody,
+                    now: now
+                )
+                expectNil(
+                    providerRetryUntil,
+                    "provider overload 429s should not create route-level availability deferrals",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm-5.1-zai",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "retry",
+                        failureClass: "classified_429_overload",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 429,
+                        retryCount: 0,
+                        source: "smart_alias",
+                        inflightAtRequest: 1
+                    ),
+                    at: now,
+                    forcedOpenUntil: now.addingTimeInterval(1)
+                )
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-zai", at: now.addingTimeInterval(0.5)),
+                    false,
+                    "provider overload 429s should not open or quarantine the preferred route",
+                    recorder: recorder
+                )
+                expectNil(
+                    OpenAICompatTemporaryShim.routeAvailabilityDeferralUntilForTesting(requestModel: "glm-5.1-zai"),
+                    "provider overload 429s should not create route cooldowns",
+                    recorder: recorder
+                )
+                expectNil(
+                    OpenAICompatTemporaryShim.rollingMetrics(forRequestModel: "glm-5.1-zai"),
+                    "provider overload 429s should not mutate route-health ranking state",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary adaptive concurrency learning re-probes upward quickly after confirmed low multi-flight caps start succeeding", recorder: recorder) {
             let routeHealthKey = "relearn::glm-5.1"
             for _ in 0..<3 {
@@ -7681,6 +7738,8 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(deliveredStatus, 200, "recovered overload retries should eventually deliver success", recorder: recorder)
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     expectEqual(deliveredJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.workerModelID, "successful overload retries should preserve the caller-visible worker model identity", recorder: recorder)
+                    expectNil(OpenAICompatTemporaryShim.routeAvailabilityDeferralUntilForTesting(requestModel: "glm-5.1-zai"), "overload retries should not leave the preferred route on cooldown after recovery", recorder: recorder)
+                    expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1-zai"), false, "overload retries should not mark the preferred route unavailable", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
