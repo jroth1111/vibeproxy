@@ -1177,7 +1177,7 @@ enum OpenAICompatTemporaryShim {
         }
 
         let canonicalCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
-        let extendedCandidates = canonicalCandidates + ["muse-spark"]
+        let extendedCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
         let acceptedCandidates = [canonicalCandidates, extendedCandidates]
         guard acceptedCandidates.contains(smartAlias.candidates),
               let primaryRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[0]),
@@ -1194,12 +1194,12 @@ enum OpenAICompatTemporaryShim {
               terminalFallbackRoute.canonicalModelID == "z-ai/glm5" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then glm5-nvidia, then muse-spark."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia."
             )
         }
 
         if smartAlias.candidates == extendedCandidates {
-            guard let metaRoute = resolveConfiguredRoute(forRequestModel: extendedCandidates[4]),
+            guard let metaRoute = resolveConfiguredRoute(forRequestModel: extendedCandidates[3]),
                   metaRoute.providerID == MetaAIWebAdapter.providerID,
                   metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias else {
                 return ClientFacingNVIDIAFailure(
@@ -4748,8 +4748,12 @@ enum MetaAIWebAdapter {
 
     private static func makeSession(authSnapshot: HARAuthSnapshot) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 120
-        configuration.timeoutIntervalForResource = 180
+        // Meta's web GraphQL lane can take materially longer on heavier prompts than the
+        // direct provider lanes. Use the same scaled timeout posture as the proxy's
+        // long-lived coding routes so the adapter has headroom instead of failing close
+        // to completion.
+        configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(180)
+        configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         configuration.httpAdditionalHeaders = [
             "User-Agent": authSnapshot.userAgent,
             "Origin": "https://meta.ai",
