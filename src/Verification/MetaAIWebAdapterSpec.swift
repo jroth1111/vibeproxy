@@ -8,7 +8,9 @@ struct MetaAIWebAdapterSpec {
         let authSnapshot = MetaAIWebAdapter.HARAuthSnapshot(
             cookieHeader: "session=abc123",
             userAgent: "MetaAdapterSpec/1.0",
-            acceptLanguage: "en-US,en;q=0.9"
+            acceptLanguage: "en-US,en;q=0.9",
+            userLocale: "en-US",
+            devicePixelRatio: 1.25
         )
 
         run("meta web adapter builds the observed GraphQL request sequence with browser-aligned headers", recorder: recorder) {
@@ -18,13 +20,13 @@ struct MetaAIWebAdapterSpec {
                 let requests = try MetaAIWebAdapter.buildExecutionRequests(
                     authSnapshot: authSnapshot,
                     conversationID: conversationID,
-                    prompt: "Hello",
-                    isNewThread: true
+                    prompt: "Hello"
                 )
 
                 expectEqual(
                     requests.map(\.kind),
                     [
+                        MetaAIWebAdapter.PlannedGraphQLRequest.Kind.updateLastSelectedMode,
                         MetaAIWebAdapter.PlannedGraphQLRequest.Kind.warmupConversation,
                         MetaAIWebAdapter.PlannedGraphQLRequest.Kind.updateConversationMode,
                         MetaAIWebAdapter.PlannedGraphQLRequest.Kind.sendMessage
@@ -34,8 +36,8 @@ struct MetaAIWebAdapterSpec {
                 )
                 expectEqual(
                     requests.map(\.isBestEffort),
-                    [false, false, false],
-                    "all setup and send requests are required",
+                    [true, false, false, false],
+                    "mode selection should be best-effort while the rest stay required",
                     recorder: recorder
                 )
 
@@ -49,13 +51,15 @@ struct MetaAIWebAdapterSpec {
                     expectEqual(request.value(forHTTPHeaderField: "Cookie"), authSnapshot.cookieHeader, "GraphQL requests should forward the HAR cookie header", recorder: recorder)
                 }
 
-                expectEqual(requests[0].request.value(forHTTPHeaderField: "Accept"), MetaAIWebAdapter.setupGraphQLAcceptHeader, "warmup should request multipart/mixed JSON", recorder: recorder)
-                expectEqual(requests[1].request.value(forHTTPHeaderField: "Accept"), MetaAIWebAdapter.setupGraphQLAcceptHeader, "mode update should request multipart/mixed JSON", recorder: recorder)
-                expectEqual(requests[2].request.value(forHTTPHeaderField: "Accept"), "text/event-stream", "sendMessage should request an event stream", recorder: recorder)
+                expectEqual(requests[0].request.value(forHTTPHeaderField: "Accept"), MetaAIWebAdapter.setupGraphQLAcceptHeader, "mode selection should request multipart/mixed JSON", recorder: recorder)
+                expectEqual(requests[1].request.value(forHTTPHeaderField: "Accept"), MetaAIWebAdapter.setupGraphQLAcceptHeader, "warmup should request multipart/mixed JSON", recorder: recorder)
+                expectEqual(requests[2].request.value(forHTTPHeaderField: "Accept"), MetaAIWebAdapter.setupGraphQLAcceptHeader, "mode update should request multipart/mixed JSON", recorder: recorder)
+                expectEqual(requests[3].request.value(forHTTPHeaderField: "Accept"), "text/event-stream", "sendMessage should request an event stream", recorder: recorder)
 
-                expectEqual(requests[0].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/", "warmup should use the root referer like the HAR", recorder: recorder)
-                expectEqual(requests[1].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/", "mode update should use the root referer like the HAR", recorder: recorder)
-                expectEqual(requests[2].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/prompt/\(conversationID)", "sendMessage should use the prompt-page referer", recorder: recorder)
+                expectEqual(requests[0].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/", "mode selection should use the root referer like the HAR", recorder: recorder)
+                expectEqual(requests[1].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/", "warmup should use the root referer like the HAR", recorder: recorder)
+                expectEqual(requests[2].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/", "mode update should use the root referer like the HAR", recorder: recorder)
+                expectEqual(requests[3].request.value(forHTTPHeaderField: "Referer"), "https://www.meta.ai/prompt/\(conversationID)", "sendMessage should use the prompt-page referer", recorder: recorder)
             } catch {
                 recorder.recordFailure("meta web adapter should build browser-aligned request headers: \(error)")
             }
@@ -68,36 +72,115 @@ struct MetaAIWebAdapterSpec {
                 let requests = try MetaAIWebAdapter.buildExecutionRequests(
                     authSnapshot: authSnapshot,
                     conversationID: conversationID,
-                    prompt: "Summarize this.",
-                    isNewThread: false
+                    prompt: "Summarize this."
                 )
 
-                let warmupBody = try graphQLBody(from: requests[0].request)
+                let modeSelectionBody = try graphQLBody(from: requests[0].request)
+                expectEqual(modeSelectionBody["doc_id"] as? String, "98081c3f48eddb05c71cb79d46fc337b", "mode selection should use the observed doc id", recorder: recorder)
+                let modeSelectionInput = (modeSelectionBody["variables"] as? [String: Any])?["input"] as? [String: Any]
+                expectEqual(modeSelectionInput?["mode"] as? String, "think_hard", "mode selection should pin think_hard", recorder: recorder)
+
+                let warmupBody = try graphQLBody(from: requests[1].request)
                 expectEqual(warmupBody["doc_id"] as? String, "e7f802582dbfed8e181b012e010993eb", "warmup should use the observed doc id", recorder: recorder)
                 expectEqual((warmupBody["variables"] as? [String: Any])?["conversationId"] as? String, conversationID, "warmup should carry the conversation id", recorder: recorder)
 
-                let updateBody = try graphQLBody(from: requests[1].request)
+                let updateBody = try graphQLBody(from: requests[2].request)
                 expectEqual(updateBody["doc_id"] as? String, "c32bbe999c48e64e855dc63177d5153f", "mode update should use the observed doc id", recorder: recorder)
                 let updateInput = (updateBody["variables"] as? [String: Any])?["input"] as? [String: Any]
                 expectEqual(updateInput?["conversationId"] as? String, conversationID, "mode update should carry the conversation id", recorder: recorder)
                 expectEqual(updateInput?["mode"] as? String, "think_hard", "mode update should pin think_hard", recorder: recorder)
 
-                let sendBody = try graphQLBody(from: requests[2].request)
+                let sendBody = try graphQLBody(from: requests[3].request)
                 expectEqual(sendBody["doc_id"] as? String, "af4c07d1fb42eb351dba31b5a299a819", "sendMessage should use the observed doc id", recorder: recorder)
                 let variables = sendBody["variables"] as? [String: Any]
                 expectEqual(variables?["conversationId"] as? String, conversationID, "sendMessage should carry the conversation id", recorder: recorder)
                 expectEqual(variables?["content"] as? String, "Summarize this.", "sendMessage should carry the prompt content", recorder: recorder)
                 expectEqual(variables?["mode"] as? String, "think_hard", "sendMessage should pin think_hard mode", recorder: recorder)
                 expectEqual(variables?["currentBranchPath"] as? String, "1", "stateless requests should start from branch 1", recorder: recorder)
-                expectEqual(variables?["isNewConversation"] as? Bool, false, "follow-up prompts should set isNewConversation=false", recorder: recorder)
+                expectEqual(variables?["isNewConversation"] as? Bool, true, "stateless follow-up prompts should still start a fresh Meta conversation", recorder: recorder)
                 expectEqual(variables?["promptEditType"] as? String, "new_message", "sendMessage should use the new_message prompt edit type", recorder: recorder)
                 expectEqual(variables?["entryPoint"] as? String, "KADABRA__UNKNOWN", "sendMessage should preserve the expected entry point", recorder: recorder)
                 expectEqual(variables?["userAgent"] as? String, authSnapshot.userAgent, "sendMessage should forward the HAR user-agent in variables", recorder: recorder)
+                expectEqual(variables?["userLocale"] as? String, authSnapshot.userLocale, "sendMessage should reuse the locale derived from the HAR session", recorder: recorder)
+                expectEqual(variables?["devicePixelRatio"] as? Double, authSnapshot.devicePixelRatio, "sendMessage should reuse the browser dpr captured in the HAR when available", recorder: recorder)
                 expectTrue(variables?["attachments"] is NSNull, "sendMessage should leave attachments null", recorder: recorder)
                 expectTrue(variables?["imagineOperationRequest"] is NSNull, "text chat should leave imagineOperationRequest null", recorder: recorder)
                 expectTrue(variables?["requestedToolCall"] is NSNull, "text chat should leave requestedToolCall null", recorder: recorder)
+                expectTrue(variables?["userEventId"] is NSNull, "text chat should leave userEventId null", recorder: recorder)
             } catch {
                 recorder.recordFailure("meta web adapter should encode stable GraphQL bodies: \(error)")
+            }
+        }
+
+        run("meta web adapter extracts required cookies and browser fingerprint from HAR GraphQL traffic", recorder: recorder) {
+            let har = """
+            {
+              "log": {
+                "entries": [
+                  {
+                    "request": {
+                      "url": "https://www.meta.ai/api/graphql",
+                      "headers": [
+                        {"name": "Cookie", "value": "datr=device123; ecto_1_sess=session456; dpr=1.5"},
+                        {"name": "User-Agent", "value": "Browser/1.0"},
+                        {"name": "Accept-Language", "value": "fr-FR,fr;q=0.9"}
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+            """
+
+            do {
+                let url = try writeTempFile(named: "meta-auth-\(UUID().uuidString).har", contents: har)
+                defer { try? FileManager.default.removeItem(at: url) }
+
+                try withTemporaryEnvironment("VIBEPROXY_META_AI_HAR_PATH", value: url.path) {
+                    let snapshot = try MetaAIWebAdapter.loadHARAuthSnapshot(fileManager: .default)
+                    expectEqual(snapshot.cookieHeader, "datr=device123; ecto_1_sess=session456; dpr=1.5", "HAR loading should preserve the cookie header", recorder: recorder)
+                    expectEqual(snapshot.userAgent, "Browser/1.0", "HAR loading should preserve the user-agent", recorder: recorder)
+                    expectEqual(snapshot.acceptLanguage, "fr-FR,fr;q=0.9", "HAR loading should preserve accept-language", recorder: recorder)
+                    expectEqual(snapshot.userLocale, "fr-FR", "HAR loading should derive locale from accept-language", recorder: recorder)
+                    expectEqual(snapshot.devicePixelRatio, 1.5, "HAR loading should parse dpr from cookies", recorder: recorder)
+                }
+            } catch {
+                recorder.recordFailure("meta web adapter should load a modern HAR auth snapshot: \(error)")
+            }
+        }
+
+        run("meta web adapter rejects HARs missing the minimum modern cookies", recorder: recorder) {
+            let har = """
+            {
+              "log": {
+                "entries": [
+                  {
+                    "request": {
+                      "url": "https://www.meta.ai/api/graphql",
+                      "headers": [
+                        {"name": "Cookie", "value": "datr=device123"},
+                        {"name": "User-Agent", "value": "Browser/1.0"}
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+            """
+
+            do {
+                let url = try writeTempFile(named: "meta-auth-missing-\(UUID().uuidString).har", contents: har)
+                defer { try? FileManager.default.removeItem(at: url) }
+
+                try withTemporaryEnvironment("VIBEPROXY_META_AI_HAR_PATH", value: url.path) {
+                    _ = try MetaAIWebAdapter.loadHARAuthSnapshot(fileManager: .default)
+                    recorder.recordFailure("meta web adapter should reject HARs missing ecto_1_sess")
+                }
+            } catch let failure as MetaAIWebAdapter.Failure {
+                expectEqual(failure.statusCode, 500, "missing auth cookies should fail as server-side adapter misconfiguration", recorder: recorder)
+                expectContains(failure.message, "datr and ecto_1_sess", "missing-cookie failures should name the minimum modern cookie set", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should throw a typed failure for incomplete HAR cookies: \(error)")
             }
         }
 
@@ -314,11 +397,55 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
-        run("meta web adapter extracts assistant text from the GraphQL event stream", recorder: recorder) {
+        run("meta web adapter rejects tool and typed-content requests during preflight validation", recorder: recorder) {
+            let toolRequest = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "hi"}
+              ],
+              "tools": [
+                {"type": "function", "function": {"name": "x", "parameters": {"type": "object"}}}
+              ]
+            }
+            """
+            let typedRequest = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {"type": "input_text", "text": "Describe this"},
+                    {"type": "input_image", "image_url": "https://example.com/cat.png"}
+                  ]
+                }
+              ]
+            }
+            """
+
+            let toolFailure = MetaAIWebAdapter.preflightFailure(
+                path: "/v1/chat/completions",
+                body: toolRequest,
+                publicModel: "muse-spark"
+            )
+            expectEqual(toolFailure?.statusCode, 501, "tool-bearing requests should fail during preflight", recorder: recorder)
+            expectContains(toolFailure?.message ?? "", "does not support live tool execution", "tool-bearing preflight should preserve the live-tool rejection", recorder: recorder)
+
+            let typedFailure = MetaAIWebAdapter.preflightFailure(
+                path: "/v1/chat/completions",
+                body: typedRequest,
+                publicModel: "muse-spark"
+            )
+            expectEqual(typedFailure?.statusCode, 400, "typed content should fail during preflight", recorder: recorder)
+            expectContains(typedFailure?.message ?? "", "only supports text message content", "typed-content preflight should preserve the text-only failure", recorder: recorder)
+        }
+
+        run("meta web adapter extracts assistant text and sources from the GraphQL event stream", recorder: recorder) {
             let stream = """
             :
             event: next
-            data: {"data":{"sendMessageStream":{"__typename":"AssistantMessage","content":"OK","error":null}}}
+            data: {"data":{"sendMessageStream":{"__typename":"AssistantMessage","content":"OK","error":null,"contentRenderer":{"message":{"sources":[{"source_url":"https://example.com/a","source_display_name":"Example A","source_subtitle":"First source"},{"source_url":"https://example.com/b","source_display_name":"Example B","source_subtitle":"Second source"}]}}}}}
             event: next
             data: {"data":{"sendMessageStream":{"__typename":"Conversation","title":"Simple Confirmation"}}}
             event: complete
@@ -329,6 +456,84 @@ struct MetaAIWebAdapterSpec {
             let parsed = MetaAIWebAdapter.parseEventStream(Data(stream.utf8))
             expectEqual(parsed.assistantText, "OK", "assistant text should come from assistant message events", recorder: recorder)
             expectEqual(parsed.errorMessage, nil, "successful assistant events should not surface an error", recorder: recorder)
+            expectEqual(parsed.sources.count, 2, "assistant events should expose extracted sources", recorder: recorder)
+            expectEqual(parsed.sources.first?.url, "https://example.com/a", "source URLs should be preserved", recorder: recorder)
+            expectEqual(parsed.sources.first?.title, "Example A", "source titles should be preserved", recorder: recorder)
+            expectEqual(parsed.sources.first?.subtitle, "First source", "source subtitles should be preserved", recorder: recorder)
+        }
+
+        run("meta web adapter extracts top-level SSE errors from the GraphQL event stream", recorder: recorder) {
+            let errorStream = #"""
+            event: next
+            data: {"errors":[{"message":"Variable \"$requestedToolCall\" got invalid value"}]}
+            """#
+
+            let parsed = MetaAIWebAdapter.parseEventStream(Data(errorStream.utf8))
+            expectEqual(parsed.assistantText, nil, "top-level SSE error frames should not invent assistant text", recorder: recorder)
+            expectContains(parsed.errorMessage ?? "", #"Variable "$requestedToolCall" got invalid value"#, "top-level SSE error frames should be surfaced directly", recorder: recorder)
+        }
+
+        run("meta web adapter translates GraphQL event-stream errors into a clean upstream failure", recorder: recorder) {
+            let errorStream = #"""
+            event: next
+            data: {"errors":[{"message":"Variable \"$requestedToolCall\" got invalid value \"browser.search\"; Expected type \"RequestedToolCallInput\" to be an object."}]}
+            """#
+
+            let message = MetaAIWebAdapter.formattedUpstreamErrorMessage(
+                statusCode: 400,
+                responseData: Data(errorStream.utf8)
+            )
+            expectContains(message, #"Variable "$requestedToolCall" got invalid value "browser.search""#, "GraphQL variable validation errors should be extracted from event streams", recorder: recorder)
+            expectContains(message, "RequestedToolCallInput", "GraphQL error formatting should preserve the schema detail", recorder: recorder)
+        }
+
+        run("meta web adapter classifies challenge pages and expired sessions cleanly", recorder: recorder) {
+            let challengeHTML = """
+            <!doctype html><html><head><title>Just a moment...</title></head><body>Cloudflare challenge-platform</body></html>
+            """
+            let authJSON = """
+            {"message":"Access token required"}
+            """
+
+            let challengeMessage = MetaAIWebAdapter.formattedUpstreamErrorMessage(
+                statusCode: 503,
+                responseData: Data(challengeHTML.utf8)
+            )
+            expectContains(challengeMessage, "challenge page", "challenge HTML should map to a clean anti-bot failure", recorder: recorder)
+
+            let authMessage = MetaAIWebAdapter.formattedUpstreamErrorMessage(
+                statusCode: 403,
+                responseData: Data(authJSON.utf8)
+            )
+            expectContains(authMessage, "session is no longer authorized", "auth failures should instruct the user to refresh the HAR session", recorder: recorder)
+            expectContains(authMessage, "ecto_1_sess", "auth failures should mention the critical session cookie", recorder: recorder)
+        }
+
+        run("meta web adapter surfaces Meta sources on responses outputs", recorder: recorder) {
+            let sources = [
+                MetaAIWebAdapter.Source(url: "https://example.com/a", title: "Example A", subtitle: "First"),
+                MetaAIWebAdapter.Source(url: "https://example.com/b", title: "Example B", subtitle: nil)
+            ]
+
+            let body = MetaAIWebAdapter.buildResponsesResponseBody(
+                text: "Grounded answer",
+                publicModel: "muse-spark",
+                sources: sources
+            )
+
+            do {
+                let response = try jsonObject(from: body)
+                let output = response["output"] as? [[String: Any]]
+                let content = output?.first?["content"] as? [[String: Any]]
+                let annotations = content?.first?["annotations"] as? [[String: Any]]
+                expectEqual(annotations?.count, 2, "responses output should expose one annotation per Meta source", recorder: recorder)
+                expectEqual(annotations?.first?["type"] as? String, "url_citation", "Meta sources should map to url citations", recorder: recorder)
+                expectEqual(annotations?.first?["url"] as? String, "https://example.com/a", "annotation URLs should preserve Meta source URLs", recorder: recorder)
+                expectEqual(annotations?.first?["title"] as? String, "Example A", "annotation titles should preserve Meta display names", recorder: recorder)
+                expectEqual(annotations?.first?["subtitle"] as? String, "First", "annotation subtitles should preserve Meta source subtitles when present", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should serialize responses annotations: \(error)")
+            }
         }
 
         exit(recorder.failures == 0 ? 0 : 1)
@@ -392,10 +597,33 @@ private func graphQLBody(from request: URLRequest) throws -> [String: Any] {
     guard let body = request.httpBody else {
         throw SpecFailure.message("missing HTTP body")
     }
+    return try jsonObject(from: body)
+}
+
+private func jsonObject(from body: Data) throws -> [String: Any] {
     guard let json = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
         throw SpecFailure.message("GraphQL body was not a JSON object")
     }
     return json
+}
+
+private func writeTempFile(named name: String, contents: String) throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+    try contents.write(to: url, atomically: true, encoding: .utf8)
+    return url
+}
+
+private func withTemporaryEnvironment(_ key: String, value: String, _ body: () throws -> Void) throws {
+    let original = getenv(key).map { String(cString: $0) }
+    setenv(key, value, 1)
+    defer {
+        if let original {
+            setenv(key, original, 1)
+        } else {
+            unsetenv(key)
+        }
+    }
+    try body()
 }
 
 private enum SpecFailure: Error {

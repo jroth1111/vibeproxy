@@ -4563,6 +4563,8 @@ enum MetaAIWebAdapter {
         let cookieHeader: String
         let userAgent: String
         let acceptLanguage: String
+        let userLocale: String
+        let devicePixelRatio: Double?
     }
 
     struct Source: Equatable {
@@ -4573,12 +4575,15 @@ enum MetaAIWebAdapter {
 
     struct PlannedGraphQLRequest {
         enum Kind: Equatable, CustomStringConvertible {
+            case updateLastSelectedMode
             case warmupConversation
             case updateConversationMode
             case sendMessage
 
             var description: String {
                 switch self {
+                case .updateLastSelectedMode:
+                    return "updateLastSelectedMode"
                 case .warmupConversation:
                     return "warmupConversation"
                 case .updateConversationMode:
@@ -4598,6 +4603,7 @@ enum MetaAIWebAdapter {
     private static let browserOrigin = "https://www.meta.ai"
     private static let browserRootReferer = "https://www.meta.ai/"
     static let setupGraphQLAcceptHeader = "multipart/mixed, application/json"
+    private static let updateLastSelectedModeDocID = "98081c3f48eddb05c71cb79d46fc337b"
     private static let warmupConversationDocID = "e7f802582dbfed8e181b012e010993eb"
     private static let updateConversationModeDocID = "c32bbe999c48e64e855dc63177d5153f"
     private static let sendMessageSubscriptionDocID = "af4c07d1fb42eb351dba31b5a299a819"
@@ -4644,8 +4650,7 @@ enum MetaAIWebAdapter {
             plannedRequests = try buildExecutionRequests(
                 authSnapshot: authSnapshot,
                 conversationID: conversationID,
-                prompt: parsedRequest.prompt,
-                isNewThread: parsedRequest.isNewThread
+                prompt: parsedRequest.prompt
             )
         } catch let failure as Failure {
             return .failure(failure)
@@ -4775,8 +4780,16 @@ enum MetaAIWebAdapter {
             )
         }
 
+        if let classifiedMessage = classifiedNonGraphQLFailureMessage(statusCode: 200, responseText: text) {
+            return ParsedEventStream(
+                assistantText: nil,
+                errorMessage: classifiedMessage,
+                sources: []
+            )
+        }
+
         var latestAssistantText: String?
-        var latestErrorMessage: String?
+        var latestErrorMessages: [String] = []
         var latestSources: [Source] = []
 
         for rawLine in text.components(separatedBy: .newlines) {
@@ -4786,8 +4799,13 @@ enum MetaAIWebAdapter {
             let payload = rawLine.dropFirst(5).trimmingCharacters(in: .whitespaces)
             guard !payload.isEmpty, payload != "[DONE]",
                   let payloadData = payload.data(using: .utf8),
-                  let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-                  let dataObject = root["data"] as? [String: Any],
+                  let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+                continue
+            }
+
+            latestErrorMessages.append(contentsOf: graphQLErrorMessages(fromJSONObject: root))
+
+            guard let dataObject = root["data"] as? [String: Any],
                   let streamObject = dataObject["sendMessageStream"] as? [String: Any] else {
                 continue
             }
@@ -4802,7 +4820,7 @@ enum MetaAIWebAdapter {
                let errorMessage = (errorObject["message"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !errorMessage.isEmpty {
-                latestErrorMessage = errorMessage
+                latestErrorMessages.append(errorMessage)
             }
 
             let extractedSources = extractSources(fromSendMessageStream: streamObject)
@@ -4811,9 +4829,10 @@ enum MetaAIWebAdapter {
             }
         }
 
+        let errorMessages = deduplicatedMessages(latestErrorMessages)
         return ParsedEventStream(
             assistantText: latestAssistantText,
-            errorMessage: latestErrorMessage,
+            errorMessage: errorMessages.isEmpty ? nil : errorMessages.joined(separator: " | "),
             sources: latestSources
         )
     }
@@ -4836,7 +4855,7 @@ enum MetaAIWebAdapter {
         path == "/v1/responses" || path == "/api/v1/responses"
     }
 
-    private static func loadHARAuthSnapshot(fileManager: FileManager) throws -> HARAuthSnapshot {
+    static func loadHARAuthSnapshot(fileManager: FileManager) throws -> HARAuthSnapshot {
         let harURL = metaAIHARURL(fileManager: fileManager)
         guard let data = try? Data(contentsOf: harURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -4869,11 +4888,25 @@ enum MetaAIWebAdapter {
                 continue
             }
 
+            let cookieValues = parseCookieHeader(cookieHeader)
+            guard requiredMetaCookieFailure(for: cookieValues) == nil else {
+                continue
+            }
+
+            let acceptLanguage = normalizedString(headerMap["accept-language"]) ?? "en-US,en;q=0.9"
+
             return HARAuthSnapshot(
                 cookieHeader: cookieHeader,
                 userAgent: userAgent,
-                acceptLanguage: normalizedString(headerMap["accept-language"]) ?? "en-US,en;q=0.9"
+                acceptLanguage: acceptLanguage,
+                userLocale: preferredMetaUserLocale(fromAcceptLanguage: acceptLanguage),
+                devicePixelRatio: parseNumericCookie(named: "dpr", in: cookieValues)
             )
+        }
+
+        let missingCookieMessage = "Meta web adapter requires a HAR with a cookie-bearing GraphQL request that includes fresh datr and ecto_1_sess cookies."
+        if harContainsCookieBearingGraphQLRequest(entries: entries) {
+            throw Failure(statusCode: 500, message: missingCookieMessage)
         }
 
         throw Failure(
@@ -4885,11 +4918,21 @@ enum MetaAIWebAdapter {
     static func buildExecutionRequests(
         authSnapshot: HARAuthSnapshot,
         conversationID: String,
-        prompt: String,
-        isNewThread: Bool
+        prompt: String
     ) throws -> [PlannedGraphQLRequest] {
         let promptReferer = conversationPromptReferer(for: conversationID)
         return [
+            PlannedGraphQLRequest(
+                kind: .updateLastSelectedMode,
+                isBestEffort: true,
+                request: try makeGraphQLRequest(
+                    authSnapshot: authSnapshot,
+                    accept: setupGraphQLAcceptHeader,
+                    docID: updateLastSelectedModeDocID,
+                    variables: ["input": ["mode": conversationMode]],
+                    referer: browserRootReferer
+                )
+            ),
             PlannedGraphQLRequest(
                 kind: .warmupConversation,
                 isBestEffort: false,
@@ -4922,8 +4965,7 @@ enum MetaAIWebAdapter {
                     variables: buildSendMessageVariables(
                         authSnapshot: authSnapshot,
                         conversationID: conversationID,
-                        prompt: prompt,
-                        isNewThread: isNewThread
+                        prompt: prompt
                     ),
                     referer: promptReferer
                 )
@@ -5043,8 +5085,7 @@ enum MetaAIWebAdapter {
     private static func buildSendMessageVariables(
         authSnapshot: HARAuthSnapshot,
         conversationID: String,
-        prompt: String,
-        isNewThread: Bool
+        prompt: String
     ) -> [String: Any] {
         [
             "assistantMessageId": UUID().uuidString,
@@ -5058,10 +5099,12 @@ enum MetaAIWebAdapter {
             "conversationStarterId": NSNull(),
             "currentBranchPath": "1",
             "developerOverridesForMessage": NSNull(),
-            "devicePixelRatio": 2,
+            "devicePixelRatio": authSnapshot.devicePixelRatio ?? NSNull(),
             "entryPoint": "KADABRA__UNKNOWN",
             "imagineOperationRequest": NSNull(),
-            "isNewConversation": isNewThread,
+            // This adapter is stateless: every request starts a fresh Meta conversation
+            // and carries prior turns only via the flattened transcript prompt.
+            "isNewConversation": true,
             "mentions": NSNull(),
             "mode": conversationMode,
             "promptEditType": "new_message",
@@ -5072,8 +5115,8 @@ enum MetaAIWebAdapter {
             "rewriteOptions": NSNull(),
             "turnId": UUID().uuidString,
             "userAgent": authSnapshot.userAgent,
-            "userEventId": UUID().uuidString,
-            "userLocale": Locale.current.identifier.replacingOccurrences(of: "-", with: "_"),
+            "userEventId": NSNull(),
+            "userLocale": authSnapshot.userLocale,
             "userMessageId": UUID().uuidString,
             "userUniqueMessageId": String(Int.random(in: 7_000_000_000_000_000_000 ... 8_999_999_999_999_999_999))
         ]
@@ -5200,6 +5243,78 @@ enum MetaAIWebAdapter {
         return trimmed
     }
 
+    private static func parseCookieHeader(_ rawCookieHeader: String) -> [String: String] {
+        rawCookieHeader
+            .split(separator: ";")
+            .reduce(into: [String: String]()) { partialResult, rawPart in
+                let part = rawPart.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !part.isEmpty,
+                      let equalsIndex = part.firstIndex(of: "=") else {
+                    return
+                }
+                let name = String(part[..<equalsIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let value = String(part[part.index(after: equalsIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty, !value.isEmpty else {
+                    return
+                }
+                partialResult[name] = value
+            }
+    }
+
+    private static func parseNumericCookie(named name: String, in cookies: [String: String]) -> Double? {
+        guard let value = normalizedString(cookies[name]) else {
+            return nil
+        }
+        return Double(value)
+    }
+
+    private static func preferredMetaUserLocale(fromAcceptLanguage acceptLanguage: String) -> String {
+        let primaryLanguageRange = acceptLanguage
+            .split(separator: ",")
+            .first?
+            .split(separator: ";")
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedString(primaryLanguageRange.map { String($0) }) ?? "en-US"
+    }
+
+    private static func requiredMetaCookieFailure(for cookies: [String: String]) -> Failure? {
+        let requiredCookieNames = ["datr", "ecto_1_sess"]
+        let missing = requiredCookieNames.filter { normalizedString(cookies[$0]) == nil }
+        guard !missing.isEmpty else {
+            return nil
+        }
+        return Failure(
+            statusCode: 500,
+            message: "Meta web adapter requires fresh \(missing.joined(separator: " and ")) cookies in the captured HAR GraphQL request."
+        )
+    }
+
+    private static func harContainsCookieBearingGraphQLRequest(entries: [[String: Any]]) -> Bool {
+        for entry in entries {
+            guard let request = entry["request"] as? [String: Any],
+                  let url = request["url"] as? String,
+                  url.contains("/api/graphql"),
+                  let headers = request["headers"] as? [[String: Any]] else {
+                continue
+            }
+
+            let headerMap = headers.reduce(into: [String: String]()) { partialResult, header in
+                guard let name = (header["name"] as? String)?.lowercased(),
+                      let value = header["value"] as? String else {
+                    return
+                }
+                partialResult[name] = value
+            }
+
+            if normalizedString(headerMap["cookie"]) != nil,
+               normalizedString(headerMap["user-agent"]) != nil {
+                return true
+            }
+        }
+        return false
+    }
+
     private static func requestsUnsupportedToolExecution(in json: [String: Any]) -> Bool {
         if let tools = json["tools"] as? [Any], !tools.isEmpty {
             return true
@@ -5223,13 +5338,17 @@ enum MetaAIWebAdapter {
     }
 
     static func formattedUpstreamErrorMessage(statusCode: Int, responseData: Data) -> String {
+        let bodyText = String(data: responseData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let classifiedMessage = classifiedNonGraphQLFailureMessage(statusCode: statusCode, responseText: bodyText) {
+            return classifiedMessage
+        }
+
         let errorMessages = extractGraphQLErrorMessages(from: responseData)
         if !errorMessages.isEmpty {
             return "Meta web adapter upstream error (\(statusCode)): \(errorMessages.joined(separator: " | "))"
         }
 
-        let bodyText = String(data: responseData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         if let bodyText, !bodyText.isEmpty {
             return "Meta web adapter upstream error (\(statusCode)): \(bodyText)"
         }
@@ -5266,7 +5385,10 @@ enum MetaAIWebAdapter {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return []
         }
+        return graphQLErrorMessages(fromJSONObject: root)
+    }
 
+    private static func graphQLErrorMessages(fromJSONObject root: [String: Any]) -> [String] {
         if let errors = root["errors"] as? [[String: Any]] {
             let messages = errors.compactMap { errorObject -> String? in
                 normalizedString(errorObject["message"] as? String)
@@ -5286,6 +5408,56 @@ enum MetaAIWebAdapter {
         }
 
         return []
+    }
+
+    private static func classifiedNonGraphQLFailureMessage(statusCode: Int, responseText: String?) -> String? {
+        guard let responseText = normalizedString(responseText) else {
+            return nil
+        }
+
+        let normalizedBody = responseText.lowercased()
+        if looksLikeMetaChallengePage(normalizedBody) {
+            return "Meta web adapter was blocked by a Meta/Cloudflare challenge page; refresh the HAR in a normal browser session and retry."
+        }
+
+        if looksLikeMetaSessionFailure(normalizedBody, statusCode: statusCode) {
+            return "Meta web adapter session is no longer authorized; capture a fresh HAR with current datr and ecto_1_sess cookies and retry."
+        }
+
+        return nil
+    }
+
+    private static func looksLikeMetaChallengePage(_ normalizedBody: String) -> Bool {
+        let htmlIndicators = ["<!doctype html", "<html", "<head", "<body"]
+        let challengeIndicators = [
+            "just a moment",
+            "cloudflare",
+            "cf-chl",
+            "captcha",
+            "attention required",
+            "challenge-platform",
+            "bot detection",
+            "verify you are human"
+        ]
+        return htmlIndicators.contains(where: normalizedBody.contains)
+            && challengeIndicators.contains(where: normalizedBody.contains)
+    }
+
+    private static func looksLikeMetaSessionFailure(_ normalizedBody: String, statusCode: Int) -> Bool {
+        let authIndicators = [
+            "access token required",
+            "authentication",
+            "unauthorized",
+            "invalid session",
+            "session expired",
+            "log in to continue",
+            "login required",
+            "please log in"
+        ]
+        if authIndicators.contains(where: normalizedBody.contains) {
+            return true
+        }
+        return statusCode == 403 && normalizedBody.contains("forbidden")
     }
 
     private static func deduplicatedMessages(_ messages: [String]) -> [String] {
@@ -9113,7 +9285,7 @@ class ThinkingProxy {
                     requestModel: candidateModel,
                     requestedAlias: publicAlias,
                     canonicalModelID: route?.canonicalModelID ?? candidateModel,
-                    transportOutcome: "send_error",
+                    transportOutcome: "retry",
                     attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: transportFailureClass(error),
@@ -9146,7 +9318,7 @@ class ThinkingProxy {
                     requestModel: candidateModel,
                     requestedAlias: publicAlias,
                     canonicalModelID: route?.canonicalModelID ?? candidateModel,
-                    transportOutcome: "send_error",
+                    transportOutcome: "retry",
                     attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: "missing_response_material",
@@ -9186,7 +9358,9 @@ class ThinkingProxy {
                 requestModel: candidateModel,
                 requestedAlias: publicAlias,
                 canonicalModelID: route?.canonicalModelID ?? candidateModel,
-                transportOutcome: statusCode >= 200 && statusCode < 300 ? "send_response" : "send_error",
+                transportOutcome: shouldFailover
+                    ? "retry"
+                    : (statusCode >= 200 && statusCode < 300 ? "send_response" : "send_error"),
                 attemptLane: attemptLane,
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: (!shouldFailover && statusCode >= 200 && statusCode < 300) ? candidateModel : nil,
