@@ -4449,6 +4449,642 @@ enum OpenAICompatTemporaryShim {
 
 }
 
+enum MetaAIWebAdapter {
+    static let providerID = "meta-web"
+    static let modelAlias = "muse-spark"
+    static let conversationMode = "think_hard"
+
+    enum ResponseSurface: Equatable {
+        case chatCompletions
+        case responses
+    }
+
+    struct Failure: Error, Equatable {
+        let statusCode: Int
+        let message: String
+    }
+
+    struct ExecutionResult {
+        let statusCode: Int
+        let headers: [String: String]
+        let body: Data
+    }
+
+    struct ParsedRequest: Equatable {
+        let surface: ResponseSurface
+        let prompt: String
+        let stream: Bool
+        let publicModel: String
+    }
+
+    struct ParsedEventStream: Equatable {
+        let assistantText: String?
+        let errorMessage: String?
+    }
+
+    struct HARAuthSnapshot: Equatable {
+        let cookieHeader: String
+        let userAgent: String
+        let acceptLanguage: String
+    }
+
+    private static let updateLastSelectedModeDocID = "98081c3f48eddb05c71cb79d46fc337b"
+    private static let warmupConversationDocID = "e7f802582dbfed8e181b012e010993eb"
+    private static let updateConversationModeDocID = "c32bbe999c48e64e855dc63177d5153f"
+    private static let sendMessageSubscriptionDocID = "af4c07d1fb42eb351dba31b5a299a819"
+
+    static func execute(
+        path: String,
+        body: String,
+        publicModel: String,
+        fileManager: FileManager = .default
+    ) -> Result<ExecutionResult, Failure> {
+        let parsedRequest: ParsedRequest
+        do {
+            parsedRequest = try parseRequest(path: path, body: body, publicModel: publicModel)
+        } catch let failure as Failure {
+            return .failure(failure)
+        } catch {
+            return .failure(Failure(statusCode: 400, message: "Meta web adapter could not parse the request body."))
+        }
+
+        let authSnapshot: HARAuthSnapshot
+        do {
+            authSnapshot = try loadHARAuthSnapshot(fileManager: fileManager)
+        } catch let failure as Failure {
+            return .failure(failure)
+        } catch {
+            return .failure(Failure(statusCode: 500, message: "Meta web adapter failed to load auth material."))
+        }
+
+        let session = makeSession(authSnapshot: authSnapshot)
+        let conversationID = UUID().uuidString
+
+        do {
+            _ = try postGraphQL(
+                session: session,
+                authSnapshot: authSnapshot,
+                accept: "application/json",
+                docID: updateLastSelectedModeDocID,
+                variables: ["input": ["mode": conversationMode]]
+            )
+            _ = try postGraphQL(
+                session: session,
+                authSnapshot: authSnapshot,
+                accept: "application/json",
+                docID: warmupConversationDocID,
+                variables: ["conversationId": conversationID]
+            )
+            _ = try postGraphQL(
+                session: session,
+                authSnapshot: authSnapshot,
+                accept: "application/json",
+                docID: updateConversationModeDocID,
+                variables: ["input": ["conversationId": conversationID, "mode": conversationMode]]
+            )
+
+            let eventStreamData = try postGraphQL(
+                session: session,
+                authSnapshot: authSnapshot,
+                accept: "text/event-stream",
+                docID: sendMessageSubscriptionDocID,
+                variables: buildSendMessageVariables(
+                    authSnapshot: authSnapshot,
+                    conversationID: conversationID,
+                    prompt: parsedRequest.prompt
+                )
+            )
+
+            let parsedEventStream = parseEventStream(eventStreamData)
+            if let assistantText = parsedEventStream.assistantText?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !assistantText.isEmpty {
+                let bodyData: Data
+                let headers: [String: String]
+                switch (parsedRequest.surface, parsedRequest.stream) {
+                case (.chatCompletions, false):
+                    bodyData = buildChatCompletionsResponseBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "application/json; charset=utf-8"]
+                case (.chatCompletions, true):
+                    bodyData = buildChatCompletionsStreamBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                case (.responses, false):
+                    bodyData = buildResponsesResponseBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "application/json; charset=utf-8"]
+                case (.responses, true):
+                    bodyData = buildResponsesStreamBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                }
+                return .success(
+                    ExecutionResult(
+                        statusCode: 200,
+                        headers: headers,
+                        body: bodyData
+                    )
+                )
+            }
+
+            let errorMessage = parsedEventStream.errorMessage?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return .failure(
+                Failure(
+                    statusCode: 502,
+                    message: errorMessage?.isEmpty == false
+                        ? errorMessage!
+                        : "Meta web adapter received no assistant output from the GraphQL stream."
+                )
+            )
+        } catch let failure as Failure {
+            return .failure(failure)
+        } catch {
+            return .failure(Failure(statusCode: 502, message: "Meta web adapter failed while executing the GraphQL request sequence."))
+        }
+    }
+
+    static func parseRequest(path: String, body: String, publicModel: String) throws -> ParsedRequest {
+        let surface: ResponseSurface
+        let normalizedBody: String
+        if isResponsesPath(path) {
+            guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(fromResponsesRequestJSON: body) else {
+                throw Failure(statusCode: 400, message: "Meta web adapter only supports /v1/responses payloads that can be flattened onto text-only chat messages.")
+            }
+            surface = .responses
+            normalizedBody = chatBody
+        } else if isChatCompletionsPath(path) {
+            surface = .chatCompletions
+            normalizedBody = body
+        } else {
+            throw Failure(statusCode: 501, message: "Meta web adapter only supports /v1/chat/completions and /v1/responses.")
+        }
+
+        guard let data = normalizedBody.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw Failure(statusCode: 400, message: "Meta web adapter requires a valid JSON request body.")
+        }
+
+        if json["tools"] != nil || json["tool_choice"] != nil || json["parallel_tool_calls"] != nil {
+            throw Failure(statusCode: 501, message: "Meta web adapter does not support tool calling through the web UI GraphQL lane.")
+        }
+
+        let stream = (json["stream"] as? Bool) ?? false
+        let prompt = try extractPrompt(fromChatRequestJSONObject: json)
+        return ParsedRequest(surface: surface, prompt: prompt, stream: stream, publicModel: publicModel)
+    }
+
+    static func parseEventStream(_ data: Data) -> ParsedEventStream {
+        guard let text = String(data: data, encoding: .utf8) else {
+            return ParsedEventStream(assistantText: nil, errorMessage: "Meta web adapter received a non-UTF8 event stream.")
+        }
+
+        var latestAssistantText: String?
+        var latestErrorMessage: String?
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            guard rawLine.hasPrefix("data:") else {
+                continue
+            }
+            let payload = rawLine.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !payload.isEmpty, payload != "[DONE]",
+                  let payloadData = payload.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+                  let dataObject = root["data"] as? [String: Any],
+                  let streamObject = dataObject["sendMessageStream"] as? [String: Any] else {
+                continue
+            }
+
+            if let assistantText = (streamObject["content"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !assistantText.isEmpty {
+                latestAssistantText = assistantText
+            }
+
+            if let errorObject = streamObject["error"] as? [String: Any],
+               let errorMessage = (errorObject["message"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !errorMessage.isEmpty {
+                latestErrorMessage = errorMessage
+            }
+        }
+
+        return ParsedEventStream(assistantText: latestAssistantText, errorMessage: latestErrorMessage)
+    }
+
+    private static func metaAIHARURL(fileManager: FileManager) -> URL {
+        if let override = ProcessInfo.processInfo.environment["VIBEPROXY_META_AI_HAR_PATH"],
+           let normalizedOverride = normalizedString(override) {
+            return URL(fileURLWithPath: normalizedOverride)
+        }
+        return fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cli-proxy-api", isDirectory: true)
+            .appendingPathComponent("meta.ai.har")
+    }
+
+    private static func isChatCompletionsPath(_ path: String) -> Bool {
+        path == "/v1/chat/completions" || path == "/api/v1/chat/completions"
+    }
+
+    private static func isResponsesPath(_ path: String) -> Bool {
+        path == "/v1/responses" || path == "/api/v1/responses"
+    }
+
+    private static func loadHARAuthSnapshot(fileManager: FileManager) throws -> HARAuthSnapshot {
+        let harURL = metaAIHARURL(fileManager: fileManager)
+        guard let data = try? Data(contentsOf: harURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let log = root["log"] as? [String: Any],
+              let entries = log["entries"] as? [[String: Any]] else {
+            throw Failure(
+                statusCode: 500,
+                message: "Meta web adapter requires a HAR at \(harURL.path) with captured meta.ai GraphQL traffic."
+            )
+        }
+
+        for entry in entries {
+            guard let request = entry["request"] as? [String: Any],
+                  let url = request["url"] as? String,
+                  url.contains("/api/graphql"),
+                  let headers = request["headers"] as? [[String: Any]] else {
+                continue
+            }
+
+            let headerMap = headers.reduce(into: [String: String]()) { partialResult, header in
+                guard let name = (header["name"] as? String)?.lowercased(),
+                      let value = header["value"] as? String else {
+                    return
+                }
+                partialResult[name] = value
+            }
+
+            guard let cookieHeader = normalizedString(headerMap["cookie"]),
+                  let userAgent = normalizedString(headerMap["user-agent"]) else {
+                continue
+            }
+
+            return HARAuthSnapshot(
+                cookieHeader: cookieHeader,
+                userAgent: userAgent,
+                acceptLanguage: normalizedString(headerMap["accept-language"]) ?? "en-US,en;q=0.9"
+            )
+        }
+
+        throw Failure(
+            statusCode: 500,
+            message: "Meta web adapter could not find a cookie-bearing GraphQL request in the configured HAR."
+        )
+    }
+
+    private static func makeSession(authSnapshot: HARAuthSnapshot) -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 120
+        configuration.timeoutIntervalForResource = 180
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": authSnapshot.userAgent,
+            "Origin": "https://meta.ai",
+            "Referer": "https://meta.ai/",
+            "Accept-Language": authSnapshot.acceptLanguage,
+            "Cookie": authSnapshot.cookieHeader
+        ]
+        return URLSession(configuration: configuration)
+    }
+
+    private static func postGraphQL(
+        session: URLSession,
+        authSnapshot: HARAuthSnapshot,
+        accept: String,
+        docID: String,
+        variables: [String: Any]
+    ) throws -> Data {
+        guard let url = URL(string: "https://meta.ai/api/graphql") else {
+            throw Failure(statusCode: 500, message: "Meta web adapter has an invalid GraphQL endpoint URL.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        request.setValue("https://meta.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://meta.ai/", forHTTPHeaderField: "Referer")
+        request.setValue(authSnapshot.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(authSnapshot.acceptLanguage, forHTTPHeaderField: "Accept-Language")
+        request.setValue(authSnapshot.cookieHeader, forHTTPHeaderField: "Cookie")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "doc_id": docID,
+            "variables": variables
+        ])
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var capturedData: Data?
+        var capturedResponse: URLResponse?
+        var capturedError: Error?
+
+        let task = session.dataTask(with: request) { data, response, error in
+            capturedData = data
+            capturedResponse = response
+            capturedError = error
+            semaphore.signal()
+        }
+        task.resume()
+        semaphore.wait()
+
+        if let capturedError {
+            throw Failure(statusCode: 502, message: "Meta web adapter network error: \(capturedError.localizedDescription)")
+        }
+
+        guard let httpResponse = capturedResponse as? HTTPURLResponse else {
+            throw Failure(statusCode: 502, message: "Meta web adapter received no HTTP response from meta.ai.")
+        }
+
+        let responseData = capturedData ?? Data()
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            let bodyText = String(data: responseData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw Failure(
+                statusCode: httpResponse.statusCode,
+                message: bodyText?.isEmpty == false
+                    ? "Meta web adapter upstream error (\(httpResponse.statusCode)): \(bodyText!)"
+                    : "Meta web adapter upstream error (\(httpResponse.statusCode))."
+            )
+        }
+
+        return responseData
+    }
+
+    private static func buildSendMessageVariables(
+        authSnapshot: HARAuthSnapshot,
+        conversationID: String,
+        prompt: String
+    ) -> [String: Any] {
+        [
+            "assistantMessageId": UUID().uuidString,
+            "attachments": NSNull(),
+            "clientLatitude": NSNull(),
+            "clientLongitude": NSNull(),
+            "clientTimezone": TimeZone.current.identifier,
+            "clippyIp": NSNull(),
+            "content": prompt,
+            "conversationId": conversationID,
+            "conversationStarterId": NSNull(),
+            "currentBranchPath": "1",
+            "developerOverridesForMessage": NSNull(),
+            "devicePixelRatio": 2,
+            "entryPoint": "KADABRA__UNKNOWN",
+            "imagineOperationRequest": NSNull(),
+            "isNewConversation": true,
+            "mentions": NSNull(),
+            "mode": conversationMode,
+            "promptEditType": "new_message",
+            "promptSessionId": UUID().uuidString,
+            "promptType": NSNull(),
+            "qplJoinId": NSNull(),
+            "requestedToolCall": NSNull(),
+            "rewriteOptions": NSNull(),
+            "turnId": UUID().uuidString,
+            "userAgent": authSnapshot.userAgent,
+            "userEventId": UUID().uuidString,
+            "userLocale": Locale.current.identifier.replacingOccurrences(of: "-", with: "_"),
+            "userMessageId": UUID().uuidString,
+            "userUniqueMessageId": String(Int.random(in: 7_000_000_000_000_000_000 ... 8_999_999_999_999_999_999))
+        ]
+    }
+
+    private static func extractPrompt(fromChatRequestJSONObject json: [String: Any]) throws -> String {
+        guard let messages = json["messages"] as? [[String: Any]], !messages.isEmpty else {
+            throw Failure(statusCode: 400, message: "Meta web adapter requires at least one chat message.")
+        }
+
+        var transcript: [String] = []
+        for message in messages {
+            let role = ((message["role"] as? String) ?? "user").lowercased()
+            if role == "tool" || message["tool_calls"] != nil {
+                throw Failure(statusCode: 501, message: "Meta web adapter does not support tool or function-call messages.")
+            }
+
+            guard let flattenedText = flattenedText(from: message["content"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !flattenedText.isEmpty else {
+                continue
+            }
+
+            switch role {
+            case "system":
+                transcript.append("System: \(flattenedText)")
+            case "assistant":
+                transcript.append("Assistant: \(flattenedText)")
+            default:
+                transcript.append("User: \(flattenedText)")
+            }
+        }
+
+        guard !transcript.isEmpty else {
+            throw Failure(statusCode: 400, message: "Meta web adapter only supports text messages.")
+        }
+
+        if transcript.count == 1,
+           let onlyLine = transcript.first,
+           onlyLine.hasPrefix("User: ") {
+            return String(onlyLine.dropFirst("User: ".count))
+        }
+
+        return transcript.joined(separator: "\n\n")
+    }
+
+    private static func flattenedText(from value: Any?) -> String? {
+        guard let value else {
+            return nil
+        }
+        if let stringValue = value as? String {
+            return stringValue
+        }
+        guard let segments = value as? [Any] else {
+            return nil
+        }
+
+        var parts: [String] = []
+        for segment in segments {
+            if let stringSegment = segment as? String {
+                parts.append(stringSegment)
+                continue
+            }
+            guard let dictionary = segment as? [String: Any] else {
+                return nil
+            }
+            let type = (dictionary["type"] as? String)?.lowercased()
+            guard let text = dictionary["text"] as? String,
+                  type == nil || type == "text" || type == "input_text" || type == "output_text" else {
+                return nil
+            }
+            parts.append(text)
+        }
+        guard !parts.isEmpty else {
+            return nil
+        }
+        return parts.joined()
+    }
+
+    private static func normalizedString(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func buildChatCompletionsResponseBody(text: String, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let id = "chatcmpl_meta_\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": publicModel,
+            "choices": [[
+                "index": 0,
+                "message": [
+                    "role": "assistant",
+                    "content": text
+                ],
+                "finish_reason": "stop"
+            ]]
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+    }
+
+    private static func buildChatCompletionsStreamBody(text: String, publicModel: String) -> Data {
+        let id = "chatcmpl_meta_\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+        let lines = [
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": ["role": "assistant"],
+                    "finish_reason": NSNull()
+                ]]
+            ]),
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": ["content": text],
+                    "finish_reason": NSNull()
+                ]]
+            ]),
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": [:],
+                    "finish_reason": "stop"
+                ]]
+            ]),
+            "data: [DONE]\n\n"
+        ]
+        return Data(lines.joined().utf8)
+    }
+
+    private static func buildResponsesResponseBody(text: String, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let responseID = "resp_meta_\(UUID().uuidString)"
+        let messageID = "msg_meta_\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "id": responseID,
+            "object": "response",
+            "created": created,
+            "status": "completed",
+            "model": publicModel,
+            "output": [[
+                "id": messageID,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [[
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                ]]
+            ]]
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+    }
+
+    private static func buildResponsesStreamBody(text: String, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let responseID = "resp_meta_\(UUID().uuidString)"
+        let messageID = "msg_meta_\(UUID().uuidString)"
+        let lines = [
+            sseLine([
+                "type": "response.created",
+                "response": [
+                    "id": responseID,
+                    "object": "response",
+                    "created": created,
+                    "status": "in_progress",
+                    "model": publicModel,
+                    "output": []
+                ]
+            ]),
+            sseLine([
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": [
+                    "id": messageID,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                ]
+            ]),
+            sseLine([
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": messageID,
+                "content_index": 0,
+                "delta": text
+            ]),
+            sseLine([
+                "type": "response.completed",
+                "response": [
+                    "id": responseID,
+                    "object": "response",
+                    "created": created,
+                    "status": "completed",
+                    "model": publicModel,
+                    "output": [[
+                        "id": messageID,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [[
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        ]]
+                    ]]
+                ]
+            ]),
+            "data: [DONE]\n\n"
+        ]
+        return Data(lines.joined().utf8)
+    }
+
+    private static func sseLine(_ json: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let string = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return "data: \(string)\n\n"
+    }
+}
+
 /**
  A lightweight HTTP proxy that intercepts requests to add extended thinking parameters
  for Claude models based on model name suffixes.
@@ -5564,6 +6200,20 @@ class ThinkingProxy {
                 sendError(to: connection, statusCode: preflightError.statusCode, message: preflightError.message)
                 return
             }
+        }
+
+        if method == "POST",
+           let metaModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: modifiedBody),
+           let metaRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: metaModel),
+           metaRoute.providerID == MetaAIWebAdapter.providerID {
+            NSLog("[ThinkingProxy] Routing %@ via Meta AI web adapter", metaModel)
+            forwardMetaAIWebRequest(
+                path: rewrittenPath,
+                body: modifiedBody,
+                publicModel: metaModel,
+                originalConnection: connection
+            )
+            return
         }
 
         // Direct proxied path for providers with per-provider proxy-url.
@@ -8408,6 +9058,35 @@ class ThinkingProxy {
                 body: data,
                 coalescingKey: nil,
                 overridingModel: overridingModel
+            )
+        }
+    }
+
+    private func forwardMetaAIWebRequest(
+        path: String,
+        body: String,
+        publicModel: String,
+        originalConnection: NWConnection
+    ) {
+        let resolutionHeaders = smartAliasResolutionHeaders(
+            publicAlias: publicModel,
+            resolvedRequestModel: publicModel
+        )
+        switch MetaAIWebAdapter.execute(path: path, body: body, publicModel: publicModel) {
+        case .success(let executionResult):
+            sendHTTPResponse(
+                to: originalConnection,
+                statusCode: executionResult.statusCode,
+                headers: executionResult.headers,
+                body: executionResult.body,
+                overridingHeaders: resolutionHeaders
+            )
+        case .failure(let failure):
+            sendError(
+                to: originalConnection,
+                statusCode: failure.statusCode,
+                message: failure.message,
+                overridingHeaders: resolutionHeaders
             )
         }
     }

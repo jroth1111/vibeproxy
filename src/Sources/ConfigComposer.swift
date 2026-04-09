@@ -35,7 +35,7 @@ enum ConfigComposer {
 
         let patchedProviders = mergeManagedProviderEntries(
             base: stringKeyedDictionaryArray(patchedRoot["openai-compatibility"]),
-            managed: temporaryNVIDIAProviderEntries()
+            managed: temporaryManagedProviderEntries()
         )
         if !patchedProviders.isEmpty {
             patchedRoot["openai-compatibility"] = patchedProviders
@@ -328,11 +328,16 @@ enum ConfigComposer {
                 let inlineEntries = apiKeys(from: entry).map { ["api-key": $0] }
                 let authEntries = authEntriesByProviderID[providerName] ?? []
                 let effectiveEntries = deduplicatedAPIKeyEntries(inlineEntries + authEntries)
-                guard !effectiveEntries.isEmpty else {
-                    continue
+                if effectiveEntries.isEmpty {
+                    if managedProviderRequiresAPIKey(entry) {
+                        continue
+                    }
+                    sanitizedEntry.removeValue(forKey: "api-key-entries")
+                    sanitizedEntry.removeValue(forKey: "api-key")
+                } else {
+                    sanitizedEntry["api-key-entries"] = effectiveEntries
+                    sanitizedEntry.removeValue(forKey: "api-key")
                 }
-                sanitizedEntry["api-key-entries"] = effectiveEntries
-                sanitizedEntry.removeValue(forKey: "api-key")
             }
             
             mergedOpenAICompatibility.append(sanitizedEntry)
@@ -696,6 +701,25 @@ enum ConfigComposer {
         return baseURL.contains("api.z.ai")
     }
 
+    private static func managedProviderRequiresAPIKey(_ entry: [String: Any]) -> Bool {
+        if let raw = entry["requires-api-key"] {
+            if let value = raw as? Bool {
+                return value
+            }
+            if let string = normalizedString(raw)?.lowercased() {
+                switch string {
+                case "true":
+                    return true
+                case "false":
+                    return false
+                default:
+                    break
+                }
+            }
+        }
+        return true
+    }
+
     private static func defaultZAIModels() -> [[String: String]] {
         [
             ["name": "glm-4.7", "alias": "glm-4.7"],
@@ -703,7 +727,7 @@ enum ConfigComposer {
         ]
     }
 
-    private static func temporaryNVIDIAProviderEntries() -> [[String: Any]] {
+    private static func temporaryManagedProviderEntries() -> [[String: Any]] {
         [
             [
                 "name": "nvidia",
@@ -725,6 +749,17 @@ enum ConfigComposer {
                 "base-url": "https://integrate.api.nvidia.com/v1",
                 "models": [
                     ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
+                ]
+            ],
+            [
+                "name": "meta-web",
+                "display-name": "Meta AI Web UI",
+                "help-text": "HAR-backed Meta AI web session adapter for the muse-spark alias.",
+                "icon-system": "bubble.left.and.bubble.right.fill",
+                "base-url": "https://meta.ai/api/graphql",
+                "requires-api-key": false,
+                "models": [
+                    ["name": "muse-spark", "alias": "muse-spark"]
                 ]
             ]
         ]

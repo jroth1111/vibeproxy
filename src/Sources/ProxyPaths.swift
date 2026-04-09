@@ -13,6 +13,10 @@ enum ProxyPaths {
         rootDirectoryURL(fileManager: fileManager).appendingPathComponent("config.yaml")
     }
 
+    static func metaAIHARURL(fileManager: FileManager = .default) -> URL {
+        rootDirectoryURL(fileManager: fileManager).appendingPathComponent("meta.ai.har")
+    }
+
     static func ensureAuthDirectoryLayout(fileManager: FileManager = .default) {
         let rootDirectory = rootDirectoryURL(fileManager: fileManager)
         let authDirectory = authDirectoryURL(fileManager: fileManager)

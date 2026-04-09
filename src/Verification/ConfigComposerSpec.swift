@@ -56,6 +56,7 @@ struct ConfigComposerSpec {
             expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "glm5-nvidia", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose both glm5 aliases plus kimi-k2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "meta-web", in: patched) ?? [:]), ["muse-spark"], "managed patches should also expose the Meta web muse-spark alias", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
             expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then NVIDIA GLM5", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
@@ -528,6 +529,18 @@ struct ConfigComposerSpec {
 
             expectNil(provider(named: "opencode", in: runtime), "managed runtime composition should no longer inject the removed opencode provider", recorder: recorder)
             expectNil(provider(named: "kilocode", in: runtime), "managed runtime composition should no longer inject the removed kilocode provider", recorder: recorder)
+            expectEqual(
+                modelAliases(in: provider(named: "meta-web", in: runtime) ?? [:]),
+                ["muse-spark"],
+                "managed runtime composition should retain authless managed providers such as meta-web",
+                recorder: recorder
+            )
+            expectEqual(
+                apiKeys(in: provider(named: "meta-web", in: runtime) ?? [:]),
+                [],
+                "authless managed providers should remain in runtime config without synthetic api-key entries",
+                recorder: recorder
+            )
             expectEqual(
                 modelAliases(in: managedZAIClaudeEntries(in: runtime).first ?? [:]),
                 ["glm-4.7", "glm-5.1-zai"],
