@@ -8240,6 +8240,67 @@ class ThinkingProxy {
             return
         }
 
+        // Meta AI web adapter: muse-spark is not an OpenAI-compatible endpoint.
+        // The GraphQL adapter must handle it directly, not through HTTP proxy forwarding.
+        if let candidateRoute = route,
+           candidateRoute.providerID == MetaAIWebAdapter.providerID {
+            let startTime = Date()
+            switch MetaAIWebAdapter.execute(path: path, body: body, publicModel: candidateModel) {
+            case .success(let result):
+                let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+                let httpResponse = HTTPURLResponse(
+                    url: URL(string: "https://meta.ai/api/graphql")!,
+                    statusCode: result.statusCode,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: result.headers
+                )
+                handleSmartAliasBufferedCandidateResult(
+                    BufferedProxyResponse(
+                        data: result.body,
+                        response: httpResponse,
+                        error: nil,
+                        firstByteLatencyMilliseconds: elapsed,
+                        totalLatencyMilliseconds: elapsed
+                    ),
+                    path: path,
+                    publicAlias: publicAlias,
+                    candidateModel: candidateModel,
+                    failoverDepth: failoverDepth,
+                    attemptLane: attemptLane,
+                    inflightAtRequest: nil,
+                    completion: completion
+                )
+            case .failure(let failure):
+                let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+                let httpResponse = HTTPURLResponse(
+                    url: URL(string: "https://meta.ai/api/graphql")!,
+                    statusCode: failure.statusCode,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let errorBody = try? JSONSerialization.data(withJSONObject: [
+                    "error": ["message": failure.message, "type": "server_error", "code": "internal_server_error"]
+                ])
+                handleSmartAliasBufferedCandidateResult(
+                    BufferedProxyResponse(
+                        data: errorBody,
+                        response: httpResponse,
+                        error: nil,
+                        firstByteLatencyMilliseconds: elapsed,
+                        totalLatencyMilliseconds: elapsed
+                    ),
+                    path: path,
+                    publicAlias: publicAlias,
+                    candidateModel: candidateModel,
+                    failoverDepth: failoverDepth,
+                    attemptLane: attemptLane,
+                    inflightAtRequest: nil,
+                    completion: completion
+                )
+            }
+            return
+        }
+
         let timeoutInterval = min(
             smartAliasCandidateTimeout(forRequestJSON: body, publicAlias: publicAlias, candidateModel: candidateModel),
             remainingBudget
