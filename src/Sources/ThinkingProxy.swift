@@ -653,8 +653,8 @@ enum OpenAICompatTemporaryShim {
     private static let concurrency429RepeatWindow: TimeInterval = 10 * 60
     private static let concurrency429Deferral: TimeInterval = 15
     private static let repeatedConcurrency429Deferral: TimeInterval = 60
-    private static let singleFlightConcurrency429Deferral: TimeInterval = 120
-    private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 300
+    private static let singleFlightConcurrency429Deferral: TimeInterval = 5
+    private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 15
     private static let legacyRequestModelRewrites: [String: String] = [
         "glm-5": "glm-5.1",
         "glm-5-turbo": "glm-5.1"
@@ -672,17 +672,64 @@ enum OpenAICompatTemporaryShim {
         private let queue = DispatchQueue(label: "io.automaze.vibeproxy.concurrency-registry")
         private var inflightCounts: [String: Int] = [:]
         private var discoveredLimits: [String: Int] = [:]
+        private var discoveredLimitUpdatedAt: [String: Date] = [:]
         private var consecutiveSuccessesAtLimit: [String: Int] = [:]
         private var concurrent429Buckets: [String: (inflightLevel: Int, count: Int)] = [:]
 
         private let defaultConcurrencyLimit = 3
         private let maxConcurrencyLimit = 8
         private let successGrowthThreshold = 20
+        private let lowLimitSuccessGrowthThreshold = 3
+        private let mediumLimitSuccessGrowthThreshold = 6
+        private let learnedLowLimitTTL: TimeInterval = 10 * 60
+
+        private func successGrowthThreshold(for learnedLimit: Int) -> Int {
+            if learnedLimit <= 1 {
+                return lowLimitSuccessGrowthThreshold
+            }
+            if learnedLimit == 2 {
+                return mediumLimitSuccessGrowthThreshold
+            }
+            return successGrowthThreshold
+        }
+
+        private func resetLearnedLimitLocked(routeHealthKey: String) {
+            discoveredLimits.removeValue(forKey: routeHealthKey)
+            discoveredLimitUpdatedAt.removeValue(forKey: routeHealthKey)
+            consecutiveSuccessesAtLimit.removeValue(forKey: routeHealthKey)
+            concurrent429Buckets.removeValue(forKey: routeHealthKey)
+        }
+
+        private func inferredLimitFromConcurrency429(inflightAtRequest: Int) -> Int? {
+            // A single-flight 429 is ambiguous: it may reflect upstream/global saturation rather
+            // than a true local concurrency ceiling of 1. Only ratchet the learned limit down when
+            // we have direct evidence that parallel local requests are colliding.
+            guard inflightAtRequest > 1 else {
+                return nil
+            }
+            return max(1, inflightAtRequest - 1)
+        }
+
+        private func effectiveLimitLocked(routeHealthKey: String, now: Date = Date()) -> Int {
+            guard let learnedLimit = discoveredLimits[routeHealthKey] else {
+                return defaultConcurrencyLimit
+            }
+
+            if learnedLimit < defaultConcurrencyLimit,
+               let updatedAt = discoveredLimitUpdatedAt[routeHealthKey],
+               now.timeIntervalSince(updatedAt) >= learnedLowLimitTTL {
+                resetLearnedLimitLocked(routeHealthKey: routeHealthKey)
+                return defaultConcurrencyLimit
+            }
+
+            return learnedLimit
+        }
 
         func resetForTesting() {
             queue.sync {
                 inflightCounts.removeAll()
                 discoveredLimits.removeAll()
+                discoveredLimitUpdatedAt.removeAll()
                 consecutiveSuccessesAtLimit.removeAll()
                 concurrent429Buckets.removeAll()
             }
@@ -690,7 +737,7 @@ enum OpenAICompatTemporaryShim {
 
         func acquireSlot(routeHealthKey: String) -> Bool {
             queue.sync {
-                let limit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let limit = effectiveLimitLocked(routeHealthKey: routeHealthKey)
                 let current = inflightCounts[routeHealthKey] ?? 0
                 guard current < limit else {
                     return false
@@ -709,12 +756,15 @@ enum OpenAICompatTemporaryShim {
 
         func record429(routeHealthKey: String, inflightAtRequest: Int) {
             queue.sync {
-                let currentLimit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let currentLimit = effectiveLimitLocked(routeHealthKey: routeHealthKey)
+                consecutiveSuccessesAtLimit[routeHealthKey] = 0
 
                 // If we were at or above the limit when the 429 arrived, the limit is too high
-                if inflightAtRequest >= currentLimit {
-                    discoveredLimits[routeHealthKey] = max(1, inflightAtRequest - 1)
-                    consecutiveSuccessesAtLimit[routeHealthKey] = 0
+                if inflightAtRequest >= currentLimit,
+                   let inferredLimit = inferredLimitFromConcurrency429(inflightAtRequest: inflightAtRequest) {
+                    discoveredLimits[routeHealthKey] = inferredLimit
+                    discoveredLimitUpdatedAt[routeHealthKey] = Date()
+                    concurrent429Buckets.removeValue(forKey: routeHealthKey)
                     return
                 }
 
@@ -722,9 +772,10 @@ enum OpenAICompatTemporaryShim {
                 let bucket = concurrent429Buckets[routeHealthKey]
                 if let bucket, bucket.inflightLevel == inflightAtRequest {
                     let newCount = bucket.count + 1
-                    if newCount >= 3 {
-                        discoveredLimits[routeHealthKey] = max(1, inflightAtRequest - 1)
-                        consecutiveSuccessesAtLimit[routeHealthKey] = 0
+                    if newCount >= 3,
+                       let inferredLimit = inferredLimitFromConcurrency429(inflightAtRequest: inflightAtRequest) {
+                        discoveredLimits[routeHealthKey] = inferredLimit
+                        discoveredLimitUpdatedAt[routeHealthKey] = Date()
                         concurrent429Buckets.removeValue(forKey: routeHealthKey)
                     } else {
                         concurrent429Buckets[routeHealthKey] = (inflightLevel: inflightAtRequest, count: newCount)
@@ -737,7 +788,7 @@ enum OpenAICompatTemporaryShim {
 
         func recordSuccess(routeHealthKey: String, inflightAtRequest: Int? = nil) {
             queue.sync {
-                let currentLimit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let currentLimit = effectiveLimitLocked(routeHealthKey: routeHealthKey)
                 let currentInflight = inflightAtRequest ?? (inflightCounts[routeHealthKey] ?? 0)
 
                 // Only count as "at-limit" success if we were near the limit
@@ -745,10 +796,12 @@ enum OpenAICompatTemporaryShim {
 
                 let successes = (consecutiveSuccessesAtLimit[routeHealthKey] ?? 0) + 1
                 consecutiveSuccessesAtLimit[routeHealthKey] = successes
+                concurrent429Buckets.removeValue(forKey: routeHealthKey)
 
                 // After sustained success at current limit, try growing
-                if successes >= successGrowthThreshold, currentLimit < maxConcurrencyLimit {
+                if successes >= successGrowthThreshold(for: currentLimit), currentLimit < maxConcurrencyLimit {
                     discoveredLimits[routeHealthKey] = currentLimit + 1
+                    discoveredLimitUpdatedAt[routeHealthKey] = Date()
                     consecutiveSuccessesAtLimit[routeHealthKey] = 0
                 }
             }
@@ -760,34 +813,80 @@ enum OpenAICompatTemporaryShim {
 
         func isAtCapacity(routeHealthKey: String) -> Bool {
             queue.sync {
-                let limit = discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit
+                let limit = effectiveLimitLocked(routeHealthKey: routeHealthKey)
                 return (inflightCounts[routeHealthKey] ?? 0) >= limit
             }
         }
 
         func currentLimit(routeHealthKey: String) -> Int {
-            queue.sync { discoveredLimits[routeHealthKey] ?? defaultConcurrencyLimit }
+            queue.sync { effectiveLimitLocked(routeHealthKey: routeHealthKey) }
         }
 
         // MARK: - Persistence
 
         func persistLocked(into payload: inout [String: Any]) {
             // Already on caller's queue — safe to read synchronously
-            let limits = queue.sync { discoveredLimits }
+            let (limits, metadata): ([String: Int], [String: [String: String]]) = queue.sync {
+                let effectiveRoutes = discoveredLimits.keys.compactMap { routeHealthKey -> (String, Int, Date?)? in
+                    let limit = effectiveLimitLocked(routeHealthKey: routeHealthKey)
+                    guard limit != defaultConcurrencyLimit else {
+                        return nil
+                    }
+                    return (routeHealthKey, limit, discoveredLimitUpdatedAt[routeHealthKey])
+                }
+
+                let limits = effectiveRoutes.reduce(into: [String: Int]()) { partial, route in
+                    partial[route.0] = route.1
+                }
+                let metadata = effectiveRoutes.reduce(into: [String: [String: String]]()) { partial, route in
+                    guard let updatedAt = route.2 else { return }
+                    partial[route.0] = [
+                        "updated_at": OpenAICompatTemporaryShim.iso8601String(from: updatedAt)
+                    ]
+                }
+                return (limits, metadata)
+            }
             guard !limits.isEmpty else { return }
             payload["discovered_concurrency_limits"] = limits
+            if !metadata.isEmpty {
+                payload["discovered_concurrency_limit_metadata"] = metadata
+            }
         }
 
-        func loadLocked(from json: [String: Any]) {
+        func loadLocked(from json: [String: Any], persistedVersion: Int) {
             guard let limits = json["discovered_concurrency_limits"] as? [String: Int] else { return }
             queue.sync {
-                discoveredLimits = limits
+                if let metadata = json["discovered_concurrency_limit_metadata"] as? [String: [String: String]] {
+                    // Versions before 5 could learn a cap of 1 from repeated single-flight 429s.
+                    // That evidence is structurally ambiguous, so migrate those persisted values
+                    // away on reload and let the new learner re-establish them from true
+                    // multi-flight contention if needed.
+                    discoveredLimits = limits.filter { _, limit in
+                        !(persistedVersion < 5 && limit <= 1)
+                    }
+                    discoveredLimitUpdatedAt = metadata.reduce(into: [String: Date]()) { partial, entry in
+                        guard discoveredLimits[entry.key] != nil else {
+                            return
+                        }
+                        guard let rawTimestamp = entry.value["updated_at"],
+                              let updatedAt = OpenAICompatTemporaryShim.parseISO8601Date(rawTimestamp) else {
+                            return
+                        }
+                        partial[entry.key] = updatedAt
+                    }
+                } else {
+                    // Legacy persisted limits lacked freshness metadata. Keep only non-restrictive
+                    // legacy values so stale single-flight caps do not pin the worker lane.
+                    discoveredLimits = limits.filter { $0.value >= defaultConcurrencyLimit }
+                    discoveredLimitUpdatedAt = [:]
+                }
             }
         }
 
         func forceDiscoveredLimitForTesting(routeHealthKey: String, limit: Int) {
             queue.sync {
                 discoveredLimits[routeHealthKey] = limit
+                discoveredLimitUpdatedAt[routeHealthKey] = Date()
             }
         }
     }
@@ -1871,13 +1970,22 @@ enum OpenAICompatTemporaryShim {
                 statusCode: response.statusCode,
                 bodyData: bodyData
            ) {
+            let failureClass: String
+            if response.statusCode == 429 {
+                failureClass = failureClassFor429(
+                    headers: response.allHeaderFields,
+                    bodyData: bodyData
+                )
+            } else {
+                failureClass = "classified_\(classifiedFailure.statusCode)"
+            }
             return RouteTelemetryEvent(
                 timestamp: Date(),
                 requestModel: state.model,
                 canonicalModelID: canonicalModelID,
                 transportOutcome: outcomeTelemetryLabel(outcome),
                 attemptLane: attemptLane,
-                failureClass: "classified_\(classifiedFailure.statusCode)",
+                failureClass: failureClass,
                 timeoutStage: attempt.deadlineStage,
                 upstreamHTTPStatus: response.statusCode,
                 retryCount: retryCount,
@@ -2196,6 +2304,12 @@ enum OpenAICompatTemporaryShim {
 
         let minimumDeferral: TimeInterval
         if inflightAtRequest <= 1 {
+            // Single-flight "concurrency" 429s are ambiguous. If upstream already told us the
+            // retry window, honor that explicit hint instead of inflating it into a long
+            // route-level cooldown that pushes traffic onto lower-priority fallbacks for minutes.
+            if deferredUntil != nil {
+                return deferredUntil
+            }
             minimumDeferral = repeatedConcurrencyFailure
                 ? repeatedSingleFlightConcurrency429Deferral
                 : singleFlightConcurrency429Deferral
@@ -2327,6 +2441,17 @@ enum OpenAICompatTemporaryShim {
         }
         routeFailureDedupQueue.sync {
             recentFailureTimestampsByRoute = [:]
+        }
+        concurrencyRegistry.resetForTesting()
+    }
+
+    static func routeAvailabilityDeferralUntilForTesting(requestModel: String) -> Date? {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return nil
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCooldownsByRouteHealthKey[route.routeHealthKey]
         }
     }
 
@@ -3466,7 +3591,7 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 3,
+              let version = json["version"] as? Int, version >= 1, version <= 5,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -3521,8 +3646,8 @@ enum OpenAICompatTemporaryShim {
         // Route cooldowns are runtime-only backpressure hints. Replaying them across restart can
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
-        concurrencyRegistry.loadLocked(from: json)
-        if prunedUnknownEntries || normalizedPersistedAvailability {
+        concurrencyRegistry.loadLocked(from: json, persistedVersion: version)
+        if prunedUnknownEntries || normalizedPersistedAvailability || version < 5 {
             persistRouteHealthLocked()
         }
 
@@ -3655,7 +3780,7 @@ enum OpenAICompatTemporaryShim {
 
         let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
-            "version": 3,
+            "version": 5,
             "routes": routes,
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns

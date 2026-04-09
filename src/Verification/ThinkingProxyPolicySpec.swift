@@ -743,8 +743,92 @@ struct ThinkingProxyPolicySpec {
             }
             expectEqual(
                 OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: concurrencyRouteHealthKey),
+                3,
+                "single-flight concurrency 429s should not infer a learned concurrency limit of 1",
+                recorder: recorder
+            )
+        }
+
+        run("temporary single-flight concurrency retry-after windows do not amplify into multi-minute route cooldowns", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_000)
+                let retryAfterHeaders: [AnyHashable: Any] = ["Retry-After": "12"]
+                let providerRetryUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                    statusCode: 429,
+                    headers: retryAfterHeaders,
+                    bodyData: nil,
+                    now: now
+                )
+
+                guard let providerRetryUntil else {
+                    recorder.recordFailure("expected a short concurrency retry-after window to produce a provider deferral")
+                    return
+                }
+
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: "glm-5.1-zai",
+                    until: providerRetryUntil,
+                    at: now
+                )
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm-5.1-zai",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "retry",
+                        failureClass: "classified_429_concurrency",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 429,
+                        retryCount: 0,
+                        source: "smart_alias",
+                        inflightAtRequest: 1
+                    ),
+                    at: now
+                )
+
+                let effectiveDeferral = OpenAICompatTemporaryShim.routeAvailabilityDeferralUntilForTesting(
+                    requestModel: "glm-5.1-zai"
+                )
+                expectEqual(
+                    Int(effectiveDeferral?.timeIntervalSince(now) ?? -1),
+                    12,
+                    "single-flight concurrency 429s should honor the provider retry-after window instead of inflating it into a long route cooldown",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary adaptive concurrency learning re-probes upward quickly after confirmed low multi-flight caps start succeeding", recorder: recorder) {
+            let routeHealthKey = "relearn::glm-5.1"
+            for _ in 0..<3 {
+                OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
+                    routeHealthKey: routeHealthKey,
+                    inflightAtRequest: 2,
+                    statusCode: 429,
+                    headers: ["Retry-After": "2"],
+                    bodyData: nil
+                )
+            }
+            expectEqual(
+                OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: routeHealthKey),
                 1,
-                "short-window concurrency 429s should still ratchet down learned concurrency",
+                "repeated multi-flight concurrency signals should still lower the learned cap initially",
+                recorder: recorder
+            )
+
+            for _ in 0..<3 {
+                OpenAICompatTemporaryShim.recordConcurrencySuccess(
+                    routeHealthKey: routeHealthKey,
+                    inflightAtRequest: 1
+                )
+            }
+            expectEqual(
+                OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: routeHealthKey),
+                2,
+                "sustained success at a provisional single-flight cap should quickly re-probe upward",
                 recorder: recorder
             )
         }
@@ -5308,6 +5392,7 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary worker smart alias coalesces duplicate safe requests from the same caller identity behind one upstream sequence", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let proxy = ThinkingProxy()
                 let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let secondConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -5380,11 +5465,13 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(transportInvocationCount, 1, "duplicate worker requests should share one upstream request sequence", recorder: recorder)
                 expectEqual(deliveredResponseCount, 2, "coalesced worker requests should fan out the winner to both waiting callers", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
         run("temporary worker smart alias does not coalesce identical safe requests across different caller identities", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let proxy = ThinkingProxy()
                 let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let secondConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -5467,6 +5554,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(transportInvocationCount, 2, "worker requests from different caller identities must not share one upstream request sequence", recorder: recorder)
                 expectEqual(deliveredResponseCount, 2, "identity-partitioned worker requests should still return one response per caller", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -5919,6 +6007,59 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("persisted legacy low learned concurrency caps are not trusted on reload without freshness metadata", recorder: recorder) {
+            withRouteHealthPath { path in
+                let payload = """
+                {
+                  "version": 3,
+                  "routes": {},
+                  "discovered_concurrency_limits": {
+                    "zai::glm-5.1": 1
+                  }
+                }
+                """
+
+                try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: "zai::glm-5.1"),
+                    3,
+                    "legacy low learned concurrency caps should reset to the default until the new process re-learns them",
+                    recorder: recorder
+                )
+            }
+        }
+
+        run("persisted pre-migration learned concurrency caps of 1 are discarded even with freshness metadata", recorder: recorder) {
+            withRouteHealthPath { path in
+                let payload = """
+                {
+                  "version": 4,
+                  "routes": {},
+                  "discovered_concurrency_limits": {
+                    "zai::glm-5.1": 1
+                  },
+                  "discovered_concurrency_limit_metadata": {
+                    "zai::glm-5.1": {
+                      "updated_at": "2026-04-09T08:53:48Z"
+                    }
+                  }
+                }
+                """
+
+                try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: "zai::glm-5.1"),
+                    3,
+                    "pre-migration learned caps of 1 should be cleared so the new learner can re-establish them from true multi-flight evidence",
+                    recorder: recorder
+                )
+            }
+        }
+
         run("temporary nvidia telemetry derives timeout-stage context from deadline-driven failures", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let state = OpenAICompatTemporaryShim.NVIDIARetryState(
@@ -5996,7 +6137,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(event.canonicalModelID, "moonshotai/kimi-k2.5", "telemetry should resolve the canonical Kimi model ID", recorder: recorder)
-                expectEqual(event.failureClass, "classified_429", "classified upstream failures should carry their normalized class", recorder: recorder)
+                expectEqual(event.failureClass, "classified_429_concurrency", "classified upstream failures should carry their normalized 429 subtype", recorder: recorder)
                 expectEqual(event.upstreamHTTPStatus, 429, "telemetry should preserve the upstream HTTP status when available", recorder: recorder)
                 expectEqual(event.retryCount, 1, "telemetry should count prior transport retries", recorder: recorder)
             }
