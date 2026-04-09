@@ -66,6 +66,43 @@ assert_probe_headers() {
   fi
 }
 
+assert_worker_probe_headers() {
+  local header_file="$1"
+  local expected_public="$2"
+  local expected_resolved_model="$3"
+  local expected_resolved_provider="$4"
+  local allowed_pool_models_json="$5"
+  local actual_public
+  local actual_resolved_model
+  local actual_resolved_provider
+
+  actual_public="$(header_value "$header_file" "X-Public-Model")"
+  actual_resolved_model="$(header_value "$header_file" "X-Resolved-Model")"
+  actual_resolved_provider="$(header_value "$header_file" "X-Resolved-Provider")"
+
+  if [[ "$actual_public" != "$expected_public" ]]; then
+    echo "worker probe returned X-Public-Model=$actual_public (want $expected_public)" >&2
+    exit 1
+  fi
+
+  if [[ "$actual_resolved_model" == "$expected_resolved_model" ]]; then
+    if [[ -n "$expected_resolved_provider" && "$actual_resolved_provider" != "$expected_resolved_provider" ]]; then
+      echo "worker probe returned X-Resolved-Provider=$actual_resolved_provider (want $expected_resolved_provider)" >&2
+      exit 1
+    fi
+    return 0
+  fi
+
+  if [[ -n "$allowed_pool_models_json" ]] &&
+     jq -e --arg model "$actual_resolved_model" 'index($model) != null' <<<"$allowed_pool_models_json" >/dev/null; then
+    echo "worker probe resolved to alternate pool winner $actual_resolved_model instead of snapshot winner $expected_resolved_model" >&2
+    return 0
+  fi
+
+  echo "worker probe returned X-Resolved-Model=$actual_resolved_model (want $expected_resolved_model)" >&2
+  exit 1
+}
+
 worker_request_surface="$(provider_to_surface "$FACTORY_WORKER_ROUTE_PROVIDER" "worker")"
 session_request_surface="$(provider_to_surface "$FACTORY_SESSION_ROUTE_PROVIDER" "session/orchestrator")"
 validation_request_surface="$(provider_to_surface "$FACTORY_VALIDATION_ROUTE_PROVIDER" "validation")"
@@ -111,6 +148,7 @@ session_effective_route_model="$(jq -r '.factory_roles.orchestration.effective_r
 session_effective_route_provider="$(jq -r '.factory_roles.orchestration.effective_route_provider // empty' "$health_body")"
 validation_effective_route_model="$(jq -r '.factory_roles.verification.effective_route_model // empty' "$health_body")"
 validation_effective_route_provider="$(jq -r '.factory_roles.verification.effective_route_provider // empty' "$health_body")"
+worker_pool_candidate_models="$(jq -c '.config_drift.proxy_worker_candidates // []' "$health_body")"
 
 echo "==> Probing the worker lane directly"
 case "$worker_request_surface" in
@@ -124,7 +162,7 @@ case "$worker_request_surface" in
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"description\":\"No-op verification tool\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],\"tool_choice\":\"none\",\"max_tokens\":32}" \
       -o "$worker_probe_body"
     jq -e '((.choices[0].message.content // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$worker_probe_body" >/dev/null
-    assert_probe_headers "$worker_probe_headers" "worker" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider"
+    assert_worker_probe_headers "$worker_probe_headers" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider" "$worker_pool_candidate_models"
     ;;
   responses)
     curl -fsS \
@@ -136,7 +174,7 @@ case "$worker_request_surface" in
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
       -o "$worker_probe_body"
     jq -e 'any(.output[]?; .type == "message" and any(.content[]?; .type == "output_text" and ((.text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"))' "$worker_probe_body" >/dev/null
-    assert_probe_headers "$worker_probe_headers" "worker" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider"
+    assert_worker_probe_headers "$worker_probe_headers" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider" "$worker_pool_candidate_models"
     ;;
   messages)
     curl -fsS \
@@ -149,7 +187,7 @@ case "$worker_request_surface" in
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
       -o "$worker_probe_body"
     jq -e '((.content[0].text // "") | gsub("^\\s+|\\s+$"; "")) == "OK"' "$worker_probe_body" >/dev/null
-    assert_probe_headers "$worker_probe_headers" "worker" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider"
+    assert_worker_probe_headers "$worker_probe_headers" "$FACTORY_WORKER_MODEL" "$worker_effective_route_model" "$worker_effective_route_provider" "$worker_pool_candidate_models"
     ;;
   *)
     echo "unsupported Factory worker request surface for proxy preflight: $worker_request_surface" >&2

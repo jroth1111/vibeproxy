@@ -650,6 +650,11 @@ enum OpenAICompatTemporaryShim {
     private static let defaultCanaryInterval: TimeInterval = 60
     private static let defaultSuspectHedgeDelay: TimeInterval = 45
     private static let routeFailureScoreDecayInterval: TimeInterval = 180
+    private static let concurrency429RepeatWindow: TimeInterval = 10 * 60
+    private static let concurrency429Deferral: TimeInterval = 15
+    private static let repeatedConcurrency429Deferral: TimeInterval = 60
+    private static let singleFlightConcurrency429Deferral: TimeInterval = 120
+    private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 300
     private static let legacyRequestModelRewrites: [String: String] = [
         "glm-5": "glm-5.1",
         "glm-5-turbo": "glm-5.1"
@@ -1478,6 +1483,11 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
+        if route.providerID == MetaAIWebAdapter.providerID,
+           let failure = MetaAIWebAdapter.preflightFailure(path: path, body: jsonString, publicModel: model) {
+            return ClientFacingNVIDIAFailure(statusCode: failure.statusCode, message: failure.message)
+        }
+
         if route.providerID == "zai",
            route.canonicalModelID == "glm-5.1",
            isResponsesPath(path) {
@@ -2115,7 +2125,50 @@ enum OpenAICompatTemporaryShim {
     private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
     private static let failureDedupWindow: TimeInterval = 0.5  // 0.5 second window for burst deduplication
     private static var disableFailureDedupForTesting = false
-    
+
+    private static func adaptiveConcurrencyDeferralUntil(
+        routeHealthKey: String,
+        currentState: RouteCircuitState?,
+        existingCooldownUntil: Date?,
+        telemetryEvent: RouteTelemetryEvent?,
+        forcedOpenUntil: Date?,
+        now: Date
+    ) -> Date? {
+        var deferredUntil = [existingCooldownUntil, forcedOpenUntil].compactMap { $0 }.max()
+
+        guard let telemetryEvent,
+              telemetryEvent.failureClass?.lowercased() == "classified_429_concurrency" else {
+            return deferredUntil
+        }
+
+        let inflightAtRequest = telemetryEvent.inflightAtRequest ??
+            concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+        let repeatedConcurrencyFailure =
+            currentState?.lastTelemetryEvent.map { lastTelemetryEvent in
+                guard lastTelemetryEvent.failureClass?.lowercased() == "classified_429_concurrency" else {
+                    return false
+                }
+                return now.timeIntervalSince(lastTelemetryEvent.timestamp) <= concurrency429RepeatWindow
+            } ?? false
+
+        let minimumDeferral: TimeInterval
+        if inflightAtRequest <= 1 {
+            minimumDeferral = repeatedConcurrencyFailure
+                ? repeatedSingleFlightConcurrency429Deferral
+                : singleFlightConcurrency429Deferral
+        } else {
+            minimumDeferral = repeatedConcurrencyFailure
+                ? repeatedConcurrency429Deferral
+                : concurrency429Deferral
+        }
+
+        let adaptiveUntil = now.addingTimeInterval(minimumDeferral)
+        if deferredUntil == nil || adaptiveUntil > deferredUntil! {
+            deferredUntil = adaptiveUntil
+        }
+        return deferredUntil
+    }
+
     static func recordRouteFailure(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
@@ -2155,7 +2208,14 @@ enum OpenAICompatTemporaryShim {
                 replacingLastTelemetryEvent: enrichedTelemetryEvent
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
-            if let cooldownUntil = forcedOpenUntil, now < cooldownUntil {
+            if let cooldownUntil = adaptiveConcurrencyDeferralUntil(
+                routeHealthKey: route.routeHealthKey,
+                currentState: current,
+                existingCooldownUntil: routeCooldownsByRouteHealthKey[route.routeHealthKey],
+                telemetryEvent: enrichedTelemetryEvent,
+                forcedOpenUntil: forcedOpenUntil,
+                now: now
+            ), now < cooldownUntil {
                 routeCooldownsByRouteHealthKey[route.routeHealthKey] = cooldownUntil
             }
             scheduleRouteHealthPersistLocked()
@@ -2765,7 +2825,7 @@ enum OpenAICompatTemporaryShim {
            !retryAfter.isEmpty {
             if let seconds = TimeInterval(retryAfter), seconds > 0 {
                 if seconds < concurrencyThreshold {
-                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
+                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - classified as concurrency; adaptive route deferral may apply downstream", seconds, concurrencyThreshold)
                     return .concurrency(retryAfterSeconds: seconds)
                 }
                 NSLog("[ThinkingProxy] Provider 429 Retry-After: %.0fs — honoring full provider reset window", seconds)
@@ -2779,7 +2839,7 @@ enum OpenAICompatTemporaryShim {
                 let seconds = date.timeIntervalSince(now)
                 if seconds <= 0 { return .concurrency(retryAfterSeconds: nil) }
                 if seconds < concurrencyThreshold {
-                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - not cooling down route", seconds, concurrencyThreshold)
+                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - classified as concurrency; adaptive route deferral may apply downstream", seconds, concurrencyThreshold)
                     return .concurrency(retryAfterSeconds: seconds)
                 }
                 NSLog("[ThinkingProxy] Provider 429 Retry-After HTTP-date: %.0fs — honoring full provider reset window", seconds)
@@ -4496,6 +4556,7 @@ enum MetaAIWebAdapter {
     struct ParsedEventStream: Equatable {
         let assistantText: String?
         let errorMessage: String?
+        let sources: [Source]
     }
 
     struct HARAuthSnapshot: Equatable {
@@ -4504,10 +4565,53 @@ enum MetaAIWebAdapter {
         let acceptLanguage: String
     }
 
-    private static let updateLastSelectedModeDocID = "98081c3f48eddb05c71cb79d46fc337b"
+    struct Source: Equatable {
+        let url: String
+        let title: String
+        let subtitle: String?
+    }
+
+    struct PlannedGraphQLRequest {
+        enum Kind: Equatable, CustomStringConvertible {
+            case warmupConversation
+            case updateConversationMode
+            case sendMessage
+
+            var description: String {
+                switch self {
+                case .warmupConversation:
+                    return "warmupConversation"
+                case .updateConversationMode:
+                    return "updateConversationMode"
+                case .sendMessage:
+                    return "sendMessage"
+                }
+            }
+        }
+
+        let kind: Kind
+        let isBestEffort: Bool
+        let request: URLRequest
+    }
+
+    private static let graphQLEndpointURL = URL(string: "https://www.meta.ai/api/graphql")!
+    private static let browserOrigin = "https://www.meta.ai"
+    private static let browserRootReferer = "https://www.meta.ai/"
+    static let setupGraphQLAcceptHeader = "multipart/mixed, application/json"
     private static let warmupConversationDocID = "e7f802582dbfed8e181b012e010993eb"
     private static let updateConversationModeDocID = "c32bbe999c48e64e855dc63177d5153f"
     private static let sendMessageSubscriptionDocID = "af4c07d1fb42eb351dba31b5a299a819"
+
+    static func preflightFailure(path: String, body: String, publicModel: String) -> Failure? {
+        do {
+            _ = try parseRequest(path: path, body: body, publicModel: publicModel)
+            return nil
+        } catch let failure as Failure {
+            return failure
+        } catch {
+            return Failure(statusCode: 400, message: "Meta web adapter could not parse the request body.")
+        }
+    }
 
     static func execute(
         path: String,
@@ -4535,42 +4639,40 @@ enum MetaAIWebAdapter {
 
         let session = makeSession(authSnapshot: authSnapshot)
         let conversationID = UUID().uuidString
+        let plannedRequests: [PlannedGraphQLRequest]
+        do {
+            plannedRequests = try buildExecutionRequests(
+                authSnapshot: authSnapshot,
+                conversationID: conversationID,
+                prompt: parsedRequest.prompt,
+                isNewThread: parsedRequest.isNewThread
+            )
+        } catch let failure as Failure {
+            return .failure(failure)
+        } catch {
+            return .failure(Failure(statusCode: 500, message: "Meta web adapter failed to build the GraphQL request sequence."))
+        }
 
         do {
-            _ = try postGraphQL(
-                session: session,
-                authSnapshot: authSnapshot,
-                accept: "application/json",
-                docID: updateLastSelectedModeDocID,
-                variables: ["input": ["mode": conversationMode]]
-            )
-            _ = try postGraphQL(
-                session: session,
-                authSnapshot: authSnapshot,
-                accept: "application/json",
-                docID: warmupConversationDocID,
-                variables: ["conversationId": conversationID]
-            )
-            _ = try postGraphQL(
-                session: session,
-                authSnapshot: authSnapshot,
-                accept: "application/json",
-                docID: updateConversationModeDocID,
-                variables: ["input": ["conversationId": conversationID, "mode": conversationMode]]
-            )
+            var eventStreamData: Data?
+            for plannedRequest in plannedRequests {
+                do {
+                    let responseData = try postGraphQL(session: session, request: plannedRequest.request)
+                    if plannedRequest.kind == .sendMessage {
+                        eventStreamData = responseData
+                    }
+                } catch let failure as Failure {
+                    if plannedRequest.isBestEffort {
+                        NSLog("[ThinkingProxy] Meta AI web adapter ignored best-effort \(plannedRequest.kind) failure (\(failure.statusCode)): \(failure.message)")
+                        continue
+                    }
+                    throw failure
+                }
+            }
 
-            let eventStreamData = try postGraphQL(
-                session: session,
-                authSnapshot: authSnapshot,
-                accept: "text/event-stream",
-                docID: sendMessageSubscriptionDocID,
-                variables: buildSendMessageVariables(
-                    authSnapshot: authSnapshot,
-                    conversationID: conversationID,
-                    prompt: parsedRequest.prompt,
-                    isNewThread: parsedRequest.isNewThread
-                )
-            )
+            guard let eventStreamData else {
+                throw Failure(statusCode: 500, message: "Meta web adapter did not produce a send-message GraphQL request.")
+            }
 
             let parsedEventStream = parseEventStream(eventStreamData)
             if let assistantText = parsedEventStream.assistantText?
@@ -4586,10 +4688,18 @@ enum MetaAIWebAdapter {
                     bodyData = buildChatCompletionsStreamBody(text: assistantText, publicModel: parsedRequest.publicModel)
                     headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
                 case (.responses, false):
-                    bodyData = buildResponsesResponseBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    bodyData = buildResponsesResponseBody(
+                        text: assistantText,
+                        publicModel: parsedRequest.publicModel,
+                        sources: parsedEventStream.sources
+                    )
                     headers = ["Content-Type": "application/json; charset=utf-8"]
                 case (.responses, true):
-                    bodyData = buildResponsesStreamBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                    bodyData = buildResponsesStreamBody(
+                        text: assistantText,
+                        publicModel: parsedRequest.publicModel,
+                        sources: parsedEventStream.sources
+                    )
                     headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
                 }
                 return .success(
@@ -4639,8 +4749,13 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter requires a valid JSON request body.")
         }
 
-        // Strip tool-related fields — the Meta web lane doesn't support tool calling,
-        // so we silently ignore tools and extract the text content from messages.
+        if requestsUnsupportedToolExecution(in: json) {
+            throw Failure(
+                statusCode: 501,
+                message: "Meta web adapter does not support live tool execution; remove tools/tool_choice or choose another provider."
+            )
+        }
+
         var cleanedJSON = json
         cleanedJSON.removeValue(forKey: "tools")
         cleanedJSON.removeValue(forKey: "tool_choice")
@@ -4653,11 +4768,16 @@ enum MetaAIWebAdapter {
 
     static func parseEventStream(_ data: Data) -> ParsedEventStream {
         guard let text = String(data: data, encoding: .utf8) else {
-            return ParsedEventStream(assistantText: nil, errorMessage: "Meta web adapter received a non-UTF8 event stream.")
+            return ParsedEventStream(
+                assistantText: nil,
+                errorMessage: "Meta web adapter received a non-UTF8 event stream.",
+                sources: []
+            )
         }
 
         var latestAssistantText: String?
         var latestErrorMessage: String?
+        var latestSources: [Source] = []
 
         for rawLine in text.components(separatedBy: .newlines) {
             guard rawLine.hasPrefix("data:") else {
@@ -4684,9 +4804,18 @@ enum MetaAIWebAdapter {
                !errorMessage.isEmpty {
                 latestErrorMessage = errorMessage
             }
+
+            let extractedSources = extractSources(fromSendMessageStream: streamObject)
+            if !extractedSources.isEmpty {
+                latestSources = extractedSources
+            }
         }
 
-        return ParsedEventStream(assistantText: latestAssistantText, errorMessage: latestErrorMessage)
+        return ParsedEventStream(
+            assistantText: latestAssistantText,
+            errorMessage: latestErrorMessage,
+            sources: latestSources
+        )
     }
 
     private static func metaAIHARURL(fileManager: FileManager) -> URL {
@@ -4753,6 +4882,55 @@ enum MetaAIWebAdapter {
         )
     }
 
+    static func buildExecutionRequests(
+        authSnapshot: HARAuthSnapshot,
+        conversationID: String,
+        prompt: String,
+        isNewThread: Bool
+    ) throws -> [PlannedGraphQLRequest] {
+        let promptReferer = conversationPromptReferer(for: conversationID)
+        return [
+            PlannedGraphQLRequest(
+                kind: .warmupConversation,
+                isBestEffort: false,
+                request: try makeGraphQLRequest(
+                    authSnapshot: authSnapshot,
+                    accept: setupGraphQLAcceptHeader,
+                    docID: warmupConversationDocID,
+                    variables: ["conversationId": conversationID],
+                    referer: browserRootReferer
+                )
+            ),
+            PlannedGraphQLRequest(
+                kind: .updateConversationMode,
+                isBestEffort: false,
+                request: try makeGraphQLRequest(
+                    authSnapshot: authSnapshot,
+                    accept: setupGraphQLAcceptHeader,
+                    docID: updateConversationModeDocID,
+                    variables: ["input": ["conversationId": conversationID, "mode": conversationMode]],
+                    referer: browserRootReferer
+                )
+            ),
+            PlannedGraphQLRequest(
+                kind: .sendMessage,
+                isBestEffort: false,
+                request: try makeGraphQLRequest(
+                    authSnapshot: authSnapshot,
+                    accept: "text/event-stream",
+                    docID: sendMessageSubscriptionDocID,
+                    variables: buildSendMessageVariables(
+                        authSnapshot: authSnapshot,
+                        conversationID: conversationID,
+                        prompt: prompt,
+                        isNewThread: isNewThread
+                    ),
+                    referer: promptReferer
+                )
+            )
+        ]
+    }
+
     private static func makeSession(authSnapshot: HARAuthSnapshot) -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         // Meta's web GraphQL lane can take materially longer on heavier prompts than the
@@ -4763,8 +4941,8 @@ enum MetaAIWebAdapter {
         configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         configuration.httpAdditionalHeaders = [
             "User-Agent": authSnapshot.userAgent,
-            "Origin": "https://meta.ai",
-            "Referer": "https://meta.ai/",
+            "Origin": browserOrigin,
+            "Referer": browserRootReferer,
             "Accept-Language": authSnapshot.acceptLanguage,
             "Cookie": authSnapshot.cookieHeader
         ]
@@ -4797,29 +4975,8 @@ enum MetaAIWebAdapter {
 
     private static func postGraphQL(
         session: URLSession,
-        authSnapshot: HARAuthSnapshot,
-        accept: String,
-        docID: String,
-        variables: [String: Any]
+        request: URLRequest
     ) throws -> Data {
-        guard let url = URL(string: "https://meta.ai/api/graphql") else {
-            throw Failure(statusCode: 500, message: "Meta web adapter has an invalid GraphQL endpoint URL.")
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(accept, forHTTPHeaderField: "Accept")
-        request.setValue("https://meta.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://meta.ai/", forHTTPHeaderField: "Referer")
-        request.setValue(authSnapshot.userAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue(authSnapshot.acceptLanguage, forHTTPHeaderField: "Accept-Language")
-        request.setValue(authSnapshot.cookieHeader, forHTTPHeaderField: "Cookie")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "doc_id": docID,
-            "variables": variables
-        ])
-
         let semaphore = DispatchSemaphore(value: 0)
         var capturedData: Data?
         var capturedResponse: URLResponse?
@@ -4844,17 +5001,43 @@ enum MetaAIWebAdapter {
 
         let responseData = capturedData ?? Data()
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            let bodyText = String(data: responseData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
             throw Failure(
                 statusCode: httpResponse.statusCode,
-                message: bodyText?.isEmpty == false
-                    ? "Meta web adapter upstream error (\(httpResponse.statusCode)): \(bodyText!)"
-                    : "Meta web adapter upstream error (\(httpResponse.statusCode))."
+                message: formattedUpstreamErrorMessage(statusCode: httpResponse.statusCode, responseData: responseData)
             )
         }
 
         return responseData
+    }
+
+    static func makeGraphQLRequest(
+        authSnapshot: HARAuthSnapshot,
+        accept: String,
+        docID: String,
+        variables: [String: Any],
+        referer: String
+    ) throws -> URLRequest {
+        var request = URLRequest(url: graphQLEndpointURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(accept, forHTTPHeaderField: "Accept")
+        request.setValue(browserOrigin, forHTTPHeaderField: "Origin")
+        request.setValue(referer, forHTTPHeaderField: "Referer")
+        request.setValue(authSnapshot.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(authSnapshot.acceptLanguage, forHTTPHeaderField: "Accept-Language")
+        request.setValue(authSnapshot.cookieHeader, forHTTPHeaderField: "Cookie")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "doc_id": docID,
+            "variables": variables
+        ])
+        return request
+    }
+
+    private static func conversationPromptReferer(for conversationID: String) -> String {
+        let trimmed = conversationID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return browserRootReferer }
+        let safeConversationID = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+        return "\(browserOrigin)/prompt/\(safeConversationID)"
     }
 
     private static func buildSendMessageVariables(
@@ -4909,7 +5092,7 @@ enum MetaAIWebAdapter {
             // Convert tool-related messages to readable transcript entries.
             // Tool results and function calls are inlined as text context.
             if role == "tool" {
-                if let text = flattenedText(from: message["content"])?
+                if let text = try flattenedText(from: message["content"])?
                     .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
                     hasNonUserRole = true
                     transcript.append("Tool result: \(text)")
@@ -4922,7 +5105,7 @@ enum MetaAIWebAdapter {
             if let toolCalls = message["tool_calls"] as? [[String: Any]] {
                 hasNonUserRole = true
                 var parts: [String] = []
-                if let text = flattenedText(from: message["content"])?
+                if let text = try flattenedText(from: message["content"])?
                     .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
                     parts.append(text)
                 }
@@ -4939,7 +5122,7 @@ enum MetaAIWebAdapter {
                 continue
             }
 
-            guard let flattenedText = flattenedText(from: message["content"])?
+            guard let flattenedText = try flattenedText(from: message["content"])?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                   !flattenedText.isEmpty else {
                 continue
@@ -4976,7 +5159,7 @@ enum MetaAIWebAdapter {
         return (transcript.joined(separator: "\n\n"), isNewThread)
     }
 
-    private static func flattenedText(from value: Any?) -> String? {
+    private static func flattenedText(from value: Any?) throws -> String? {
         guard let value else {
             return nil
         }
@@ -4984,7 +5167,7 @@ enum MetaAIWebAdapter {
             return stringValue
         }
         guard let segments = value as? [Any] else {
-            return nil
+            throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
 
         var parts: [String] = []
@@ -4994,17 +5177,17 @@ enum MetaAIWebAdapter {
                 continue
             }
             guard let dictionary = segment as? [String: Any] else {
-                return nil
+                throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
             let type = (dictionary["type"] as? String)?.lowercased()
             guard let text = dictionary["text"] as? String,
                   type == nil || type == "text" || type == "input_text" || type == "output_text" else {
-                return nil
+                throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
             parts.append(text)
         }
         guard !parts.isEmpty else {
-            return nil
+            throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
         return parts.joined()
     }
@@ -5015,6 +5198,180 @@ enum MetaAIWebAdapter {
             return nil
         }
         return trimmed
+    }
+
+    private static func requestsUnsupportedToolExecution(in json: [String: Any]) -> Bool {
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            return true
+        }
+
+        guard let toolChoice = json["tool_choice"] else {
+            return false
+        }
+
+        if let toolChoiceString = toolChoice as? String {
+            let normalized = toolChoiceString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized != "auto" && normalized != "none"
+        }
+
+        guard let toolChoiceDictionary = toolChoice as? [String: Any],
+              let type = (toolChoiceDictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return true
+        }
+
+        return type != "auto" && type != "none"
+    }
+
+    static func formattedUpstreamErrorMessage(statusCode: Int, responseData: Data) -> String {
+        let errorMessages = extractGraphQLErrorMessages(from: responseData)
+        if !errorMessages.isEmpty {
+            return "Meta web adapter upstream error (\(statusCode)): \(errorMessages.joined(separator: " | "))"
+        }
+
+        let bodyText = String(data: responseData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let bodyText, !bodyText.isEmpty {
+            return "Meta web adapter upstream error (\(statusCode)): \(bodyText)"
+        }
+
+        return "Meta web adapter upstream error (\(statusCode))."
+    }
+
+    private static func extractGraphQLErrorMessages(from responseData: Data) -> [String] {
+        guard let text = String(data: responseData, encoding: .utf8) else {
+            return []
+        }
+
+        var messages: [String] = []
+        for rawLine in text.components(separatedBy: .newlines) {
+            guard rawLine.hasPrefix("data:") else {
+                continue
+            }
+            let payload = rawLine.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !payload.isEmpty, payload != "[DONE]",
+                  let payloadData = payload.data(using: .utf8) else {
+                continue
+            }
+            messages.append(contentsOf: graphQLErrorMessages(fromJSONObjectData: payloadData))
+        }
+
+        if !messages.isEmpty {
+            return deduplicatedMessages(messages)
+        }
+
+        return deduplicatedMessages(graphQLErrorMessages(fromJSONObjectData: responseData))
+    }
+
+    private static func graphQLErrorMessages(fromJSONObjectData data: Data) -> [String] {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+
+        if let errors = root["errors"] as? [[String: Any]] {
+            let messages = errors.compactMap { errorObject -> String? in
+                normalizedString(errorObject["message"] as? String)
+            }
+            if !messages.isEmpty {
+                return messages
+            }
+        }
+
+        if let errorObject = root["error"] as? [String: Any],
+           let message = normalizedString(errorObject["message"] as? String) {
+            return [message]
+        }
+
+        if let message = normalizedString(root["message"] as? String) {
+            return [message]
+        }
+
+        return []
+    }
+
+    private static func deduplicatedMessages(_ messages: [String]) -> [String] {
+        var seen: Set<String> = []
+        var deduplicated: [String] = []
+        for message in messages {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else {
+                continue
+            }
+            seen.insert(trimmed)
+            deduplicated.append(trimmed)
+        }
+        return deduplicated
+    }
+
+    private static func extractSources(fromSendMessageStream streamObject: [String: Any]) -> [Source] {
+        let candidateSourceArrays: [Any?] = [
+            streamObject["sources"],
+            ((streamObject["contentRenderer"] as? [String: Any])?["message"] as? [String: Any])?["sources"],
+            ((streamObject["message"] as? [String: Any])?["sources"])
+        ]
+
+        for candidate in candidateSourceArrays {
+            guard let sourceObjects = candidate as? [[String: Any]], !sourceObjects.isEmpty else {
+                continue
+            }
+
+            let sources = sourceObjects.compactMap { sourceObject -> Source? in
+                guard let url = normalizedString(
+                    (sourceObject["source_url"] as? String) ??
+                        (sourceObject["url"] as? String) ??
+                        ((sourceObject["source"] as? [String: Any])?["url"] as? String)
+                ) else {
+                    return nil
+                }
+
+                let title = normalizedString(
+                    (sourceObject["source_display_name"] as? String) ??
+                        (sourceObject["title"] as? String) ??
+                        (sourceObject["name"] as? String)
+                ) ?? url
+
+                let subtitle = normalizedString(
+                    (sourceObject["source_subtitle"] as? String) ??
+                        (sourceObject["subtitle"] as? String)
+                )
+
+                return Source(url: url, title: title, subtitle: subtitle)
+            }
+
+            if !sources.isEmpty {
+                return deduplicatedSources(sources)
+            }
+        }
+
+        return []
+    }
+
+    private static func deduplicatedSources(_ sources: [Source]) -> [Source] {
+        var seenURLs: Set<String> = []
+        var deduplicated: [Source] = []
+        for source in sources {
+            guard !seenURLs.contains(source.url) else {
+                continue
+            }
+            seenURLs.insert(source.url)
+            deduplicated.append(source)
+        }
+        return deduplicated
+    }
+
+    static func responseAnnotations(from sources: [Source]) -> [[String: Any]] {
+        sources.map { source in
+            var annotation: [String: Any] = [
+                "type": "url_citation",
+                "url": source.url,
+                "title": source.title,
+                "start_index": 0,
+                "end_index": 0
+            ]
+            if let subtitle = source.subtitle {
+                annotation["subtitle"] = subtitle
+            }
+            return annotation
+        }
     }
 
     private static func buildChatCompletionsResponseBody(text: String, publicModel: String) -> Data {
@@ -5079,7 +5436,7 @@ enum MetaAIWebAdapter {
         return Data(lines.joined().utf8)
     }
 
-    private static func buildResponsesResponseBody(text: String, publicModel: String) -> Data {
+    static func buildResponsesResponseBody(text: String, publicModel: String, sources: [Source] = []) -> Data {
         let created = Int(Date().timeIntervalSince1970)
         let responseID = "resp_meta_\(UUID().uuidString)"
         let messageID = "msg_meta_\(UUID().uuidString)"
@@ -5097,17 +5454,18 @@ enum MetaAIWebAdapter {
                 "content": [[
                     "type": "output_text",
                     "text": text,
-                    "annotations": []
+                    "annotations": responseAnnotations(from: sources)
                 ]]
             ]]
         ]
         return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
     }
 
-    private static func buildResponsesStreamBody(text: String, publicModel: String) -> Data {
+    static func buildResponsesStreamBody(text: String, publicModel: String, sources: [Source] = []) -> Data {
         let created = Int(Date().timeIntervalSince1970)
         let responseID = "resp_meta_\(UUID().uuidString)"
         let messageID = "msg_meta_\(UUID().uuidString)"
+        let annotations = responseAnnotations(from: sources)
         let lines = [
             sseLine([
                 "type": "response.created",
@@ -5139,6 +5497,28 @@ enum MetaAIWebAdapter {
                 "delta": text
             ]),
             sseLine([
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": messageID,
+                "content_index": 0,
+                "text": text
+            ]),
+            sseLine([
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": [
+                    "id": messageID,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [[
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": annotations
+                    ]]
+                ]
+            ]),
+            sseLine([
                 "type": "response.completed",
                 "response": [
                     "id": responseID,
@@ -5154,7 +5534,7 @@ enum MetaAIWebAdapter {
                         "content": [[
                             "type": "output_text",
                             "text": text,
-                            "annotations": []
+                            "annotations": annotations
                         ]]
                     ]]
                 ]
@@ -7345,7 +7725,55 @@ class ThinkingProxy {
                     currentBody: candidateBody,
                     publicAlias: publicAlias,
                     remainingCandidateModels: [requestModel] + remainingCandidateModels,
-                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
+                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                    failoverDepth: failoverDepth,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
+                )
+            }
+        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
+            where telemetryEvent.failureClass == "classified_429_concurrency":
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: telemetryEvent.requestModel,
+                telemetryEvent: telemetryEvent,
+                forcedOpenUntil: cooldownUntil,
+                healthSensitivity: healthSensitivity
+            )
+            let retryDelay = max(
+                0.25,
+                min(1.0, cooldownUntil?.timeIntervalSinceNow ?? 1.0)
+            )
+            let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
+            guard remainingBudget > retryDelay else {
+                deliverSmartAliasTerminalOutcome(
+                    .retryableFailure(
+                        requestModel: requestModel,
+                        telemetryEvent: telemetryEvent,
+                        cooldownUntil: cooldownUntil
+                    ),
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                guard let self else { return }
+                self.attemptSmartAliasCandidate(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: candidateBody,
+                    publicAlias: publicAlias,
+                    remainingCandidateModels: [requestModel] + remainingCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels.union([requestModel]),
                     primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                     failoverDepth: failoverDepth,
                     deadlineAt: deadlineAt,
@@ -8216,6 +8644,7 @@ class ThinkingProxy {
         }
 
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let concurrencyRetryUntil = Date().addingTimeInterval(1)
         let concurrencyLimitedTelemetry = annotatedSmartAliasTelemetryEvent(
             OpenAICompatTemporaryShim.RouteTelemetryEvent(
                 timestamp: Date(),
@@ -8225,13 +8654,14 @@ class ThinkingProxy {
                 transportOutcome: "retry",
                 attemptLane: attemptLane,
                 failoverDepth: failoverDepth,
-                failureClass: "classified_429",
+                failureClass: "classified_429_concurrency",
                 timeoutStage: .none,
                 upstreamHTTPStatus: 429,
                 retryCount: 0,
                 source: "smart_alias",
                 firstByteLatencyMilliseconds: nil,
-                totalLatencyMilliseconds: nil
+                totalLatencyMilliseconds: nil,
+                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -8282,7 +8712,7 @@ class ThinkingProxy {
             case .success(let result):
                 let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
                 let httpResponse = HTTPURLResponse(
-                    url: URL(string: "https://meta.ai/api/graphql")!,
+                    url: URL(string: "https://www.meta.ai/api/graphql")!,
                     statusCode: result.statusCode,
                     httpVersion: "HTTP/1.1",
                     headerFields: result.headers
@@ -8306,7 +8736,7 @@ class ThinkingProxy {
             case .failure(let failure):
                 let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
                 let httpResponse = HTTPURLResponse(
-                    url: URL(string: "https://meta.ai/api/graphql")!,
+                    url: URL(string: "https://www.meta.ai/api/graphql")!,
                     statusCode: failure.statusCode,
                     httpVersion: "HTTP/1.1",
                     headerFields: ["Content-Type": "application/json"]
@@ -8344,7 +8774,7 @@ class ThinkingProxy {
                 .retryableFailure(
                     requestModel: candidateModel,
                     telemetryEvent: concurrencyLimitedTelemetry,
-                    cooldownUntil: nil
+                    cooldownUntil: concurrencyRetryUntil
                 )
             )
             return
@@ -8446,6 +8876,7 @@ class ThinkingProxy {
             remainingBudget
         )
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let concurrencyRetryUntil = Date().addingTimeInterval(1)
         let concurrencyLimitedTelemetry = annotatedSmartAliasTelemetryEvent(
             OpenAICompatTemporaryShim.RouteTelemetryEvent(
                 timestamp: Date(),
@@ -8455,13 +8886,14 @@ class ThinkingProxy {
                 transportOutcome: "retry",
                 attemptLane: attemptLane,
                 failoverDepth: failoverDepth,
-                failureClass: "classified_429",
+                failureClass: "classified_429_concurrency",
                 timeoutStage: .none,
                 upstreamHTTPStatus: 429,
                 retryCount: 0,
                 source: "smart_alias",
                 firstByteLatencyMilliseconds: nil,
-                totalLatencyMilliseconds: nil
+                totalLatencyMilliseconds: nil,
+                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -8472,7 +8904,7 @@ class ThinkingProxy {
                 .retryableFailure(
                     requestModel: candidateModel,
                     telemetryEvent: concurrencyLimitedTelemetry,
-                    cooldownUntil: nil
+                    cooldownUntil: concurrencyRetryUntil
                 )
             )
             return
