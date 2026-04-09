@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_PATH="$REPO_ROOT/VibeProxy.app"
 APP_BINARY_PATH="$APP_PATH/Contents/MacOS/CLIProxyMenuBar"
+VERIFY_APP_BUNDLE_SCRIPT="$SCRIPT_DIR/verify-app-bundle.sh"
 LOG_DIR="$HOME/.cli-proxy-api"
 STDOUT_LOG="$LOG_DIR/launchd-vibeproxy.out.log"
 STDERR_LOG="$LOG_DIR/launchd-vibeproxy.err.log"
@@ -20,10 +21,55 @@ if [ ! -d "$APP_PATH" ]; then
     exit 1
 fi
 
+if [ ! -x "$APP_BINARY_PATH" ]; then
+    echo "VibeProxy app binary not found or not executable at $APP_BINARY_PATH" >&2
+    exit 1
+fi
+
 cleanup() {
     rm -f "$HEALTH_BODY"
 }
 trap cleanup EXIT
+
+verify_app_bundle() {
+    "$VERIFY_APP_BUNDLE_SCRIPT" "$APP_PATH" >/dev/null
+}
+
+repair_app_bundle() {
+    local expected_framework_rpath="@loader_path/../Frameworks"
+    local sparkle_framework="$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
+
+    if [ ! -f "$sparkle_framework" ]; then
+        return 1
+    fi
+
+    if ! otool -l "$APP_BINARY_PATH" | awk '/LC_RPATH/{show=1;next} show&&/path /{print $2;show=0}' | grep -Fxq "$expected_framework_rpath"; then
+        echo "Repairing app bundle: restoring missing $expected_framework_rpath rpath on CLIProxyMenuBar" >&2
+        install_name_tool -add_rpath "$expected_framework_rpath" "$APP_BINARY_PATH"
+    fi
+
+    chmod +x "$APP_BINARY_PATH"
+    codesign --force --deep --sign - "$APP_PATH" >/dev/null
+}
+
+ensure_launchable_app_bundle() {
+    if verify_app_bundle; then
+        return 0
+    fi
+
+    echo "App bundle verification failed before launch; attempting repair." >&2
+    if ! repair_app_bundle; then
+        echo "Automatic app bundle repair failed." >&2
+        "$VERIFY_APP_BUNDLE_SCRIPT" "$APP_PATH" >&2 || true
+        return 1
+    fi
+
+    if ! verify_app_bundle; then
+        echo "App bundle is still invalid after repair." >&2
+        "$VERIFY_APP_BUNDLE_SCRIPT" "$APP_PATH" >&2 || true
+        return 1
+    fi
+}
 
 probe_health() {
     if ! curl -fsS --connect-timeout 3 --max-time 5 -o "$HEALTH_BODY" "$HEALTH_URL" >/dev/null 2>&1; then
@@ -38,6 +84,7 @@ probe_health() {
 }
 
 mkdir -p "$LOG_DIR"
+ensure_launchable_app_bundle
 
 # launchctl restarts this wrapper, not the app bundle itself. Explicitly stop any
 # existing repo-local app instance so kickstart produces one authoritative proxy.

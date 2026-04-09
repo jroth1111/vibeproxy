@@ -808,6 +808,49 @@ enum OpenAICompatTemporaryShim {
         concurrencyRegistry.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
     }
 
+    static func shouldTreatProvider429AsConcurrency(
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) -> Bool {
+        guard let disposition = classifyProvider429Disposition(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        ) else {
+            return false
+        }
+
+        if case .concurrency = disposition {
+            return true
+        }
+        return false
+    }
+
+    static func recordConcurrency429IfNeeded(
+        routeHealthKey: String,
+        inflightAtRequest: Int? = nil,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) {
+        guard shouldTreatProvider429AsConcurrency(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        ) else {
+            return
+        }
+        recordConcurrency429(
+            routeHealthKey: routeHealthKey,
+            inflightAtRequest: inflightAtRequest
+        )
+    }
+
     static func recordConcurrencySuccess(routeHealthKey: String, inflightAtRequest: Int? = nil) {
         concurrencyRegistry.recordSuccess(routeHealthKey: routeHealthKey, inflightAtRequest: inflightAtRequest)
     }
@@ -2185,12 +2228,6 @@ enum OpenAICompatTemporaryShim {
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
             
             // Always count failures — the circuit breaker threshold dampens rapid failures naturally
-            
-            // Feed concurrency registry for 429 responses
-            if let fc = telemetryEvent?.failureClass, (fc == "classified_429" || fc == "classified_429_concurrency"),
-               let inflight = telemetryEvent?.inflightAtRequest {
-                concurrencyRegistry.record429(routeHealthKey: route.routeHealthKey, inflightAtRequest: inflight)
-            }
 
             var nextState = nextRouteCircuitState(
                 current: current,
@@ -4644,7 +4681,6 @@ enum MetaAIWebAdapter {
             return .failure(Failure(statusCode: 500, message: "Meta web adapter failed to load auth material."))
         }
 
-        let session = makeSession(authSnapshot: authSnapshot)
         let conversationID = UUID().uuidString
         let plannedRequests: [PlannedGraphQLRequest]
         do {
@@ -4658,6 +4694,9 @@ enum MetaAIWebAdapter {
         } catch {
             return .failure(Failure(statusCode: 500, message: "Meta web adapter failed to build the GraphQL request sequence."))
         }
+
+        let session = makeSession(authSnapshot: authSnapshot)
+        defer { session.finishTasksAndInvalidate() }
 
         do {
             var eventStreamData: Data?
@@ -4777,14 +4816,6 @@ enum MetaAIWebAdapter {
             return ParsedEventStream(
                 assistantText: nil,
                 errorMessage: "Meta web adapter received a non-UTF8 event stream.",
-                sources: []
-            )
-        }
-
-        if let classifiedMessage = classifiedNonGraphQLFailureMessage(statusCode: 200, responseText: text) {
-            return ParsedEventStream(
-                assistantText: nil,
-                errorMessage: classifiedMessage,
                 sources: []
             )
         }
@@ -5538,7 +5569,9 @@ enum MetaAIWebAdapter {
     private static func looksLikeMetaSessionFailure(_ normalizedBody: String, statusCode: Int) -> Bool {
         let authIndicators = [
             "access token required",
-            "authentication",
+            "authentication required",
+            "authentication failed",
+            "authentication error",
             "unauthorized",
             "invalid session",
             "session expired",
@@ -9215,10 +9248,13 @@ class ThinkingProxy {
 
             switch outcome {
             case .retry(let nextState):
-                if attempt.response?.statusCode == 429 {
-                    OpenAICompatTemporaryShim.recordConcurrency429(
+                if let response = attempt.response {
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                         routeHealthKey: permit.routeHealthKey,
-                        inflightAtRequest: permit.inflightAtRequest
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: response.statusCode,
+                        headers: response.allHeaderFields,
+                        bodyData: attempt.data
                     )
                 }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
@@ -9252,12 +9288,13 @@ class ThinkingProxy {
                     bodyData: responseBody,
                     path: path
                 ).shouldFailover {
-                    if statusCode == 429 {
-                        OpenAICompatTemporaryShim.recordConcurrency429(
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                             routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest
-                        )
-                    }
+                            inflightAtRequest: permit.inflightAtRequest,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            bodyData: responseBody
+                    )
                     let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
                         statusCode: statusCode,
                         headers: responseHeaders,
@@ -9471,10 +9508,13 @@ class ThinkingProxy {
 
         if shouldFailover {
             // Record 429 in concurrency registry for auto-discovery of provider limits
-            if statusCode == 429, let routeHealthKey = route?.routeHealthKey {
-                OpenAICompatTemporaryShim.recordConcurrency429(
+            if let routeHealthKey = route?.routeHealthKey {
+                OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                     routeHealthKey: routeHealthKey,
-                    inflightAtRequest: inflightAtRequest
+                    inflightAtRequest: inflightAtRequest,
+                    statusCode: statusCode,
+                    headers: response.allHeaderFields,
+                    bodyData: responseData
                 )
             }
             let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
@@ -10517,10 +10557,13 @@ class ThinkingProxy {
 
             switch outcome {
             case .retry(let nextState):
-                if attempt.response?.statusCode == 429 {
-                    OpenAICompatTemporaryShim.recordConcurrency429(
+                if let response = attempt.response {
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                         routeHealthKey: permit.routeHealthKey,
-                        inflightAtRequest: permit.inflightAtRequest
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: response.statusCode,
+                        headers: response.allHeaderFields,
+                        bodyData: attempt.data
                     )
                 }
                 guard !coordinator.isFinished() else { return }
@@ -10566,12 +10609,13 @@ class ThinkingProxy {
                     )
                     OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else if statusCode == 429 || statusCode == 403 || statusCode == 404 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    if statusCode == 429 {
-                        OpenAICompatTemporaryShim.recordConcurrency429(
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                             routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest
-                        )
-                    }
+                            inflightAtRequest: permit.inflightAtRequest,
+                            statusCode: statusCode,
+                            headers: headers,
+                            bodyData: bodyData
+                    )
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
@@ -10590,10 +10634,13 @@ class ThinkingProxy {
                     winnerAttemptLane: attemptLane
                 )
                 if statusCode == 429 || statusCode == 403 || statusCode == 404 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
-                    if statusCode == 429 {
-                        OpenAICompatTemporaryShim.recordConcurrency429(
+                    if let response = attempt.response {
+                        OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                             routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest
+                            inflightAtRequest: permit.inflightAtRequest,
+                            statusCode: response.statusCode,
+                            headers: response.allHeaderFields,
+                            bodyData: attempt.data
                         )
                     }
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
