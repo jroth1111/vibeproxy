@@ -4563,6 +4563,7 @@ enum MetaAIWebAdapter {
         let cookieHeader: String
         let userAgent: String
         let acceptLanguage: String
+        let clientTimezone: String
         let userLocale: String
         let devicePixelRatio: Double?
     }
@@ -4867,6 +4868,13 @@ enum MetaAIWebAdapter {
             )
         }
 
+        var selectedCookieHeader: String?
+        var selectedUserAgent: String?
+        var selectedAcceptLanguage: String?
+        var selectedClientTimezone: String?
+        var selectedUserLocale: String?
+        var selectedDevicePixelRatio: Double?
+
         for entry in entries {
             guard let request = entry["request"] as? [String: Any],
                   let url = request["url"] as? String,
@@ -4894,13 +4902,47 @@ enum MetaAIWebAdapter {
             }
 
             let acceptLanguage = normalizedString(headerMap["accept-language"]) ?? "en-US,en;q=0.9"
+            let requestHints = extractGraphQLRequestHints(from: request)
 
+            if selectedCookieHeader == nil {
+                selectedCookieHeader = cookieHeader
+                selectedUserAgent = userAgent
+                selectedAcceptLanguage = acceptLanguage
+            }
+
+            guard cookieHeader == selectedCookieHeader,
+                  userAgent == selectedUserAgent else {
+                continue
+            }
+
+            if selectedClientTimezone == nil {
+                selectedClientTimezone = requestHints.clientTimezone
+            }
+            if selectedUserLocale == nil {
+                selectedUserLocale = requestHints.userLocale
+            }
+            if selectedDevicePixelRatio == nil {
+                selectedDevicePixelRatio = requestHints.devicePixelRatio
+            }
+
+            if selectedClientTimezone != nil,
+               selectedUserLocale != nil,
+               selectedDevicePixelRatio != nil {
+                break
+            }
+        }
+
+        if let cookieHeader = selectedCookieHeader,
+           let userAgent = selectedUserAgent,
+           let acceptLanguage = selectedAcceptLanguage {
             return HARAuthSnapshot(
                 cookieHeader: cookieHeader,
                 userAgent: userAgent,
                 acceptLanguage: acceptLanguage,
-                userLocale: preferredMetaUserLocale(fromAcceptLanguage: acceptLanguage),
-                devicePixelRatio: parseNumericCookie(named: "dpr", in: cookieValues)
+                clientTimezone: selectedClientTimezone ?? "UTC",
+                userLocale: selectedUserLocale ?? preferredMetaUserLocale(fromAcceptLanguage: acceptLanguage),
+                devicePixelRatio: selectedDevicePixelRatio
+                    ?? parseNumericCookie(named: "dpr", in: parseCookieHeader(cookieHeader))
             )
         }
 
@@ -5092,7 +5134,7 @@ enum MetaAIWebAdapter {
             "attachments": NSNull(),
             "clientLatitude": NSNull(),
             "clientLongitude": NSNull(),
-            "clientTimezone": TimeZone.current.identifier,
+            "clientTimezone": authSnapshot.clientTimezone,
             "clippyIp": NSNull(),
             "content": prompt,
             "conversationId": conversationID,
@@ -5278,6 +5320,39 @@ enum MetaAIWebAdapter {
         return normalizedString(primaryLanguageRange.map { String($0) }) ?? "en-US"
     }
 
+    private struct GraphQLRequestHints {
+        let clientTimezone: String?
+        let userLocale: String?
+        let devicePixelRatio: Double?
+    }
+
+    private static func extractGraphQLRequestHints(from request: [String: Any]) -> GraphQLRequestHints {
+        guard let postData = request["postData"] as? [String: Any],
+              let text = postData["text"] as? String,
+              let data = text.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let variables = root["variables"] as? [String: Any] else {
+            return GraphQLRequestHints(clientTimezone: nil, userLocale: nil, devicePixelRatio: nil)
+        }
+
+        return GraphQLRequestHints(
+            clientTimezone: normalizedString(variables["clientTimezone"] as? String),
+            userLocale: normalizedString(variables["userLocale"] as? String),
+            devicePixelRatio: numericJSONValue(variables["devicePixelRatio"])
+        )
+    }
+
+    private static func numericJSONValue(_ value: Any?) -> Double? {
+        switch value {
+        case let number as NSNumber:
+            return number.doubleValue
+        case let string as String:
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        default:
+            return nil
+        }
+    }
+
     private static func requiredMetaCookieFailure(for cookies: [String: String]) -> Failure? {
         let requiredCookieNames = ["datr", "ecto_1_sess"]
         let missing = requiredCookieNames.filter { normalizedString(cookies[$0]) == nil }
@@ -5420,6 +5495,10 @@ enum MetaAIWebAdapter {
             return "Meta web adapter was blocked by a Meta/Cloudflare challenge page; refresh the HAR in a normal browser session and retry."
         }
 
+        if looksLikeMetaServiceFailurePage(normalizedBody, statusCode: statusCode) {
+            return "Meta web adapter received a temporary Meta error page; retry later. If this persists, verify meta.ai is reachable in a normal browser session."
+        }
+
         if looksLikeMetaSessionFailure(normalizedBody, statusCode: statusCode) {
             return "Meta web adapter session is no longer authorized; capture a fresh HAR with current datr and ecto_1_sess cookies and retry."
         }
@@ -5441,6 +5520,19 @@ enum MetaAIWebAdapter {
         ]
         return htmlIndicators.contains(where: normalizedBody.contains)
             && challengeIndicators.contains(where: normalizedBody.contains)
+    }
+
+    private static func looksLikeMetaServiceFailurePage(_ normalizedBody: String, statusCode: Int) -> Bool {
+        let serviceIndicators = [
+            "facebook | error",
+            "no server is available for the request",
+            "temporarily unavailable",
+            "an unexpected error occurred"
+        ]
+        if serviceIndicators.contains(where: normalizedBody.contains) {
+            return true
+        }
+        return statusCode >= 500 && normalizedBody.contains("<title>facebook | error</title>")
     }
 
     private static func looksLikeMetaSessionFailure(_ normalizedBody: String, statusCode: Int) -> Bool {

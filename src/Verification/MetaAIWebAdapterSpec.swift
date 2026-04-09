@@ -9,6 +9,7 @@ struct MetaAIWebAdapterSpec {
             cookieHeader: "session=abc123",
             userAgent: "MetaAdapterSpec/1.0",
             acceptLanguage: "en-US,en;q=0.9",
+            clientTimezone: "Australia/Melbourne",
             userLocale: "en-US",
             devicePixelRatio: 1.25
         )
@@ -101,6 +102,7 @@ struct MetaAIWebAdapterSpec {
                 expectEqual(variables?["promptEditType"] as? String, "new_message", "sendMessage should use the new_message prompt edit type", recorder: recorder)
                 expectEqual(variables?["entryPoint"] as? String, "KADABRA__UNKNOWN", "sendMessage should preserve the expected entry point", recorder: recorder)
                 expectEqual(variables?["userAgent"] as? String, authSnapshot.userAgent, "sendMessage should forward the HAR user-agent in variables", recorder: recorder)
+                expectEqual(variables?["clientTimezone"] as? String, authSnapshot.clientTimezone, "sendMessage should reuse the browser timezone captured in the HAR when available", recorder: recorder)
                 expectEqual(variables?["userLocale"] as? String, authSnapshot.userLocale, "sendMessage should reuse the locale derived from the HAR session", recorder: recorder)
                 expectEqual(variables?["devicePixelRatio"] as? Double, authSnapshot.devicePixelRatio, "sendMessage should reuse the browser dpr captured in the HAR when available", recorder: recorder)
                 expectTrue(variables?["attachments"] is NSNull, "sendMessage should leave attachments null", recorder: recorder)
@@ -124,7 +126,10 @@ struct MetaAIWebAdapterSpec {
                         {"name": "Cookie", "value": "datr=device123; ecto_1_sess=session456; dpr=1.5"},
                         {"name": "User-Agent", "value": "Browser/1.0"},
                         {"name": "Accept-Language", "value": "fr-FR,fr;q=0.9"}
-                      ]
+                      ],
+                      "postData": {
+                        "text": "{\\"variables\\":{\\"clientTimezone\\":\\"Australia/Melbourne\\",\\"userLocale\\":\\"en-US\\",\\"devicePixelRatio\\":2.0}}"
+                      }
                     }
                   }
                 ]
@@ -141,11 +146,47 @@ struct MetaAIWebAdapterSpec {
                     expectEqual(snapshot.cookieHeader, "datr=device123; ecto_1_sess=session456; dpr=1.5", "HAR loading should preserve the cookie header", recorder: recorder)
                     expectEqual(snapshot.userAgent, "Browser/1.0", "HAR loading should preserve the user-agent", recorder: recorder)
                     expectEqual(snapshot.acceptLanguage, "fr-FR,fr;q=0.9", "HAR loading should preserve accept-language", recorder: recorder)
+                    expectEqual(snapshot.clientTimezone, "Australia/Melbourne", "HAR loading should reuse the browser timezone captured in GraphQL variables", recorder: recorder)
+                    expectEqual(snapshot.userLocale, "en-US", "HAR loading should prefer request-level userLocale over accept-language derivation", recorder: recorder)
+                    expectEqual(snapshot.devicePixelRatio, 2.0, "HAR loading should prefer request-level devicePixelRatio over cookie dpr", recorder: recorder)
+                }
+            } catch {
+                recorder.recordFailure("meta web adapter should load a modern HAR auth snapshot: \(error)")
+            }
+        }
+
+        run("meta web adapter falls back to UTC when HAR traffic omits a browser timezone", recorder: recorder) {
+            let har = """
+            {
+              "log": {
+                "entries": [
+                  {
+                    "request": {
+                      "url": "https://www.meta.ai/api/graphql",
+                      "headers": [
+                        {"name": "Cookie", "value": "datr=device123; ecto_1_sess=session456; dpr=1.5"},
+                        {"name": "User-Agent", "value": "Browser/1.0"},
+                        {"name": "Accept-Language", "value": "fr-FR,fr;q=0.9"}
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+            """
+
+            do {
+                let url = try writeTempFile(named: "meta-auth-utc-\(UUID().uuidString).har", contents: har)
+                defer { try? FileManager.default.removeItem(at: url) }
+
+                try withTemporaryEnvironment("VIBEPROXY_META_AI_HAR_PATH", value: url.path) {
+                    let snapshot = try MetaAIWebAdapter.loadHARAuthSnapshot(fileManager: .default)
+                    expectEqual(snapshot.clientTimezone, "UTC", "HAR loading should fall back to a stable timezone instead of the proxy host timezone", recorder: recorder)
                     expectEqual(snapshot.userLocale, "fr-FR", "HAR loading should derive locale from accept-language", recorder: recorder)
                     expectEqual(snapshot.devicePixelRatio, 1.5, "HAR loading should parse dpr from cookies", recorder: recorder)
                 }
             } catch {
-                recorder.recordFailure("meta web adapter should load a modern HAR auth snapshot: \(error)")
+                recorder.recordFailure("meta web adapter should fall back to UTC when timezone hints are absent: \(error)")
             }
         }
 
@@ -507,6 +548,19 @@ struct MetaAIWebAdapterSpec {
             )
             expectContains(authMessage, "session is no longer authorized", "auth failures should instruct the user to refresh the HAR session", recorder: recorder)
             expectContains(authMessage, "ecto_1_sess", "auth failures should mention the critical session cookie", recorder: recorder)
+        }
+
+        run("meta web adapter classifies temporary Meta error pages cleanly", recorder: recorder) {
+            let serviceHTML = """
+            <!doctype html><html lang="en" id="facebook"><head><title>Facebook | Error</title></head><body>No server is available for the request</body></html>
+            """
+
+            let serviceMessage = MetaAIWebAdapter.formattedUpstreamErrorMessage(
+                statusCode: 503,
+                responseData: Data(serviceHTML.utf8)
+            )
+            expectContains(serviceMessage, "temporary Meta error page", "raw Meta service error HTML should map to a clean retryable failure", recorder: recorder)
+            expectContains(serviceMessage, "retry later", "temporary Meta service failures should encourage retry", recorder: recorder)
         }
 
         run("meta web adapter surfaces Meta sources on responses outputs", recorder: recorder) {
