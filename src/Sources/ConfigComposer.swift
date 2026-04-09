@@ -756,7 +756,7 @@ enum ConfigComposer {
                 "display-name": "Meta AI Web UI",
                 "help-text": "HAR-backed Meta AI web session adapter for the muse-spark alias.",
                 "icon-system": "bubble.left.and.bubble.right.fill",
-                "base-url": "https://www.meta.ai/api/graphql",
+                "base-url": "https://meta.ai/api/graphql",
                 "requires-api-key": false,
                 "models": [
                     ["name": "muse-spark", "alias": "muse-spark"]

@@ -4756,8 +4756,8 @@ enum MetaAIWebAdapter {
         configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         configuration.httpAdditionalHeaders = [
             "User-Agent": authSnapshot.userAgent,
-            "Origin": "https://www.meta.ai",
-            "Referer": "https://www.meta.ai/",
+            "Origin": "https://meta.ai",
+            "Referer": "https://meta.ai/",
             "Accept-Language": authSnapshot.acceptLanguage,
             "Cookie": authSnapshot.cookieHeader
         ]
@@ -4771,7 +4771,7 @@ enum MetaAIWebAdapter {
         docID: String,
         variables: [String: Any]
     ) throws -> Data {
-        guard let url = URL(string: "https://www.meta.ai/api/graphql") else {
+        guard let url = URL(string: "https://meta.ai/api/graphql") else {
             throw Failure(statusCode: 500, message: "Meta web adapter has an invalid GraphQL endpoint URL.")
         }
 
@@ -4779,8 +4779,8 @@ enum MetaAIWebAdapter {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(accept, forHTTPHeaderField: "Accept")
-        request.setValue("https://www.meta.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://www.meta.ai/", forHTTPHeaderField: "Referer")
+        request.setValue("https://meta.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://meta.ai/", forHTTPHeaderField: "Referer")
         request.setValue(authSnapshot.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(authSnapshot.acceptLanguage, forHTTPHeaderField: "Accept-Language")
         request.setValue(authSnapshot.cookieHeader, forHTTPHeaderField: "Cookie")
