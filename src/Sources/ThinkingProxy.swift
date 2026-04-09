@@ -1176,24 +1176,37 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        let expectedCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
-        guard smartAlias.candidates == expectedCandidates,
-              let primaryRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[0]),
+        let canonicalCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
+        let extendedCandidates = canonicalCandidates + ["muse-spark"]
+        let acceptedCandidates = [canonicalCandidates, extendedCandidates]
+        guard acceptedCandidates.contains(smartAlias.candidates),
+              let primaryRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[0]),
               primaryRoute.providerID == "zai",
               primaryRoute.canonicalModelID == "glm-5.1",
-              let secondaryRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[1]),
+              let secondaryRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[1]),
               secondaryRoute.providerID == "ollama-pro",
               secondaryRoute.canonicalModelID == "glm-5.1",
-              let fallbackRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[2]),
+              let fallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[2]),
               fallbackRoute.providerID == "ollama-pro",
               fallbackRoute.canonicalModelID == "minimax-m2.7",
-              let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: expectedCandidates[3]),
+              let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[3]),
               terminalFallbackRoute.providerID == "nvidia",
               terminalFallbackRoute.canonicalModelID == "z-ai/glm5" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then glm5-nvidia."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then glm5-nvidia, then muse-spark."
             )
+        }
+
+        if smartAlias.candidates == extendedCandidates {
+            guard let metaRoute = resolveConfiguredRoute(forRequestModel: extendedCandidates[4]),
+                  metaRoute.providerID == MetaAIWebAdapter.providerID,
+                  metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias else {
+                return ClientFacingNVIDIAFailure(
+                    statusCode: 500,
+                    message: "The \(requestModel) pooled alias is misconfigured: muse-spark must resolve to the Meta AI web adapter."
+                )
+            }
         }
 
         return nil
