@@ -4488,6 +4488,9 @@ enum MetaAIWebAdapter {
         let prompt: String
         let stream: Bool
         let publicModel: String
+        /// True when the request contains only a single user message (new thread).
+        /// False when it contains multi-turn context (system/assistant messages = follow-up).
+        let isNewThread: Bool
     }
 
     struct ParsedEventStream: Equatable {
@@ -4564,7 +4567,8 @@ enum MetaAIWebAdapter {
                 variables: buildSendMessageVariables(
                     authSnapshot: authSnapshot,
                     conversationID: conversationID,
-                    prompt: parsedRequest.prompt
+                    prompt: parsedRequest.prompt,
+                    isNewThread: parsedRequest.isNewThread
                 )
             )
 
@@ -4640,8 +4644,8 @@ enum MetaAIWebAdapter {
         }
 
         let stream = (json["stream"] as? Bool) ?? false
-        let prompt = try extractPrompt(fromChatRequestJSONObject: json)
-        return ParsedRequest(surface: surface, prompt: prompt, stream: stream, publicModel: publicModel)
+        let (prompt, isNewThread) = try extractPrompt(fromChatRequestJSONObject: json)
+        return ParsedRequest(surface: surface, prompt: prompt, stream: stream, publicModel: publicModel, isNewThread: isNewThread)
     }
 
     static func parseEventStream(_ data: Data) -> ParsedEventStream {
@@ -4761,7 +4765,31 @@ enum MetaAIWebAdapter {
             "Accept-Language": authSnapshot.acceptLanguage,
             "Cookie": authSnapshot.cookieHeader
         ]
-        return URLSession(configuration: configuration)
+        let delegate = RedirectFollowingDelegate()
+        return URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+    }
+
+    /// URLSessionDelegate that follows HTTP redirects while preserving per-request headers
+    /// (Content-Type, Accept, Origin, Referer) that URLSession strips on cross-host redirects.
+    private final class RedirectFollowingDelegate: NSObject, URLSessionTaskDelegate {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            var redirected = request
+            // Re-apply headers that the system drops when building the redirect request.
+            if let original = task.originalRequest {
+                for header in ["Content-Type", "Accept", "Origin", "Referer"] {
+                    if let value = original.value(forHTTPHeaderField: header) {
+                        redirected.setValue(value, forHTTPHeaderField: header)
+                    }
+                }
+            }
+            completionHandler(redirected)
+        }
     }
 
     private static func postGraphQL(
@@ -4829,7 +4857,8 @@ enum MetaAIWebAdapter {
     private static func buildSendMessageVariables(
         authSnapshot: HARAuthSnapshot,
         conversationID: String,
-        prompt: String
+        prompt: String,
+        isNewThread: Bool
     ) -> [String: Any] {
         [
             "assistantMessageId": UUID().uuidString,
@@ -4846,7 +4875,7 @@ enum MetaAIWebAdapter {
             "devicePixelRatio": 2,
             "entryPoint": "KADABRA__UNKNOWN",
             "imagineOperationRequest": NSNull(),
-            "isNewConversation": true,
+            "isNewConversation": isNewThread,
             "mentions": NSNull(),
             "mode": conversationMode,
             "promptEditType": "new_message",
@@ -4864,12 +4893,13 @@ enum MetaAIWebAdapter {
         ]
     }
 
-    private static func extractPrompt(fromChatRequestJSONObject json: [String: Any]) throws -> String {
+    private static func extractPrompt(fromChatRequestJSONObject json: [String: Any]) throws -> (prompt: String, isNewThread: Bool) {
         guard let messages = json["messages"] as? [[String: Any]], !messages.isEmpty else {
             throw Failure(statusCode: 400, message: "Meta web adapter requires at least one chat message.")
         }
 
         var transcript: [String] = []
+        var hasNonUserRole = false
         for message in messages {
             let role = ((message["role"] as? String) ?? "user").lowercased()
             if role == "tool" || message["tool_calls"] != nil {
@@ -4880,6 +4910,10 @@ enum MetaAIWebAdapter {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                   !flattenedText.isEmpty else {
                 continue
+            }
+
+            if role != "user" {
+                hasNonUserRole = true
             }
 
             switch role {
@@ -4896,13 +4930,17 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text messages.")
         }
 
-        if transcript.count == 1,
+        // New thread: single user message with no system/assistant context.
+        // Follow-up: multi-turn (system/assistant messages present) or multiple user messages.
+        let isNewThread = !hasNonUserRole && transcript.count == 1
+
+        if isNewThread,
            let onlyLine = transcript.first,
            onlyLine.hasPrefix("User: ") {
-            return String(onlyLine.dropFirst("User: ".count))
+            return (String(onlyLine.dropFirst("User: ".count)), true)
         }
 
-        return transcript.joined(separator: "\n\n")
+        return (transcript.joined(separator: "\n\n"), isNewThread)
     }
 
     private static func flattenedText(from value: Any?) -> String? {

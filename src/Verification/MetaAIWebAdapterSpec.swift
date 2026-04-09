@@ -25,8 +25,57 @@ struct MetaAIWebAdapterSpec {
                 expectEqual(parsed.surface, .chatCompletions, "chat requests should keep the chat-completions surface", recorder: recorder)
                 expectEqual(parsed.stream, false, "chat requests should default stream=false", recorder: recorder)
                 expectEqual(parsed.prompt, "System: Be terse.\n\nUser: Say hi", "chat requests should flatten into a stable transcript", recorder: recorder)
+                expectEqual(parsed.isNewThread, false, "multi-turn with system message is a follow-up", recorder: recorder)
             } catch {
                 recorder.recordFailure("meta web adapter should parse text-only chat requests: \(error)")
+            }
+        }
+
+        run("meta web adapter detects single user message as new thread", recorder: recorder) {
+            let request = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "Hello"}
+              ]
+            }
+            """
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(parsed.prompt, "Hello", "single user message should strip User: prefix", recorder: recorder)
+                expectEqual(parsed.isNewThread, true, "single user message should be detected as new thread", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should parse single user message: \(error)")
+            }
+        }
+
+        run("meta web adapter detects multi-turn as follow-up", recorder: recorder) {
+            let request = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello"},
+                {"role": "user", "content": "How are you?"}
+              ]
+            }
+            """
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(parsed.prompt, "User: Hi\n\nAssistant: Hello\n\nUser: How are you?", "multi-turn should flatten into transcript", recorder: recorder)
+                expectEqual(parsed.isNewThread, false, "multi-turn with assistant messages is a follow-up", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should parse multi-turn messages: \(error)")
             }
         }
 
@@ -51,6 +100,7 @@ struct MetaAIWebAdapterSpec {
                 expectEqual(parsed.surface, .responses, "responses requests should keep the responses surface", recorder: recorder)
                 expectEqual(parsed.stream, true, "responses requests should preserve stream=true", recorder: recorder)
                 expectEqual(parsed.prompt, "System: Be terse.\n\nUser: Return exactly OK", "responses requests should reuse the same prompt flattening logic", recorder: recorder)
+                expectEqual(parsed.isNewThread, false, "responses with instructions have system context = follow-up", recorder: recorder)
             } catch {
                 recorder.recordFailure("meta web adapter should parse text-only responses requests: \(error)")
             }
