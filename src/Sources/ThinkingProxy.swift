@@ -503,7 +503,7 @@ enum OpenAICompatTemporaryShim {
         Swift.assert(Set(keys).count == keys.count, "Duplicate key in modelTierByCanonicalModelID")
     }()
     #endif
-    static let canaryDisabledCanonicalModelIDs: Set<String> = []
+    static let canaryDisabledCanonicalModelIDs: Set<String> = [MetaAIWebAdapter.modelAlias]
     private static let workerSmartRouteRequestPolicy = RequestPolicy(
         minimumMaxTokens: 128,
         maximumMaxTokens: nil,
@@ -4639,12 +4639,15 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter requires a valid JSON request body.")
         }
 
-        if json["tools"] != nil || json["tool_choice"] != nil || json["parallel_tool_calls"] != nil {
-            throw Failure(statusCode: 501, message: "Meta web adapter does not support tool calling through the web UI GraphQL lane.")
-        }
+        // Strip tool-related fields — the Meta web lane doesn't support tool calling,
+        // so we silently ignore tools and extract the text content from messages.
+        var cleanedJSON = json
+        cleanedJSON.removeValue(forKey: "tools")
+        cleanedJSON.removeValue(forKey: "tool_choice")
+        cleanedJSON.removeValue(forKey: "parallel_tool_calls")
 
         let stream = (json["stream"] as? Bool) ?? false
-        let (prompt, isNewThread) = try extractPrompt(fromChatRequestJSONObject: json)
+        let (prompt, isNewThread) = try extractPrompt(fromChatRequestJSONObject: cleanedJSON)
         return ParsedRequest(surface: surface, prompt: prompt, stream: stream, publicModel: publicModel, isNewThread: isNewThread)
     }
 
@@ -4902,8 +4905,38 @@ enum MetaAIWebAdapter {
         var hasNonUserRole = false
         for message in messages {
             let role = ((message["role"] as? String) ?? "user").lowercased()
-            if role == "tool" || message["tool_calls"] != nil {
-                throw Failure(statusCode: 501, message: "Meta web adapter does not support tool or function-call messages.")
+
+            // Convert tool-related messages to readable transcript entries.
+            // Tool results and function calls are inlined as text context.
+            if role == "tool" {
+                if let text = flattenedText(from: message["content"])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                    hasNonUserRole = true
+                    transcript.append("Tool result: \(text)")
+                }
+                continue
+            }
+
+            // For assistant messages with tool_calls, include both the text content
+            // and a summary of the tool invocations.
+            if let toolCalls = message["tool_calls"] as? [[String: Any]] {
+                hasNonUserRole = true
+                var parts: [String] = []
+                if let text = flattenedText(from: message["content"])?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                    parts.append(text)
+                }
+                for call in toolCalls {
+                    if let fn = call["function"] as? [String: Any],
+                       let name = fn["name"] as? String {
+                        let args = fn["arguments"] as? String ?? ""
+                        parts.append("[Called \(name)(\(args.prefix(200)))]")
+                    }
+                }
+                if !parts.isEmpty {
+                    transcript.append("Assistant: \(parts.joined(separator: " "))")
+                }
+                continue
             }
 
             guard let flattenedText = flattenedText(from: message["content"])?
