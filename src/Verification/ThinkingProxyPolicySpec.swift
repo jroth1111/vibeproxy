@@ -922,6 +922,46 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("concurrency-classified 429 retry windows create deferrals without opening route health", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_000_010)
+                let retryUntil = now.addingTimeInterval(3)
+                let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: now,
+                    requestModel: "glm-5.1-zai",
+                    requestedAlias: "worker",
+                    canonicalModelID: "glm-5.1",
+                    transportOutcome: "retry",
+                    failureClass: "classified_429_concurrency",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 429,
+                    retryCount: 0,
+                    source: "smart_alias",
+                    inflightAtRequest: 2
+                )
+
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: event,
+                    at: now,
+                    forcedOpenUntil: retryUntil
+                )
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "concurrency retry windows should not open route health", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "concurrency retry windows should not increase failure score", recorder: recorder)
+                expectEqual(
+                    Int(OpenAICompatTemporaryShim.routeAvailabilityDeferralUntilForTesting(requestModel: "glm-5.1-zai")?.timeIntervalSince(now) ?? -1),
+                    3,
+                    "concurrency retry windows should still produce a short route deferral",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary provider route-health reload clears stale in-memory provider cooldowns", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withRouteHealthPath { path in

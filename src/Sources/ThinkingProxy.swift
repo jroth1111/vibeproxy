@@ -2341,7 +2341,9 @@ enum OpenAICompatTemporaryShim {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
 
-            if telemetryEvent?.failureClass?.lowercased() == "classified_429_overload" {
+            let normalizedFailureClass = telemetryEvent?.failureClass?.lowercased()
+
+            if normalizedFailureClass == "classified_429_overload" {
                 // Overload 429s are transient provider pressure, not evidence that
                 // the route itself is unhealthy. Preserve telemetry, but do not
                 // change circuit state, cooldowns, or ranking inputs.
@@ -2352,6 +2354,48 @@ enum OpenAICompatTemporaryShim {
                         from: currentStatus,
                         to: currentStatus
                     )
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
+            if normalizedFailureClass == "classified_429_concurrency" {
+                // Concurrency 429s should influence short retry routing and the
+                // learned concurrency registry, but they are not evidence that
+                // the route itself is unhealthy. Preserve the current route
+                // state, emit telemetry, and only update the availability
+                // deferral window.
+                let currentStatus = current?.status ?? .closed
+                let enrichedTelemetryEvent = telemetryEvent.map {
+                    enrichTelemetryEvent($0, from: currentStatus, to: currentStatus)
+                }
+                let preservedState = routeCircuitState(
+                    current ?? RouteCircuitState(
+                        status: .closed,
+                        failureScore: 0,
+                        recoverySuccesses: 0,
+                        openUntil: nil,
+                        lastScoreUpdatedAt: now,
+                        lastTelemetryEvent: nil,
+                        rollingMetrics: .empty,
+                        emaMetrics: .empty,
+                        recoveredAt: nil
+                    ),
+                    replacingLastTelemetryEvent: enrichedTelemetryEvent
+                )
+                routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = preservedState
+                if let cooldownUntil = adaptiveConcurrencyDeferralUntil(
+                    routeHealthKey: route.routeHealthKey,
+                    currentState: current,
+                    existingCooldownUntil: routeCooldownsByRouteHealthKey[route.routeHealthKey],
+                    telemetryEvent: enrichedTelemetryEvent,
+                    forcedOpenUntil: forcedOpenUntil,
+                    now: now
+                ), now < cooldownUntil {
+                    routeCooldownsByRouteHealthKey[route.routeHealthKey] = cooldownUntil
+                }
+                scheduleRouteHealthPersistLocked()
+                if let enrichedTelemetryEvent {
                     logNVIDIARouteTelemetry(enrichedTelemetryEvent)
                 }
                 return
@@ -10157,6 +10201,9 @@ class ThinkingProxy {
             return nil
         }
 
+        let canonicalCoalescingSourceBody = canonicalJSONStringForCoalescing(coalescingSourceBody)
+        let canonicalBody = canonicalJSONStringForCoalescing(body)
+
         if let requestedModelAlias,
            OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: requestedModelAlias) != nil,
            OpenAICompatTemporaryShim.isSafePlainChatRequest(
@@ -10164,7 +10211,7 @@ class ThinkingProxy {
                 path: path,
                 jsonString: coalescingSourceBody
            ) {
-            return "\(identityPartition)\n\(method) \(path)\n\(coalescingSourceBody)"
+            return "\(identityPartition)\n\(method) \(path)\n\(canonicalCoalescingSourceBody)"
         }
 
         guard OpenAICompatTemporaryShim.allowsPlainSafeNVIDIARequest(
@@ -10176,7 +10223,17 @@ class ThinkingProxy {
         OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: model) == .suspect else {
             return nil
         }
-        return "\(identityPartition)\n\(method) \(path)\n\(body)"
+        return "\(identityPartition)\n\(method) \(path)\n\(canonicalBody)"
+    }
+
+    private func canonicalJSONStringForCoalescing(_ jsonString: String) -> String {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let jsonObject = try? JSONSerialization.jsonObject(with: jsonData),
+              let canonicalData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.sortedKeys]),
+              let canonicalString = String(data: canonicalData, encoding: .utf8) else {
+            return jsonString
+        }
+        return canonicalString
     }
 
     private func coalescingIdentityPartition(headers: [(String, String)]) -> String? {
