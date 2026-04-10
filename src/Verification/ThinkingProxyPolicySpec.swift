@@ -820,8 +820,8 @@ struct ThinkingProxyPolicySpec {
                 let messages = json["messages"] as? [[String: Any]]
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    "Check repo",
-                    "reasoning and metadata_marker content should be dropped while preserving visible summary text",
+                    "Check repohidden chain of thought{\"step\":1}",
+                    "reasoning text and metadata_marker values preserved alongside visible summary text",
                     recorder: recorder
                 )
             }
@@ -905,8 +905,8 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    "",
-                    "metadata-only typed transcript content should collapse to empty visible text instead of failing preflight",
+                    "hidden chain of thought{\"step\":1}",
+                    "metadata-only typed transcript content should preserve reasoning text and metadata_marker values",
                     recorder: recorder
                 )
                 expectNil(preflightError, "metadata-only typed transcript content should not fail NVIDIA preflight", recorder: recorder)
