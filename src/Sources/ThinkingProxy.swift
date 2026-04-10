@@ -4468,16 +4468,20 @@ enum OpenAICompatTemporaryShim {
             return .unchanged
         }
         if let dictionary = content as? [String: Any] {
-            guard let flattened = flattenedTextMessageContent(from: dictionary) else {
-                return .unsupported
+            if let flattened = flattenedTextMessageContent(from: dictionary) {
+                return .flattened(flattened)
             }
-            return .flattened(flattened)
+            if isIgnorableNonMediaTypedContent(dictionary) {
+                return .flattened("")
+            }
+            return .unsupported
         }
         guard let segments = content as? [Any] else {
             return .unsupported
         }
 
         var collectedSegments: [String] = []
+        var sawIgnorableNonMediaSegment = false
         for segment in segments {
             if let textSegment = segment as? String {
                 collectedSegments.append(textSegment)
@@ -4491,15 +4495,26 @@ enum OpenAICompatTemporaryShim {
                 return .unsupported
             }
             guard let textValue = flattenedTextMessageContent(from: dictionary) else {
+                if isIgnorableNonMediaTypedContent(dictionary) {
+                    sawIgnorableNonMediaSegment = true
+                    continue
+                }
                 continue
             }
             collectedSegments.append(textValue)
         }
 
+        if !collectedSegments.isEmpty {
+            return .flattened(collectedSegments.joined())
+        }
+
+        if sawIgnorableNonMediaSegment {
+            return .flattened("")
+        }
+
         guard !collectedSegments.isEmpty else {
             return .unsupported
         }
-
         return .flattened(collectedSegments.joined())
     }
 
@@ -4558,6 +4573,28 @@ enum OpenAICompatTemporaryShim {
         }
 
         return nil
+    }
+
+    private static func isIgnorableNonMediaTypedContent(_ dictionary: [String: Any]) -> Bool {
+        guard !containsUnsupportedMediaPayload(dictionary),
+              let type = (dictionary["type"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+              !type.isEmpty else {
+            return false
+        }
+
+        let nonIgnorableTypes: Set<String> = [
+            "text",
+            "input_text",
+            "output_text",
+            "summary_text",
+            "tool_result",
+            "output_json",
+            "input_json",
+            "json"
+        ]
+        return !nonIgnorableTypes.contains(type)
     }
 
     private static func normalizedTextMessageScalar(_ value: Any?) -> String? {
@@ -6065,6 +6102,7 @@ enum MetaAIWebAdapter {
         }
 
         var parts: [String] = []
+        var sawIgnorableNonMediaSegment = false
         for segment in segments {
             if let stringSegment = segment as? String {
                 parts.append(stringSegment)
@@ -6077,9 +6115,19 @@ enum MetaAIWebAdapter {
                 throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
             guard let text = try flattenedText(fromContentDictionary: dictionary) else {
+                if isIgnorableNonMediaContent(dictionary) {
+                    sawIgnorableNonMediaSegment = true
+                    continue
+                }
                 continue
             }
             parts.append(text)
+        }
+        if !parts.isEmpty {
+            return parts.joined()
+        }
+        if sawIgnorableNonMediaSegment {
+            return ""
         }
         guard !parts.isEmpty else {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
@@ -6139,7 +6187,30 @@ enum MetaAIWebAdapter {
             return structuredContent
         }
 
+        if isIgnorableNonMediaContent(dictionary) {
+            return ""
+        }
+
         return nil
+    }
+
+    private static func isIgnorableNonMediaContent(_ dictionary: [String: Any]) -> Bool {
+        guard !containsUnsupportedMediaContent(dictionary),
+              let type = normalizedString(dictionary["type"] as? String)?.lowercased() else {
+            return false
+        }
+
+        let nonIgnorableTypes: Set<String> = [
+            "text",
+            "input_text",
+            "output_text",
+            "summary_text",
+            "tool_result",
+            "output_json",
+            "input_json",
+            "json"
+        ]
+        return !nonIgnorableTypes.contains(type)
     }
 
     private static func containsUnsupportedMediaContent(_ dictionary: [String: Any]) -> Bool {

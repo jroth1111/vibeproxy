@@ -596,6 +596,41 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter ignores metadata-only typed transcript content instead of rejecting the request", recorder: recorder) {
+            let request = #"""
+            {
+              "model": "muse-spark",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "content": [
+                    {"type": "reasoning", "text": "hidden chain of thought"},
+                    {"type": "metadata_marker", "value": {"step": 1}}
+                  ]
+                },
+                {"role": "user", "content": "Answer briefly"}
+              ]
+            }
+            """#
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(
+                    parsed.prompt,
+                    "Answer briefly",
+                    "metadata-only typed transcript content should be ignored instead of excluding the Meta bridge",
+                    recorder: recorder
+                )
+                expectEqual(parsed.isNewThread, true, "ignorable metadata-only assistant context should not force follow-up mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should ignore metadata-only typed transcript content instead of rejecting the request: \(error)")
+            }
+        }
+
         run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {
