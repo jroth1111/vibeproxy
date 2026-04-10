@@ -2674,6 +2674,88 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("mixed typed worker transcript shapes keep glm5-nvidia eligible after candidate-level request shims", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let until = Date().addingTimeInterval(300)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredError: String?
+                var seenModels: [String] = []
+                var seenContents: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? "?"
+                    let messages = json["messages"] as? [[String: Any]]
+                    let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                    seenModels.append(model)
+                    seenContents.append(assistantContent)
+                    completion(ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    ))
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {
+                              "role": "assistant",
+                              "content": [
+                                {"type": "input_text", "text": "Checked "},
+                                {"type": "summary_text", "text": "repo"},
+                                {"type": "reasoning", "text": "hidden chain of thought"},
+                                {"type": "metadata_marker", "value": {"step": 1}}
+                              ]
+                            },
+                            {"role": "user", "content": "Return exactly OK"}
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("mixed typed worker transcript shapes should still deliver through glm5-nvidia when sibling lanes are unavailable")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "mixed typed worker transcript shapes should still succeed", recorder: recorder)
+                expectEqual(deliveredError, nil, "mixed typed worker transcript shapes should not surface a terminal routing error", recorder: recorder)
+                expectEqual(seenModels, ["glm5-nvidia"], "candidate-level request shims should keep glm5-nvidia eligible for mixed typed worker transcript shapes", recorder: recorder)
+                expectEqual(seenContents, ["Checked repo"], "candidate-level request shims should flatten mixed typed worker transcript content before NVIDIA dispatch", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("true multimodal worker transcript shapes still exclude muse-spark before candidate selection", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -8404,7 +8486,8 @@ struct ThinkingProxyPolicySpec {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
 
-                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, completion in
+                proxy.directProxiedTransportForTesting = { _, endpoint, completion in
+                    expectEqual(endpoint.baseURL, "https://opencode.ai/zen/v1", "direct proxied telemetry should resolve the SOCKS5 provider endpoint", recorder: recorder)
                     completion(
                         ThinkingProxy.BufferedProxyResponse(
                             data: Data("""
@@ -8416,6 +8499,7 @@ struct ThinkingProxyPolicySpec {
                             totalLatencyMilliseconds: 23
                         )
                     )
+                    return {}
                 }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
@@ -8448,9 +8532,9 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "direct proxied requests should deliver a 200 response", recorder: recorder)
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied success should record live-request telemetry", recorder: recorder)
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.requestModel, "mimo-v2-pro-opencode", "direct proxied success should preserve the original request model alias", recorder: recorder)
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct proxied success should be tracked as a successful response", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied success should record live-request telemetry", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.requestModel, "mimo-v2-pro-opencode", "direct proxied success should preserve the original request model alias", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct proxied success should be tracked as a successful response", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct proxied success should emit a route telemetry event", recorder: recorder)
             }
         }
@@ -8469,7 +8553,8 @@ struct ThinkingProxyPolicySpec {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
 
-                proxy.directProxiedTransportForTesting = { _, _, completion in
+                proxy.directProxiedTransportForTesting = { _, endpoint, completion in
+                    expectEqual(endpoint.baseURL, "https://opencode.ai/zen/v1", "direct proxied timeout telemetry should resolve the SOCKS5 provider endpoint", recorder: recorder)
                     completion(
                         ThinkingProxy.BufferedProxyResponse(
                             data: nil,
@@ -8515,9 +8600,9 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 504, "direct proxied timeouts should surface as gateway timeouts", recorder: recorder)
                 expectEqual(deliveredMessage, "Gateway Timeout", "direct proxied timeouts should preserve the timeout message", recorder: recorder)
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.failureClass, "transport_timeout", "direct proxied timeouts should record transport_timeout", recorder: recorder)
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.timeoutStage, .firstResponse, "direct proxied timeouts should preserve the first-response deadline stage", recorder: recorder)
-                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied timeouts should remain attributed to live requests", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.failureClass, "transport_timeout", "direct proxied timeouts should record transport_timeout", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.timeoutStage, .firstResponse, "direct proxied timeouts should preserve the first-response deadline stage", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied timeouts should remain attributed to live requests", recorder: recorder)
             }
         }
 
@@ -10334,6 +10419,61 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz ignores recent smart-router failure telemetry when reporting the effective worker lane", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "minimax-m2.7-ollama-pro",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "minimax-m2.7-ollama-pro",
+                            requestedAlias: alias,
+                            canonicalModelID: "minimax-m2.7",
+                            transportOutcome: "retry",
+                            failureClass: "classified_429_concurrency",
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 429,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("failure-filtered healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should not treat the freshest failed fallback attempt as the observed worker winner", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should keep reporting the primary dispatchable worker provider when recent alias telemetry is only a failed retry", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("self-routed worker requests try the healthy GLM sibling before a suspect primary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
@@ -11559,7 +11699,39 @@ private func workerMergedConfigYAML() -> String {
 
 private func workerWithProxyMergedConfigYAML() -> String {
     [
-        workerMergedConfigYAML(),
+        "claude-api-key:",
+        "- api-key: test-zai-key",
+        "  base-url: https://api.z.ai/api/anthropic",
+        "  models:",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "openai-compatibility:",
+        "- name: ollama-pro",
+        "  api-key-entries:",
+        "  - api-key: test-ollama-key",
+        "  base-url: https://ollama.com/v1",
+        "  models:",
+        "  - alias: glm-5.1-ollama-pro",
+        "    name: glm-5.1",
+        "    register-canonical-name: false",
+        "  - alias: minimax-m2.7-ollama-pro",
+        "    name: minimax-m2.7",
+        "    register-canonical-name: false",
+        "- name: nvidia",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: glm5",
+        "    name: z-ai/glm5",
+        "  - alias: glm5-nvidia",
+        "    name: z-ai/glm5",
+        "- name: meta-web",
+        "  api-key: test-meta-web-key",
+        "  base-url: https://www.meta.ai",
+        "  models:",
+        "  - alias: muse-spark",
+        "    name: muse-spark",
         "- name: kilocode",
         "  api-key: test-kilo-key",
         "  base-url: https://api.kilo.ai/api/openrouter/v1",
@@ -11574,6 +11746,17 @@ private func workerWithProxyMergedConfigYAML() -> String {
         "    name: mimo-v2-pro-free",
         "  - alias: minimax-m2.5-opencode",
         "    name: minimax-m2.5-free",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5.1-zai",
+        "    - glm-5.1-ollama-pro",
+        "    - minimax-m2.7-ollama-pro",
+        "    - muse-spark",
+        "    - glm5-nvidia"
     ].joined(separator: "\n")
 }
 

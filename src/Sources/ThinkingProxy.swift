@@ -1538,18 +1538,23 @@ enum OpenAICompatTemporaryShim {
            Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
             return .skipped(reason: "concurrency_capacity")
         }
+        let transformedCandidateBody = transformRequest(
+            method: method,
+            path: path,
+            jsonString: candidateBody
+        ) ?? candidateBody
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
-            jsonString: candidateBody
+            jsonString: transformedCandidateBody
            ) {
             return .providerPreflightBlocked(
                 reason: "provider_preflight_\(preflightError.statusCode)",
                 error: preflightError
             )
         }
-        return .available(body: candidateBody)
+        return .available(body: transformedCandidateBody)
     }
 
     fileprivate static func nextSmartAliasCandidateSelection(
@@ -2814,21 +2819,33 @@ enum OpenAICompatTemporaryShim {
     ) -> String? {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            let freshestEvent = routeCircuitStatesByRouteHealthKey.values
+            let freshestObservedWinner = routeCircuitStatesByRouteHealthKey.values
                 .compactMap(\.lastTelemetryEvent)
-                .filter { event in
-                    event.requestedAlias == requestedAlias &&
-                        event.source == "smart_alias" &&
-                        now.timeIntervalSince(event.timestamp) <= maxAge
+                .compactMap { event -> (timestamp: Date, requestModel: String)? in
+                    guard event.requestedAlias == requestedAlias,
+                          event.source == "smart_alias",
+                          now.timeIntervalSince(event.timestamp) <= maxAge else {
+                        return nil
+                    }
+
+                    if let finalWinnerRequestModel = event.finalWinnerRequestModel {
+                        return (event.timestamp, finalWinnerRequestModel)
+                    }
+
+                    guard event.transportOutcome == "send_response",
+                          event.failureClass == nil,
+                          let upstreamHTTPStatus = event.upstreamHTTPStatus,
+                          (200..<300).contains(upstreamHTTPStatus) else {
+                        return nil
+                    }
+
+                    return (event.timestamp, event.requestModel)
                 }
                 .max { lhs, rhs in
                     lhs.timestamp < rhs.timestamp
                 }
 
-            guard let freshestEvent else {
-                return nil
-            }
-            return freshestEvent.finalWinnerRequestModel ?? freshestEvent.requestModel
+            return freshestObservedWinner?.requestModel
         }
     }
 
@@ -4535,8 +4552,8 @@ enum OpenAICompatTemporaryShim {
         let type = (dictionary["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "tool_result"
-        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json" || type == "reasoning" || type == "metadata_marker"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
 
         if let textValue = normalizedTextMessageScalar(dictionary["text"]),
            allowsDirectText {
@@ -6201,8 +6218,8 @@ enum MetaAIWebAdapter {
         }
 
         let type = normalizedString(dictionary["type"] as? String)?.lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "tool_result"
-        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json" || type == "reasoning" || type == "metadata_marker"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
         if let text = normalizedContentText(dictionary["text"]),
            allowsDirectText {
             return text
