@@ -659,7 +659,8 @@ enum OpenAICompatTemporaryShim {
     private static let legacyRequestModelRewrites: [String: String] = [
         "glm-5": "glm-5.1",
         "glm-5-turbo": "glm-5.1",
-        "glm5-nvidia": "z-ai/glm5"
+        // Rewrites must land on a concrete configured request-model alias, not a bare canonical name.
+        "z-ai/glm5": "glm5-nvidia"
     ]
     #if DEBUG
     private static let _assertLegacyRewritesHaveNoDuplicates: Void = {
@@ -4506,7 +4507,7 @@ enum OpenAICompatTemporaryShim {
         let type = (dictionary["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "metadata_marker" || type == "tool_result"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
         let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
 
         if let textValue = normalizedTextMessageScalar(dictionary["text"]),
@@ -6092,7 +6093,7 @@ enum MetaAIWebAdapter {
         }
 
         let type = normalizedString(dictionary["type"] as? String)?.lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "metadata_marker" || type == "tool_result"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
         let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
         if let text = normalizedContentText(dictionary["text"]),
            allowsDirectText {

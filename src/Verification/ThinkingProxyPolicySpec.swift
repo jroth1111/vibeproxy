@@ -161,6 +161,47 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("canonical z-ai/glm5 rewrites onto the exact nvidia alias without breaking glm5-nvidia routing", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let exactAliasRequest = """
+                {
+                  "model": "glm5-nvidia",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let exactAliasRewrite = OpenAICompatTemporaryShim.normalizedRequestModelRewrite(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: exactAliasRequest
+                )
+                expectNil(exactAliasRewrite, "the exact glm5-nvidia request-model alias should stay stable instead of being rewritten to a bare canonical name", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: exactAliasRequest), "glm5-nvidia", "glm5-nvidia requests should preserve the concrete routable alias", recorder: recorder)
+
+                let canonicalRequest = """
+                {
+                  "model": "z-ai/glm5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let canonicalRewrite = OpenAICompatTemporaryShim.normalizedRequestModelRewrite(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: canonicalRequest
+                )
+                expectEqual(canonicalRewrite?.normalizedModel, "glm5-nvidia", "canonical z-ai/glm5 requests should normalize onto the concrete nvidia alias", recorder: recorder)
+                let canonicalJSON = parseJSONObject(canonicalRewrite?.rewrittenJSONString, recorder: recorder)
+                expectEqual(canonicalJSON["model"] as? String, "glm5-nvidia", "canonical z-ai/glm5 requests should be rewritten to the exact routable alias", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.providerID, "nvidia", "canonical z-ai/glm5 should still resolve onto the nvidia route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.canonicalModelID, "z-ai/glm5", "canonical z-ai/glm5 should preserve the canonical model identity after alias normalization", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia preflight rejects streaming for buffered mitigation routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
