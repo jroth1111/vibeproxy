@@ -8312,6 +8312,215 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("direct meta-web requests record live-request success telemetry", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    expectEqual(publicModel, "muse-spark", "direct meta-web telemetry should preserve the requested model", recorder: recorder)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-meta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"muse-spark"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil,
+                        firstByteLatencyMilliseconds: 17,
+                        totalLatencyMilliseconds: 17
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct meta-web success should not surface an error: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "muse-spark",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct meta-web requests should complete successfully")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "direct meta-web requests should deliver a 200 response", recorder: recorder)
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.source, "live_request", "direct meta-web success should record live-request telemetry", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct meta-web success should be tracked as a successful response", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.finalWinnerRequestModel, "muse-spark", "direct meta-web success should preserve the winning request model", recorder: recorder)
+                expectEqual(recordedEvents.contains(where: { $0.requestModel == "muse-spark" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct meta-web success should emit a route telemetry event", recorder: recorder)
+            }
+        }
+
+        run("direct proxied requests record live-request success telemetry", recorder: recorder) {
+            withMergedConfig(workerWithProxyMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, completion in
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-proxy","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"xiaomi/mimo-v2-pro:free"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 23,
+                            totalLatencyMilliseconds: 23
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct proxied success should not surface an error: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "mimo-v2-pro-opencode",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct proxied requests should complete successfully")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "direct proxied requests should deliver a 200 response", recorder: recorder)
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied success should record live-request telemetry", recorder: recorder)
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.requestModel, "mimo-v2-pro-opencode", "direct proxied success should preserve the original request model alias", recorder: recorder)
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct proxied success should be tracked as a successful response", recorder: recorder)
+                expectEqual(recordedEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct proxied success should emit a route telemetry event", recorder: recorder)
+            }
+        }
+
+        run("direct proxied timeouts preserve deadline stage in live-request telemetry", recorder: recorder) {
+            withMergedConfig(workerWithProxyMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.directProxiedTransportForTesting = { _, _, completion in
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: nil,
+                            response: nil,
+                            error: URLError(.timedOut),
+                            firstByteLatencyMilliseconds: nil,
+                            totalLatencyMilliseconds: 720000,
+                            deadlineStage: .firstResponse
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    recorder.recordFailure("direct proxied timeout should not surface a successful response: \(statusCode)")
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "mimo-v2-pro-opencode",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct proxied timeout should return a gateway timeout error")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 504, "direct proxied timeouts should surface as gateway timeouts", recorder: recorder)
+                expectEqual(deliveredMessage, "Gateway Timeout", "direct proxied timeouts should preserve the timeout message", recorder: recorder)
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.failureClass, "transport_timeout", "direct proxied timeouts should record transport_timeout", recorder: recorder)
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.timeoutStage, .firstResponse, "direct proxied timeouts should preserve the first-response deadline stage", recorder: recorder)
+                expectEqual(snapshot["xiaomi/mimo-v2-pro:free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied timeouts should remain attributed to live requests", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia canary success immediately closes quarantined routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
