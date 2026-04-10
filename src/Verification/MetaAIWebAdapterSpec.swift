@@ -326,7 +326,7 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
-        run("meta web adapter rejects tool-bearing chat requests", recorder: recorder) {
+        run("meta web adapter accepts tool-bearing chat requests for synthetic single-tool mode", recorder: recorder) {
             let request = """
             {
               "model": "muse-spark",
@@ -341,17 +341,17 @@ struct MetaAIWebAdapterSpec {
             """
 
             do {
-                _ = try MetaAIWebAdapter.parseRequest(
+                let parsed = try MetaAIWebAdapter.parseRequest(
                     path: "/v1/chat/completions",
                     body: request,
                     publicModel: "muse-spark"
                 )
-                recorder.recordFailure("meta web adapter should reject tool-bearing chat requests")
-            } catch let failure as MetaAIWebAdapter.Failure {
-                expectEqual(failure.statusCode, 501, "tool-bearing requests should fail closed", recorder: recorder)
-                expectContains(failure.message, "does not support live tool execution", "tool-bearing requests should explain the unsupported live-tool path", recorder: recorder)
+                expectEqual(parsed.toolDefinitions.map(\.name), ["x"], "tool-bearing chat requests should preserve the declared function tools", recorder: recorder)
+                expectEqual(parsed.toolChoice, .required, "tool-bearing chat requests should preserve required tool_choice", recorder: recorder)
+                expectContains(parsed.executionPrompt, #"{"name":"tool_name","arguments":{"key":"value"}}"#, "synthetic tool mode should require the exact JSON directive shape", recorder: recorder)
+                expectContains(parsed.executionPrompt, "- x", "synthetic tool mode should enumerate the available tools", recorder: recorder)
             } catch {
-                recorder.recordFailure("meta web adapter should throw a typed failure for tool-bearing requests: \(error)")
+                recorder.recordFailure("meta web adapter should parse tool-bearing chat requests into synthetic tool mode: \(error)")
             }
         }
 
@@ -438,7 +438,7 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
-        run("meta web adapter rejects tool and typed-content requests during preflight validation", recorder: recorder) {
+        run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {
               "model": "muse-spark",
@@ -470,8 +470,7 @@ struct MetaAIWebAdapterSpec {
                 body: toolRequest,
                 publicModel: "muse-spark"
             )
-            expectEqual(toolFailure?.statusCode, 501, "tool-bearing requests should fail during preflight", recorder: recorder)
-            expectContains(toolFailure?.message ?? "", "does not support live tool execution", "tool-bearing preflight should preserve the live-tool rejection", recorder: recorder)
+            expectEqual(toolFailure, nil, "tool-bearing requests should pass preflight under synthetic tool mode", recorder: recorder)
 
             let typedFailure = MetaAIWebAdapter.preflightFailure(
                 path: "/v1/chat/completions",
@@ -480,6 +479,68 @@ struct MetaAIWebAdapterSpec {
             )
             expectEqual(typedFailure?.statusCode, 400, "typed content should fail during preflight", recorder: recorder)
             expectContains(typedFailure?.message ?? "", "only supports text message content", "typed-content preflight should preserve the text-only failure", recorder: recorder)
+        }
+
+        run("meta web adapter parses a strict synthetic tool directive", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Find weather",
+                executionPrompt: "Find weather",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "search",
+                        description: "Look up information",
+                        parametersJSONString: #"{"type":"object","properties":{"q":{"type":"string"}}}"#
+                    )
+                ],
+                toolChoice: .required,
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"name":"search","arguments":{"q":"weather Boston"}}"#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "search", "synthetic tool mode should accept declared tool names", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"q":"weather Boston"}"#, "synthetic tool mode should normalize arguments to stable JSON", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should parse a valid synthetic tool directive: \(error)")
+            }
+        }
+
+        run("meta web adapter rejects undeclared synthetic tool directives", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Find weather",
+                executionPrompt: "Find weather",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "search",
+                        description: "Look up information",
+                        parametersJSONString: #"{"type":"object","properties":{"q":{"type":"string"}}}"#
+                    )
+                ],
+                toolChoice: .required,
+                isNewThread: true
+            )
+
+            do {
+                _ = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"name":"browser.search","arguments":{"q":"weather Boston"}}"#,
+                    parsedRequest: parsedRequest
+                )
+                recorder.recordFailure("meta web adapter should reject undeclared synthetic tool names")
+            } catch let failure as MetaAIWebAdapter.Failure {
+                expectEqual(failure.statusCode, 502, "undeclared tool names should fail closed", recorder: recorder)
+                expectContains(failure.message, "undeclared tool", "undeclared tool names should explain the contract violation", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should throw a typed failure for undeclared synthetic tools: \(error)")
+            }
         }
 
         run("meta web adapter extracts assistant text and sources from the GraphQL event stream", recorder: recorder) {

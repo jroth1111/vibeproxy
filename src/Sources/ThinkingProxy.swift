@@ -4842,11 +4842,32 @@ enum MetaAIWebAdapter {
     struct ParsedRequest: Equatable {
         let surface: ResponseSurface
         let prompt: String
+        let executionPrompt: String
         let stream: Bool
         let publicModel: String
+        let toolDefinitions: [ToolDefinition]
+        let toolChoice: ToolChoice
         /// True when the request contains only a single user message (new thread).
         /// False when it contains multi-turn context (system/assistant messages = follow-up).
         let isNewThread: Bool
+    }
+
+    enum ToolChoice: Equatable {
+        case none
+        case auto
+        case required
+        case specific(String)
+    }
+
+    struct ToolDefinition: Equatable {
+        let name: String
+        let description: String?
+        let parametersJSONString: String
+    }
+
+    struct SyntheticToolDirective: Equatable {
+        let name: String
+        let argumentsJSONString: String
     }
 
     struct ParsedEventStream: Equatable {
@@ -4946,7 +4967,7 @@ enum MetaAIWebAdapter {
             plannedRequests = try buildExecutionRequests(
                 authSnapshot: authSnapshot,
                 conversationID: conversationID,
-                prompt: parsedRequest.prompt
+                prompt: parsedRequest.executionPrompt
             )
         } catch let failure as Failure {
             return .failure(failure)
@@ -4982,28 +5003,51 @@ enum MetaAIWebAdapter {
             if let assistantText = parsedEventStream.assistantText?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !assistantText.isEmpty {
+                let renderedAssistantOutput: RenderedAssistantOutput
+                do {
+                    renderedAssistantOutput = try renderAssistantOutput(
+                        assistantText: assistantText,
+                        parsedRequest: parsedRequest
+                    )
+                } catch let failure as Failure {
+                    return .failure(failure)
+                } catch {
+                    return .failure(Failure(statusCode: 502, message: "Meta web adapter failed while rendering synthetic tool output."))
+                }
                 let bodyData: Data
                 let headers: [String: String]
-                switch (parsedRequest.surface, parsedRequest.stream) {
-                case (.chatCompletions, false):
-                    bodyData = buildChatCompletionsResponseBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                switch (parsedRequest.surface, parsedRequest.stream, renderedAssistantOutput) {
+                case (.chatCompletions, false, .text(let text)):
+                    bodyData = buildChatCompletionsResponseBody(text: text, publicModel: parsedRequest.publicModel)
                     headers = ["Content-Type": "application/json; charset=utf-8"]
-                case (.chatCompletions, true):
-                    bodyData = buildChatCompletionsStreamBody(text: assistantText, publicModel: parsedRequest.publicModel)
+                case (.chatCompletions, true, .text(let text)):
+                    bodyData = buildChatCompletionsStreamBody(text: text, publicModel: parsedRequest.publicModel)
                     headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
-                case (.responses, false):
+                case (.responses, false, .text(let text)):
                     bodyData = buildResponsesResponseBody(
-                        text: assistantText,
+                        text: text,
                         publicModel: parsedRequest.publicModel,
                         sources: parsedEventStream.sources
                     )
                     headers = ["Content-Type": "application/json; charset=utf-8"]
-                case (.responses, true):
+                case (.responses, true, .text(let text)):
                     bodyData = buildResponsesStreamBody(
-                        text: assistantText,
+                        text: text,
                         publicModel: parsedRequest.publicModel,
                         sources: parsedEventStream.sources
                     )
+                    headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                case (.chatCompletions, false, .toolCall(let directive)):
+                    bodyData = buildChatCompletionsResponseBody(toolCall: directive, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "application/json; charset=utf-8"]
+                case (.chatCompletions, true, .toolCall(let directive)):
+                    bodyData = buildChatCompletionsStreamBody(toolCall: directive, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
+                case (.responses, false, .toolCall(let directive)):
+                    bodyData = buildResponsesResponseBody(toolCall: directive, publicModel: parsedRequest.publicModel)
+                    headers = ["Content-Type": "application/json; charset=utf-8"]
+                case (.responses, true, .toolCall(let directive)):
+                    bodyData = buildResponsesStreamBody(toolCall: directive, publicModel: parsedRequest.publicModel)
                     headers = ["Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache"]
                 }
                 return .success(
@@ -5053,12 +5097,8 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter requires a valid JSON request body.")
         }
 
-        if requestsUnsupportedToolExecution(in: json) {
-            throw Failure(
-                statusCode: 501,
-                message: "Meta web adapter does not support live tool execution; remove tools/tool_choice or choose another provider."
-            )
-        }
+        let toolDefinitions = try parseToolDefinitions(from: json)
+        let toolChoice = try parseToolChoice(from: json, toolDefinitions: toolDefinitions)
 
         var cleanedJSON = json
         cleanedJSON.removeValue(forKey: "tools")
@@ -5067,7 +5107,21 @@ enum MetaAIWebAdapter {
 
         let stream = (json["stream"] as? Bool) ?? false
         let (prompt, isNewThread) = try extractPrompt(fromChatRequestJSONObject: cleanedJSON)
-        return ParsedRequest(surface: surface, prompt: prompt, stream: stream, publicModel: publicModel, isNewThread: isNewThread)
+        return ParsedRequest(
+            surface: surface,
+            prompt: prompt,
+            executionPrompt: buildExecutionPrompt(basePrompt: prompt, toolDefinitions: toolDefinitions, toolChoice: toolChoice),
+            stream: stream,
+            publicModel: publicModel,
+            toolDefinitions: toolDefinitions,
+            toolChoice: toolChoice,
+            isNewThread: isNewThread
+        )
+    }
+
+    private enum RenderedAssistantOutput: Equatable {
+        case text(String)
+        case toolCall(SyntheticToolDirective)
     }
 
     static func parseEventStream(_ data: Data) -> ParsedEventStream {
@@ -5702,6 +5756,355 @@ enum MetaAIWebAdapter {
         return type != "auto" && type != "none"
     }
 
+    private static func parseToolDefinitions(from json: [String: Any]) throws -> [ToolDefinition] {
+        guard let toolsValue = json["tools"] else {
+            return []
+        }
+        guard let tools = toolsValue as? [Any] else {
+            throw Failure(statusCode: 400, message: "Meta web adapter requires tools to be an array.")
+        }
+
+        if let parallelToolCalls = json["parallel_tool_calls"] as? Bool, parallelToolCalls {
+            throw Failure(statusCode: 501, message: "Meta web adapter synthetic tool mode only supports one tool call at a time; disable parallel_tool_calls or choose another provider.")
+        }
+
+        var definitions: [ToolDefinition] = []
+        for tool in tools {
+            guard let toolDictionary = tool as? [String: Any],
+                  let type = (toolDictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+                throw Failure(statusCode: 400, message: "Meta web adapter requires tools to be function definitions.")
+            }
+            guard type == "function" else {
+                throw Failure(statusCode: 501, message: "Meta web adapter synthetic tool mode only supports function tools.")
+            }
+            guard let function = toolDictionary["function"] as? [String: Any],
+                  let rawName = function["name"] as? String,
+                  let name = normalizedString(rawName) else {
+                throw Failure(statusCode: 400, message: "Meta web adapter requires each function tool to include a non-empty name.")
+            }
+
+            let parametersObject = function["parameters"] ?? ["type": "object", "properties": [String: Any]()]
+            guard JSONSerialization.isValidJSONObject(parametersObject),
+                  let parametersData = try? JSONSerialization.data(withJSONObject: parametersObject, options: [.sortedKeys]),
+                  let parametersJSONString = String(data: parametersData, encoding: .utf8) else {
+                throw Failure(statusCode: 400, message: "Meta web adapter requires each function tool to expose JSON-schema parameters.")
+            }
+
+            definitions.append(
+                ToolDefinition(
+                    name: name,
+                    description: normalizedString(function["description"] as? String),
+                    parametersJSONString: parametersJSONString
+                )
+            )
+        }
+
+        let dedupedNames = Set(definitions.map(\.name))
+        guard dedupedNames.count == definitions.count else {
+            throw Failure(statusCode: 400, message: "Meta web adapter requires function tool names to be unique.")
+        }
+        return definitions
+    }
+
+    private static func parseToolChoice(from json: [String: Any], toolDefinitions: [ToolDefinition]) throws -> ToolChoice {
+        guard !toolDefinitions.isEmpty else {
+            return .none
+        }
+
+        guard let toolChoice = json["tool_choice"] else {
+            return .auto
+        }
+
+        if let toolChoiceString = toolChoice as? String {
+            switch toolChoiceString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "", "auto":
+                return .auto
+            case "none":
+                return .none
+            case "required":
+                return .required
+            default:
+                throw Failure(statusCode: 400, message: "Meta web adapter received an unsupported tool_choice string.")
+            }
+        }
+
+        guard let toolChoiceDictionary = toolChoice as? [String: Any],
+              let type = (toolChoiceDictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            throw Failure(statusCode: 400, message: "Meta web adapter received an invalid tool_choice object.")
+        }
+
+        switch type {
+        case "auto":
+            return .auto
+        case "none":
+            return .none
+        case "required":
+            return .required
+        case "function":
+            let functionContainer = toolChoiceDictionary["function"] as? [String: Any]
+            let rawName = (functionContainer?["name"] as? String) ?? (toolChoiceDictionary["name"] as? String)
+            guard let functionName = normalizedString(rawName) else {
+                throw Failure(statusCode: 400, message: "Meta web adapter requires tool_choice.function.name for specific function selection.")
+            }
+            guard toolDefinitions.contains(where: { $0.name == functionName }) else {
+                throw Failure(statusCode: 400, message: "Meta web adapter tool_choice.function.name must match one of the declared function tools.")
+            }
+            return .specific(functionName)
+        default:
+            throw Failure(statusCode: 400, message: "Meta web adapter received an unsupported tool_choice type.")
+        }
+    }
+
+    private static func buildExecutionPrompt(
+        basePrompt: String,
+        toolDefinitions: [ToolDefinition],
+        toolChoice: ToolChoice
+    ) -> String {
+        guard !toolDefinitions.isEmpty, toolChoice != .none else {
+            return basePrompt
+        }
+
+        let toolLines = toolDefinitions.map { tool in
+            var line = "- \(tool.name)"
+            if let description = tool.description {
+                line += ": \(description)"
+            }
+            line += "\n  parameters: \(tool.parametersJSONString)"
+            return line
+        }.joined(separator: "\n")
+
+        let directiveInstruction: String
+        switch toolChoice {
+        case .required:
+            directiveInstruction = "You must respond with exactly one tool directive JSON object and no prose."
+        case .specific(let name):
+            directiveInstruction = "You must respond with exactly one tool directive JSON object using the tool name \"\(name)\" and no prose."
+        case .auto:
+            directiveInstruction = "If a tool is needed, respond with exactly one tool directive JSON object and no prose. If no tool is needed, answer normally in plain text."
+        case .none:
+            directiveInstruction = "Answer normally in plain text."
+        }
+
+        return """
+        Tool-use mode:
+        \(directiveInstruction)
+        Use at most one tool call in this turn.
+        Any prose outside the tool directive will be discarded as a failure.
+        The only valid tool directive format is a single raw JSON object with this exact shape:
+        {"name":"tool_name","arguments":{"key":"value"}}
+        Do not wrap the JSON in markdown unless absolutely necessary.
+        Do not invent tool names.
+        Arguments must be a JSON object.
+
+        Available tools:
+        \(toolLines)
+
+        Conversation transcript:
+        \(basePrompt)
+        """
+    }
+
+    private static func renderAssistantOutput(
+        assistantText: String,
+        parsedRequest: ParsedRequest
+    ) throws -> RenderedAssistantOutput {
+        guard !parsedRequest.toolDefinitions.isEmpty, parsedRequest.toolChoice != .none else {
+            return .text(assistantText)
+        }
+
+        let directiveAttempted = looksLikeSyntheticToolDirective(assistantText)
+        if let directive = try syntheticToolDirective(from: assistantText, parsedRequest: parsedRequest) {
+            return .toolCall(directive)
+        }
+
+        switch parsedRequest.toolChoice {
+        case .required:
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode required a tool call, but Meta returned plain text instead.")
+        case .specific(let name):
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode required tool \(name), but Meta did not return a valid tool directive.")
+        case .auto:
+            if directiveAttempted {
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned an invalid tool directive; refusing to guess at tool execution.")
+            }
+            return .text(assistantText)
+        case .none:
+            return .text(assistantText)
+        }
+    }
+
+    private static func looksLikeSyntheticToolDirective(_ assistantText: String) -> Bool {
+        let trimmed = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{") || trimmed.hasPrefix("```") {
+            return true
+        }
+        let lower = trimmed.lowercased()
+        return lower.contains("\"arguments\"") || lower.contains("\"tool\"") || lower.contains("\"name\"")
+    }
+
+    static func syntheticToolDirective(
+        from assistantText: String,
+        parsedRequest: ParsedRequest
+    ) throws -> SyntheticToolDirective? {
+        let candidateJSONStrings = syntheticToolDirectiveCandidateStrings(from: assistantText)
+        guard !candidateJSONStrings.isEmpty else {
+            return nil
+        }
+
+        let allowedToolNames = Set(parsedRequest.toolDefinitions.map(\.name))
+        for candidateJSONString in candidateJSONStrings {
+            guard let candidateData = candidateJSONString.data(using: .utf8),
+                  let root = try? JSONSerialization.jsonObject(with: candidateData) as? [String: Any] else {
+                continue
+            }
+
+            let rawName = root["name"] ?? root["tool"] ?? root["tool_name"]
+            guard let toolName = normalizedString(rawName as? String) else {
+                continue
+            }
+            guard allowedToolNames.contains(toolName) else {
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned undeclared tool \(toolName).")
+            }
+
+            if case .specific(let requiredName) = parsedRequest.toolChoice, requiredName != toolName {
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned tool \(toolName), but tool_choice required \(requiredName).")
+            }
+
+            let rawArguments = root["arguments"] ?? root["args"] ?? root["parameters"]
+            let argumentsObject: [String: Any]
+            switch rawArguments {
+            case let dictionary as [String: Any]:
+                argumentsObject = dictionary
+            case let string as String:
+                guard let stringData = string.data(using: .utf8),
+                      let parsedArguments = try? JSONSerialization.jsonObject(with: stringData) as? [String: Any] else {
+                    throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned non-object function arguments.")
+                }
+                argumentsObject = parsedArguments
+            default:
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode requires arguments to be a JSON object.")
+            }
+
+            guard JSONSerialization.isValidJSONObject(argumentsObject),
+                  let argumentsData = try? JSONSerialization.data(withJSONObject: argumentsObject, options: [.sortedKeys]),
+                  let argumentsJSONString = String(data: argumentsData, encoding: .utf8) else {
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode could not serialize function arguments.")
+            }
+
+            return SyntheticToolDirective(name: toolName, argumentsJSONString: argumentsJSONString)
+        }
+
+        if let heuristicDirective = try heuristicSyntheticToolDirective(
+            from: assistantText,
+            allowedToolNames: allowedToolNames,
+            parsedRequest: parsedRequest
+        ) {
+            return heuristicDirective
+        }
+
+        return nil
+    }
+
+    private static func syntheticToolDirectiveCandidateStrings(from assistantText: String) -> [String] {
+        let trimmed = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return []
+        }
+
+        var candidates: [String] = [trimmed]
+
+        if trimmed.hasPrefix("```"), let range = trimmed.range(of: "```", options: .backwards), range.lowerBound > trimmed.startIndex {
+            let withoutPrefix = trimmed.dropFirst(3)
+            let bodyStart = withoutPrefix.firstIndex(of: "\n").map { withoutPrefix.index(after: $0) } ?? withoutPrefix.startIndex
+            let body = String(withoutPrefix[bodyStart..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty {
+                candidates.append(body)
+            }
+        }
+
+        if let start = trimmed.range(of: "{"), let end = trimmed.range(of: "}", options: .backwards), start.lowerBound < end.upperBound {
+            let body = String(trimmed[start.lowerBound..<end.upperBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty {
+                candidates.append(body)
+            }
+        }
+
+        var deduped: [String] = []
+        var seen: Set<String> = []
+        for candidate in candidates {
+            if seen.insert(candidate).inserted {
+                deduped.append(candidate)
+            }
+        }
+        return deduped
+    }
+
+    private static func heuristicSyntheticToolDirective(
+        from assistantText: String,
+        allowedToolNames: Set<String>,
+        parsedRequest: ParsedRequest
+    ) throws -> SyntheticToolDirective? {
+        let trimmed = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        for toolName in allowedToolNames.sorted() {
+            if let argumentsJSONString = extractArgumentsObject(
+                pattern: #"(?is)\b\#(toolName)\s*\(\s*(\{.*\})\s*\)"#,
+                from: trimmed
+            ) {
+                return SyntheticToolDirective(name: toolName, argumentsJSONString: argumentsJSONString)
+            }
+
+            if let argumentsJSONString = extractArgumentsObject(
+                pattern: #"(?is)\b(?:tool|function)\s*:\s*\#(toolName)\b.*?\barguments?\s*:\s*(\{.*\})"#,
+                from: trimmed
+            ) {
+                return SyntheticToolDirective(name: toolName, argumentsJSONString: argumentsJSONString)
+            }
+
+            if let argumentsJSONString = extractArgumentsObject(
+                pattern: #"(?is)\b(?:call|use)\s+\#(toolName)\b.*?\barguments?\b.*?(\{.*\})"#,
+                from: trimmed
+            ) {
+                return SyntheticToolDirective(name: toolName, argumentsJSONString: argumentsJSONString)
+            }
+        }
+
+        if allowedToolNames.count == 1,
+           let soleToolName = allowedToolNames.first,
+           let argumentsJSONString = extractArgumentsObject(
+            pattern: #"(?is)(\{.*\})"#,
+            from: trimmed
+           ),
+           case .required = parsedRequest.toolChoice {
+            return SyntheticToolDirective(name: soleToolName, argumentsJSONString: argumentsJSONString)
+        }
+
+        return nil
+    }
+
+    private static func extractArgumentsObject(pattern: String, from text: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              match.numberOfRanges >= 2,
+              let objectRange = Range(match.range(at: match.numberOfRanges - 1), in: text) else {
+            return nil
+        }
+        let candidate = String(text[objectRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let candidateData = candidate.data(using: .utf8),
+              let jsonObject = try? JSONSerialization.jsonObject(with: candidateData) as? [String: Any],
+              JSONSerialization.isValidJSONObject(jsonObject),
+              let normalizedData = try? JSONSerialization.data(withJSONObject: jsonObject, options: [.sortedKeys]),
+              let normalizedJSONString = String(data: normalizedData, encoding: .utf8) else {
+            return nil
+        }
+        return normalizedJSONString
+    }
+
     static func formattedUpstreamErrorMessage(statusCode: Int, responseData: Data) -> String {
         let bodyText = String(data: responseData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5950,6 +6353,35 @@ enum MetaAIWebAdapter {
         return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
     }
 
+    private static func buildChatCompletionsResponseBody(toolCall: SyntheticToolDirective, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let id = "chatcmpl_meta_\(UUID().uuidString)"
+        let callID = "call_meta_\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": publicModel,
+            "choices": [[
+                "index": 0,
+                "message": [
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [[
+                        "id": callID,
+                        "type": "function",
+                        "function": [
+                            "name": toolCall.name,
+                            "arguments": toolCall.argumentsJSONString
+                        ]
+                    ]]
+                ],
+                "finish_reason": "tool_calls"
+            ]]
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+    }
+
     private static func buildChatCompletionsStreamBody(text: String, publicModel: String) -> Data {
         let id = "chatcmpl_meta_\(UUID().uuidString)"
         let created = Int(Date().timeIntervalSince1970)
@@ -5992,6 +6424,59 @@ enum MetaAIWebAdapter {
         return Data(lines.joined().utf8)
     }
 
+    private static func buildChatCompletionsStreamBody(toolCall: SyntheticToolDirective, publicModel: String) -> Data {
+        let id = "chatcmpl_meta_\(UUID().uuidString)"
+        let callID = "call_meta_\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+        let lines = [
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": ["role": "assistant"],
+                    "finish_reason": NSNull()
+                ]]
+            ]),
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": [
+                        "tool_calls": [[
+                            "index": 0,
+                            "id": callID,
+                            "type": "function",
+                            "function": [
+                                "name": toolCall.name,
+                                "arguments": toolCall.argumentsJSONString
+                            ]
+                        ]]
+                    ],
+                    "finish_reason": NSNull()
+                ]]
+            ]),
+            sseLine([
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": publicModel,
+                "choices": [[
+                    "index": 0,
+                    "delta": [:],
+                    "finish_reason": "tool_calls"
+                ]]
+            ]),
+            "data: [DONE]\n\n"
+        ]
+        return Data(lines.joined().utf8)
+    }
+
     static func buildResponsesResponseBody(text: String, publicModel: String, sources: [Source] = []) -> Data {
         let created = Int(Date().timeIntervalSince1970)
         let responseID = "resp_meta_\(UUID().uuidString)"
@@ -6012,6 +6497,28 @@ enum MetaAIWebAdapter {
                     "text": text,
                     "annotations": responseAnnotations(from: sources)
                 ]]
+            ]]
+        ]
+        return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
+    }
+
+    static func buildResponsesResponseBody(toolCall: SyntheticToolDirective, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let responseID = "resp_meta_\(UUID().uuidString)"
+        let callID = "call_meta_\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "id": responseID,
+            "object": "response",
+            "created": created,
+            "status": "completed",
+            "model": publicModel,
+            "output": [[
+                "id": "fc_\(callID)",
+                "type": "function_call",
+                "call_id": callID,
+                "name": toolCall.name,
+                "arguments": toolCall.argumentsJSONString,
+                "status": "completed"
             ]]
         ]
         return (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
@@ -6094,6 +6601,69 @@ enum MetaAIWebAdapter {
                         ]]
                     ]]
                 ]
+            ]),
+            "data: [DONE]\n\n"
+        ]
+        return Data(lines.joined().utf8)
+    }
+
+    static func buildResponsesStreamBody(toolCall: SyntheticToolDirective, publicModel: String) -> Data {
+        let created = Int(Date().timeIntervalSince1970)
+        let responseID = "resp_meta_\(UUID().uuidString)"
+        let callID = "call_meta_\(UUID().uuidString)"
+        let outputItem: [String: Any] = [
+            "id": "fc_\(callID)",
+            "type": "function_call",
+            "call_id": callID,
+            "name": toolCall.name,
+            "arguments": toolCall.argumentsJSONString,
+            "status": "completed"
+        ]
+        var addedItem = outputItem
+        addedItem["arguments"] = ""
+        let responseObject: [String: Any] = [
+            "id": responseID,
+            "object": "response",
+            "created": created,
+            "status": "completed",
+            "model": publicModel,
+            "output": [outputItem]
+        ]
+        let lines = [
+            sseLine([
+                "type": "response.created",
+                "response": [
+                    "id": responseID,
+                    "object": "response",
+                    "created": created,
+                    "status": "in_progress",
+                    "model": publicModel,
+                    "output": []
+                ]
+            ]),
+            sseLine([
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": addedItem
+            ]),
+            sseLine([
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "delta": toolCall.argumentsJSONString
+            ]),
+            sseLine([
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "arguments": toolCall.argumentsJSONString
+            ]),
+            sseLine([
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": outputItem
+            ]),
+            sseLine([
+                "type": "response.completed",
+                "response": responseObject
             ]),
             "data: [DONE]\n\n"
         ]
