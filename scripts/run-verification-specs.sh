@@ -13,18 +13,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PREPARED_SWIFT_SOURCES=()
+
+prepare_stable_sources() {
+    local dest_dir="$1"
+    shift
+
+    PREPARED_SWIFT_SOURCES=()
+    mkdir -p "$dest_dir"
+
+    local index=0
+    local relative_path
+    for relative_path in "$@"; do
+        local copied_path="$dest_dir/${index}_$(basename "$relative_path")"
+        cp "$SRC_DIR/$relative_path" "$copied_path"
+        PREPARED_SWIFT_SOURCES+=("$copied_path")
+        index=$((index + 1))
+    done
+}
+
 run_spec() {
     local name="$1"
     shift
 
     local output="$TMP_BUILD_DIR/$name"
-    local -a swift_sources=()
-    for relative_path in "$@"; do
-        swift_sources+=("$SRC_DIR/$relative_path")
-    done
+    prepare_stable_sources "$TMP_BUILD_DIR/$name-sources" "$@"
 
     echo "▶ Compiling $name"
-    swiftc -o "$output" "${swift_sources[@]}"
+    swiftc -o "$output" "${PREPARED_SWIFT_SOURCES[@]}"
 
     echo "▶ Running $name"
     "$output"
@@ -45,15 +61,19 @@ run_thinking_proxy_policy_spec() {
         )
     fi
 
+    prepare_stable_sources \
+        "$TMP_BUILD_DIR/$name-sources" \
+        "Sources/ObjCExceptionCatcher.swift" \
+        "Sources/ThinkingProxy.swift" \
+        "Sources/ProviderCatalog.swift" \
+        "Verification/ThinkingProxyPolicySpec.swift"
+
     echo "▶ Compiling $name"
     swiftc \
         -I "$build_dir" \
         -I "$bridge_build_dir" \
         -o "$output" \
-        "$SRC_DIR/Sources/ObjCExceptionCatcher.swift" \
-        "$SRC_DIR/Sources/ThinkingProxy.swift" \
-        "$SRC_DIR/Sources/ProviderCatalog.swift" \
-        "$SRC_DIR/Verification/ThinkingProxyPolicySpec.swift" \
+        "${PREPARED_SWIFT_SOURCES[@]}" \
         "$bridge_object"
 
     echo "▶ Running $name"
@@ -75,15 +95,19 @@ run_meta_ai_web_adapter_spec() {
         )
     fi
 
+    prepare_stable_sources \
+        "$TMP_BUILD_DIR/$name-sources" \
+        "Sources/ObjCExceptionCatcher.swift" \
+        "Sources/ThinkingProxy.swift" \
+        "Sources/ProviderCatalog.swift" \
+        "Verification/MetaAIWebAdapterSpec.swift"
+
     echo "▶ Compiling $name"
     swiftc \
         -I "$build_dir" \
         -I "$bridge_build_dir" \
         -o "$output" \
-        "$SRC_DIR/Sources/ObjCExceptionCatcher.swift" \
-        "$SRC_DIR/Sources/ThinkingProxy.swift" \
-        "$SRC_DIR/Sources/ProviderCatalog.swift" \
-        "$SRC_DIR/Verification/MetaAIWebAdapterSpec.swift" \
+        "${PREPARED_SWIFT_SOURCES[@]}" \
         "$bridge_object"
 
     echo "▶ Running $name"
