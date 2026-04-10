@@ -801,6 +801,49 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia shim ignores metadata-only tool_result wrappers without failing preflight", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked repo"},
+                        {"type": "tool_result", "tool_use_id": "call_1"}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed ?? request, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: transformed ?? request
+                )
+
+                expectEqual(
+                    messages?.first?["content"] as? String,
+                    "Checked repo",
+                    "metadata-only tool_result wrappers should be dropped while preserving visible transcript text",
+                    recorder: recorder
+                )
+                expectNil(preflightError, "metadata-only tool_result wrappers should not fail NVIDIA preflight", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia shim drops metadata-only typed transcript content without failing preflight", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
@@ -2753,6 +2796,88 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenContents, ["Checked repo"], "candidate-level request shims should flatten mixed typed worker transcript content before NVIDIA dispatch", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("self-routed worker transcript tool_result metadata wrappers keep glm5-nvidia eligible when sibling lanes are unavailable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredStatus: Int?
+                    var deliveredError: String?
+                    var seenModels: [String] = []
+                    var seenContents: [String] = []
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        let model = json["model"] as? String ?? "?"
+                        let messages = json["messages"] as? [[String: Any]]
+                        let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                        seenModels.append(model)
+                        seenContents.append(assistantContent)
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-self-routed-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        ))
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                        deliveredStatus = statusCode
+                        delivered.signal()
+                    }
+                    proxy.deliveredErrorForTesting = { _, message in
+                        deliveredError = message
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(
+                            method: "POST",
+                            path: "/v1/chat/completions",
+                            body: """
+                            {
+                              "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                              "stream": false,
+                              "messages": [
+                                {
+                                  "role": "assistant",
+                                  "content": [
+                                    {"type": "input_text", "text": "Checked repo"},
+                                    {"type": "tool_result", "tool_use_id": "call_1"}
+                                  ]
+                                },
+                                {"role": "user", "content": "Return exactly OK"}
+                              ]
+                            }
+                            """
+                        ),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 2) == .success else {
+                        recorder.recordFailure("self-routed worker transcript metadata wrappers should still deliver through glm5-nvidia when sibling lanes are unavailable")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    expectEqual(deliveredStatus, 200, "self-routed worker transcript metadata wrappers should still succeed", recorder: recorder)
+                    expectEqual(deliveredError, nil, "self-routed worker transcript metadata wrappers should not surface a terminal routing error", recorder: recorder)
+                    expectEqual(seenModels, ["glm5-nvidia"], "self-routed worker transcript metadata wrappers should keep glm5-nvidia eligible", recorder: recorder)
+                    expectEqual(seenContents, ["Checked repo"], "self-routed worker transcript metadata wrappers should preserve visible assistant text before NVIDIA dispatch", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
             }
         }
 

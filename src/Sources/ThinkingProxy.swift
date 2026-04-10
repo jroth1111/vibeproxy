@@ -11678,7 +11678,8 @@ class ThinkingProxy {
         statusCode: Int,
         headers: [AnyHashable: Any],
         bodyData: Data?,
-        path: String
+        path: String,
+        requiredToolParameters: [String: [String]]? = nil
     ) -> (shouldFailover: Bool, failureClass: String?) {
         if let bodyData,
            let failureClass = classifyRetryableSmartAliasErrorBody(statusCode: statusCode, path: path, bodyData: bodyData) {
@@ -11686,7 +11687,7 @@ class ThinkingProxy {
         }
         if statusCode >= 200 && statusCode < 300,
            let bodyData,
-           let failureClass = classifySmartAliasSuccessBodyFailure(path: path, bodyData: bodyData) {
+           let failureClass = classifySmartAliasSuccessBodyFailure(path: path, bodyData: bodyData, requiredToolParameters: requiredToolParameters) {
             return (true, failureClass)
         }
         switch statusCode {
