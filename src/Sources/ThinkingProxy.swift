@@ -1235,6 +1235,27 @@ enum OpenAICompatTemporaryShim {
         return (json["stream"] as? Bool) == true
     }
 
+    static func allowsDirectNVIDIAStreaming(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> Bool {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String,
+              resolveNVIDIAHostedRoute(forRequestModel: normalizedRequestModel(model)) != nil else {
+            return false
+        }
+
+        if let tools = json["tools"] as? [Any], !tools.isEmpty {
+            return false
+        }
+
+        return true
+    }
+
     static func allowsHedgedNVIDIARequest(
         method: String,
         path: String,
@@ -1989,7 +2010,8 @@ enum OpenAICompatTemporaryShim {
         }
 
         if policy.clientStreamingMode == .rejectBufferedMitigation,
-           requestedStream(forRequestJSON: jsonString) {
+           requestedStream(forRequestJSON: jsonString),
+           !allowsDirectNVIDIAStreaming(method: method, path: path, jsonString: jsonString) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
                 message: "Streaming is temporarily disabled for this NVIDIA route in the proxy because full-response normalization is required; use non-streaming chat completions.",
@@ -2062,8 +2084,7 @@ enum OpenAICompatTemporaryShim {
 
         // Only NVIDIA-hosted routes enter the NVIDIA reasoning path.
         // Non-NVIDIA models (e.g. gpt-5.4(high)) may have retryableFailureClasses
-        // in their policy but must NOT enter this path — the NVIDIA path delivers
-        // buffered responses and cannot synthesize SSE for streaming clients.
+        // in their policy but must NOT enter this path.
         guard resolveNVIDIAHostedRoute(forRequestModel: normalizedRequestModel(model)) != nil else {
             return false
         }
@@ -8602,6 +8623,38 @@ class ThinkingProxy {
         }
     }
 
+    struct NVIDIADirectTransportResponse {
+        let chunks: [Data]
+        let response: HTTPURLResponse?
+        let error: Error?
+        let firstByteLatencyMilliseconds: Int?
+        let totalLatencyMilliseconds: Int?
+        let deadlineStage: OpenAICompatTemporaryShim.DeadlineStage
+
+        var bodyData: Data? {
+            guard !chunks.isEmpty else { return nil }
+            return chunks.reduce(into: Data()) { partial, chunk in
+                partial.append(chunk)
+            }
+        }
+
+        init(
+            chunks: [Data],
+            response: HTTPURLResponse?,
+            error: Error?,
+            firstByteLatencyMilliseconds: Int? = nil,
+            totalLatencyMilliseconds: Int? = nil,
+            deadlineStage: OpenAICompatTemporaryShim.DeadlineStage = .none
+        ) {
+            self.chunks = chunks
+            self.response = response
+            self.error = error
+            self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
+            self.totalLatencyMilliseconds = totalLatencyMilliseconds
+            self.deadlineStage = deadlineStage
+        }
+    }
+
     private enum CoalescedReplayPayload {
         case http(statusCode: Int, headers: [AnyHashable: Any], body: Data, overridingHeaders: [String: String])
         case error(statusCode: Int, message: String, overridingHeaders: [String: String])
@@ -8700,6 +8753,7 @@ class ThinkingProxy {
     private var recentCoalescedReplays: [String: CoalescedReplayEntry] = [:]
     private let coalescedReplayWindow: TimeInterval = 5
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
+    var nvidiaDirectTransportForTesting: ((URLRequest, @escaping (NVIDIADirectTransportResponse) -> Void) -> (() -> Void))?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
     var bufferedProxyCancelableTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
     var directProxiedTransportForTesting: ((URLRequest, OpenAICompatTemporaryShim.ProviderEndpoint, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
@@ -8936,11 +8990,16 @@ class ThinkingProxy {
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-first-response")
+        private let onDataReceived: ((Data, Date) -> Void)?
         private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
         private var firstResponseDeadlineWorkItem: DispatchWorkItem?
         private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
         private let startedAt = Date()
         private var firstPayloadAt: Date?
+
+        init(onDataReceived: ((Data, Date) -> Void)? = nil) {
+            self.onDataReceived = onDataReceived
+        }
 
         func installDeadlines(
             firstResponseSeconds: TimeInterval?,
@@ -9040,6 +9099,7 @@ class ThinkingProxy {
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
             guard !data.isEmpty else { return }
             markPayloadReceived()
+            onDataReceived?(data, Date())
         }
     }
 
@@ -13913,6 +13973,122 @@ class ThinkingProxy {
         targetConnection.start(queue: .global(qos: .userInitiated))
     }
 
+    private struct NVIDIADirectAttemptExecutionResult {
+        let attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult
+        let streamedResponseBody: Data?
+    }
+
+    private func nvidiaSyntheticSSEEnvelope(for payload: Data) -> Data? {
+        guard let payloadString = String(data: payload, encoding: .utf8) else {
+            return nil
+        }
+        let lines = payloadString
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "data: \($0)" }
+        return Data((lines.joined(separator: "\n") + "\n\n").utf8)
+    }
+
+    private func processNVIDIADirectTransportResponse(
+        _ transportResponse: NVIDIADirectTransportResponse,
+        state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        attemptLane: Int,
+        clientRequestedStream: Bool
+    ) -> NVIDIADirectAttemptExecutionResult {
+        guard transportResponse.error == nil,
+              let response = transportResponse.response,
+              let rawBodyData = transportResponse.bodyData else {
+            return NVIDIADirectAttemptExecutionResult(
+                attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                    data: transportResponse.bodyData,
+                    response: transportResponse.response,
+                    error: transportResponse.error,
+                    deadlineStage: transportResponse.deadlineStage,
+                    firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
+                    totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds
+                ),
+                streamedResponseBody: nil
+            )
+        }
+
+        let contentType = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let parserChunks: [Data]
+        if contentType.contains("text/event-stream") {
+            parserChunks = transportResponse.chunks.isEmpty ? [rawBodyData] : transportResponse.chunks
+        } else if let envelope = nvidiaSyntheticSSEEnvelope(for: rawBodyData) {
+            parserChunks = [envelope]
+        } else {
+            parserChunks = []
+        }
+
+        var normalizedBodyData = rawBodyData
+        var fallbackStreamBody: Data?
+        if !parserChunks.isEmpty {
+            var engine = NVIDIAStreamEngine()
+            var bufferedSink = NVIDIABufferedAccumulatorSink()
+            var streamedSink = clientRequestedStream
+                ? NVIDIAEventStreamSink(policy: Self.nvidiaDirectTransportPolicy.sinkPolicy)
+                : nil
+
+            do {
+                for chunk in parserChunks {
+                    let outputs = try engine.ingest(
+                        chunk,
+                        surface: .direct,
+                        attemptLane: attemptLane
+                    )
+                    for output in outputs {
+                        try bufferedSink.consume(output)
+                        if var sink = streamedSink {
+                            try sink.consume(output)
+                            streamedSink = sink
+                        }
+                    }
+                }
+                let trailingOutputs = try engine.finish(
+                    surface: .direct,
+                    attemptLane: attemptLane
+                )
+                for output in trailingOutputs {
+                    try bufferedSink.consume(output)
+                    if var sink = streamedSink {
+                        try sink.consume(output)
+                        streamedSink = sink
+                    }
+                }
+                if let finalMessage = bufferedSink.messages.last,
+                   let finalData = finalMessage.joinedData.data(using: .utf8) {
+                    normalizedBodyData = finalData
+                }
+                if var sink = streamedSink, !sink.terminalReceived {
+                    try sink.consume(.done)
+                    streamedSink = sink
+                }
+                if let streamedSink, !streamedSink.emittedFrames.isEmpty {
+                    fallbackStreamBody = Data(streamedSink.emittedFrames.joined().utf8)
+                }
+            } catch {
+                normalizedBodyData = rawBodyData
+                fallbackStreamBody = nil
+            }
+        }
+
+        let syntheticStreamBody = clientRequestedStream
+            ? (syntheticChatCompletionsStreamBody(from: normalizedBodyData, publicAlias: state.model) ?? fallbackStreamBody)
+            : nil
+
+        return NVIDIADirectAttemptExecutionResult(
+            attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                data: normalizedBodyData,
+                response: response,
+                error: nil,
+                deadlineStage: transportResponse.deadlineStage,
+                firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds
+            ),
+            streamedResponseBody: syntheticStreamBody
+        )
+    }
+
     private func forwardNvidiaReasoningRequest(
         method: String,
         path: String,
@@ -13974,9 +14150,14 @@ class ThinkingProxy {
             return
         }
 
+        let clientRequestedStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+        let upstreamBody = clientRequestedStream
+            ? (forcingNonStreamChatRequestBody(from: body) ?? body)
+            : body
+
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.httpBody = Data(body.utf8)
+        request.httpBody = Data(upstreamBody.utf8)
         request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: state.model) else {
             guard attemptLane == 1 else { return }
@@ -14008,39 +14189,21 @@ class ThinkingProxy {
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
-        let sessionKey = "direct:127.0.0.1:\(targetPort)"
-        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
-            permit.release()
-            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
-            self.deliverBufferedError(
-                defaultConnection: originalConnection,
-                statusCode: 502,
-                message: "upstream session unavailable",
-                coalescingKey: state.coalescingKey,
-                overridingHeaders: requestTrace.responseHeaders
-            )
-            return
-        }
-        let responseProgress = ResponseProgressDelegate()
-        let taskHolder = TaskIdHolder()
-        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
+        let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             guard let self else { return }
             defer {
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
-                responseProgress.finish()
             }
             guard requestController.isCancelled() != true else { return }
-            let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
-                data: data,
-                response: response as? HTTPURLResponse,
-                error: error,
-                deadlineStage: responseProgress.currentDeadlineStage(),
-                firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
+
+            let processedAttempt = self.processNVIDIADirectTransportResponse(
+                transportResponse,
+                state: state,
+                attemptLane: attemptLane,
+                clientRequestedStream: clientRequestedStream
             )
+            let attempt = processedAttempt.attempt
             let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
                 state: state,
@@ -14119,16 +14282,45 @@ class ThinkingProxy {
                     OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else if statusCode == 429 || statusCode == 403 || statusCode == 404 || statusCode == 502 || statusCode == 503 || statusCode == 504 {
                     OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
-                            routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest,
-                            statusCode: statusCode,
-                            headers: headers,
-                            bodyData: bodyData
+                        routeHealthKey: permit.routeHealthKey,
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: statusCode,
+                        headers: headers,
+                        bodyData: bodyData
                     )
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
+
+                if clientRequestedStream,
+                   statusCode >= 200,
+                   statusCode < 300 {
+                    guard let streamedBody = processedAttempt.streamedResponseBody else {
+                        self.deliverBufferedError(
+                            defaultConnection: originalConnection,
+                            statusCode: 502,
+                            message: "Bad Gateway - Upstream provider returned an unusable response",
+                            coalescingKey: state.coalescingKey,
+                            overridingHeaders: requestTrace.responseHeaders
+                        )
+                        return
+                    }
+                    let sseHeaders: [AnyHashable: Any] = [
+                        "Content-Type": "text/event-stream; charset=utf-8",
+                        "Cache-Control": "no-cache",
+                        "X-Accel-Buffering": "no"
+                    ]
+                    self.sendHTTPResponse(
+                        to: originalConnection,
+                        statusCode: 200,
+                        headers: sseHeaders,
+                        body: streamedBody,
+                        overridingHeaders: requestTrace.responseHeaders
+                    )
+                    return
+                }
+
                 self.deliverBufferedHTTPResponse(
                     defaultConnection: originalConnection,
                     statusCode: statusCode,
@@ -14166,6 +14358,60 @@ class ThinkingProxy {
                     overridingHeaders: requestTrace.responseHeaders
                 )
             }
+        }
+
+        if let nvidiaDirectTransportForTesting {
+            let cancel = nvidiaDirectTransportForTesting(request, handleTransportResponse)
+            coordinator.registerAttempt(attemptLane: attemptLane) {
+                permit.release()
+                cancel()
+            }
+            requestController.registerCurrentCancel {
+                _ = coordinator.tryFinish(attemptLane: 0)
+            }
+            return
+        }
+
+        let sessionKey = "direct:127.0.0.1:\(targetPort)"
+        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+            permit.release()
+            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+            self.deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 502,
+                message: "upstream session unavailable",
+                coalescingKey: state.coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
+            )
+            return
+        }
+        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-chunks")
+        var responseChunks: [Data] = []
+        let responseProgress = ResponseProgressDelegate { chunk, _ in
+            responseChunksQueue.sync {
+                responseChunks.append(chunk)
+            }
+        }
+        let taskHolder = TaskIdHolder()
+        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
+            defer {
+                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
+                responseProgress.finish()
+            }
+            let chunks = responseChunksQueue.sync {
+                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
+            }
+            handleTransportResponse(
+                NVIDIADirectTransportResponse(
+                    chunks: chunks,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
+                    deadlineStage: responseProgress.currentDeadlineStage()
+                )
+            )
         }
         guard let task else {
             NSLog("[SafeDataTask] forwardNvidiaReasoningRequestWithRetry: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")

@@ -144,11 +144,24 @@ jq -e '.factory_roles.verification.ready == true' "$health_body" >/dev/null
 
 worker_effective_route_model="$(jq -r '.factory_worker.effective_route_model // empty' "$health_body")"
 worker_effective_route_provider="$(jq -r '.factory_worker.effective_route_provider // empty' "$health_body")"
+worker_effective_route_recent_p95_total_latency_ms="$(jq -r '.factory_worker.effective_route_recent_p95_total_latency_ms // 0' "$health_body")"
 session_effective_route_model="$(jq -r '.factory_roles.orchestration.effective_route_model // empty' "$health_body")"
 session_effective_route_provider="$(jq -r '.factory_roles.orchestration.effective_route_provider // empty' "$health_body")"
 validation_effective_route_model="$(jq -r '.factory_roles.verification.effective_route_model // empty' "$health_body")"
 validation_effective_route_provider="$(jq -r '.factory_roles.verification.effective_route_provider // empty' "$health_body")"
 worker_pool_candidate_models="$(jq -c '.config_drift.proxy_worker_candidates // []' "$health_body")"
+worker_probe_max_time=45
+
+if [[ "$worker_effective_route_recent_p95_total_latency_ms" =~ ^[0-9]+$ ]] &&
+   (( worker_effective_route_recent_p95_total_latency_ms > 0 )); then
+  derived_worker_probe_max_time=$(( (worker_effective_route_recent_p95_total_latency_ms + 999) / 1000 + 15 ))
+  if (( derived_worker_probe_max_time < worker_probe_max_time )); then
+    derived_worker_probe_max_time=$worker_probe_max_time
+  elif (( derived_worker_probe_max_time > 420 )); then
+    derived_worker_probe_max_time=420
+  fi
+  worker_probe_max_time=$derived_worker_probe_max_time
+fi
 
 echo "==> Probing the worker lane directly"
 case "$worker_request_surface" in
@@ -158,7 +171,7 @@ case "$worker_request_surface" in
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       -H "X-VibeProxy-Probe: factory-worker-preflight" \
-      --max-time 45 \
+      --max-time "$worker_probe_max_time" \
       "$FRONTEND_URL/v1/chat/completions" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"description\":\"No-op verification tool\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],\"tool_choice\":\"none\",\"max_tokens\":32}" \
       -o "$worker_probe_body"
@@ -171,7 +184,7 @@ case "$worker_request_surface" in
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
       -H "X-VibeProxy-Probe: factory-worker-preflight" \
-      --max-time 45 \
+      --max-time "$worker_probe_max_time" \
       "$FRONTEND_URL/v1/responses" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
       -o "$worker_probe_body"
@@ -185,7 +198,7 @@ case "$worker_request_surface" in
       -H "x-api-key: $API_KEY" \
       -H "anthropic-version: 2023-06-01" \
       -H "X-VibeProxy-Probe: factory-worker-preflight" \
-      --max-time 45 \
+      --max-time "$worker_probe_max_time" \
       "$FRONTEND_URL/v1/messages" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \
       -o "$worker_probe_body"

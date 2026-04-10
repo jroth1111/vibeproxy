@@ -228,7 +228,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia preflight rejects streaming for buffered mitigation routes", recorder: recorder) {
+        run("temporary direct nvidia streaming stays caller-visible instead of failing at preflight", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
@@ -252,7 +252,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectNil(transformed, "stream-only requests should not be silently rewritten just to hide buffering", recorder: recorder)
-                expectEqual(preflightError?.statusCode ?? 0, 501, "buffered NVIDIA mitigations should reject client streaming explicitly", recorder: recorder)
+                expectNil(preflightError, "direct NVIDIA streaming should no longer be rejected at preflight", recorder: recorder)
             }
         }
 
@@ -9114,6 +9114,239 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.requestModel, "mimo-v2-pro-opencode", "direct proxied success should preserve the original request model alias", recorder: recorder)
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct proxied success should be tracked as a successful response", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct proxied success should emit a route telemetry event", recorder: recorder)
+            }
+        }
+
+        run("direct NVIDIA buffered requests execute through the streaming transport boundary", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+                var upstreamBody: String?
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    upstreamBody = String(data: request.httpBody ?? Data(), encoding: .utf8)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("""
+                                {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"glm5-nvidia"}
+                                """.utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 33,
+                            totalLatencyMilliseconds: 44
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct NVIDIA buffered success should not surface an error: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA buffered requests should complete successfully")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(upstreamBody, recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredStatus, 200, "direct NVIDIA buffered requests should deliver a 200 response", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "buffered direct NVIDIA requests should keep upstream on the non-stream path", recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "glm5-nvidia", "direct NVIDIA buffered requests should preserve the public alias in the delivered body", recorder: recorder)
+                expectEqual(
+                    ((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String,
+                    "OK",
+                    "direct NVIDIA buffered requests should deliver the normalized assistant text",
+                    recorder: recorder
+                )
+            }
+        }
+
+        run("direct NVIDIA stream requests synthesize SSE from the new transport boundary", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredBody: Data?
+                var upstreamBody: String?
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    upstreamBody = String(data: request.httpBody ?? Data(), encoding: .utf8)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("""
+                                {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"glm5-nvidia"}
+                                """.utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 51,
+                            totalLatencyMilliseconds: 87
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct NVIDIA stream success should not surface an error: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA stream requests should complete successfully")
+                    return
+                }
+
+                let forwardedJSON = parseJSONObject(upstreamBody, recorder: recorder)
+                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                expectEqual(deliveredStatus, 200, "direct NVIDIA stream requests should deliver a 200 response", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, false, "streamed direct NVIDIA requests should force a buffered upstream body while the downstream surface is being replaced", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streamed direct NVIDIA requests should deliver SSE headers", recorder: recorder)
+                expectEqual(deliveredText.contains("chat.completion.chunk"), true, "streamed direct NVIDIA requests should deliver chat-completion chunk frames", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "streamed direct NVIDIA requests should terminate with the SSE done sentinel", recorder: recorder)
+            }
+        }
+
+        run("direct NVIDIA slow-success telemetry stays successful without a timeout stage", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectTransportForTesting = { _, completion in
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("""
+                                {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"glm5-nvidia"}
+                                """.utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 162394,
+                            totalLatencyMilliseconds: 654221,
+                            deadlineStage: .none
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("slow-success direct NVIDIA requests should not surface an error: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("slow-success direct NVIDIA requests should complete successfully")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "slow-success direct NVIDIA requests should still deliver a 200 response", recorder: recorder)
+                expectEqual(
+                    recordedEvents.contains(where: {
+                        $0.requestModel == "glm5-nvidia" &&
+                        $0.source == "live_request" &&
+                        $0.transportOutcome == "send_response" &&
+                        $0.timeoutStage == .none &&
+                        $0.totalLatencyMilliseconds == 654221
+                    }),
+                    true,
+                    "slow-success direct NVIDIA requests should preserve a non-timeout live-request telemetry event",
+                    recorder: recorder
+                )
             }
         }
 
