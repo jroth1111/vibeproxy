@@ -135,6 +135,20 @@ run_spec \
     "Verification/ConfigInputFingerprintSpec.swift"
 
 run_spec \
+    "NVIDIAStreamParserSpec" \
+    "Sources/NVIDIAStreamParser.swift" \
+    "Verification/NVIDIAStreamSpecSupport.swift" \
+    "Verification/NVIDIAStreamParserSpec.swift"
+
+run_spec \
+    "NVIDIAStreamEngineSpec" \
+    "Sources/NVIDIAStreamParser.swift" \
+    "Sources/NVIDIAStreamEngine.swift" \
+    "Sources/NVIDIAStreamSink.swift" \
+    "Verification/NVIDIAStreamSpecSupport.swift" \
+    "Verification/NVIDIAStreamEngineSpec.swift"
+
+run_spec \
     "ZAIAPIKeyStoreSpec" \
     "Sources/ConfigComposer.swift" \
     "Sources/CustomProviders.swift" \
