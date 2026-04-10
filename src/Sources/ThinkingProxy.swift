@@ -5821,6 +5821,9 @@ enum MetaAIWebAdapter {
         if let stringValue = value as? String {
             return stringValue
         }
+        if let dictionaryValue = value as? [String: Any] {
+            return try flattenedText(fromContentDictionary: dictionaryValue)
+        }
         guard let segments = value as? [Any] else {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
@@ -5834,9 +5837,7 @@ enum MetaAIWebAdapter {
             guard let dictionary = segment as? [String: Any] else {
                 throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
-            let type = (dictionary["type"] as? String)?.lowercased()
-            guard let text = dictionary["text"] as? String,
-                  type == nil || type == "text" || type == "input_text" || type == "output_text" else {
+            guard let text = try flattenedText(fromContentDictionary: dictionary) else {
                 throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
             parts.append(text)
@@ -5845,6 +5846,68 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
         return parts.joined()
+    }
+
+    private static func flattenedText(fromContentDictionary dictionary: [String: Any]) throws -> String? {
+        if containsUnsupportedMediaContent(dictionary) {
+            throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
+        }
+
+        if let text = normalizedString(dictionary["text"] as? String) {
+            return text
+        }
+        if let outputText = normalizedString(dictionary["output_text"] as? String) {
+            return outputText
+        }
+        if let valueText = normalizedString(dictionary["value"] as? String) {
+            return valueText
+        }
+
+        if let content = dictionary["content"],
+           let flattenedContent = try flattenedText(from: content)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !flattenedContent.isEmpty {
+            return flattenedContent
+        }
+
+        return nil
+    }
+
+    private static func containsUnsupportedMediaContent(_ dictionary: [String: Any]) -> Bool {
+        let unsupportedTypes: Set<String> = [
+            "input_image",
+            "image",
+            "image_url",
+            "input_audio",
+            "audio",
+            "audio_url",
+            "file",
+            "input_file",
+            "video",
+            "input_video"
+        ]
+        let unsupportedKeys: Set<String> = [
+            "image",
+            "image_url",
+            "audio",
+            "audio_url",
+            "file",
+            "file_data",
+            "file_url",
+            "video",
+            "video_url"
+        ]
+
+        if let type = normalizedString(dictionary["type"] as? String)?.lowercased(),
+           unsupportedTypes.contains(type) {
+            return true
+        }
+
+        for key in unsupportedKeys where dictionary[key] != nil {
+            return true
+        }
+
+        return false
     }
 
     private static func normalizedString(_ value: String?) -> String? {

@@ -1548,7 +1548,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("meta-incompatible worker transcript shapes exclude muse-spark before candidate selection", recorder: recorder) {
+        run("text-bearing wrapper transcript shapes keep muse-spark eligible for worker routing", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
@@ -1572,21 +1572,20 @@ struct ThinkingProxyPolicySpec {
                 var seenModels: [String] = []
 
                 proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
-                    recorder.recordFailure("muse-spark should be excluded before selection for meta-incompatible transcript shapes, but attempted \(publicModel)")
-                    return ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil)
+                    seenModels.append(publicModel)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-meta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"\(publicModel)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
                 }
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
                     let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
                     seenModels.append(model)
-                    completion(
-                        ThinkingProxy.BufferedProxyResponse(
-                            data: Data("""
-                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"\(model)"}
-                            """.utf8),
-                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
-                            error: nil
-                        )
-                    )
+                    recorder.recordFailure("text-bearing wrapper transcript shapes should allow muse-spark to be attempted before native fallback, but attempted \(model)")
+                    completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
                 }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
@@ -1617,14 +1616,68 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 guard delivered.wait(timeout: .now() + 2) == .success else {
-                    recorder.recordFailure("meta-incompatible worker transcript shapes should still deliver through a later compatible lane")
+                    recorder.recordFailure("text-bearing wrapper transcript shapes should still deliver through muse-spark")
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     return
                 }
 
-                expectEqual(deliveredStatus, 200, "meta-incompatible worker transcript shapes should still succeed on a later compatible lane", recorder: recorder)
-                expectEqual(deliveredError, nil, "meta-incompatible worker transcript shapes should not surface a terminal error", recorder: recorder)
-                expectEqual(seenModels, ["glm5-nvidia"], "meta-incompatible worker transcript shapes should exclude muse-spark before attempting candidates", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "text-bearing wrapper transcript shapes should still succeed", recorder: recorder)
+                expectEqual(deliveredError, nil, "text-bearing wrapper transcript shapes should not surface a terminal error", recorder: recorder)
+                expectEqual(seenModels, ["muse-spark"], "text-bearing wrapper transcript shapes should keep muse-spark eligible and selectable", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("true multimodal worker transcript shapes still exclude muse-spark before candidate selection", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker") else {
+                    recorder.recordFailure("worker should resolve to a smart-alias definition")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "worker",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: """
+                    {
+                      "model": "worker",
+                      "stream": false,
+                      "messages": [
+                        {
+                          "role": "user",
+                          "content": [
+                            {"type": "input_text", "text": "Describe this image."},
+                            {"type": "input_image", "image_url": "https://example.com/cat.png"}
+                          ]
+                        }
+                      ]
+                    }
+                    """,
+                    smartAlias: smartAlias
+                )
+                expectEqual(
+                    candidates,
+                    ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    "true multimodal worker transcript shapes should exclude muse-spark before candidate selection while preserving the remaining availability-ranked order",
+                    recorder: recorder
+                )
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }

@@ -466,6 +466,45 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter repairs text-bearing wrapper objects into transcript context", recorder: recorder) {
+            let request = #"""
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "Find the weather"},
+                {"role": "assistant", "content": {"type": "tool_result", "text": "Already read the repo."}},
+                {"role": "tool", "content": {"type": "tool_result", "content": [{"type": "output_text", "text": "72F and sunny"}]}},
+                {"role": "user", "content": "Answer briefly"}
+              ]
+            }
+            """#
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(
+                    parsed.prompt,
+                    """
+                    User: Find the weather
+
+                    Assistant: Already read the repo.
+
+                    Tool result: 72F and sunny
+
+                    User: Answer briefly
+                    """,
+                    "text-bearing wrapper objects should be flattened instead of rejected",
+                    recorder: recorder
+                )
+                expectEqual(parsed.isNewThread, false, "wrapper-based assistant and tool context should keep the request in follow-up mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should repair text-bearing wrapper objects into transcript context: \(error)")
+            }
+        }
+
         run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {
