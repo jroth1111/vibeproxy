@@ -1079,6 +1079,7 @@ enum OpenAICompatTemporaryShim {
 
     static func resetConcurrencyRegistryForTesting() {
         concurrencyRegistry.resetForTesting()
+        retryBackoffJitterProviderForTesting = nil
     }
 
     static func resetRetryBackoffJitterForTesting() {
@@ -5853,8 +5854,12 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
-            // Capture first API key from api-key-entries (for direct proxied requests)
-            if indent == 4, trimmed.hasPrefix("api-key: "), let value = scalarValue(from: trimmed),
+            // Capture first API key from api-key-entries (for direct proxied requests).
+            // Accept both standard YAML list-item indentation (`- api-key:`) and any
+            // already-flattened scalar form that may appear in merged configs.
+            if (indent == 2 && trimmed.hasPrefix("- api-key: "))
+                || (indent == 4 && trimmed.hasPrefix("api-key: ")),
+               let value = scalarValue(from: trimmed),
                currentProvider?.apiKey == nil {
                 currentProvider?.apiKey = value
                 continue

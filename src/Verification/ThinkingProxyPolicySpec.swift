@@ -3051,6 +3051,28 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("provider endpoint parsing captures credentials from api-key-entries list items", recorder: recorder) {
+            withMergedConfig(
+                [
+                    "openai-compatibility:",
+                    "- name: proxied-provider",
+                    "  api-key-entries:",
+                    "  - api-key: test-proxy-key",
+                    "  base-url: https://proxy.example.com/v1",
+                    "  proxy-url: socks5://user:pass@proxy.example.com:1080",
+                    "  models:",
+                    "  - alias: proxied-model",
+                    "    name: proxied-model"
+                ].joined(separator: "\n")
+            ) {
+                guard let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "proxied-provider") else {
+                    recorder.recordFailure("proxied-provider should have a proxy endpoint when configured through api-key-entries")
+                    return
+                }
+                expectEqual(endpoint.apiKey, "test-proxy-key", "proxied-provider should capture the first api-key-entries credential for direct proxied forwarding", recorder: recorder)
+            }
+        }
+
         run("provider endpoint returns nil when proxy-url is empty", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let endpoint = OpenAICompatTemporaryShim.providerEndpoint(forProviderID: "ollama-pro")

@@ -16,8 +16,28 @@ SRC_DIR="$PROJECT_DIR/src"
 APP_NAME="VibeProxy"
 BUNDLE_ID="com.cliproxyapi.menubar"
 BUILD_DIR="$SRC_DIR/.build/release"
-APP_DIR="$PROJECT_DIR/$APP_NAME.app"
+FINAL_APP_DIR="$PROJECT_DIR/$APP_NAME.app"
+APP_DIR="$PROJECT_DIR/.${APP_NAME}.app.tmp"
+BACKUP_APP_DIR="$PROJECT_DIR/.${APP_NAME}.app.backup"
 VERIFY_APP_BUNDLE_SCRIPT="$PROJECT_DIR/scripts/verify-app-bundle.sh"
+
+cleanup() {
+    local exit_code="$1"
+
+    if [ "$exit_code" -eq 0 ]; then
+        /bin/rm -rf "$BACKUP_APP_DIR" "$APP_DIR"
+        return
+    fi
+
+    /bin/rm -rf "$APP_DIR"
+    if [ -d "$BACKUP_APP_DIR" ] && [ ! -e "$FINAL_APP_DIR" ]; then
+        mv "$BACKUP_APP_DIR" "$FINAL_APP_DIR"
+    else
+        /bin/rm -rf "$BACKUP_APP_DIR"
+    fi
+}
+
+trap 'cleanup $?' EXIT
 
 ensure_rpath() {
     local binary_path="$1"
@@ -45,7 +65,7 @@ echo -e "${GREEN}✅ Build complete${NC}"
 
 # Create .app structure
 echo -e "${BLUE}Creating .app bundle structure...${NC}"
-/bin/rm -rf "$APP_DIR"
+/bin/rm -rf "$APP_DIR" "$BACKUP_APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 mkdir -p "$APP_DIR/Contents/Frameworks"
@@ -219,9 +239,16 @@ fi
 echo -e "${BLUE}Verifying app bundle runtime dependencies...${NC}"
 "$VERIFY_APP_BUNDLE_SCRIPT" "$APP_DIR"
 
+if [ -e "$FINAL_APP_DIR" ]; then
+    mv "$FINAL_APP_DIR" "$BACKUP_APP_DIR"
+fi
+mv "$APP_DIR" "$FINAL_APP_DIR"
+/bin/rm -rf "$BACKUP_APP_DIR"
+trap - EXIT
+
 echo -e "${GREEN}✅ App bundle created successfully!${NC}"
 echo ""
-echo -e "${GREEN}Location: $APP_DIR${NC}"
+echo -e "${GREEN}Location: $FINAL_APP_DIR${NC}"
 echo ""
 echo "To install:"
 echo "  1. Drag '$APP_NAME.app' to /Applications"
