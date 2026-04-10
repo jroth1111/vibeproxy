@@ -1,9 +1,26 @@
 import Foundation
 
+enum NVIDIAExecutionSurface: String, Equatable {
+    case direct
+    case smartAlias
+}
+
+struct NVIDIAStreamOwner: Equatable {
+    let surface: NVIDIAExecutionSurface
+    let attemptLane: Int
+}
+
+struct NVIDIAStreamExecutionPolicy: Equatable {
+    let retryAllowed: Bool
+    let hedgeAllowed: Bool
+    let owner: NVIDIAStreamOwner?
+}
+
 struct NVIDIAStreamState: Equatable {
     var firstByteReceivedAt: Date?
     var lastChunkReceivedAt: Date?
     var meaningfulOutputEmitted = false
+    var meaningfulOutputOwner: NVIDIAStreamOwner?
     var toolCallStarted = false
     var terminalReceived = false
     var upstreamErrorSeen = false
@@ -29,7 +46,12 @@ struct NVIDIAStreamEngine {
         self.parser = parser
     }
 
-    mutating func ingest(_ chunk: Data, receivedAt: Date = Date()) throws -> [NVIDIAStreamParserOutput] {
+    mutating func ingest(
+        _ chunk: Data,
+        receivedAt: Date = Date(),
+        surface: NVIDIAExecutionSurface = .direct,
+        attemptLane: Int = 1
+    ) throws -> [NVIDIAStreamParserOutput] {
         guard !chunk.isEmpty else { return [] }
         if state.firstByteReceivedAt == nil {
             state.firstByteReceivedAt = receivedAt
@@ -37,11 +59,15 @@ struct NVIDIAStreamEngine {
         state.lastChunkReceivedAt = receivedAt
 
         let outputs = try parser.ingest(chunk)
-        apply(outputs)
+        apply(outputs, surface: surface, attemptLane: attemptLane)
         return outputs
     }
 
-    mutating func finish(receivedAt: Date = Date()) throws -> [NVIDIAStreamParserOutput] {
+    mutating func finish(
+        receivedAt: Date = Date(),
+        surface: NVIDIAExecutionSurface = .direct,
+        attemptLane: Int = 1
+    ) throws -> [NVIDIAStreamParserOutput] {
         let outputs = try parser.finish()
         if !outputs.isEmpty {
             if state.firstByteReceivedAt == nil {
@@ -49,11 +75,35 @@ struct NVIDIAStreamEngine {
             }
             state.lastChunkReceivedAt = receivedAt
         }
-        apply(outputs)
+        apply(outputs, surface: surface, attemptLane: attemptLane)
         return outputs
     }
 
-    private mutating func apply(_ outputs: [NVIDIAStreamParserOutput]) {
+    func executionPolicy(
+        surface: NVIDIAExecutionSurface,
+        attemptLane: Int
+    ) -> NVIDIAStreamExecutionPolicy {
+        let owner = state.meaningfulOutputOwner
+        let allowsFurtherExecution = owner == nil && !state.terminalReceived
+        return NVIDIAStreamExecutionPolicy(
+            retryAllowed: allowsFurtherExecution,
+            hedgeAllowed: allowsFurtherExecution,
+            owner: owner
+        )
+    }
+
+    func ownsMeaningfulOutput(
+        surface: NVIDIAExecutionSurface,
+        attemptLane: Int
+    ) -> Bool {
+        state.meaningfulOutputOwner == NVIDIAStreamOwner(surface: surface, attemptLane: attemptLane)
+    }
+
+    private mutating func apply(
+        _ outputs: [NVIDIAStreamParserOutput],
+        surface: NVIDIAExecutionSurface,
+        attemptLane: Int
+    ) {
         for output in outputs {
             switch output {
             case .comment:
@@ -64,6 +114,9 @@ struct NVIDIAStreamEngine {
                 let flags = Self.semanticFlags(for: message)
                 if flags.meaningfulOutput {
                     state.meaningfulOutputEmitted = true
+                    if state.meaningfulOutputOwner == nil {
+                        state.meaningfulOutputOwner = NVIDIAStreamOwner(surface: surface, attemptLane: attemptLane)
+                    }
                 }
                 if flags.toolCallStarted {
                     state.toolCallStarted = true

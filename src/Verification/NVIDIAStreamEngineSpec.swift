@@ -74,6 +74,81 @@ struct NVIDIAStreamEngineSpec {
             )
         }
 
+        for surface in [NVIDIAExecutionSurface.direct, .smartAlias] {
+            runNVIDIAStreamSpec("engine locks request ownership after meaningful \(surface.rawValue) text output", recorder: recorder) {
+                var engine = NVIDIAStreamEngine()
+                let openPolicy = engine.executionPolicy(surface: surface, attemptLane: 1)
+                expectNVIDIATrue(openPolicy.retryAllowed, "retries should be allowed before meaningful output", recorder: recorder)
+                expectNVIDIATrue(openPolicy.hedgeAllowed, "hedges should be allowed before meaningful output", recorder: recorder)
+
+                _ = try engine.ingest(
+                    Data("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n".utf8),
+                    surface: surface,
+                    attemptLane: 2
+                )
+
+                let lockedPolicy = engine.executionPolicy(surface: surface, attemptLane: 2)
+                expectNVIDIATrue(lockedPolicy.retryAllowed == false, "retries should stop after meaningful output", recorder: recorder)
+                expectNVIDIATrue(lockedPolicy.hedgeAllowed == false, "hedges should stop after meaningful output", recorder: recorder)
+                expectNVIDIAEqual(
+                    lockedPolicy.owner,
+                    NVIDIAStreamOwner(surface: surface, attemptLane: 2),
+                    "the first meaningful lane should own the request",
+                    recorder: recorder
+                )
+                expectNVIDIATrue(
+                    engine.ownsMeaningfulOutput(surface: surface, attemptLane: 2),
+                    "the winning lane should stay recorded as the request owner",
+                    recorder: recorder
+                )
+            }
+
+            runNVIDIAStreamSpec("engine locks request ownership after meaningful \(surface.rawValue) tool-call output", recorder: recorder) {
+                var engine = NVIDIAStreamEngine()
+                _ = try engine.ingest(
+                    Data("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\"}]}}]}\n\n".utf8),
+                    surface: surface,
+                    attemptLane: 3
+                )
+
+                let lockedPolicy = engine.executionPolicy(surface: surface, attemptLane: 1)
+                expectNVIDIATrue(lockedPolicy.retryAllowed == false, "tool calls should also lock retries", recorder: recorder)
+                expectNVIDIATrue(lockedPolicy.hedgeAllowed == false, "tool calls should also lock hedges", recorder: recorder)
+                expectNVIDIAEqual(
+                    lockedPolicy.owner,
+                    NVIDIAStreamOwner(surface: surface, attemptLane: 3),
+                    "tool-call output should claim ownership for the emitting lane",
+                    recorder: recorder
+                )
+            }
+
+            runNVIDIAStreamSpec("engine locks request ownership after meaningful \(surface.rawValue) responses output", recorder: recorder) {
+                var engine = NVIDIAStreamEngine()
+                _ = try engine.ingest(
+                    Data("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n".utf8),
+                    surface: surface,
+                    attemptLane: 4
+                )
+                _ = try engine.ingest(
+                    Data("data: {\"choices\":[{\"delta\":{\"content\":\"ignored by losing lane\"}}]}\n\n".utf8),
+                    surface: surface,
+                    attemptLane: 5
+                )
+
+                expectNVIDIAEqual(
+                    engine.state.meaningfulOutputOwner,
+                    NVIDIAStreamOwner(surface: surface, attemptLane: 4),
+                    "later lanes should not override the first meaningful owner",
+                    recorder: recorder
+                )
+                expectNVIDIATrue(
+                    engine.executionPolicy(surface: surface, attemptLane: 5).retryAllowed == false,
+                    "later lanes should still see retries suppressed once ownership is locked",
+                    recorder: recorder
+                )
+            }
+        }
+
         recorder.finish()
     }
 }
