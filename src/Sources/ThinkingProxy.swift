@@ -748,11 +748,13 @@ enum OpenAICompatTemporaryShim {
     private static var routeCooldownsByRouteHealthKey: [String: Date] = [:]
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
+    static var retryBackoffJitterProviderForTesting: ((ClosedRange<Int>) -> Int)?
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
         failureThreshold: 4,
         cooldown: 10,
         recoverySuccessThreshold: 1
     )
+    private static let retryBackoffPositiveJitterDivisor = 4
     private static let adaptiveFailureEscalationWindow: TimeInterval = 30 * 60
     private static let adaptiveFailureCooldownMaxMultiplier = 8
     private static let routeRollingWindow = 8
@@ -1077,6 +1079,19 @@ enum OpenAICompatTemporaryShim {
 
     static func resetConcurrencyRegistryForTesting() {
         concurrencyRegistry.resetForTesting()
+    }
+
+    static func resetRetryBackoffJitterForTesting() {
+        retryBackoffJitterProviderForTesting = nil
+    }
+
+    static func jitteredRetryBackoffMilliseconds(_ baseMilliseconds: Int) -> Int {
+        guard baseMilliseconds > 0 else { return 0 }
+        let jitterUpperBound = max(1, baseMilliseconds / retryBackoffPositiveJitterDivisor)
+        let rawOffset = retryBackoffJitterProviderForTesting?(0 ... jitterUpperBound)
+            ?? Int.random(in: 0 ... jitterUpperBound)
+        let jitterOffset = min(max(0, rawOffset), jitterUpperBound)
+        return baseMilliseconds + jitterOffset
     }
 
     // MARK: - Route Health Write Debouncing
@@ -5943,6 +5958,7 @@ enum MetaAIWebAdapter {
     static let providerID = "meta-web"
     static let modelAlias = "muse-spark"
     static let conversationMode = "think_hard"
+    private static let maxEventStreamDataLineBytes = 256 * 1024
 
     enum ResponseSurface: Equatable {
         case chatCompletions
@@ -6275,6 +6291,13 @@ enum MetaAIWebAdapter {
                 continue
             }
             let payload = rawLine.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload.utf8.count > maxEventStreamDataLineBytes {
+                return ParsedEventStream(
+                    assistantText: nil,
+                    errorMessage: "Meta web adapter received an oversized event-stream frame.",
+                    sources: []
+                )
+            }
             guard !payload.isEmpty, payload != "[DONE]",
                   let payloadData = payload.data(using: .utf8),
                   let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
@@ -12034,7 +12057,9 @@ class ThinkingProxy {
                     )
                 }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                let delay = DispatchTimeInterval.milliseconds(max(0, nextState.retryBackoffMilliseconds))
+                let delay = DispatchTimeInterval.milliseconds(
+                    OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(nextState.retryBackoffMilliseconds)
+                )
                 let retryBlock = { [weak self] in
                     guard let self, controller?.isCancelled() != true else { return }
                     self.executeSmartAliasMitigatedCandidate(
@@ -13854,7 +13879,10 @@ class ThinkingProxy {
         request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: state.model) else {
             guard attemptLane == 1 else { return }
-            requestController.scheduleRetry(after: .milliseconds(250)) { [weak self] in
+            let retryDelay = DispatchTimeInterval.milliseconds(
+                OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(250)
+            )
+            requestController.scheduleRetry(after: retryDelay) { [weak self] in
                 guard let self, !coordinator.isFinished() else { return }
                 self.forwardNvidiaReasoningRequestWithRetry(
                     method: method,
@@ -14373,7 +14401,9 @@ self.forwardNvidiaReasoningRequestWithRetry(
         hedgeEligible: Bool,
         requestTrace: RequestTraceContext
     ) {
-        let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
+        let delay = DispatchTimeInterval.milliseconds(
+            OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(state.retryBackoffMilliseconds)
+        )
         requestController.scheduleRetry(after: delay) { [weak self] in
             guard let self, !coordinator.isFinished() else { return }
             self.forwardNvidiaReasoningRequestWithRetry(
@@ -15567,7 +15597,9 @@ self.forwardNvidiaReasoningRequestWithRetry(
             if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
                 forRequestedAlias: routeModel
             ),
-            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: recentObservedCandidate) == nil {
+            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: recentObservedCandidate) == nil,
+            let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: recentObservedCandidate),
+            !OpenAICompatTemporaryShim.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
                 return recentObservedCandidate
             }
             return firstAvailableFactoryWorkerCandidateModel(from: candidateModels)
