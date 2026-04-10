@@ -4433,12 +4433,31 @@ enum OpenAICompatTemporaryShim {
             return valueText
         }
 
+        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]) {
+            return structuredJSON
+        }
+
+        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]) {
+            return structuredResult
+        }
+
+        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]) {
+            return structuredArguments
+        }
+
+        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]) {
+            return structuredValue
+        }
+
         if let nestedContent = dictionary["content"] {
             switch normalizedContentResult(from: nestedContent) {
             case .flattened(let flattened):
                 return flattened
             case .unchanged, .unsupported:
                 break
+            }
+            if let structuredContent = normalizedStructuredPayloadString(nestedContent) {
+                return structuredContent
             }
         }
 
@@ -4451,6 +4470,87 @@ enum OpenAICompatTemporaryShim {
         }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : value
+    }
+
+    private static func normalizedStructuredPayloadString(_ value: Any?) -> String? {
+        if let text = normalizedTextMessageScalar(value) {
+            return text
+        }
+        if let boolean = value as? Bool {
+            return boolean ? "true" : "false"
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        if let dictionary = value as? [String: Any] {
+            guard !containsUnsupportedMediaPayload(dictionary),
+                  JSONSerialization.isValidJSONObject(dictionary),
+                  let data = try? JSONSerialization.data(withJSONObject: dictionary, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text
+        }
+        if let array = value as? [Any] {
+            guard !containsUnsupportedMediaPayload(array),
+                  JSONSerialization.isValidJSONObject(array),
+                  let data = try? JSONSerialization.data(withJSONObject: array, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text
+        }
+        return nil
+    }
+
+    private static func containsUnsupportedMediaPayload(_ value: Any) -> Bool {
+        let unsupportedTypes: Set<String> = [
+            "input_image",
+            "image",
+            "image_url",
+            "input_audio",
+            "audio",
+            "audio_url",
+            "file",
+            "input_file",
+            "video",
+            "input_video"
+        ]
+        let unsupportedKeys: Set<String> = [
+            "image",
+            "image_url",
+            "audio",
+            "audio_url",
+            "file",
+            "file_data",
+            "file_url",
+            "video",
+            "video_url"
+        ]
+
+        if let dictionary = value as? [String: Any] {
+            if let type = (dictionary["type"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+               unsupportedTypes.contains(type) {
+                return true
+            }
+            if dictionary.keys.contains(where: { unsupportedKeys.contains($0) }) {
+                return true
+            }
+            for nestedValue in dictionary.values where containsUnsupportedMediaPayload(nestedValue) {
+                return true
+            }
+            return false
+        }
+
+        if let array = value as? [Any] {
+            for element in array where containsUnsupportedMediaPayload(element) {
+                return true
+            }
+        }
+
+        return false
     }
 
     fileprivate static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
@@ -5903,11 +6003,31 @@ enum MetaAIWebAdapter {
             return valueText
         }
 
+        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]) {
+            return structuredJSON
+        }
+
+        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]) {
+            return structuredResult
+        }
+
+        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]) {
+            return structuredArguments
+        }
+
+        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]) {
+            return structuredValue
+        }
+
         if let content = dictionary["content"],
            let flattenedContent = try flattenedText(from: content)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !flattenedContent.isEmpty {
             return flattenedContent
+        }
+
+        if let structuredContent = normalizedStructuredPayloadString(dictionary["content"]) {
+            return structuredContent
         }
 
         return nil
@@ -5956,6 +6076,58 @@ enum MetaAIWebAdapter {
             return nil
         }
         return trimmed
+    }
+
+    private static func normalizedStructuredPayloadString(_ value: Any?) -> String? {
+        if let stringValue = value as? String,
+           let normalized = normalizedString(stringValue) {
+            return normalized
+        }
+        if let boolean = value as? Bool {
+            return boolean ? "true" : "false"
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        if let dictionary = value as? [String: Any] {
+            guard !containsUnsupportedMediaPayload(dictionary),
+                  JSONSerialization.isValidJSONObject(dictionary),
+                  let data = try? JSONSerialization.data(withJSONObject: dictionary, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text
+        }
+        if let array = value as? [Any] {
+            guard !containsUnsupportedMediaPayload(array),
+                  JSONSerialization.isValidJSONObject(array),
+                  let data = try? JSONSerialization.data(withJSONObject: array, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+            return text
+        }
+        return nil
+    }
+
+    private static func containsUnsupportedMediaPayload(_ value: Any) -> Bool {
+        if let dictionary = value as? [String: Any] {
+            if containsUnsupportedMediaContent(dictionary) {
+                return true
+            }
+            for nestedValue in dictionary.values where containsUnsupportedMediaPayload(nestedValue) {
+                return true
+            }
+            return false
+        }
+
+        if let array = value as? [Any] {
+            for element in array where containsUnsupportedMediaPayload(element) {
+                return true
+            }
+        }
+
+        return false
     }
 
     private static func parseCookieHeader(_ rawCookieHeader: String) -> [String: String] {
@@ -7541,6 +7713,7 @@ class ThinkingProxy {
         static let anthropicVersion = "2023-06-01"
         static let nvidiaReasoningSemanticRetries = 2
         static let nvidiaReasoningTransportRetries = 2
+        static let smartAliasMaxLoopRetryDelay: TimeInterval = 0.5
         static let defaultMitigatedAttemptTimeout: TimeInterval = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         static let nvidiaCanaryTimeout: TimeInterval = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
         static let healthcheckTimeout: TimeInterval = 0.5
@@ -8972,6 +9145,7 @@ class ThinkingProxy {
                 if isImmediateRetryClass,
                    loopRetriesRemaining > 0,
                    let retryDelay = nextRetryDelay,
+                   retryDelay <= Config.smartAliasMaxLoopRetryDelay,
                    remainingSmartAliasBudget(until: deadlineAt) > retryDelay {
                     restartSmartAliasLoop(
                         method: method,
@@ -9014,23 +9188,6 @@ class ThinkingProxy {
                     )
                     return
                 }
-            }
-
-            if loopRetriesRemaining > 0, remainingSmartAliasBudget(until: deadlineAt) > 0 {
-                restartSmartAliasLoop(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: currentBody,
-                    publicAlias: publicAlias,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    loopRetriesRemaining: loopRetriesRemaining,
-                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
-                    deliveryMode: deliveryMode
-                )
-                return
             }
 
             if let terminalFallbackOutcome {

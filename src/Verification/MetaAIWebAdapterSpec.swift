@@ -505,6 +505,56 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter stringifies structured JSON tool-result wrappers into transcript context", recorder: recorder) {
+            let request = #"""
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "Check the weather"},
+                {
+                  "role": "tool",
+                  "content": {
+                    "type": "tool_result",
+                    "content": [
+                      {
+                        "type": "output_json",
+                        "value": {
+                          "city": "Boston",
+                          "temp_f": 72
+                        }
+                      }
+                    ]
+                  }
+                },
+                {"role": "user", "content": "Answer briefly"}
+              ]
+            }
+            """#
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(
+                    parsed.prompt,
+                    """
+                    User: Check the weather
+
+                    Tool result: {"city":"Boston","temp_f":72}
+
+                    User: Answer briefly
+                    """,
+                    "structured JSON tool results should be serialized into stable transcript text instead of excluding muse-spark",
+                    recorder: recorder
+                )
+                expectEqual(parsed.isNewThread, false, "structured tool-result context should keep the request in follow-up mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should serialize structured JSON tool-result wrappers into transcript context: \(error)")
+            }
+        }
+
         run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {

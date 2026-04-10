@@ -294,6 +294,48 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia shim stringifies structured tool-result payloads", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {
+                      "role": "tool",
+                      "content": {
+                        "type": "tool_result",
+                        "content": [
+                          {
+                            "type": "output_json",
+                            "value": {
+                              "city": "Boston",
+                              "temp_f": 72
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                expectEqual(
+                    messages?.first?["content"] as? String,
+                    #"{"city":"Boston","temp_f":72}"#,
+                    "structured JSON tool results should be stringified instead of excluding text-only lanes",
+                    recorder: recorder
+                )
+            }
+        }
+
         run("temporary nvidia preflight rejects unsupported typed content arrays", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
@@ -1656,6 +1698,101 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "text-bearing wrapper transcript shapes should still succeed", recorder: recorder)
                 expectEqual(deliveredError, nil, "text-bearing wrapper transcript shapes should not surface a terminal error", recorder: recorder)
                 expectEqual(seenModels, ["muse-spark"], "text-bearing wrapper transcript shapes should keep muse-spark eligible and selectable", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("structured JSON tool-result transcript shapes keep muse-spark eligible for worker routing", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredError: String?
+                var seenModels: [String] = []
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    seenModels.append(publicModel)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-meta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"\(publicModel)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    recorder.recordFailure("structured JSON tool-result transcript shapes should allow muse-spark to be attempted before native fallback, but attempted \(model)")
+                    completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {"role": "system", "content": "You are a worker."},
+                            {
+                              "role": "tool",
+                              "content": {
+                                "type": "tool_result",
+                                "content": [
+                                  {
+                                    "type": "output_json",
+                                    "value": {
+                                      "city": "Boston",
+                                      "temp_f": 72
+                                    }
+                                  }
+                                ]
+                              }
+                            },
+                            {"role": "user", "content": "Return exactly: OK"}
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("structured JSON tool-result transcript shapes should still deliver through muse-spark")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "structured JSON tool-result transcript shapes should still succeed", recorder: recorder)
+                expectEqual(deliveredError, nil, "structured JSON tool-result transcript shapes should not surface a terminal error", recorder: recorder)
+                expectEqual(seenModels, ["muse-spark"], "structured JSON tool-result transcript shapes should keep muse-spark eligible and selectable", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -6156,6 +6293,185 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker should give the preferred primary one bounded retry, then advance through the rest of the pool instead of spinning indefinitely", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should surface a retryable concurrency error when every pool lane is saturated", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream concurrency limit reached for worker; retry shortly.", "worker should return the public worker concurrency guidance after exhausting the pool", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias does not loop when provider-aware preflight eliminates the last healthy lane", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: "glm-5.1-zai",
+                    until: now.addingTimeInterval(30),
+                    at: now
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: now.addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: now.addingTimeInterval(300)
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var upstreamAttemptCount = 0
+
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 4
+                proxy.smartAliasTotalTimeoutOverrideForTesting = 5
+                proxy.bufferedProxyTransportForTesting = { _, _, _, _, _, _ in
+                    upstreamAttemptCount += 1
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, _ in
+                    upstreamAttemptCount += 1
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("{}".utf8),
+                        response: httpURLResponse(statusCode: 500),
+                        error: nil
+                    )
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                let start = Date()
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {
+                              "role": "user",
+                              "content": [
+                                {"type": "text", "text": "Describe this image."},
+                                {"type": "image_url", "image_url": {"url": "https://example.com/test.png"}}
+                              ]
+                            }
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker should terminate promptly when provider-aware preflight eliminates the only healthy lane")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let elapsed = Date().timeIntervalSince(start)
+                expectEqual(deliveredStatus, 429, "worker should surface a retryable error instead of spinning loop retries", recorder: recorder)
+                expectEqual(deliveredMessage?.isEmpty, false, "worker should return a public-facing retry message when only cooldown-bound lanes remain", recorder: recorder)
+                expectEqual(upstreamAttemptCount, 0, "worker should not touch any upstream transport when the pool is structurally unavailable after provider-aware preflight", recorder: recorder)
+                expectEqual(elapsed < 0.75, true, "worker should fail fast instead of burning loop retries when no candidate can be dispatched", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary worker smart alias does not burn loop retries against long cooldowns after a retryable failure", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: "glm-5.1-ollama-pro",
+                    until: now.addingTimeInterval(32),
+                    at: now
+                )
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: "minimax-m2.7-ollama-pro",
+                    until: now.addingTimeInterval(64),
+                    at: now
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var seenModels: [String] = []
+
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 4
+                proxy.smartAliasTotalTimeoutOverrideForTesting = 5
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"message\":\"Too many concurrent requests\"}}".utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "32"
+                                ]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, _ in
+                    recorder.recordFailure("meta adapter should be excluded for unsupported multimodal worker turns")
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("{}".utf8),
+                        response: httpURLResponse(statusCode: 500),
+                        error: nil
+                    )
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                let start = Date()
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {
+                              "role": "user",
+                              "content": [
+                                {"type": "text", "text": "Describe this image."},
+                                {"type": "image_url", "image_url": {"url": "https://example.com/test.png"}}
+                              ]
+                            }
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("worker should surface a retryable cooldown error promptly instead of looping through long retry windows")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let elapsed = Date().timeIntervalSince(start)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai"], "worker should allow one bounded same-lane retry, then stop once every remaining lane is cooldown-bound or preflight-incompatible", recorder: recorder)
+                expectEqual(deliveredStatus, 429, "worker should surface a retryable error instead of spending loop retries on long cooldowns", recorder: recorder)
+                expectEqual(deliveredMessage?.isEmpty, false, "worker should return public retry guidance after the long-cooldown failure chain", recorder: recorder)
+                expectEqual(elapsed < 0.75, true, "worker should fail fast once only long cooldowns remain", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
