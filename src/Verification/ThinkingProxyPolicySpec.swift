@@ -6734,6 +6734,139 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias fails over when a primary tool-call response omits required arguments", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-zai-invalid-tool",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {
+                                        "role": "assistant",
+                                        "content": null,
+                                        "tool_calls": [
+                                          {
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                              "name": "Read",
+                                              "arguments": "{}"
+                                            }
+                                          }
+                                        ]
+                                      },
+                                      "finish_reason": "tool_calls"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "glm-5.1-ollama-pro":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-ollama-valid",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OLLAMA OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected model\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "Read",
+                        "parameters": {
+                          "type": "object",
+                          "required": ["file_path"],
+                          "properties": {
+                            "file_path": {"type": "string"}
+                          }
+                        }
+                      }
+                    }
+                  ],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should fail over after a primary tool-call omits required arguments")
+                    return
+                }
+
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro"], "worker should reject the malformed primary tool-call response and advance to the next worker candidate", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "worker should succeed once a fallback returns a valid response", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "OLLAMA OK", "worker should return the fallback response after rejecting the malformed primary tool-call payload", recorder: recorder)
+            }
+        }
+
         run("temporary worker smart alias keeps trying deferred backends after raced fallback terminals", recorder: recorder) {
             withMergedConfig(workerMergedConfigWithLastResortYAML()) {
                 let proxy = ThinkingProxy()
@@ -9902,6 +10035,55 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectNil(evaluation.retryReason, "without schema, valid JSON arguments should pass through", recorder: recorder)
+            }
+        }
+
+        run("requiredToolParametersIndex extracts required params from request tools", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let requestJSON = """
+                {
+                  "model": "glm5",
+                  "messages": [],
+                  "tools": [
+                    {
+                      "function": {
+                        "name": "Read",
+                        "parameters": {
+                          "type": "object",
+                          "required": ["file_path"],
+                          "properties": {"file_path": {"type": "string"}}
+                        }
+                      }
+                    },
+                    {
+                      "function": {
+                        "name": "Glob",
+                        "parameters": {
+                          "type": "object",
+                          "required": ["pattern"],
+                          "properties": {"pattern": {"type": "string"}}
+                        }
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let index = OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: requestJSON)
+                expectEqual(index?["Read"] ?? [], ["file_path"], "should extract Read required params", recorder: recorder)
+                expectEqual(index?["Glob"] ?? [], ["pattern"], "should extract Glob required params", recorder: recorder)
+                expectNil(index?["UnknownTool"], "unknown tools should not appear in index", recorder: recorder)
+            }
+        }
+
+        run("requiredToolParametersIndex returns nil for requests without tools", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let requestJSON = """
+                {"model": "glm5", "messages": []}
+                """
+
+                let index = OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: requestJSON)
+                expectNil(index, "requests without tools should produce nil index", recorder: recorder)
             }
         }
 

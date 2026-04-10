@@ -11069,6 +11069,7 @@ class ThinkingProxy {
         }
 
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let requiredToolParameters = OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: body)
         let telemetrySource = smartAliasTelemetrySource(headers: headers)
         let concurrencyRetryUntil = Date().addingTimeInterval(1)
         let concurrencyLimitedTelemetry = annotatedSmartAliasTelemetryEvent(
@@ -11115,7 +11116,7 @@ class ThinkingProxy {
                 controller: controller,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: candidateModel,
-                    requiredToolParameters: OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: body),
+                    requiredToolParameters: requiredToolParameters,
                     initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
@@ -11148,6 +11149,7 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 attemptLane: attemptLane,
                 inflightAtRequest: nil,
+                requiredToolParameters: requiredToolParameters,
                 completion: completion
             )
             return
@@ -11194,6 +11196,7 @@ class ThinkingProxy {
                     failoverDepth: failoverDepth,
                     attemptLane: attemptLane,
                     inflightAtRequest: permit.inflightAtRequest,
+                    requiredToolParameters: requiredToolParameters,
                     completion: completion
                 )
             }
@@ -11224,6 +11227,7 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 attemptLane: attemptLane,
                 inflightAtRequest: permit.inflightAtRequest,
+                requiredToolParameters: requiredToolParameters,
                 completion: completion
             )
         }
@@ -11378,7 +11382,8 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     headers: responseHeaders,
                     bodyData: responseBody,
-                    path: path
+                    path: path,
+                    requiredToolParameters: state.requiredToolParameters
                 ).shouldFailover {
                     OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
                             routeHealthKey: permit.routeHealthKey,
@@ -11445,7 +11450,8 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     headers: attempt.response?.allHeaderFields ?? [:],
                     bodyData: nil,
-                    path: path
+                    path: path,
+                    requiredToolParameters: state.requiredToolParameters
                 ).shouldFailover {
                     let cooldownUntil = attempt.response.map {
                         OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
@@ -11500,6 +11506,7 @@ class ThinkingProxy {
         failoverDepth: Int,
         attemptLane: Int,
         inflightAtRequest: Int? = nil,
+        requiredToolParameters: [String: [String]]? = nil,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
@@ -11575,7 +11582,8 @@ class ThinkingProxy {
             statusCode: statusCode,
             headers: response.allHeaderFields,
             bodyData: responseData,
-            path: path
+            path: path,
+            requiredToolParameters: requiredToolParameters
         )
         let shouldFailover = failureClassification.shouldFailover
         let failureClass = failureClassification.failureClass
