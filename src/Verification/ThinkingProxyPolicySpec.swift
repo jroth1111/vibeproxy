@@ -1915,6 +1915,37 @@ struct ThinkingProxyPolicySpec {
             expectEqual(proxy.inflightRequestWaiterCount(for: key), 0, "taking the slot should clear the coalescing registry", recorder: recorder)
         }
 
+        run("temporary completed safe-request responses replay from the short coalescing cache", recorder: recorder) {
+            let proxy = ThinkingProxy()
+            let key = "POST /v1/chat/completions\n{\"model\":\"glm5\",\"messages\":[{\"role\":\"user\",\"content\":\"OK\"}]}"
+            let replayConnection = NWConnection(
+                to: .hostPort(host: "127.0.0.1", port: 1),
+                using: .tcp
+            )
+            var deliveredStatus: Int?
+            var deliveredBody: String?
+            proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                deliveredStatus = statusCode
+                deliveredBody = String(data: body, encoding: .utf8)
+            }
+
+            proxy.rememberCompletedCoalescedHTTPResponseForTesting(
+                key: key,
+                statusCode: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data("{\"ok\":true}".utf8)
+            )
+
+            expectEqual(
+                proxy.replayCompletedCoalescedRequestIfAvailableForTesting(key: key, connection: replayConnection),
+                true,
+                "a just-completed safe request should be replayable for a short dedup window",
+                recorder: recorder
+            )
+            expectEqual(deliveredStatus, 200, "replayed coalesced responses should preserve the original status code", recorder: recorder)
+            expectEqual(deliveredBody, "{\"ok\":true}", "replayed coalesced responses should preserve the original body", recorder: recorder)
+        }
+
         run("temporary worker smart alias is config-driven and skips quarantined fallback models", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -8279,6 +8310,75 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5", at: now), false, "one new failure after recovery should still keep the route available", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
+        }
+
+        run("temporary repeated failures exponentially extend route cooldowns instead of reopening too early", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date(timeIntervalSince1970: 1_700_200_000)
+
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now)
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(6))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(12))
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(18))
+
+                var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                let baseOpenUntil = snapshot["z-ai/glm5"]?.openUntil
+                expectEqual(
+                    Int(baseOpenUntil?.timeIntervalSince(now.addingTimeInterval(18)) ?? 0),
+                    10,
+                    "the first quarantine should preserve the base cooldown",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(24))
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                let secondOpenInterval = snapshot["z-ai/glm5"]?.openUntil?.timeIntervalSince(now.addingTimeInterval(24)) ?? 0
+                expectEqual(
+                    secondOpenInterval >= 20,
+                    true,
+                    "a fifth recent failure should extend the cooldown beyond the base reopen delay",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: "glm5", at: now.addingTimeInterval(30))
+                snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                let thirdOpenInterval = snapshot["z-ai/glm5"]?.openUntil?.timeIntervalSince(now.addingTimeInterval(30)) ?? 0
+                expectEqual(
+                    thirdOpenInterval >= 40,
+                    true,
+                    "continued repeated failures should exponentially extend the cooldown",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary nvidia direct session pool matches the slow-success timeout budget", recorder: recorder) {
+            ThinkingProxy.clearDirectSessionPoolForTesting()
+            guard let session = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
+                recorder.recordFailure("expected a direct testing session for nvidia requests")
+                return
+            }
+            expectEqual(
+                Int(session.configuration.timeoutIntervalForRequest),
+                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(300)),
+                "nvidia direct sessions should inherit the full slow-success request timeout",
+                recorder: recorder
+            )
+            expectEqual(
+                Int(session.configuration.timeoutIntervalForResource),
+                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(360)),
+                "nvidia direct sessions should allow total resource time beyond the request timeout",
+                recorder: recorder
+            )
+            expectEqual(
+                session.configuration.waitsForConnectivity,
+                true,
+                "nvidia direct sessions should wait briefly for connectivity instead of failing immediately on transient path issues",
+                recorder: recorder
+            )
+            ThinkingProxy.clearDirectSessionPoolForTesting()
         }
 
         run("temporary nvidia preflight rejects quarantined hosted routes before spending timeout budget", recorder: recorder) {

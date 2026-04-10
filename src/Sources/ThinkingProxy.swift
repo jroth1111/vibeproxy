@@ -5,6 +5,13 @@ enum OpenAICompatTemporaryShim {
     struct ClientFacingNVIDIAFailure {
         let statusCode: Int
         let message: String
+        let reasonCode: String?
+
+        init(statusCode: Int, message: String, reasonCode: String? = nil) {
+            self.statusCode = statusCode
+            self.message = message
+            self.reasonCode = reasonCode
+        }
     }
 
     struct NvidiaReasoningEvaluation {
@@ -92,6 +99,10 @@ enum OpenAICompatTemporaryShim {
         let firstByteLatencyMilliseconds: Int?
         let totalLatencyMilliseconds: Int?
         let inflightAtRequest: Int?
+        let proxyRequestID: String?
+        let callerRequestID: String?
+        let callerSessionID: String?
+        let requestShape: String?
 
         init(
             timestamp: Date,
@@ -111,7 +122,11 @@ enum OpenAICompatTemporaryShim {
             source: String,
             firstByteLatencyMilliseconds: Int? = nil,
             totalLatencyMilliseconds: Int? = nil,
-            inflightAtRequest: Int? = nil
+            inflightAtRequest: Int? = nil,
+            proxyRequestID: String? = nil,
+            callerRequestID: String? = nil,
+            callerSessionID: String? = nil,
+            requestShape: String? = nil
         ) {
             self.timestamp = timestamp
             self.requestModel = requestModel
@@ -131,6 +146,10 @@ enum OpenAICompatTemporaryShim {
             self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
             self.totalLatencyMilliseconds = totalLatencyMilliseconds
             self.inflightAtRequest = inflightAtRequest
+            self.proxyRequestID = proxyRequestID
+            self.callerRequestID = callerRequestID
+            self.callerSessionID = callerSessionID
+            self.requestShape = requestShape
         }
     }
 
@@ -262,6 +281,25 @@ enum OpenAICompatTemporaryShim {
         let invalidSuccessCount: Int
         let recentOutcomes: [String]
         let recentFirstByteLatencyMilliseconds: [Int]
+        let recentTotalLatencyMilliseconds: [Int]
+
+        init(
+            requestCount: Int,
+            successCount: Int,
+            timeoutCount: Int,
+            invalidSuccessCount: Int,
+            recentOutcomes: [String],
+            recentFirstByteLatencyMilliseconds: [Int],
+            recentTotalLatencyMilliseconds: [Int] = []
+        ) {
+            self.requestCount = requestCount
+            self.successCount = successCount
+            self.timeoutCount = timeoutCount
+            self.invalidSuccessCount = invalidSuccessCount
+            self.recentOutcomes = recentOutcomes
+            self.recentFirstByteLatencyMilliseconds = recentFirstByteLatencyMilliseconds
+            self.recentTotalLatencyMilliseconds = recentTotalLatencyMilliseconds
+        }
 
         static let empty = RouteRollingMetrics(
             requestCount: 0,
@@ -269,7 +307,8 @@ enum OpenAICompatTemporaryShim {
             timeoutCount: 0,
             invalidSuccessCount: 0,
             recentOutcomes: [],
-            recentFirstByteLatencyMilliseconds: []
+            recentFirstByteLatencyMilliseconds: [],
+            recentTotalLatencyMilliseconds: []
         )
 
         var timeoutRate: Double {
@@ -288,6 +327,20 @@ enum OpenAICompatTemporaryShim {
             guard !recentFirstByteLatencyMilliseconds.isEmpty else { return nil }
             let total = recentFirstByteLatencyMilliseconds.reduce(0, +)
             return total / recentFirstByteLatencyMilliseconds.count
+        }
+
+        var averageTotalLatencyMilliseconds: Int? {
+            guard !recentTotalLatencyMilliseconds.isEmpty else { return nil }
+            let total = recentTotalLatencyMilliseconds.reduce(0, +)
+            return total / recentTotalLatencyMilliseconds.count
+        }
+
+        var p95FirstByteLatencyMilliseconds: Int? {
+            percentileLatencyMilliseconds(recentFirstByteLatencyMilliseconds, percentile: 0.95)
+        }
+
+        var p95TotalLatencyMilliseconds: Int? {
+            percentileLatencyMilliseconds(recentTotalLatencyMilliseconds, percentile: 0.95)
         }
     }
 
@@ -329,6 +382,24 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    struct RouteLatencyDiagnostics: Equatable {
+        let averageFirstByteLatencyMilliseconds: Int?
+        let p95FirstByteLatencyMilliseconds: Int?
+        let averageTotalLatencyMilliseconds: Int?
+        let p95TotalLatencyMilliseconds: Int?
+        let slowFirstByteThresholdMilliseconds: Int?
+        let slowTotalThresholdMilliseconds: Int?
+        let pressureStatus: String
+    }
+
+    private static func percentileLatencyMilliseconds(_ samples: [Int], percentile: Double) -> Int? {
+        guard !samples.isEmpty else { return nil }
+        let sorted = samples.sorted()
+        let clampedPercentile = min(max(percentile, 0), 1)
+        let index = Int(ceil(Double(sorted.count - 1) * clampedPercentile))
+        return sorted[min(max(index, 0), sorted.count - 1)]
+    }
+
     struct RouteCircuitState: Equatable {
         let status: RouteHealthStatus
         let failureScore: Int
@@ -339,6 +410,40 @@ enum OpenAICompatTemporaryShim {
         let rollingMetrics: RouteRollingMetrics
         let emaMetrics: RouteEMAMetrics
         let recoveredAt: Date?
+        let lastSuccessAt: Date?
+        let lastSuccessRequestID: String?
+        let lastFailureAt: Date?
+        let lastFailureClass: String?
+
+        init(
+            status: RouteHealthStatus,
+            failureScore: Int,
+            recoverySuccesses: Int,
+            openUntil: Date?,
+            lastScoreUpdatedAt: Date?,
+            lastTelemetryEvent: RouteTelemetryEvent?,
+            rollingMetrics: RouteRollingMetrics,
+            emaMetrics: RouteEMAMetrics,
+            recoveredAt: Date?,
+            lastSuccessAt: Date? = nil,
+            lastSuccessRequestID: String? = nil,
+            lastFailureAt: Date? = nil,
+            lastFailureClass: String? = nil
+        ) {
+            self.status = status
+            self.failureScore = failureScore
+            self.recoverySuccesses = recoverySuccesses
+            self.openUntil = openUntil
+            self.lastScoreUpdatedAt = lastScoreUpdatedAt
+            self.lastTelemetryEvent = lastTelemetryEvent
+            self.rollingMetrics = rollingMetrics
+            self.emaMetrics = emaMetrics
+            self.recoveredAt = recoveredAt
+            self.lastSuccessAt = lastSuccessAt
+            self.lastSuccessRequestID = lastSuccessRequestID
+            self.lastFailureAt = lastFailureAt
+            self.lastFailureClass = lastFailureClass
+        }
 
         private static let momentumBaseBonus: Double = 50.0
         private static let momentumDecayPerSecond: Double = 0.95
@@ -648,6 +753,8 @@ enum OpenAICompatTemporaryShim {
         cooldown: 10,
         recoverySuccessThreshold: 1
     )
+    private static let adaptiveFailureEscalationWindow: TimeInterval = 30 * 60
+    private static let adaptiveFailureCooldownMaxMultiplier = 8
     private static let routeRollingWindow = 8
     private static let fastCanaryInterval: TimeInterval = 30
     private static let defaultCanaryInterval: TimeInterval = 60
@@ -1496,12 +1603,82 @@ enum OpenAICompatTemporaryShim {
     fileprivate struct SmartAliasCandidateSelectionResult {
         let transition: SmartAliasCandidateTransition?
         let terminalPreflightError: ClientFacingNVIDIAFailure?
+        let exhaustionSummary: SmartAliasExhaustionSummary?
+    }
+
+    fileprivate struct SmartAliasExhaustionSummary {
+        let classification: String
+        let countsByReason: [String: Int]
+        let skippedReasons: [(model: String, reason: String)]
+
+        var statusCode: Int {
+            switch classification {
+            case "capacity_exhausted", "cooldown_exhausted":
+                return 429
+            default:
+                return 503
+            }
+        }
+
+        func clientFacingMessage(publicAlias: String) -> String {
+            switch classification {
+            case "capacity_exhausted":
+                return "All configured worker backends for \(publicAlias) are currently at concurrency capacity; retry shortly."
+            case "cooldown_exhausted":
+                return "All configured worker backends for \(publicAlias) are temporarily cooling down after upstream pressure; retry shortly."
+            case "policy_exhausted":
+                return "All remaining worker backends for \(publicAlias) were rejected by proxy policy for this request shape."
+            case "route_unavailable":
+                return "All configured worker backends for \(publicAlias) are currently quarantined or unavailable."
+            case "mixed_exhaustion":
+                return "All configured worker backends for \(publicAlias) are currently unavailable due to mixed capacity, cooldown, and policy constraints."
+            default:
+                return "All configured worker backends are currently unavailable."
+            }
+        }
+
+        var logSummary: [String: Any] {
+            [
+                "classification": classification,
+                "counts_by_reason": countsByReason,
+                "skipped": skippedReasons.map { ["model": $0.model, "reason": $0.reason] }
+            ]
+        }
     }
 
     private enum SmartAliasCandidateEvaluation {
         case available(body: String)
         case skipped(reason: String)
         case providerPreflightBlocked(reason: String, error: ClientFacingNVIDIAFailure)
+    }
+
+    private static func smartAliasExhaustionSummary(
+        for skippedReasons: [(model: String, reason: String)]
+    ) -> SmartAliasExhaustionSummary? {
+        guard !skippedReasons.isEmpty else { return nil }
+        let countsByReason = skippedReasons.reduce(into: [String: Int]()) { counts, skipped in
+            counts[skipped.reason, default: 0] += 1
+        }
+        let reasonSet = Set(skippedReasons.map(\.reason))
+
+        let classification: String
+        if reasonSet.allSatisfy({ $0 == "concurrency_capacity" }) {
+            classification = "capacity_exhausted"
+        } else if reasonSet.allSatisfy({ $0 == "provider_cooldown" }) {
+            classification = "cooldown_exhausted"
+        } else if reasonSet.allSatisfy({ $0 == "route_closed" }) {
+            classification = "route_unavailable"
+        } else if reasonSet.allSatisfy({ $0.hasPrefix("provider_preflight_") }) {
+            classification = "policy_exhausted"
+        } else {
+            classification = "mixed_exhaustion"
+        }
+
+        return SmartAliasExhaustionSummary(
+            classification: classification,
+            countsByReason: countsByReason,
+            skippedReasons: skippedReasons
+        )
     }
 
     private static func evaluateSmartAliasCandidate(
@@ -1549,8 +1726,12 @@ enum OpenAICompatTemporaryShim {
             path: path,
             jsonString: transformedCandidateBody
            ) {
+            let reason = [
+                "provider_preflight_\(preflightError.statusCode)",
+                preflightError.reasonCode
+            ].compactMap { $0 }.joined(separator: "_")
             return .providerPreflightBlocked(
-                reason: "provider_preflight_\(preflightError.statusCode)",
+                reason: reason,
                 error: preflightError
             )
         }
@@ -1585,7 +1766,8 @@ enum OpenAICompatTemporaryShim {
                         model: nextCandidateModel,
                         remainingCandidateModels: remainingCandidateModels
                     ),
-                    terminalPreflightError: nil
+                    terminalPreflightError: nil,
+                    exhaustionSummary: nil
                 )
             case .skipped(let reason):
                 sawNonPreflightSkip = true
@@ -1597,11 +1779,19 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
-        NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
+        let exhaustionSummary = smartAliasExhaustionSummary(for: skippedReasons)
+        if let exhaustionSummary,
+           let jsonData = try? JSONSerialization.data(withJSONObject: exhaustionSummary.logSummary, options: [.sortedKeys]),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@", jsonString)
+        } else {
+            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
+        }
 
         return SmartAliasCandidateSelectionResult(
             transition: nil,
-            terminalPreflightError: sawNonPreflightSkip ? nil : terminalPreflightError
+            terminalPreflightError: sawNonPreflightSkip ? nil : terminalPreflightError,
+            exhaustionSummary: exhaustionSummary
         )
     }
 
@@ -1742,14 +1932,16 @@ enum OpenAICompatTemporaryShim {
         if isResponsesPath(path) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "NVIDIA hosted inference does not reliably support /v1/responses via this proxy; use /v1/chat/completions."
+                message: "NVIDIA hosted inference does not reliably support /v1/responses via this proxy; use /v1/chat/completions.",
+                reasonCode: "responses_path_unsupported"
             )
         }
 
         if isNVIDIAHostedRouteOpen(forRequestModel: model) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 503,
-                message: "This NVIDIA route is temporarily quarantined by the proxy due to repeated upstream failures. Retry later or use another model."
+                message: "This NVIDIA route is temporarily quarantined by the proxy due to repeated upstream failures. Retry later or use another model.",
+                reasonCode: "route_quarantined"
             )
         }
 
@@ -1757,7 +1949,8 @@ enum OpenAICompatTemporaryShim {
            containsUnsupportedTypedMessageContent(in: json) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 400,
-                message: "NVIDIA hosted chat completions currently require string message content; typed content arrays are not supported on this route."
+                message: "NVIDIA hosted chat completions currently require string message content; typed content arrays are not supported on this route.",
+                reasonCode: "typed_content_array"
             )
         }
 
@@ -1770,7 +1963,8 @@ enum OpenAICompatTemporaryShim {
            requestedStream(forRequestJSON: jsonString) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "Streaming is temporarily disabled for this NVIDIA route in the proxy because full-response normalization is required; use non-streaming chat completions."
+                message: "Streaming is temporarily disabled for this NVIDIA route in the proxy because full-response normalization is required; use non-streaming chat completions.",
+                reasonCode: "buffered_streaming_disabled"
             )
         }
 
@@ -1779,7 +1973,8 @@ enum OpenAICompatTemporaryShim {
            requestedStream(forRequestJSON: jsonString) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "Streaming NVIDIA tool calls are not reliably supported through this proxy; use non-streaming chat completions."
+                message: "Streaming NVIDIA tool calls are not reliably supported through this proxy; use non-streaming chat completions.",
+                reasonCode: "streaming_tool_calls"
             )
         }
 
@@ -1787,7 +1982,8 @@ enum OpenAICompatTemporaryShim {
            hasStrictToolChoice(in: json) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "This NVIDIA route does not reliably preserve required/function tool-choice semantics through the proxy; use tool_choice=auto or another provider."
+                message: "This NVIDIA route does not reliably preserve required/function tool-choice semantics through the proxy; use tool_choice=auto or another provider.",
+                reasonCode: "strict_tool_choice"
             )
         }
 
@@ -1806,7 +2002,11 @@ enum OpenAICompatTemporaryShim {
 
         if route.providerID == MetaAIWebAdapter.providerID,
            let failure = MetaAIWebAdapter.preflightFailure(path: path, body: jsonString, publicModel: model) {
-            return ClientFacingNVIDIAFailure(statusCode: failure.statusCode, message: failure.message)
+            return ClientFacingNVIDIAFailure(
+                statusCode: failure.statusCode,
+                message: failure.message,
+                reasonCode: "meta_preflight_rejection"
+            )
         }
 
         if route.providerID == "zai",
@@ -1814,7 +2014,8 @@ enum OpenAICompatTemporaryShim {
            isResponsesPath(path) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 501,
-                message: "Z.AI glm-5.1 does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions."
+                message: "Z.AI glm-5.1 does not provide a reliable /v1/responses surface via this proxy; use Anthropic /v1/messages or /v1/chat/completions.",
+                reasonCode: "responses_path_unsupported"
             )
         }
 
@@ -2481,6 +2682,69 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    static func routeHealthState(forRequestModel requestModel: String) -> RouteCircuitState? {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
+            return nil
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
+        }
+    }
+
+    static func routeCooldownUntil(forRequestModel requestModel: String, at now: Date = Date()) -> Date? {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
+            return nil
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            guard let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
+                  cooldownUntil > now else {
+                return nil
+            }
+            return cooldownUntil
+        }
+    }
+
+    static func latencyDiagnostics(forRequestModel requestModel: String) -> RouteLatencyDiagnostics? {
+        guard let metrics = rollingMetrics(forRequestModel: requestModel) else {
+            return nil
+        }
+
+        let slowFirstByteThresholdMilliseconds = policy(forModel: requestModel)?
+            .firstResponseDeadline
+            .map { Int($0 * 1000) }
+        let slowTotalThresholdMilliseconds = policy(forModel: requestModel)?
+            .attemptTimeout
+            .map { Int($0 * 1000) }
+
+        let p95FirstByte = metrics.p95FirstByteLatencyMilliseconds
+        let p95Total = metrics.p95TotalLatencyMilliseconds
+
+        let pressureStatus: String
+        if let p95Total, let threshold = slowTotalThresholdMilliseconds, p95Total >= Int(Double(threshold) * 0.9) {
+            pressureStatus = "severe"
+        } else if let p95FirstByte, let threshold = slowFirstByteThresholdMilliseconds, p95FirstByte >= Int(Double(threshold) * 0.9) {
+            pressureStatus = "severe"
+        } else if let p95Total, let threshold = slowTotalThresholdMilliseconds, p95Total >= Int(Double(threshold) * 0.75) {
+            pressureStatus = "elevated"
+        } else if let p95FirstByte, let threshold = slowFirstByteThresholdMilliseconds, p95FirstByte >= Int(Double(threshold) * 0.75) {
+            pressureStatus = "elevated"
+        } else {
+            pressureStatus = "normal"
+        }
+
+        return RouteLatencyDiagnostics(
+            averageFirstByteLatencyMilliseconds: metrics.averageFirstByteLatencyMilliseconds,
+            p95FirstByteLatencyMilliseconds: p95FirstByte,
+            averageTotalLatencyMilliseconds: metrics.averageTotalLatencyMilliseconds,
+            p95TotalLatencyMilliseconds: p95Total,
+            slowFirstByteThresholdMilliseconds: slowFirstByteThresholdMilliseconds,
+            slowTotalThresholdMilliseconds: slowTotalThresholdMilliseconds,
+            pressureStatus: pressureStatus
+        )
+    }
+
     static func recommendedNVIDIAHedgeDelay(forRequestModel requestModel: String) -> TimeInterval {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return defaultSuspectHedgeDelay
@@ -2548,6 +2812,12 @@ enum OpenAICompatTemporaryShim {
             return deferredUntil
         }
 
+        // When upstream already supplied an explicit short retry window for this request,
+        // honor it exactly instead of inflating it into the proxy's learned fallback deferral.
+        if deferredUntil != nil {
+            return deferredUntil
+        }
+
         let inflightAtRequest = telemetryEvent.inflightAtRequest ??
             concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
         let repeatedConcurrencyFailure =
@@ -2582,6 +2852,49 @@ enum OpenAICompatTemporaryShim {
         return deferredUntil
     }
 
+    private static func noteFailureAndReturnRecentCount(
+        routeHealthKey: String,
+        at now: Date
+    ) -> Int {
+        routeFailureDedupQueue.sync {
+            var timestamps = recentFailureTimestampsByRoute[routeHealthKey] ?? []
+            timestamps.removeAll { now.timeIntervalSince($0) > adaptiveFailureEscalationWindow }
+
+            if !disableFailureDedupForTesting,
+               let last = timestamps.last,
+               now.timeIntervalSince(last) <= failureDedupWindow {
+                recentFailureTimestampsByRoute[routeHealthKey] = timestamps
+                return timestamps.count
+            }
+
+            timestamps.append(now)
+            recentFailureTimestampsByRoute[routeHealthKey] = timestamps
+            return timestamps.count
+        }
+    }
+
+    private static func adaptiveFailureOpenUntil(
+        currentOpenUntil: Date?,
+        recentFailureCount: Int,
+        now: Date
+    ) -> Date? {
+        guard recentFailureCount >= routeCircuitBreakerPolicy.failureThreshold else {
+            return currentOpenUntil
+        }
+
+        let escalationExponent = max(0, recentFailureCount - routeCircuitBreakerPolicy.failureThreshold)
+        let multiplier = min(
+            adaptiveFailureCooldownMaxMultiplier,
+            Int(pow(2.0, Double(escalationExponent)))
+        )
+        let escalatedUntil = now.addingTimeInterval(routeCircuitBreakerPolicy.cooldown * TimeInterval(multiplier))
+
+        guard let currentOpenUntil else {
+            return escalatedUntil
+        }
+        return max(currentOpenUntil, escalatedUntil)
+    }
+
     static func recordRouteFailure(
         forRequestModel requestModel: String,
         telemetryEvent: RouteTelemetryEvent? = nil,
@@ -2596,6 +2909,10 @@ enum OpenAICompatTemporaryShim {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
+            let recentFailureCount = noteFailureAndReturnRecentCount(
+                routeHealthKey: route.routeHealthKey,
+                at: now
+            )
 
             let normalizedFailureClass = telemetryEvent?.failureClass?.lowercased()
 
@@ -2667,6 +2984,24 @@ enum OpenAICompatTemporaryShim {
                 forcedOpenUntil: forcedOpenUntil,
                 healthSensitivity: healthSensitivity
             )
+            if nextState.status == .open,
+               let adaptiveOpenUntil = adaptiveFailureOpenUntil(
+                    currentOpenUntil: nextState.openUntil,
+                    recentFailureCount: recentFailureCount,
+                    now: now
+               ) {
+                nextState = RouteCircuitState(
+                    status: nextState.status,
+                    failureScore: nextState.failureScore,
+                    recoverySuccesses: nextState.recoverySuccesses,
+                    openUntil: adaptiveOpenUntil,
+                    lastScoreUpdatedAt: nextState.lastScoreUpdatedAt,
+                    lastTelemetryEvent: nextState.lastTelemetryEvent,
+                    rollingMetrics: nextState.rollingMetrics,
+                    emaMetrics: nextState.emaMetrics,
+                    recoveredAt: nextState.recoveredAt
+                )
+            }
             let enrichedTelemetryEvent = telemetryEvent.map {
                 enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
             }
@@ -3581,6 +3916,10 @@ enum OpenAICompatTemporaryShim {
             .compactMap { $0 }
             .filter { $0 > now }
             .max()
+        let nextLastSuccessAt = current?.lastSuccessAt
+        let nextLastSuccessRequestID = current?.lastSuccessRequestID
+        let nextLastFailureAt = telemetryEvent != nil ? now : current?.lastFailureAt
+        let nextLastFailureClass = telemetryEvent?.failureClass ?? current?.lastFailureClass
 
         if let effectiveForcedOpenUntil {
             return RouteCircuitState(
@@ -3592,7 +3931,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         }
 
@@ -3608,7 +3951,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: current?.recoveredAt
+                    recoveredAt: current?.recoveredAt,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             let nextFailureScore = min(
@@ -3625,7 +3972,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: nil
+                    recoveredAt: nil,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             return RouteCircuitState(
@@ -3637,7 +3988,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         case .open, .halfOpen:
             if failurePenalty == 0 {
@@ -3650,7 +4005,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: current?.recoveredAt
+                    recoveredAt: current?.recoveredAt,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             return RouteCircuitState(
@@ -3662,7 +4021,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         }
     }
@@ -3689,6 +4052,10 @@ enum OpenAICompatTemporaryShim {
             now: now
         )
         let reducedScore = max(0, decayedScore - 1)
+        let nextLastSuccessAt = telemetryEvent != nil ? now : current?.lastSuccessAt
+        let nextLastSuccessRequestID = telemetryEvent?.proxyRequestID ?? current?.lastSuccessRequestID
+        let nextLastFailureAt = current?.lastFailureAt
+        let nextLastFailureClass = current?.lastFailureClass
 
         switch current?.status ?? .closed {
         case .closed:
@@ -3701,7 +4068,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         case .suspect:
             if reducedScore > 0 || shouldRemainSuspectAfterSuccess(metrics: nextRollingMetrics) {
@@ -3714,7 +4085,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: nil
+                    recoveredAt: nil,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             return RouteCircuitState(
@@ -3726,7 +4101,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         case .open:
             if effectivePolicy.recoverySuccessThreshold <= 1 {
@@ -3739,7 +4118,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: now
+                    recoveredAt: now,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             return RouteCircuitState(
@@ -3751,7 +4134,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         case .halfOpen:
             let nextRecoverySuccesses = (current?.recoverySuccesses ?? 0) + 1
@@ -3765,7 +4152,11 @@ enum OpenAICompatTemporaryShim {
                     lastTelemetryEvent: lastTelemetryEvent,
                     rollingMetrics: nextRollingMetrics,
                     emaMetrics: nextEMA,
-                    recoveredAt: now
+                    recoveredAt: now,
+                    lastSuccessAt: nextLastSuccessAt,
+                    lastSuccessRequestID: nextLastSuccessRequestID,
+                    lastFailureAt: nextLastFailureAt,
+                    lastFailureClass: nextLastFailureClass
                 )
             }
             return RouteCircuitState(
@@ -3777,7 +4168,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: nextRollingMetrics,
                 emaMetrics: nextEMA,
-                recoveredAt: nil
+                recoveredAt: nil,
+                lastSuccessAt: nextLastSuccessAt,
+                lastSuccessRequestID: nextLastSuccessRequestID,
+                lastFailureAt: nextLastFailureAt,
+                lastFailureClass: nextLastFailureClass
             )
         }
     }
@@ -3795,7 +4190,11 @@ enum OpenAICompatTemporaryShim {
             lastTelemetryEvent: telemetryEvent,
             rollingMetrics: state.rollingMetrics,
             emaMetrics: state.emaMetrics,
-            recoveredAt: state.recoveredAt
+            recoveredAt: state.recoveredAt,
+            lastSuccessAt: state.lastSuccessAt,
+            lastSuccessRequestID: state.lastSuccessRequestID,
+            lastFailureAt: state.lastFailureAt,
+            lastFailureClass: state.lastFailureClass
         )
     }
 
@@ -3822,7 +4221,12 @@ enum OpenAICompatTemporaryShim {
             retryCount: event.retryCount,
             source: event.source,
             firstByteLatencyMilliseconds: event.firstByteLatencyMilliseconds,
-            totalLatencyMilliseconds: event.totalLatencyMilliseconds
+            totalLatencyMilliseconds: event.totalLatencyMilliseconds,
+            inflightAtRequest: event.inflightAtRequest,
+            proxyRequestID: event.proxyRequestID,
+            callerRequestID: event.callerRequestID,
+            callerSessionID: event.callerSessionID,
+            requestShape: event.requestShape
         )
     }
 
@@ -3902,13 +4306,22 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
+        var recentTotalLatencyMilliseconds = prior.recentTotalLatencyMilliseconds
+        if let totalLatencyMilliseconds = telemetryEvent.totalLatencyMilliseconds {
+            recentTotalLatencyMilliseconds.append(totalLatencyMilliseconds)
+            if recentTotalLatencyMilliseconds.count > routeRollingWindow {
+                recentTotalLatencyMilliseconds.removeFirst(recentTotalLatencyMilliseconds.count - routeRollingWindow)
+            }
+        }
+
         return RouteRollingMetrics(
             requestCount: prior.requestCount + 1,
             successCount: prior.successCount + (telemetryEvent.failureClass == nil ? 1 : 0),
             timeoutCount: prior.timeoutCount + (telemetryEvent.failureClass == "transport_timeout" ? 1 : 0),
             invalidSuccessCount: prior.invalidSuccessCount + (isInvalidSuccessFailureClass(telemetryEvent.failureClass) ? 1 : 0),
             recentOutcomes: recentOutcomes,
-            recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds
+            recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds,
+            recentTotalLatencyMilliseconds: recentTotalLatencyMilliseconds
         )
     }
 
@@ -4016,7 +4429,7 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 5,
+              let version = json["version"] as? Int, version >= 1, version <= 6,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -4046,6 +4459,10 @@ enum OpenAICompatTemporaryShim {
             let lastScoreUpdatedAt = parseISO8601Date(entry["last_score_updated_at"])
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
             let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
+            let lastSuccessAt = parseISO8601Date(entry["last_success_at"])
+            let lastSuccessRequestID = entry["last_success_request_id"] as? String
+            let lastFailureAt = parseISO8601Date(entry["last_failure_at"])
+            let lastFailureClass = entry["last_failure_class"] as? String
 
             if status == .open {
                 // Persisted open circuits are useful evidence, but they should not hard-quarantine
@@ -4064,7 +4481,11 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: lastTelemetryEvent,
                 rollingMetrics: rollingMetrics,
                 emaMetrics: parseEMAMetrics(entry["ema_metrics"]),
-                recoveredAt: parseISO8601Date(entry["recovered_at"] as? String)
+                recoveredAt: parseISO8601Date(entry["recovered_at"] as? String),
+                lastSuccessAt: lastSuccessAt,
+                lastSuccessRequestID: lastSuccessRequestID,
+                lastFailureAt: lastFailureAt,
+                lastFailureClass: lastFailureClass
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
@@ -4072,7 +4493,7 @@ enum OpenAICompatTemporaryShim {
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
         concurrencyRegistry.loadLocked(from: json, persistedVersion: version)
-        if prunedUnknownEntries || normalizedPersistedAvailability || version < 5 {
+        if prunedUnknownEntries || normalizedPersistedAvailability || version < 6 {
             persistRouteHealthLocked()
         }
 
@@ -4231,12 +4652,24 @@ enum OpenAICompatTemporaryShim {
             if let recoveredAt = state.recoveredAt {
                 entry["recovered_at"] = iso8601String(from: recoveredAt)
             }
+            if let lastSuccessAt = state.lastSuccessAt {
+                entry["last_success_at"] = iso8601String(from: lastSuccessAt)
+            }
+            if let lastSuccessRequestID = state.lastSuccessRequestID {
+                entry["last_success_request_id"] = lastSuccessRequestID
+            }
+            if let lastFailureAt = state.lastFailureAt {
+                entry["last_failure_at"] = iso8601String(from: lastFailureAt)
+            }
+            if let lastFailureClass = state.lastFailureClass {
+                entry["last_failure_class"] = lastFailureClass
+            }
             routes[routeHealthKey] = entry
         }
 
         let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
-            "version": 5,
+            "version": 6,
             "routes": routes,
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns
@@ -4298,6 +4731,21 @@ enum OpenAICompatTemporaryShim {
         if let totalLatencyMilliseconds = event.totalLatencyMilliseconds {
             dict["total_latency_ms"] = totalLatencyMilliseconds
         }
+        if let inflightAtRequest = event.inflightAtRequest {
+            dict["inflight_at_request"] = inflightAtRequest
+        }
+        if let proxyRequestID = event.proxyRequestID {
+            dict["proxy_request_id"] = proxyRequestID
+        }
+        if let callerRequestID = event.callerRequestID {
+            dict["caller_request_id"] = callerRequestID
+        }
+        if let callerSessionID = event.callerSessionID {
+            dict["caller_session_id"] = callerSessionID
+        }
+        if let requestShape = event.requestShape {
+            dict["request_shape"] = requestShape
+        }
         return dict
     }
 
@@ -4331,7 +4779,12 @@ enum OpenAICompatTemporaryShim {
             retryCount: retryCount,
             source: source,
             firstByteLatencyMilliseconds: integerValue(dict["first_byte_latency_ms"]),
-            totalLatencyMilliseconds: integerValue(dict["total_latency_ms"])
+            totalLatencyMilliseconds: integerValue(dict["total_latency_ms"]),
+            inflightAtRequest: integerValue(dict["inflight_at_request"]),
+            proxyRequestID: dict["proxy_request_id"] as? String,
+            callerRequestID: dict["caller_request_id"] as? String,
+            callerSessionID: dict["caller_session_id"] as? String,
+            requestShape: dict["request_shape"] as? String
         )
     }
 
@@ -4342,7 +4795,8 @@ enum OpenAICompatTemporaryShim {
             "timeout_count": metrics.timeoutCount,
             "invalid_success_count": metrics.invalidSuccessCount,
             "recent_outcomes": metrics.recentOutcomes,
-            "recent_first_byte_latency_ms": metrics.recentFirstByteLatencyMilliseconds
+            "recent_first_byte_latency_ms": metrics.recentFirstByteLatencyMilliseconds,
+            "recent_total_latency_ms": metrics.recentTotalLatencyMilliseconds
         ]
     }
 
@@ -4364,7 +4818,8 @@ enum OpenAICompatTemporaryShim {
             timeoutCount: integerValue(dict["timeout_count"]) ?? 0,
             invalidSuccessCount: integerValue(dict["invalid_success_count"]) ?? 0,
             recentOutcomes: dict["recent_outcomes"] as? [String] ?? [],
-            recentFirstByteLatencyMilliseconds: dict["recent_first_byte_latency_ms"] as? [Int] ?? []
+            recentFirstByteLatencyMilliseconds: dict["recent_first_byte_latency_ms"] as? [Int] ?? [],
+            recentTotalLatencyMilliseconds: dict["recent_total_latency_ms"] as? [Int] ?? []
         )
     }
 
@@ -4422,7 +4877,12 @@ enum OpenAICompatTemporaryShim {
             retryCount: event.retryCount,
             source: event.source,
             firstByteLatencyMilliseconds: event.firstByteLatencyMilliseconds,
-            totalLatencyMilliseconds: event.totalLatencyMilliseconds
+            totalLatencyMilliseconds: event.totalLatencyMilliseconds,
+            inflightAtRequest: event.inflightAtRequest,
+            proxyRequestID: event.proxyRequestID,
+            callerRequestID: event.callerRequestID,
+            callerSessionID: event.callerSessionID,
+            requestShape: event.requestShape
         )
     }
 
@@ -4470,7 +4930,7 @@ enum OpenAICompatTemporaryShim {
         value.lowercased().hasPrefix("<think>")
     }
 
-    private static func containsUnsupportedTypedMessageContent(in json: [String: Any]) -> Bool {
+    fileprivate static func containsUnsupportedTypedMessageContent(in json: [String: Any]) -> Bool {
         guard let messages = json["messages"] as? [[String: Any]] else {
             return false
         }
@@ -5366,7 +5826,7 @@ enum OpenAICompatTemporaryShim {
         )
     }
 
-    private static func hasStrictToolChoice(in json: [String: Any]) -> Bool {
+    fileprivate static func hasStrictToolChoice(in json: [String: Any]) -> Bool {
         guard let toolChoice = json["tool_choice"] else {
             return false
         }
@@ -7830,6 +8290,25 @@ class ThinkingProxy {
         let mergedConfigFingerprint: String?
     }
 
+    private struct RequestTraceContext {
+        let proxyRequestID: String
+        let callerRequestID: String?
+        let callerSessionID: String?
+        let requestShape: String
+
+        var responseHeaders: [String: String] {
+            var headers = ["X-VibeProxy-Request-ID": proxyRequestID]
+            if let callerRequestID {
+                headers["X-VibeProxy-Caller-Request-ID"] = callerRequestID
+            }
+            if let callerSessionID {
+                headers["X-VibeProxy-Caller-Session-ID"] = callerSessionID
+            }
+            headers["X-VibeProxy-Request-Shape"] = requestShape
+            return headers
+        }
+    }
+
     private struct FactoryWorkerContract {
         let workerModelID: String
         let validationWorkerModelID: String?
@@ -7919,6 +8398,20 @@ class ThinkingProxy {
         }
     }
 
+    private enum CoalescedReplayPayload {
+        case http(statusCode: Int, headers: [AnyHashable: Any], body: Data, overridingHeaders: [String: String])
+        case error(statusCode: Int, message: String, overridingHeaders: [String: String])
+    }
+
+    private struct CoalescedReplayEntry {
+        let expiresAt: Date
+        let payload: CoalescedReplayPayload
+
+        var isExpired: Bool {
+            expiresAt <= Date()
+        }
+    }
+
     private enum SmartAliasCandidateAttemptOutcome {
         case success(
             requestModel: String,
@@ -8000,6 +8493,8 @@ class ThinkingProxy {
     private let smartAliasForcedPrimaryRetryLimit = 2
     private let smartAliasMaxLoopRetries = 4
     private var inflightCoalescedRequests: [String: [NWConnection]] = [:]
+    private var recentCoalescedReplays: [String: CoalescedReplayEntry] = [:]
+    private let coalescedReplayWindow: TimeInterval = 5
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
     var bufferedProxyCancelableTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
@@ -8473,8 +8968,9 @@ class ThinkingProxy {
             }
 
             let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(120)
-            configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
+            configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
+            configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(360)
+            configuration.waitsForConnectivity = true
             let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: nil)
 
             if directSessionPool.count >= directPoolMaxSize {
@@ -8501,6 +8997,10 @@ class ThinkingProxy {
             }
         }
         session.finishTasksAndInvalidate()
+    }
+
+    static func acquireDirectSessionForTesting(key: String) -> URLSession? {
+        acquireDirectSession(key: key)
     }
 
     private static func evictIdleDirectSessionsLocked() {
@@ -8597,6 +9097,7 @@ class ThinkingProxy {
             nvidiaInflightQueue.sync {
                 nvidiaRaceWaiters.removeAll()
                 inflightCoalescedRequests.removeAll()
+                recentCoalescedReplays.removeAll()
             }
             NSLog("[ThinkingProxy] Stopped")
         }
@@ -8706,7 +9207,6 @@ class ThinkingProxy {
         let method = parts[0]
         let path = parts[1]
         let httpVersion = parts[2]
-        NSLog("[ThinkingProxy] Incoming request: \(method) \(path)")
 
         // Collect headers while preserving original casing
         var headers: [(String, String)] = []
@@ -8728,6 +9228,13 @@ class ThinkingProxy {
         
         let bodyStart = requestString.distance(from: requestString.startIndex, to: bodyStartRange.upperBound)
         let bodyString = String(requestString[requestString.index(requestString.startIndex, offsetBy: bodyStart)...])
+        let requestTrace = requestTraceContext(
+            method: method,
+            path: path,
+            headers: headers,
+            body: bodyString
+        )
+        NSLog("[ThinkingProxy] Incoming request [%@]: %@ %@", requestTrace.proxyRequestID, method, path)
         
         // Redirect Amp CLI login directly to ampcode.com to preserve auth state cookies
         if path.starts(with: "/auth/cli-login") || path.starts(with: "/api/auth/cli-login") {
@@ -8915,10 +9422,15 @@ class ThinkingProxy {
                         coalescingSourceBody: coalescingSourceBody,
                         requestedModelAlias: publicAlias
                     )
-                    if let coalescingKey,
-                       !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
-                        NSLog("[ThinkingProxy] Joined coalesced smart-alias request for %@", publicAlias)
-                        return
+                    if let coalescingKey {
+                        if replayCompletedCoalescedRequestIfAvailable(key: coalescingKey, connection: connection) {
+                            NSLog("[ThinkingProxy] Replayed completed coalesced smart-alias request for %@", publicAlias)
+                            return
+                        }
+                        if !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
+                            NSLog("[ThinkingProxy] Joined coalesced smart-alias request for %@", publicAlias)
+                            return
+                        }
                     }
                     forwardSmartAliasRequest(
                         method: method,
@@ -8930,7 +9442,8 @@ class ThinkingProxy {
                         forceProbeCandidateModels: forceProbeCandidateModels,
                         originalConnection: connection,
                         coalescingKey: coalescingKey,
-                        deliveryMode: executionPlan.deliveryMode
+                        deliveryMode: executionPlan.deliveryMode,
+                        requestTrace: requestTrace
                     )
                     return
                 }
@@ -8946,7 +9459,8 @@ class ThinkingProxy {
                         forceProbeCandidateModels: forceProbeCandidateModels,
                         originalConnection: connection,
                         coalescingKey: nil,
-                        deliveryMode: executionPlan.deliveryMode
+                        deliveryMode: executionPlan.deliveryMode,
+                        requestTrace: requestTrace
                     )
                     return
                 }
@@ -8965,7 +9479,12 @@ class ThinkingProxy {
                 jsonString: modifiedBody
             ) {
                 NSLog("[ThinkingProxy] NVIDIA preflight mitigation blocked request for \(rewrittenPath): \(preflightError.message)")
-                sendError(to: connection, statusCode: preflightError.statusCode, message: preflightError.message)
+                sendError(
+                    to: connection,
+                    statusCode: preflightError.statusCode,
+                    message: preflightError.message,
+                    overridingHeaders: requestTrace.responseHeaders
+                )
                 return
             }
         }
@@ -8979,7 +9498,8 @@ class ThinkingProxy {
                 path: rewrittenPath,
                 body: modifiedBody,
                 publicModel: metaModel,
-                originalConnection: connection
+                originalConnection: connection,
+                requestTrace: requestTrace
             )
             return
         }
@@ -8998,7 +9518,8 @@ class ThinkingProxy {
                 body: modifiedBody,
                 candidateModel: directProxyModel,
                 endpoint: directProxyEndpoint,
-                originalConnection: connection
+                originalConnection: connection,
+                requestTrace: requestTrace
             )
             return
         }
@@ -9018,7 +9539,8 @@ class ThinkingProxy {
                 body: factoryBoundExecutionPlan.body,
                 binding: factoryModelBinding,
                 deliveryMode: factoryBoundExecutionPlan.deliveryMode,
-                originalConnection: connection
+                originalConnection: connection,
+                requestTrace: requestTrace
             )
             return
         }
@@ -9038,19 +9560,25 @@ class ThinkingProxy {
                 coalescingSourceBody: coalescingSourceBody,
                 requestedModelAlias: nil
             )
-            if let coalescingKey,
-               !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
-                NSLog("[ThinkingProxy] Joined coalesced NVIDIA request for %@", model)
-                return
+            if let coalescingKey {
+                if replayCompletedCoalescedRequestIfAvailable(key: coalescingKey, connection: connection) {
+                    NSLog("[ThinkingProxy] Replayed completed coalesced NVIDIA request for %@", model)
+                    return
+                }
+                if !registerOrJoinInflightRequest(key: coalescingKey, connection: connection) {
+                    NSLog("[ThinkingProxy] Joined coalesced NVIDIA request for %@", model)
+                    return
+                }
             }
-            forwardNvidiaReasoningRequest(
-                method: method,
-                path: rewrittenPath,
-                headers: headers,
-                body: modifiedBody,
-                originalConnection: connection,
-                state: OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: model,
+                forwardNvidiaReasoningRequest(
+                    method: method,
+                    path: rewrittenPath,
+                    headers: headers,
+                    body: modifiedBody,
+                    originalConnection: connection,
+                    requestTrace: requestTrace,
+                    state: OpenAICompatTemporaryShim.NVIDIARetryState(
+                        model: model,
                     requiredToolParameters: OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: modifiedBody),
                     initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
@@ -9092,7 +9620,8 @@ class ThinkingProxy {
         forceProbeCandidateModels: Set<String>,
         originalConnection: NWConnection,
         coalescingKey: String?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController)
@@ -9113,7 +9642,8 @@ class ThinkingProxy {
             exhaustedRetryableOutcome: nil,
             deliveryMode: deliveryMode,
             loopRetriesRemaining: smartAliasLoopRetryLimitOverrideForTesting ?? smartAliasMaxLoopRetries,
-            requestController: requestController
+            requestController: requestController,
+            requestTrace: requestTrace
         )
     }
 
@@ -9124,14 +9654,16 @@ class ThinkingProxy {
         body: String,
         binding: FactoryModelBinding,
         deliveryMode: FactoryBoundDeliveryMode = .bufferedJSON,
-        originalConnection: NWConnection
+        originalConnection: NWConnection,
+        requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let resolvedRequestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body) ?? binding.routeModel
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: binding.incomingModelID,
-            resolvedRequestModel: resolvedRequestModel
+            resolvedRequestModel: resolvedRequestModel,
+            requestTrace: requestTrace
         )
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: resolvedRequestModel)
         let timeoutInterval = smartAliasCandidateTimeout(forRequestJSON: body)
@@ -9419,7 +9951,8 @@ class ThinkingProxy {
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0,
-        requestController: RequestCancellationController
+        requestController: RequestCancellationController,
+        requestTrace: RequestTraceContext
     ) {
         guard requestController.isCancelled() != true else { return }
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
@@ -9478,7 +10011,8 @@ class ThinkingProxy {
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
             return
         }
@@ -9501,6 +10035,7 @@ class ThinkingProxy {
             forceAllowClosedModels: forceProbeCandidateModels
         )
         guard let transition = selection.transition else {
+            let exhaustionSummary = selection.exhaustionSummary
             let poolRetryDelay = effectiveCandidateModels.flatMap {
                 OpenAICompatTemporaryShim.nextSmartAliasRetryDelay(
                     forCandidateModels: $0,
@@ -9532,7 +10067,8 @@ class ThinkingProxy {
                         retryDelaySeconds: retryDelay,
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                         deliveryMode: deliveryMode,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                     return
                 }
@@ -9558,7 +10094,8 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         coalescingKey: coalescingKey,
                         deliveryMode: deliveryMode,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                     return
                 }
@@ -9569,7 +10106,8 @@ class ThinkingProxy {
                     defaultConnection: originalConnection,
                     statusCode: terminalPreflightError.statusCode,
                     message: terminalPreflightError.message,
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: requestTrace.responseHeaders
                 )
                 return
             }
@@ -9581,7 +10119,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
                 return
             }
@@ -9593,7 +10132,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
                 return
             }
@@ -9613,16 +10153,17 @@ class ThinkingProxy {
                             until: retryUntil,
                             fallbackSeconds: max(1, Int(ceil(nextRetryDelay)))
                         )
-                    ]
+                    ].merging(requestTrace.responseHeaders) { current, _ in current }
                 )
                 return
             }
 
             deliverBufferedError(
                 defaultConnection: originalConnection,
-                statusCode: 503,
-                message: "All configured worker backends are currently unavailable.",
-                coalescingKey: coalescingKey
+                statusCode: exhaustionSummary?.statusCode ?? 503,
+                message: exhaustionSummary?.clientFacingMessage(publicAlias: publicAlias) ?? "All configured worker backends are currently unavailable.",
+                coalescingKey: coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
             )
             return
         }
@@ -9640,7 +10181,8 @@ class ThinkingProxy {
             attemptLane: 1,
             deadlineAt: deadlineAt,
             coalescingKey: coalescingKey,
-            controller: requestController
+            controller: requestController,
+            requestTrace: requestTrace
         ) { [weak self] outcome in
             guard let self else { return }
             self.handleSmartAliasSerialCandidateOutcome(
@@ -9661,7 +10203,8 @@ class ThinkingProxy {
                 exhaustedRetryableOutcome: nil,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
         }
     }
@@ -9685,7 +10228,8 @@ class ThinkingProxy {
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0,
-        requestController: RequestCancellationController
+        requestController: RequestCancellationController,
+        requestTrace: RequestTraceContext
     ) {
         guard requestController.isCancelled() != true else { return }
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels, healthSensitivity: healthSensitivity)
@@ -9715,7 +10259,8 @@ class ThinkingProxy {
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
             return
         }
@@ -9758,7 +10303,8 @@ class ThinkingProxy {
                     exhaustedRetryableOutcome: nil,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
                 return
             }
@@ -9792,7 +10338,8 @@ class ThinkingProxy {
                 exhaustedRetryableOutcome: nil,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
         }
 
@@ -9832,7 +10379,8 @@ class ThinkingProxy {
                     resolvedRequestModel: requestModel,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
             case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
                 OpenAICompatTemporaryShim.recordRouteFailure(
@@ -9933,7 +10481,8 @@ class ThinkingProxy {
                 attemptLane: attemptLane,
                 deadlineAt: deadlineAt,
                 coalescingKey: coalescingKey,
-                controller: controller
+                controller: controller,
+                requestTrace: requestTrace
             ) { [weak self] outcome in
                 guard self != nil else { return }
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -9971,7 +10520,8 @@ class ThinkingProxy {
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
         loopRetriesRemaining: Int = 0,
-        requestController: RequestCancellationController
+        requestController: RequestCancellationController,
+        requestTrace: RequestTraceContext
     ) {
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         guard requestController.isCancelled() != true else { return }
@@ -10000,7 +10550,8 @@ class ThinkingProxy {
                 resolvedRequestModel: requestModel,
                 coalescingKey: coalescingKey,
                 deliveryMode: deliveryMode,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where telemetryEvent.failureClass == "classified_429_overload":
@@ -10033,7 +10584,8 @@ class ThinkingProxy {
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                         deliveryMode: deliveryMode,
                         loopRetriesRemaining: loopRetriesRemaining,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                 }
                 return
@@ -10062,7 +10614,8 @@ class ThinkingProxy {
                         ),
                         deliveryMode: deliveryMode,
                         loopRetriesRemaining: loopRetriesRemaining,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                 }
                 return
@@ -10077,7 +10630,8 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 deliveryMode: deliveryMode,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
             return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
@@ -10114,7 +10668,8 @@ class ThinkingProxy {
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                         deliveryMode: deliveryMode,
                         loopRetriesRemaining: loopRetriesRemaining,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                 }
                 return
@@ -10143,7 +10698,8 @@ class ThinkingProxy {
                         ),
                         deliveryMode: deliveryMode,
                         loopRetriesRemaining: loopRetriesRemaining,
-                        requestController: requestController
+                        requestController: requestController,
+                        requestTrace: requestTrace
                     )
                 }
                 return
@@ -10159,7 +10715,8 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
                 return
             }
@@ -10173,7 +10730,8 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
                 deliveryMode: deliveryMode,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
             return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
@@ -10207,7 +10765,8 @@ class ThinkingProxy {
                     exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
             }
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
@@ -10242,7 +10801,8 @@ class ThinkingProxy {
                         : exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
             }
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -10256,7 +10816,8 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey,
                 overridingHeaders: smartAliasResolutionHeaders(
                     publicAlias: publicAlias,
-                    resolvedRequestModel: requestModel
+                    resolvedRequestModel: requestModel,
+                    requestTrace: requestTrace
                 )
             )
         case .terminalError(_, let statusCode, let message, let telemetryEvent):
@@ -10268,7 +10829,8 @@ class ThinkingProxy {
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 message: message,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
             )
         }
     }
@@ -10286,14 +10848,16 @@ class ThinkingProxy {
         retryDelaySeconds: TimeInterval = 1,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
-        requestController: RequestCancellationController
+        requestController: RequestCancellationController,
+        requestTrace: RequestTraceContext
     ) {
         guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias) else {
             deliverBufferedError(
                 defaultConnection: originalConnection,
                 statusCode: 503,
                 message: "All configured worker backends are currently unavailable.",
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
             )
             return
         }
@@ -10316,7 +10880,8 @@ class ThinkingProxy {
                 defaultConnection: originalConnection,
                 statusCode: 503,
                 message: "All configured worker backends are currently unavailable.",
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
             )
             return
         }
@@ -10341,7 +10906,8 @@ class ThinkingProxy {
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
                 loopRetriesRemaining: loopRetriesRemaining - 1,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
         }
     }
@@ -10352,7 +10918,8 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         coalescingKey: String?,
         deliveryMode: SmartAliasDeliveryMode,
-        requestController: RequestCancellationController? = nil
+        requestController: RequestCancellationController? = nil,
+        requestTrace: RequestTraceContext? = nil
     ) {
         guard requestController?.isCancelled() != true else { return }
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
@@ -10366,7 +10933,8 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey,
                 overridingHeaders: smartAliasResolutionHeaders(
                     publicAlias: publicAlias,
-                    resolvedRequestModel: requestModel
+                    resolvedRequestModel: requestModel,
+                    requestTrace: requestTrace
                 )
             )
         case .terminalError(_, let statusCode, let message, _):
@@ -10374,7 +10942,8 @@ class ThinkingProxy {
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
                 message: message,
-                coalescingKey: coalescingKey
+                coalescingKey: coalescingKey,
+                overridingHeaders: requestTrace?.responseHeaders ?? [:]
             )
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
             guard requestController?.isCancelled() != true else { return }
@@ -10395,7 +10964,8 @@ class ThinkingProxy {
                 resolvedRequestModel: requestModel,
                 coalescingKey: coalescingKey,
                 deliveryMode: deliveryMode,
-                requestController: requestController
+                requestController: requestController,
+                requestTrace: requestTrace
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
             guard requestController?.isCancelled() != true else { return }
@@ -10416,6 +10986,7 @@ class ThinkingProxy {
                     message: quotaWindowErrorMessage(forRequestModel: publicAlias),
                     coalescingKey: coalescingKey,
                     overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 300)]
+                        .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
                 )
             } else if telemetryEvent.failureClass == "classified_429_overload" {
                 deliverBufferedError(
@@ -10424,6 +10995,7 @@ class ThinkingProxy {
                     message: overloadErrorMessage(forRequestModel: publicAlias),
                     coalescingKey: coalescingKey,
                     overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 1)]
+                        .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
                 )
             } else if telemetryEvent.failureClass == "classified_429" ||
                 telemetryEvent.failureClass == "classified_429_concurrency" ||
@@ -10434,6 +11006,7 @@ class ThinkingProxy {
                     message: concurrencyLimitErrorMessage(forRequestModel: publicAlias),
                     coalescingKey: coalescingKey,
                     overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 30)]
+                        .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
                 )
             } else if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
                upstreamStatus == 402 || upstreamStatus == 403 {
@@ -10444,13 +11017,15 @@ class ThinkingProxy {
                     message: "Rate limit exceeded. Please retry after 30 seconds.",
                     coalescingKey: coalescingKey,
                     overridingHeaders: ["Retry-After": "30"]
+                        .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
                 )
             } else {
                 deliverBufferedError(
                     defaultConnection: originalConnection,
                     statusCode: 503,
                     message: "All configured worker backends are currently unavailable.",
-                    coalescingKey: coalescingKey
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: requestTrace?.responseHeaders ?? [:]
                 )
             }
         }
@@ -10465,12 +11040,14 @@ class ThinkingProxy {
         resolvedRequestModel: String,
         coalescingKey: String?,
         deliveryMode: SmartAliasDeliveryMode,
-        requestController: RequestCancellationController? = nil
+        requestController: RequestCancellationController? = nil,
+        requestTrace: RequestTraceContext? = nil
     ) {
         guard requestController?.isCancelled() != true else { return }
         let overridingHeaders = smartAliasResolutionHeaders(
             publicAlias: publicAlias,
-            resolvedRequestModel: resolvedRequestModel
+            resolvedRequestModel: resolvedRequestModel,
+            requestTrace: requestTrace
         )
 
         switch deliveryMode {
@@ -11032,6 +11609,7 @@ class ThinkingProxy {
         deadlineAt: Date,
         coalescingKey: String?,
         controller: RequestCancellationController?,
+        requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
@@ -11067,7 +11645,11 @@ class ThinkingProxy {
                 source: telemetrySource,
                 firstByteLatencyMilliseconds: nil,
                 totalLatencyMilliseconds: nil,
-                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
+                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) },
+                proxyRequestID: requestTrace.proxyRequestID,
+                callerRequestID: requestTrace.callerRequestID,
+                callerSessionID: requestTrace.callerSessionID,
+                requestShape: requestTrace.requestShape
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -11105,6 +11687,7 @@ class ThinkingProxy {
                     bestEffortRepairedBodyData: nil,
                     coalescingKey: coalescingKey
                 ),
+                requestTrace: requestTrace,
                 completion: completion
             )
             return
@@ -11129,6 +11712,7 @@ class ThinkingProxy {
                 attemptLane: attemptLane,
                 inflightAtRequest: nil,
                 requiredToolParameters: requiredToolParameters,
+                requestTrace: requestTrace,
                 completion: completion
             )
             return
@@ -11176,6 +11760,7 @@ class ThinkingProxy {
                     attemptLane: attemptLane,
                     inflightAtRequest: permit.inflightAtRequest,
                     requiredToolParameters: requiredToolParameters,
+                    requestTrace: requestTrace,
                     completion: completion
                 )
             }
@@ -11207,6 +11792,7 @@ class ThinkingProxy {
                 attemptLane: attemptLane,
                 inflightAtRequest: permit.inflightAtRequest,
                 requiredToolParameters: requiredToolParameters,
+                requestTrace: requestTrace,
                 completion: completion
             )
         }
@@ -11228,6 +11814,7 @@ class ThinkingProxy {
         deadlineAt: Date,
         controller: RequestCancellationController?,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
+        requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
@@ -11266,7 +11853,11 @@ class ThinkingProxy {
                 source: telemetrySource,
                 firstByteLatencyMilliseconds: nil,
                 totalLatencyMilliseconds: nil,
-                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
+                inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) },
+                proxyRequestID: requestTrace.proxyRequestID,
+                callerRequestID: requestTrace.callerRequestID,
+                callerSessionID: requestTrace.callerSessionID,
+                requestShape: requestTrace.requestShape
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -11348,6 +11939,7 @@ class ThinkingProxy {
                         deadlineAt: deadlineAt,
                         controller: controller,
                         state: nextState,
+                        requestTrace: requestTrace,
                         completion: completion
                     )
                 }
@@ -11486,6 +12078,7 @@ class ThinkingProxy {
         attemptLane: Int,
         inflightAtRequest: Int? = nil,
         requiredToolParameters: [String: [String]]? = nil,
+        requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
@@ -11507,7 +12100,12 @@ class ThinkingProxy {
                     retryCount: 0,
                     source: telemetrySource,
                     firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
-                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
+                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                    inflightAtRequest: inflightAtRequest,
+                    proxyRequestID: requestTrace.proxyRequestID,
+                    callerRequestID: requestTrace.callerRequestID,
+                    callerSessionID: requestTrace.callerSessionID,
+                    requestShape: requestTrace.requestShape
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -11540,7 +12138,12 @@ class ThinkingProxy {
                     retryCount: 0,
                     source: telemetrySource,
                     firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
-                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
+                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                    inflightAtRequest: inflightAtRequest,
+                    proxyRequestID: requestTrace.proxyRequestID,
+                    callerRequestID: requestTrace.callerRequestID,
+                    callerSessionID: requestTrace.callerSessionID,
+                    requestShape: requestTrace.requestShape
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -11585,7 +12188,11 @@ class ThinkingProxy {
                 source: telemetrySource,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
-                inflightAtRequest: inflightAtRequest
+                inflightAtRequest: inflightAtRequest,
+                proxyRequestID: requestTrace.proxyRequestID,
+                callerRequestID: requestTrace.callerRequestID,
+                callerSessionID: requestTrace.callerSessionID,
+                requestShape: requestTrace.requestShape
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -12010,7 +12617,8 @@ class ThinkingProxy {
         body: String,
         candidateModel: String,
         endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
-        originalConnection: NWConnection
+        originalConnection: NWConnection,
+        requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController)
@@ -12026,7 +12634,8 @@ class ThinkingProxy {
                 forcedUpstreamStatus: 429,
                 inflightAtRequest: OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel).map {
                     OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey)
-                }
+                },
+                requestTrace: requestTrace
             )
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: candidateModel,
@@ -12035,7 +12644,8 @@ class ThinkingProxy {
             )
             var limitHeaders = smartAliasResolutionHeaders(
                 publicAlias: candidateModel,
-                resolvedRequestModel: candidateModel
+                resolvedRequestModel: candidateModel,
+                requestTrace: requestTrace
             )
             limitHeaders["Retry-After"] = "1"
             sendError(
@@ -12064,7 +12674,8 @@ class ThinkingProxy {
                 path: path,
                 requestModel: candidateModel,
                 bufferedResponse: bufferedResponse,
-                inflightAtRequest: permit.inflightAtRequest
+                inflightAtRequest: permit.inflightAtRequest,
+                requestTrace: requestTrace
             )
             if telemetryEvaluation.shouldRecordFailure {
                 if let response = bufferedResponse.response {
@@ -12105,13 +12716,19 @@ class ThinkingProxy {
                 self.sendError(
                     to: originalConnection,
                     statusCode: statusCode,
-                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway"
+                    message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway",
+                    overridingHeaders: requestTrace.responseHeaders
                 )
                 return
             }
             guard let response = bufferedResponse.response,
                   let data = bufferedResponse.data else {
-                self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
+                self.sendError(
+                    to: originalConnection,
+                    statusCode: 502,
+                    message: "Bad Gateway",
+                    overridingHeaders: requestTrace.responseHeaders
+                )
                 return
             }
             var responseHeaders: [AnyHashable: Any] = [:]
@@ -12125,7 +12742,8 @@ class ThinkingProxy {
                 headers: responseHeaders,
                 body: data,
                 coalescingKey: nil,
-                overridingModel: overridingModel
+                overridingModel: overridingModel,
+                overridingHeaders: requestTrace.responseHeaders
             )
         }
         requestController.registerCurrentCancel {
@@ -12138,13 +12756,15 @@ class ThinkingProxy {
         path: String,
         body: String,
         publicModel: String,
-        originalConnection: NWConnection
+        originalConnection: NWConnection,
+        requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: publicModel,
-            resolvedRequestModel: publicModel
+            resolvedRequestModel: publicModel,
+            requestTrace: requestTrace
         )
         let bufferedResponse = executeMetaAIAdapterBufferedResponse(
             path: path,
@@ -12155,7 +12775,8 @@ class ThinkingProxy {
         let telemetryEvaluation = evaluateDirectBufferedRouteTelemetry(
             path: path,
             requestModel: publicModel,
-            bufferedResponse: bufferedResponse
+            bufferedResponse: bufferedResponse,
+            requestTrace: requestTrace
         )
         if telemetryEvaluation.shouldRecordFailure {
             if let deferredUntil = telemetryEvaluation.deferralUntil {
@@ -12268,7 +12889,8 @@ class ThinkingProxy {
         forcedFailureClass: String? = nil,
         forcedTransportOutcome: String? = nil,
         forcedUpstreamStatus: Int? = nil,
-        inflightAtRequest: Int? = nil
+        inflightAtRequest: Int? = nil,
+        requestTrace: RequestTraceContext? = nil
     ) -> (
         event: OpenAICompatTemporaryShim.RouteTelemetryEvent,
         shouldRecordSuccess: Bool,
@@ -12292,7 +12914,11 @@ class ThinkingProxy {
                 source: source,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
-                inflightAtRequest: inflightAtRequest
+                inflightAtRequest: inflightAtRequest,
+                proxyRequestID: requestTrace?.proxyRequestID,
+                callerRequestID: requestTrace?.callerRequestID,
+                callerSessionID: requestTrace?.callerSessionID,
+                requestShape: requestTrace?.requestShape
             )
             return (
                 event: event,
@@ -12324,7 +12950,11 @@ class ThinkingProxy {
                 source: source,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
-                inflightAtRequest: inflightAtRequest
+                inflightAtRequest: inflightAtRequest,
+                proxyRequestID: requestTrace?.proxyRequestID,
+                callerRequestID: requestTrace?.callerRequestID,
+                callerSessionID: requestTrace?.callerSessionID,
+                requestShape: requestTrace?.requestShape
             )
             return (
                 event: event,
@@ -12349,7 +12979,11 @@ class ThinkingProxy {
                 source: source,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
-                inflightAtRequest: inflightAtRequest
+                inflightAtRequest: inflightAtRequest,
+                proxyRequestID: requestTrace?.proxyRequestID,
+                callerRequestID: requestTrace?.callerRequestID,
+                callerSessionID: requestTrace?.callerSessionID,
+                requestShape: requestTrace?.requestShape
             )
             return (
                 event: event,
@@ -12505,6 +13139,7 @@ class ThinkingProxy {
         connection: NWConnection
     ) -> Bool {
         nvidiaInflightQueue.sync {
+            evictExpiredCoalescedReplaysLocked()
             if inflightCoalescedRequests[key] != nil {
                 inflightCoalescedRequests[key, default: []].append(connection)
                 return false
@@ -12514,8 +13149,112 @@ class ThinkingProxy {
         }
     }
 
+    private func evictExpiredCoalescedReplaysLocked(now: Date = Date()) {
+        recentCoalescedReplays = recentCoalescedReplays.filter { $0.value.expiresAt > now }
+    }
+
+    private func replayCompletedCoalescedRequestIfAvailable(
+        key: String,
+        connection: NWConnection
+    ) -> Bool {
+        let replayEntry = nvidiaInflightQueue.sync { () -> CoalescedReplayEntry? in
+            evictExpiredCoalescedReplaysLocked()
+            guard let entry = recentCoalescedReplays[key], !entry.isExpired else {
+                recentCoalescedReplays.removeValue(forKey: key)
+                return nil
+            }
+            return entry
+        }
+
+        guard let replayEntry else {
+            return false
+        }
+
+        switch replayEntry.payload {
+        case .http(let statusCode, let headers, let body, let overridingHeaders):
+            sendHTTPResponse(
+                to: connection,
+                statusCode: statusCode,
+                headers: headers,
+                body: body,
+                overridingHeaders: overridingHeaders
+            )
+        case .error(let statusCode, let message, let overridingHeaders):
+            sendError(
+                to: connection,
+                statusCode: statusCode,
+                message: message,
+                overridingHeaders: overridingHeaders
+            )
+        }
+        return true
+    }
+
+    private func rememberCompletedCoalescedHTTPResponse(
+        key: String,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        body: Data,
+        overridingHeaders: [String: String]
+    ) {
+        nvidiaInflightQueue.sync {
+            evictExpiredCoalescedReplaysLocked()
+            recentCoalescedReplays[key] = CoalescedReplayEntry(
+                expiresAt: Date().addingTimeInterval(coalescedReplayWindow),
+                payload: .http(
+                    statusCode: statusCode,
+                    headers: headers,
+                    body: body,
+                    overridingHeaders: overridingHeaders
+                )
+            )
+        }
+    }
+
+    private func rememberCompletedCoalescedError(
+        key: String,
+        statusCode: Int,
+        message: String,
+        overridingHeaders: [String: String]
+    ) {
+        nvidiaInflightQueue.sync {
+            evictExpiredCoalescedReplaysLocked()
+            recentCoalescedReplays[key] = CoalescedReplayEntry(
+                expiresAt: Date().addingTimeInterval(coalescedReplayWindow),
+                payload: .error(
+                    statusCode: statusCode,
+                    message: message,
+                    overridingHeaders: overridingHeaders
+                )
+            )
+        }
+    }
+
     func registerOrJoinInflightRequestForTesting(key: String, connection: NWConnection) -> Bool {
         registerOrJoinInflightRequest(key: key, connection: connection)
+    }
+
+    func rememberCompletedCoalescedHTTPResponseForTesting(
+        key: String,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        body: Data,
+        overridingHeaders: [String: String] = [:]
+    ) {
+        rememberCompletedCoalescedHTTPResponse(
+            key: key,
+            statusCode: statusCode,
+            headers: headers,
+            body: body,
+            overridingHeaders: overridingHeaders
+        )
+    }
+
+    func replayCompletedCoalescedRequestIfAvailableForTesting(
+        key: String,
+        connection: NWConnection
+    ) -> Bool {
+        replayCompletedCoalescedRequestIfAvailable(key: key, connection: connection)
     }
 
     func inflightRequestWaiterCount(for key: String) -> Int {
@@ -12550,6 +13289,15 @@ class ThinkingProxy {
             overridingModelWith: overridingModel,
             statusCode: statusCode
         ) ?? body
+        if let coalescingKey {
+            rememberCompletedCoalescedHTTPResponse(
+                key: coalescingKey,
+                statusCode: statusCode,
+                headers: headers,
+                body: deliveredBody,
+                overridingHeaders: overridingHeaders
+            )
+        }
         let connections = takeInflightRequestConnections(for: coalescingKey) ?? [defaultConnection]
         for connection in connections {
             sendHTTPResponse(
@@ -12564,12 +13312,18 @@ class ThinkingProxy {
 
     private func smartAliasResolutionHeaders(
         publicAlias: String,
-        resolvedRequestModel: String
+        resolvedRequestModel: String,
+        requestTrace: RequestTraceContext? = nil
     ) -> [String: String] {
         var headers: [String: String] = [
             "X-Public-Model": publicAlias,
             "X-Resolved-Model": resolvedRequestModel
         ]
+        if let requestTrace {
+            for (name, value) in requestTrace.responseHeaders {
+                headers[name] = value
+            }
+        }
         if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: resolvedRequestModel) {
             headers["X-Resolved-Provider"] = route.providerID
             headers["X-Resolved-Canonical-Model"] = route.canonicalModelID
@@ -12618,6 +13372,14 @@ class ThinkingProxy {
         coalescingKey: String?,
         overridingHeaders: [String: String] = [:]
     ) {
+        if let coalescingKey {
+            rememberCompletedCoalescedError(
+                key: coalescingKey,
+                statusCode: statusCode,
+                message: message,
+                overridingHeaders: overridingHeaders
+            )
+        }
         let connections = takeInflightRequestConnections(for: coalescingKey) ?? [defaultConnection]
         for connection in connections {
             sendError(
@@ -12886,6 +13648,7 @@ class ThinkingProxy {
         headers: [(String, String)],
         body: String,
         originalConnection: NWConnection,
+        requestTrace: RequestTraceContext,
         state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
         let coordinator = NVIDIAAttemptCoordinator()
@@ -12908,7 +13671,8 @@ class ThinkingProxy {
             coordinator: coordinator,
             requestController: requestController,
             attemptLane: 1,
-            hedgeEligible: hedgeEligible
+            hedgeEligible: hedgeEligible,
+            requestTrace: requestTrace
         )
     }
 
@@ -12922,7 +13686,8 @@ class ThinkingProxy {
         coordinator: NVIDIAAttemptCoordinator,
         requestController: RequestCancellationController,
         attemptLane: Int,
-        hedgeEligible: Bool
+        hedgeEligible: Bool,
+        requestTrace: RequestTraceContext
     ) {
         guard requestController.isCancelled() != true else { return }
         guard !coordinator.isFinished() else { return }
@@ -12951,7 +13716,8 @@ class ThinkingProxy {
                     coordinator: coordinator,
                     requestController: requestController,
                     attemptLane: attemptLane,
-                    hedgeEligible: hedgeEligible
+                    hedgeEligible: hedgeEligible,
+                    requestTrace: requestTrace
                 )
             }
             return
@@ -13028,7 +13794,8 @@ class ThinkingProxy {
                         coordinator: coordinator,
                         requestController: requestController,
                         attemptLane: 2,
-                        hedgeEligible: false
+                        hedgeEligible: false,
+                        requestTrace: requestTrace
                     )
                     return
                 }
@@ -13043,7 +13810,8 @@ class ThinkingProxy {
                     coordinator: coordinator,
                     requestController: requestController,
                     attemptLane: attemptLane,
-                    hedgeEligible: hedgeEligible
+                    hedgeEligible: hedgeEligible,
+                    requestTrace: requestTrace
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -13151,7 +13919,8 @@ self.forwardNvidiaReasoningRequestWithRetry(
                     coordinator: coordinator,
                     requestController: requestController,
                     attemptLane: 2,
-                    hedgeEligible: false
+                    hedgeEligible: false,
+                    requestTrace: requestTrace
                 )
             }
         }
@@ -13438,7 +14207,8 @@ self.forwardNvidiaReasoningRequestWithRetry(
         coordinator: NVIDIAAttemptCoordinator,
         requestController: RequestCancellationController,
         attemptLane: Int,
-        hedgeEligible: Bool
+        hedgeEligible: Bool,
+        requestTrace: RequestTraceContext
     ) {
         let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
         requestController.scheduleRetry(after: delay) { [weak self] in
@@ -13453,7 +14223,8 @@ self.forwardNvidiaReasoningRequestWithRetry(
                 coordinator: coordinator,
                 requestController: requestController,
                 attemptLane: attemptLane,
-                hedgeEligible: hedgeEligible
+                hedgeEligible: hedgeEligible,
+                requestTrace: requestTrace
             )
         }
     }
@@ -14050,12 +14821,61 @@ self.forwardNvidiaReasoningRequestWithRetry(
                     "failure_score": state.failureScore,
                     "recovery_successes": state.recoverySuccesses
                 ]
+                if let lastSuccessAt = state.lastSuccessAt {
+                    routePayload["last_success_at"] = ISO8601DateFormatter().string(from: lastSuccessAt)
+                }
+                if let lastSuccessRequestID = state.lastSuccessRequestID {
+                    routePayload["last_success_request_id"] = lastSuccessRequestID
+                }
+                if let lastFailureAt = state.lastFailureAt {
+                    routePayload["last_failure_at"] = ISO8601DateFormatter().string(from: lastFailureAt)
+                }
+                if let lastFailureClass = state.lastFailureClass {
+                    routePayload["last_failure_class"] = lastFailureClass
+                }
+                if let lastEvent = state.lastTelemetryEvent {
+                    routePayload["last_event"] = [
+                        "timestamp": ISO8601DateFormatter().string(from: lastEvent.timestamp),
+                        "request_model": lastEvent.requestModel,
+                        "failure_class": lastEvent.failureClass as Any,
+                        "transport_outcome": lastEvent.transportOutcome,
+                        "upstream_http_status": lastEvent.upstreamHTTPStatus as Any,
+                        "proxy_request_id": lastEvent.proxyRequestID as Any,
+                        "caller_request_id": lastEvent.callerRequestID as Any,
+                        "caller_session_id": lastEvent.callerSessionID as Any,
+                        "request_shape": lastEvent.requestShape as Any
+                    ]
+                }
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
                     routePayload["provider"] = route.providerID
                     routePayload["canonical_model_id"] = route.canonicalModelID
                     routePayload["route_health_key"] = route.routeHealthKey
                     routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: route.routeHealthKey)
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
+                }
+                if let cooldownUntil = OpenAICompatTemporaryShim.routeCooldownUntil(forRequestModel: requestModel) {
+                    routePayload["cooldown_until"] = ISO8601DateFormatter().string(from: cooldownUntil)
+                }
+                if let latencyDiagnostics = OpenAICompatTemporaryShim.latencyDiagnostics(forRequestModel: requestModel) {
+                    routePayload["latency_pressure_status"] = latencyDiagnostics.pressureStatus
+                    if let averageFirstByte = latencyDiagnostics.averageFirstByteLatencyMilliseconds {
+                        routePayload["recent_average_first_byte_latency_ms"] = averageFirstByte
+                    }
+                    if let p95FirstByte = latencyDiagnostics.p95FirstByteLatencyMilliseconds {
+                        routePayload["recent_p95_first_byte_latency_ms"] = p95FirstByte
+                    }
+                    if let averageTotal = latencyDiagnostics.averageTotalLatencyMilliseconds {
+                        routePayload["recent_average_total_latency_ms"] = averageTotal
+                    }
+                    if let p95Total = latencyDiagnostics.p95TotalLatencyMilliseconds {
+                        routePayload["recent_p95_total_latency_ms"] = p95Total
+                    }
+                    if let slowFirstByte = latencyDiagnostics.slowFirstByteThresholdMilliseconds {
+                        routePayload["slow_first_byte_threshold_ms"] = slowFirstByte
+                    }
+                    if let slowTotal = latencyDiagnostics.slowTotalThresholdMilliseconds {
+                        routePayload["slow_total_threshold_ms"] = slowTotal
+                    }
                 }
                 result[requestModel] = routePayload
             }
@@ -14092,6 +14912,38 @@ self.forwardNvidiaReasoningRequestWithRetry(
             headers["X-VibeProxy-Config-Fingerprint"] = mergedConfigFingerprint
         }
         return headers
+    }
+
+    private func requestShapeDescriptor(method: String, path: String, body: String) -> String {
+        guard let jsonData = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+            return "\(method):\(path):opaque"
+        }
+
+        let model = (json["model"] as? String) ?? "unknown"
+        let stream = (json["stream"] as? Bool) == true ? "stream" : "buffered"
+        let toolsCount = (json["tools"] as? [Any])?.count ?? 0
+        let strictToolChoice = OpenAICompatTemporaryShim.hasStrictToolChoice(in: json) ? "strict_tool_choice" : "tool_choice_auto"
+        let typedContent = OpenAICompatTemporaryShim.containsUnsupportedTypedMessageContent(in: json) ? "typed_content" : "string_content"
+        let surface = OpenAICompatTemporaryShim.isResponsesPath(path) ? "responses" : (OpenAICompatTemporaryShim.isChatCompletionsPath(path) ? "chat" : "other")
+        return "\(method):\(surface):\(model):\(stream):tools=\(toolsCount):\(strictToolChoice):\(typedContent)"
+    }
+
+    private func requestTraceContext(
+        method: String,
+        path: String,
+        headers: [(String, String)],
+        body: String
+    ) -> RequestTraceContext {
+        RequestTraceContext(
+            proxyRequestID: UUID().uuidString,
+            callerRequestID: requestHeaderValue("X-Request-ID", in: headers)
+                ?? requestHeaderValue("X-Client-Request-ID", in: headers),
+            callerSessionID: requestHeaderValue("X-Session-ID", in: headers)
+                ?? requestHeaderValue("X-Factory-Session-ID", in: headers)
+                ?? requestHeaderValue("X-Droid-Session-ID", in: headers),
+            requestShape: requestShapeDescriptor(method: method, path: path, body: body)
+        )
     }
 
     private func runtimeProvenance() -> RuntimeProvenance {
@@ -14171,6 +15023,12 @@ self.forwardNvidiaReasoningRequestWithRetry(
         if let effectiveRouteProvider = contract.effectiveRouteProvider {
             dict["effective_route_provider"] = effectiveRouteProvider
         }
+        if let latencyDiagnostics = OpenAICompatTemporaryShim.latencyDiagnostics(forRequestModel: contract.effectiveRouteModel) {
+            dict["effective_route_latency_pressure_status"] = latencyDiagnostics.pressureStatus
+            if let p95Total = latencyDiagnostics.p95TotalLatencyMilliseconds {
+                dict["effective_route_recent_p95_total_latency_ms"] = p95Total
+            }
+        }
         if let bindings = Self.factoryModelBindings()?.bindingsByIncomingModelID.values {
             let workerBindings = bindings.filter {
                 $0.authoritativeModelID == contract.workerModelID &&
@@ -14235,6 +15093,12 @@ self.forwardNvidiaReasoningRequestWithRetry(
         }
         if let effectiveRouteProvider = contract.effectiveRouteProvider {
             dict["effective_route_provider"] = effectiveRouteProvider
+        }
+        if let latencyDiagnostics = OpenAICompatTemporaryShim.latencyDiagnostics(forRequestModel: contract.effectiveRouteModel) {
+            dict["effective_route_latency_pressure_status"] = latencyDiagnostics.pressureStatus
+            if let p95Total = latencyDiagnostics.p95TotalLatencyMilliseconds {
+                dict["effective_route_recent_p95_total_latency_ms"] = p95Total
+            }
         }
         if let displayName = contract.displayName {
             dict["display_name"] = displayName
