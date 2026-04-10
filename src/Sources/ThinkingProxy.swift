@@ -4535,8 +4535,8 @@ enum OpenAICompatTemporaryShim {
         let type = (dictionary["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
-        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json" || type == "reasoning" || type == "metadata_marker"
 
         if let textValue = normalizedTextMessageScalar(dictionary["text"]),
            allowsDirectText {
@@ -6201,8 +6201,8 @@ enum MetaAIWebAdapter {
         }
 
         let type = normalizedString(dictionary["type"] as? String)?.lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
-        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json" || type == "reasoning" || type == "metadata_marker"
         if let text = normalizedContentText(dictionary["text"]),
            allowsDirectText {
             return text
@@ -7845,19 +7845,22 @@ class ThinkingProxy {
         let error: Error?
         let firstByteLatencyMilliseconds: Int?
         let totalLatencyMilliseconds: Int?
+        let deadlineStage: OpenAICompatTemporaryShim.DeadlineStage
 
         init(
             data: Data?,
             response: HTTPURLResponse?,
             error: Error?,
             firstByteLatencyMilliseconds: Int? = nil,
-            totalLatencyMilliseconds: Int? = nil
+            totalLatencyMilliseconds: Int? = nil,
+            deadlineStage: OpenAICompatTemporaryShim.DeadlineStage = .none
         ) {
             self.data = data
             self.response = response
             self.error = error
             self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
             self.totalLatencyMilliseconds = totalLatencyMilliseconds
+            self.deadlineStage = deadlineStage
         }
     }
 
@@ -11236,7 +11239,7 @@ class ThinkingProxy {
                 data: bufferedResponse.data,
                 response: bufferedResponse.response,
                 error: bufferedResponse.error,
-                deadlineStage: .none,
+                deadlineStage: bufferedResponse.deadlineStage,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
             )
@@ -11437,7 +11440,7 @@ class ThinkingProxy {
                     attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: transportFailureClass(error),
-                    timeoutStage: .none,
+                    timeoutStage: bufferedResponse.deadlineStage,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
                     source: telemetrySource,
@@ -11470,7 +11473,7 @@ class ThinkingProxy {
                     attemptLane: attemptLane,
                     failoverDepth: failoverDepth,
                     failureClass: "missing_response_material",
-                    timeoutStage: .none,
+                    timeoutStage: bufferedResponse.deadlineStage,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
                     source: telemetrySource,
@@ -11513,12 +11516,13 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 finalWinnerRequestModel: (!shouldFailover && statusCode >= 200 && statusCode < 300) ? candidateModel : nil,
                 failureClass: failureClass,
-                timeoutStage: .none,
+                timeoutStage: bufferedResponse.deadlineStage,
                 upstreamHTTPStatus: statusCode,
                 retryCount: 0,
                 source: telemetrySource,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                inflightAtRequest: inflightAtRequest
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -11803,7 +11807,8 @@ class ThinkingProxy {
                     response: response as? HTTPURLResponse,
                     error: error,
                     firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
+                    deadlineStage: responseProgress.currentDeadlineStage()
                 )
             )
             session.finishTasksAndInvalidate()
@@ -11910,7 +11915,8 @@ class ThinkingProxy {
                     response: response as? HTTPURLResponse,
                     error: error,
                     firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds()
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
+                    deadlineStage: responseProgress.currentDeadlineStage()
                 )
             )
         }
@@ -11947,6 +11953,22 @@ class ThinkingProxy {
         let timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: candidateModel) else {
+            let telemetryEvaluation = evaluateDirectBufferedRouteTelemetry(
+                path: path,
+                requestModel: candidateModel,
+                bufferedResponse: BufferedProxyResponse(data: nil, response: nil, error: nil),
+                forcedFailureClass: "classified_429_concurrency",
+                forcedTransportOutcome: "send_error",
+                forcedUpstreamStatus: 429,
+                inflightAtRequest: OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel).map {
+                    OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey)
+                }
+            )
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: candidateModel,
+                telemetryEvent: telemetryEvaluation.event,
+                forcedOpenUntil: telemetryEvaluation.forcedOpenUntil
+            )
             var limitHeaders = smartAliasResolutionHeaders(
                 publicAlias: candidateModel,
                 resolvedRequestModel: candidateModel
@@ -11974,6 +11996,45 @@ class ThinkingProxy {
             permit.release()
             guard let self else { return }
             guard requestController.isCancelled() != true else { return }
+            let telemetryEvaluation = self.evaluateDirectBufferedRouteTelemetry(
+                path: path,
+                requestModel: candidateModel,
+                bufferedResponse: bufferedResponse,
+                inflightAtRequest: permit.inflightAtRequest
+            )
+            if telemetryEvaluation.shouldRecordFailure {
+                if let response = bufferedResponse.response {
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
+                        routeHealthKey: permit.routeHealthKey,
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: response.statusCode,
+                        headers: response.allHeaderFields,
+                        bodyData: bufferedResponse.data
+                    )
+                }
+                if let deferredUntil = telemetryEvaluation.deferralUntil {
+                    OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                        forRequestModel: candidateModel,
+                        until: deferredUntil
+                    )
+                }
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: candidateModel,
+                    telemetryEvent: telemetryEvaluation.event,
+                    forcedOpenUntil: telemetryEvaluation.forcedOpenUntil
+                )
+            } else if telemetryEvaluation.shouldRecordSuccess {
+                OpenAICompatTemporaryShim.recordConcurrencySuccess(
+                    routeHealthKey: permit.routeHealthKey,
+                    inflightAtRequest: permit.inflightAtRequest
+                )
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: candidateModel,
+                    telemetryEvent: telemetryEvaluation.event
+                )
+            } else {
+                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvaluation.event)
+            }
             if let error = bufferedResponse.error {
                 let nsError = error as NSError
                 let statusCode = (nsError.domain == NSURLErrorDomain && nsError.code == URLError.timedOut.rawValue) ? 504 : 502
@@ -12027,6 +12088,31 @@ class ThinkingProxy {
             publicModel: publicModel
         )
         guard requestController.isCancelled() != true else { return }
+        let telemetryEvaluation = evaluateDirectBufferedRouteTelemetry(
+            path: path,
+            requestModel: publicModel,
+            bufferedResponse: bufferedResponse
+        )
+        if telemetryEvaluation.shouldRecordFailure {
+            if let deferredUntil = telemetryEvaluation.deferralUntil {
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: publicModel,
+                    until: deferredUntil
+                )
+            }
+            OpenAICompatTemporaryShim.recordRouteFailure(
+                forRequestModel: publicModel,
+                telemetryEvent: telemetryEvaluation.event,
+                forcedOpenUntil: telemetryEvaluation.forcedOpenUntil
+            )
+        } else if telemetryEvaluation.shouldRecordSuccess {
+            OpenAICompatTemporaryShim.recordRouteSuccess(
+                forRequestModel: publicModel,
+                telemetryEvent: telemetryEvaluation.event
+            )
+        } else {
+            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvaluation.event)
+        }
         if let response = bufferedResponse.response,
            (200 ..< 300).contains(response.statusCode) {
             sendHTTPResponse(
@@ -12108,6 +12194,151 @@ class ThinkingProxy {
                 totalLatencyMilliseconds: elapsed
             )
         }
+    }
+
+    private func evaluateDirectBufferedRouteTelemetry(
+        path: String,
+        requestModel: String,
+        bufferedResponse: BufferedProxyResponse,
+        source: String = "live_request",
+        forcedFailureClass: String? = nil,
+        forcedTransportOutcome: String? = nil,
+        forcedUpstreamStatus: Int? = nil,
+        inflightAtRequest: Int? = nil
+    ) -> (
+        event: OpenAICompatTemporaryShim.RouteTelemetryEvent,
+        shouldRecordSuccess: Bool,
+        shouldRecordFailure: Bool,
+        forcedOpenUntil: Date?,
+        deferralUntil: Date?
+    ) {
+        let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel)
+        let canonicalModelID = route?.canonicalModelID ?? requestModel
+
+        if let forcedFailureClass {
+            let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: requestModel,
+                canonicalModelID: canonicalModelID,
+                transportOutcome: forcedTransportOutcome ?? "send_error",
+                failureClass: forcedFailureClass,
+                timeoutStage: bufferedResponse.deadlineStage,
+                upstreamHTTPStatus: forcedUpstreamStatus,
+                retryCount: 0,
+                source: source,
+                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                inflightAtRequest: inflightAtRequest
+            )
+            return (
+                event: event,
+                shouldRecordSuccess: false,
+                shouldRecordFailure: true,
+                forcedOpenUntil: OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                    failureClass: forcedFailureClass,
+                    statusCode: forcedUpstreamStatus ?? 429,
+                    headers: [:]
+                ),
+                deferralUntil: OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                    failureClass: forcedFailureClass,
+                    statusCode: forcedUpstreamStatus ?? 429,
+                    headers: [:]
+                )
+            )
+        }
+
+        if let error = bufferedResponse.error {
+            let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: requestModel,
+                canonicalModelID: canonicalModelID,
+                transportOutcome: "send_error",
+                failureClass: transportFailureClass(error),
+                timeoutStage: bufferedResponse.deadlineStage,
+                upstreamHTTPStatus: nil,
+                retryCount: 0,
+                source: source,
+                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                inflightAtRequest: inflightAtRequest
+            )
+            return (
+                event: event,
+                shouldRecordSuccess: false,
+                shouldRecordFailure: true,
+                forcedOpenUntil: nil,
+                deferralUntil: nil
+            )
+        }
+
+        guard let response = bufferedResponse.response,
+              let responseData = bufferedResponse.data else {
+            let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: requestModel,
+                canonicalModelID: canonicalModelID,
+                transportOutcome: "send_error",
+                failureClass: "missing_response_material",
+                timeoutStage: bufferedResponse.deadlineStage,
+                upstreamHTTPStatus: nil,
+                retryCount: 0,
+                source: source,
+                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+                inflightAtRequest: inflightAtRequest
+            )
+            return (
+                event: event,
+                shouldRecordSuccess: false,
+                shouldRecordFailure: true,
+                forcedOpenUntil: nil,
+                deferralUntil: nil
+            )
+        }
+
+        let classification = classifySmartAliasCandidateFailure(
+            statusCode: response.statusCode,
+            headers: response.allHeaderFields,
+            bodyData: responseData,
+            path: path
+        )
+        let shouldRecordSuccess = !classification.shouldFailover && (200 ..< 300).contains(response.statusCode)
+        let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+            timestamp: Date(),
+            requestModel: requestModel,
+            canonicalModelID: canonicalModelID,
+            transportOutcome: shouldRecordSuccess ? "send_response" : "send_error",
+            finalWinnerRequestModel: shouldRecordSuccess ? requestModel : nil,
+            failureClass: classification.failureClass,
+            timeoutStage: bufferedResponse.deadlineStage,
+            upstreamHTTPStatus: response.statusCode,
+            retryCount: 0,
+            source: source,
+            firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+            totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
+            inflightAtRequest: inflightAtRequest
+        )
+        return (
+            event: event,
+            shouldRecordSuccess: shouldRecordSuccess,
+            shouldRecordFailure: classification.shouldFailover,
+            forcedOpenUntil: classification.shouldFailover
+                ? OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                    failureClass: classification.failureClass,
+                    statusCode: response.statusCode,
+                    headers: response.allHeaderFields,
+                    bodyData: responseData
+                )
+                : nil,
+            deferralUntil: classification.shouldFailover
+                ? OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                    failureClass: classification.failureClass,
+                    statusCode: response.statusCode,
+                    headers: response.allHeaderFields,
+                    bodyData: responseData
+                )
+                : nil
+        )
     }
 
     private func smartAliasCandidateTimeout(forRequestJSON jsonString: String, publicAlias: String? = nil, candidateModel: String? = nil) -> TimeInterval {
