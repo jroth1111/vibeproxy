@@ -1323,10 +1323,8 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        let canonicalCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
-        let extendedCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
-        let acceptedCandidates = [canonicalCandidates, extendedCandidates]
-        guard acceptedCandidates.contains(smartAlias.candidates),
+        let canonicalCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
+        guard smartAlias.candidates == canonicalCandidates,
               let primaryRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[0]),
               primaryRoute.providerID == "zai",
               primaryRoute.canonicalModelID == "glm-5.1",
@@ -1336,24 +1334,16 @@ enum OpenAICompatTemporaryShim {
               let fallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[2]),
               fallbackRoute.providerID == "ollama-pro",
               fallbackRoute.canonicalModelID == "minimax-m2.7",
-              let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[3]),
+              let metaRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[3]),
+              metaRoute.providerID == MetaAIWebAdapter.providerID,
+              metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias,
+              let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[4]),
               terminalFallbackRoute.providerID == "nvidia",
               terminalFallbackRoute.canonicalModelID == "z-ai/glm5" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
                 message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia."
             )
-        }
-
-        if smartAlias.candidates == extendedCandidates {
-            guard let metaRoute = resolveConfiguredRoute(forRequestModel: extendedCandidates[3]),
-                  metaRoute.providerID == MetaAIWebAdapter.providerID,
-                  metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias else {
-                return ClientFacingNVIDIAFailure(
-                    statusCode: 500,
-                    message: "The \(requestModel) pooled alias is misconfigured: muse-spark must resolve to the Meta AI web adapter."
-                )
-            }
         }
 
         return nil
@@ -7207,6 +7197,7 @@ class ThinkingProxy {
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
     var bufferedProxyCancelableTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
     var directProxiedTransportForTesting: ((URLRequest, OpenAICompatTemporaryShim.ProviderEndpoint, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
+    var metaAIBufferedResponseForTesting: ((String, String, String) -> BufferedProxyResponse)?
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
     var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
@@ -10233,60 +10224,21 @@ class ThinkingProxy {
         // The GraphQL adapter must handle it directly, not through HTTP proxy forwarding.
         if let candidateRoute = route,
            candidateRoute.providerID == MetaAIWebAdapter.providerID {
-            let startTime = Date()
-            switch MetaAIWebAdapter.execute(path: path, body: body, publicModel: candidateModel) {
-            case .success(let result):
-                let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-                let httpResponse = HTTPURLResponse(
-                    url: URL(string: "https://www.meta.ai/api/graphql")!,
-                    statusCode: result.statusCode,
-                    httpVersion: "HTTP/1.1",
-                    headerFields: result.headers
-                )
-                handleSmartAliasBufferedCandidateResult(
-                    BufferedProxyResponse(
-                        data: result.body,
-                        response: httpResponse,
-                        error: nil,
-                        firstByteLatencyMilliseconds: elapsed,
-                        totalLatencyMilliseconds: elapsed
-                    ),
-                    path: path,
-                    publicAlias: publicAlias,
-                    candidateModel: candidateModel,
-                    failoverDepth: failoverDepth,
-                    attemptLane: attemptLane,
-                    inflightAtRequest: nil,
-                    completion: completion
-                )
-            case .failure(let failure):
-                let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-                let httpResponse = HTTPURLResponse(
-                    url: URL(string: "https://www.meta.ai/api/graphql")!,
-                    statusCode: failure.statusCode,
-                    httpVersion: "HTTP/1.1",
-                    headerFields: ["Content-Type": "application/json"]
-                )
-                let errorBody = try? JSONSerialization.data(withJSONObject: [
-                    "error": ["message": failure.message, "type": "server_error", "code": "internal_server_error"]
-                ])
-                handleSmartAliasBufferedCandidateResult(
-                    BufferedProxyResponse(
-                        data: errorBody,
-                        response: httpResponse,
-                        error: nil,
-                        firstByteLatencyMilliseconds: elapsed,
-                        totalLatencyMilliseconds: elapsed
-                    ),
-                    path: path,
-                    publicAlias: publicAlias,
-                    candidateModel: candidateModel,
-                    failoverDepth: failoverDepth,
-                    attemptLane: attemptLane,
-                    inflightAtRequest: nil,
-                    completion: completion
-                )
-            }
+            let metaBufferedResponse = executeMetaAIAdapterBufferedResponse(
+                path: path,
+                body: body,
+                publicModel: candidateModel
+            )
+            handleSmartAliasBufferedCandidateResult(
+                metaBufferedResponse,
+                path: path,
+                publicAlias: publicAlias,
+                candidateModel: candidateModel,
+                failoverDepth: failoverDepth,
+                attemptLane: attemptLane,
+                inflightAtRequest: nil,
+                completion: completion
+            )
             return
         }
 
@@ -11188,21 +11140,90 @@ class ThinkingProxy {
             publicAlias: publicModel,
             resolvedRequestModel: publicModel
         )
-        switch MetaAIWebAdapter.execute(path: path, body: body, publicModel: publicModel) {
-        case .success(let executionResult):
+        let bufferedResponse = executeMetaAIAdapterBufferedResponse(
+            path: path,
+            body: body,
+            publicModel: publicModel
+        )
+        if let response = bufferedResponse.response,
+           (200 ..< 300).contains(response.statusCode) {
             sendHTTPResponse(
                 to: originalConnection,
-                statusCode: executionResult.statusCode,
-                headers: executionResult.headers,
-                body: executionResult.body,
+                statusCode: response.statusCode,
+                headers: response.allHeaderFields,
+                body: bufferedResponse.data ?? Data(),
                 overridingHeaders: resolutionHeaders
             )
+            return
+        }
+
+        let failureBody = bufferedResponse.data.flatMap { String(data: $0, encoding: .utf8) }
+        let failureMessage: String
+        if let failureBody,
+           let failureData = failureBody.data(using: .utf8),
+           let failureJSON = try? JSONSerialization.jsonObject(with: failureData) as? [String: Any],
+           let error = failureJSON["error"] as? [String: Any],
+           let message = (error["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !message.isEmpty {
+            failureMessage = message
+        } else if let failureBody = failureBody?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !failureBody.isEmpty {
+            failureMessage = failureBody
+        } else {
+            failureMessage = "Meta web adapter failed while handling the request."
+        }
+        let statusCode = bufferedResponse.response?.statusCode ?? 502
+        sendError(
+            to: originalConnection,
+            statusCode: statusCode,
+            message: failureMessage,
+            overridingHeaders: resolutionHeaders
+        )
+    }
+
+    private func executeMetaAIAdapterBufferedResponse(
+        path: String,
+        body: String,
+        publicModel: String
+    ) -> BufferedProxyResponse {
+        if let metaAIBufferedResponseForTesting {
+            return metaAIBufferedResponseForTesting(path, body, publicModel)
+        }
+
+        let startTime = Date()
+        switch MetaAIWebAdapter.execute(path: path, body: body, publicModel: publicModel) {
+        case .success(let result):
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            let httpResponse = HTTPURLResponse(
+                url: URL(string: "https://www.meta.ai/api/graphql")!,
+                statusCode: result.statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: result.headers
+            )
+            return BufferedProxyResponse(
+                data: result.body,
+                response: httpResponse,
+                error: nil,
+                firstByteLatencyMilliseconds: elapsed,
+                totalLatencyMilliseconds: elapsed
+            )
         case .failure(let failure):
-            sendError(
-                to: originalConnection,
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            let httpResponse = HTTPURLResponse(
+                url: URL(string: "https://www.meta.ai/api/graphql")!,
                 statusCode: failure.statusCode,
-                message: failure.message,
-                overridingHeaders: resolutionHeaders
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )
+            let errorBody = try? JSONSerialization.data(withJSONObject: [
+                "error": ["message": failure.message, "type": "server_error", "code": "internal_server_error"]
+            ])
+            return BufferedProxyResponse(
+                data: errorBody,
+                response: httpResponse,
+                error: nil,
+                firstByteLatencyMilliseconds: elapsed,
+                totalLatencyMilliseconds: elapsed
             )
         }
     }

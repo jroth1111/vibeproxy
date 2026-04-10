@@ -1263,7 +1263,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
@@ -1282,7 +1282,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "glm-5.1 should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -1291,7 +1291,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "proxy-worker-smart-router should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "proxy-worker-smart-router should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -1328,7 +1328,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "tool-heavy glm-5.1 requests should keep the same worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "tool-heavy glm-5.1 requests should keep the same worker pool", recorder: recorder)
             }
         }
 
@@ -1358,7 +1358,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "tool-heavy proxy-worker-smart-router requests should keep the same worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "tool-heavy proxy-worker-smart-router requests should keep the same worker pool", recorder: recorder)
             }
         }
 
@@ -1425,7 +1425,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stickyCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
+                expectEqual(stickyCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
 
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "glm-5.1-ollama-pro",
@@ -1439,7 +1439,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "minimax-m2.7-ollama-pro", "glm5-nvidia", "glm-5.1-ollama-pro"], "tool-heavy worker requests should demote degraded siblings behind still-healthy fallbacks while preserving the healthy primary", recorder: recorder)
+                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "glm-5.1-ollama-pro"], "tool-heavy worker requests should demote degraded siblings behind still-healthy fallbacks while preserving the healthy primary", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -1703,7 +1703,7 @@ struct ThinkingProxyPolicySpec {
 
                     expectEqual(smartAlias?.requestClass, "plain-chat", "self-routed smart-router worker IDs should inherit the worker request class from proxy source of truth", recorder: recorder)
                     expectEqual(smartAlias?.failover, "silent", "self-routed smart-router worker IDs should inherit worker failover from proxy source of truth", recorder: recorder)
-                    expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
+                    expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
                 }
             }
         }
@@ -1730,7 +1730,7 @@ struct ThinkingProxyPolicySpec {
                         )!
                     )
 
-                    expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "tool-heavy self-routed smart-router requests should keep the same worker pool", recorder: recorder)
+                    expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "tool-heavy self-routed smart-router requests should keep the same worker pool", recorder: recorder)
                 }
             }
         }
@@ -5686,6 +5686,22 @@ struct ThinkingProxyPolicySpec {
                         )
                     )
                 }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    lock.lock()
+                    seenModels.append(publicModel)
+                    lock.unlock()
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("{\"error\":\"rate limited\"}".utf8),
+                        response: httpURLResponse(
+                            statusCode: 429,
+                            headerFields: [
+                                "Content-Type": "application/json",
+                                "Retry-After": "3600"
+                            ]
+                        ),
+                        error: nil
+                    )
+                }
                 proxy.deliveredErrorForTesting = { statusCode, message in
                     deliveredStatus = statusCode
                     deliveredMessage = message
@@ -5714,7 +5730,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should return one retryable 429 when every configured candidate is in a quota window", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream rate-limit window reached for worker; retry when the provider window resets.", "worker should emit the quota-window retry guidance after exhausting the pool", recorder: recorder)
             }
@@ -5827,6 +5843,16 @@ struct ThinkingProxyPolicySpec {
                         )
                     )
                 }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    lock.lock()
+                    seenModels.append(publicModel)
+                    lock.unlock()
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("{\"error\":\"busy\"}".utf8),
+                        response: httpURLResponse(statusCode: 429, headerFields: ["Retry-After": "0.1"]),
+                        error: nil
+                    )
+                }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
                     delivered.signal()
@@ -5857,7 +5883,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "worker should give the preferred primary one bounded retry, then advance through the rest of the pool instead of spinning indefinitely", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker should give the preferred primary one bounded retry, then advance through the rest of the pool instead of spinning indefinitely", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should surface a retryable concurrency error when every pool lane is saturated", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream concurrency limit reached for worker; retry shortly.", "worker should return the public worker concurrency guidance after exhausting the pool", recorder: recorder)
             }
@@ -7618,7 +7644,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let deferredUntil = Date().addingTimeInterval(30)
-                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"].forEach { requestModel in
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"].forEach { requestModel in
                         OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
                             forRequestModel: requestModel,
                             until: deferredUntil
@@ -7833,6 +7859,22 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                     }
+                    proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                        lock.lock()
+                        seenModels.append(publicModel)
+                        lock.unlock()
+                        return ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"rate limited\"}".utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "3600"
+                                ]
+                            ),
+                            error: nil
+                        )
+                    }
                     proxy.deliveredErrorForTesting = { statusCode, message in
                         deliveredStatus = statusCode
                         deliveredMessage = message
@@ -7859,7 +7901,7 @@ struct ThinkingProxyPolicySpec {
                         return
                     }
 
-                    expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
+                    expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
                     expectEqual(deliveredStatus, 429, "shared-pool saturation should surface as a retryable quota-window limit once every candidate is exhausted", recorder: recorder)
                     expectEqual(deliveredMessage, "Upstream rate-limit window reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry when the provider window resets.", "shared-pool saturation should preserve the caller-visible worker model identity in the retryable quota-window error", recorder: recorder)
 
@@ -8315,15 +8357,15 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("worker smart alias candidate ordering keeps z.ai glm primary ahead of the ollama sibling and minimax fallback", recorder: recorder) {
+        run("worker smart alias candidate ordering keeps muse-spark above the nvidia terminal fallback", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
                 let candidates = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
-                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -8333,7 +8375,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
-                let allCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "glm5-nvidia"]
+                let allCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
 
                 for candidate in allCandidates.dropLast() {
                     OpenAICompatTemporaryShim.forceOpenRouteForTesting(
@@ -8789,6 +8831,12 @@ private func workerMergedConfigYAML() -> String {
         "    name: z-ai/glm5",
         "  - alias: glm5-nvidia",
         "    name: z-ai/glm5",
+        "- name: meta-web",
+        "  api-key: test-meta-web-key",
+        "  base-url: https://www.meta.ai",
+        "  models:",
+        "  - alias: muse-spark",
+        "    name: muse-spark",
         "request-retry: 3",
         "smart-aliases:",
         "  worker:",
@@ -8798,6 +8846,7 @@ private func workerMergedConfigYAML() -> String {
         "    - glm-5.1-zai",
         "    - glm-5.1-ollama-pro",
         "    - minimax-m2.7-ollama-pro",
+        "    - muse-spark",
         "    - glm5-nvidia"
     ].joined(separator: "\n")
 }
