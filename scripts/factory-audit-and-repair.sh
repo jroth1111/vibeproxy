@@ -236,31 +236,7 @@ suspect_route_health_count="$(
   jq '[.[] | select(.status == "suspect" or .status == "open")] | length' <<<"$route_statuses_json"
 )"
 if [[ "$suspect_route_health_count" -gt 0 ]]; then
-  record_action "suspect_route_health_restart" "Detected $suspect_route_health_count suspect/open routes; restarting proxy to force a clean health reload."
-  kickstart_proxy || true
-  sleep 4
-  refresh_health || true
-  if [[ -f "$ROUTE_HEALTH_PATH" ]]; then
-    cp "$ROUTE_HEALTH_PATH" "$route_health_json"
-  else
-    printf '{"routes":{}}' >"$route_health_json"
-  fi
-  route_statuses_json="$(
-    jq '
-      (.routes // {})
-      | to_entries
-      | map({
-          route: .key,
-          status: (.value.status // null),
-          failure_score: (.value.failure_score // null),
-          timeout_count: (.value.rolling_metrics.timeout_count // null),
-          invalid_success_count: (.value.rolling_metrics.invalid_success_count // null)
-        })
-    ' "$route_health_json"
-  )"
-  suspect_route_health_count="$(
-    jq '[.[] | select(.status == "suspect" or .status == "open")] | length' <<<"$route_statuses_json"
-  )"
+  record_action "suspect_route_health_observed" "Detected $suspect_route_health_count suspect/open routes; preserving proxy runtime and reporting the degraded lanes instead of restarting a healthy proxy."
 fi
 
 # --- Codex token health ---

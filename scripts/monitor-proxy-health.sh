@@ -1,7 +1,9 @@
 #!/bin/bash
 #
 # Proxy Health Monitoring Script
-# Monitors VibeProxy (8317) and CLIProxyAPIPlus (8318) and auto-restarts if down
+# Monitors the frontend VibeProxy health surface (8317) and trusts that payload
+# for backend reachability, rather than probing the backend with a nonexistent
+# /healthz endpoint.
 #
 # Usage: ./monitor-proxy-health.sh [--daemon]
 #   --daemon: Run continuously in the background (default: check once and exit)
@@ -10,8 +12,10 @@
 
 set -euo pipefail
 
-PROXY_PORTS=(8317 8318)
-PROXY_NAMES=("VibeProxy" "CLIProxyAPIPlus")
+FRONTEND_PORT=8317
+PROXY_NAME="VibeProxy"
+LAUNCH_TARGET="gui/$(id -u)/com.vibeproxy.repo"
+INSTALLED_VIBEPROXY_AGENT_PLIST="${INSTALLED_VIBEPROXY_AGENT_PLIST:-$HOME/Library/LaunchAgents/com.vibeproxy.repo.plist}"
 LOG_FILE="${HOME}/Library/Logs/vibeproxy-health.log"
 CHECK_INTERVAL=60
 
@@ -19,76 +23,80 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-check_port() {
-    local port=$1
-    curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://127.0.0.1:${port}/healthz" 2>/dev/null || echo "000"
+check_frontend_health() {
+    local body_file
+    body_file="$(mktemp "${TMPDIR:-/tmp}/vibeproxy-monitor-health.XXXXXX")"
+    trap 'rm -f "$body_file"' RETURN
+
+    local http_code
+    http_code="$(curl -sS -o "$body_file" -w "%{http_code}" --connect-timeout 5 --max-time 10 "http://127.0.0.1:${FRONTEND_PORT}/healthz" 2>/dev/null || echo "000")"
+    if [[ "$http_code" != "200" ]]; then
+        echo "$http_code"
+        return 0
+    fi
+
+    if jq -e '
+        .status == "ok"
+        and .backend.reachable == true
+        and .factory_worker.ready == true
+        and .factory_roles.orchestration.ready == true
+        and .factory_roles.verification.ready == true
+    ' "$body_file" >/dev/null 2>&1; then
+        echo "200"
+    else
+        echo "503"
+    fi
 }
 
 restart_proxy() {
-    local name=$1
-    local pid
-    pid=$(pgrep -x "$name" 2>/dev/null | head -1)
-
-    if [[ -n "$pid" ]]; then
-        log "WARNING: $name appears to be running (PID $pid) but port is not responding"
-        log "Attempting to restart $name..."
-        kill "$pid" 2>/dev/null || true
-        sleep 2
-    fi
-
-    # Try to find and restart the app
-    local app_path
-    app_path="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/.build/debug/CLIProxyMenuBar"
-
-    if [[ -x "$app_path" ]]; then
-        log "Starting $name..."
-        nohup "$app_path" > /dev/null 2>&1 &
+    if launchctl print "$LAUNCH_TARGET" >/dev/null 2>&1; then
+        log "Restarting $PROXY_NAME via launchctl kickstart"
+        launchctl kickstart -k "$LAUNCH_TARGET"
         sleep 3
-    else
-        log "ERROR: Could not find executable to restart $name (looked at $app_path)"
-        return 1
+        return 0
     fi
+
+    if [[ -f "$INSTALLED_VIBEPROXY_AGENT_PLIST" ]]; then
+        log "Bootstrapping $PROXY_NAME launch agent from $INSTALLED_VIBEPROXY_AGENT_PLIST"
+        launchctl bootstrap "gui/$(id -u)" "$INSTALLED_VIBEPROXY_AGENT_PLIST" >/dev/null 2>&1 || true
+        launchctl kickstart -k "$LAUNCH_TARGET"
+        sleep 3
+        return 0
+    fi
+
+    log "ERROR: Could not find installed launch agent for $PROXY_NAME"
+    return 1
 }
 
 health_check() {
-    local all_healthy=true
-    
-    for i in "${!PROXY_PORTS[@]}"; do
-        local port=${PROXY_PORTS[$i]}
-        local name=${PROXY_NAMES[$i]}
-        local http_code
-        
-        http_code=$(check_port "$port")
-        
-        if [[ "$http_code" == "000" ]]; then
-            log "ERROR: $name (port $port) is DOWN (connection refused)"
-            all_healthy=false
-            
-            # Try restart (with rate limiting via timestamp file)
-            local restart_file="/tmp/vibeproxy-restart-${port}.lock"
-            local now cooldown_remaining
-            now=$(date +%s)
-            if [[ ! -f "$restart_file" ]] || \
-               (( now - $(cat "$restart_file" 2>/dev/null || echo 0) > 300 )); then
-                restart_proxy "$name" || true
-                echo "$now" > "$restart_file"
-            else
-                cooldown_remaining=$(( 300 - (now - $(cat "$restart_file")) ))
-                log "SKIP: Recent restart attempted for $name, cooldown ${cooldown_remaining}s remaining"
-            fi
-        elif [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-            log "OK: $name (port $port) responding with HTTP $http_code"
-        else
-            log "WARNING: $name (port $port) responding with HTTP $http_code (unexpected)"
-        fi
-    done
-    
-    if $all_healthy; then
+    local http_code
+    http_code=$(check_frontend_health)
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        log "OK: $PROXY_NAME (frontend port ${FRONTEND_PORT}) health surface is ready"
         log "All proxies healthy"
         return 0
-    else
-        return 1
     fi
+
+    if [[ "$http_code" == "000" ]]; then
+        log "ERROR: $PROXY_NAME frontend health endpoint is unreachable"
+    else
+        log "WARNING: $PROXY_NAME frontend health endpoint returned HTTP $http_code"
+    fi
+
+    local restart_file="/tmp/vibeproxy-restart-${FRONTEND_PORT}.lock"
+    local now cooldown_remaining
+    now=$(date +%s)
+    if [[ ! -f "$restart_file" ]] || \
+       (( now - $(cat "$restart_file" 2>/dev/null || echo 0) > 300 )); then
+        restart_proxy || true
+        echo "$now" > "$restart_file"
+    else
+        cooldown_remaining=$(( 300 - (now - $(cat "$restart_file")) ))
+        log "SKIP: Recent restart attempted for $PROXY_NAME, cooldown ${cooldown_remaining}s remaining"
+    fi
+
+    return 1
 }
 
 run_daemon() {
