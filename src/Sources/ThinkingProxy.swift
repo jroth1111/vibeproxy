@@ -655,6 +655,7 @@ enum OpenAICompatTemporaryShim {
     private static let repeatedConcurrency429Deferral: TimeInterval = 60
     private static let singleFlightConcurrency429Deferral: TimeInterval = 5
     private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 15
+    private static let retryableMetaAdapterDeferral: TimeInterval = 60
     private static let legacyRequestModelRewrites: [String: String] = [
         "glm-5": "glm-5.1",
         "glm-5-turbo": "glm-5.1"
@@ -1276,19 +1277,52 @@ enum OpenAICompatTemporaryShim {
         path: String,
         jsonString: String
     ) -> [String] {
-        guard metaBridgeShouldYieldToNativeToolLanes(
+        switch metaBridgeDispositionForWorkerRequest(
+        method: method,
+        path: path,
+        jsonString: jsonString
+        ) {
+        case .keep:
+            return candidateModels
+        case .deferToNative:
+            return moveCandidate(
+                MetaAIWebAdapter.modelAlias,
+                after: "glm5-nvidia",
+                in: candidateModels
+            )
+        case .exclude:
+            return candidateModels.filter { $0 != MetaAIWebAdapter.modelAlias }
+        }
+    }
+
+    private enum WorkerMetaBridgeDisposition {
+        case keep
+        case deferToNative
+        case exclude
+    }
+
+    private static func metaBridgeDispositionForWorkerRequest(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> WorkerMetaBridgeDisposition {
+        if MetaAIWebAdapter.preflightFailure(
+            path: path,
+            body: jsonString,
+            publicModel: MetaAIWebAdapter.modelAlias
+        ) != nil {
+            return .exclude
+        }
+
+        if metaBridgeShouldYieldToNativeToolLanes(
             method: method,
             path: path,
             jsonString: jsonString
-        ) else {
-            return candidateModels
+        ) {
+            return .deferToNative
         }
 
-        return moveCandidate(
-            MetaAIWebAdapter.modelAlias,
-            after: "glm5-nvidia",
-            in: candidateModels
-        )
+        return .keep
     }
 
     private static func metaBridgeShouldYieldToNativeToolLanes(
@@ -3332,6 +3366,56 @@ enum OpenAICompatTemporaryShim {
         case .quotaWindow(let cooldownUntil):
             return cooldownUntil
         }
+    }
+
+    static func smartAliasForcedOpenUntil(
+        failureClass: String?,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) -> Date? {
+        let providerCooldown = providerCooldownUntil(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        )
+
+        guard failureClass?.lowercased() == "classified_retryable_400_meta_adapter" else {
+            return providerCooldown
+        }
+
+        let metaAdapterCooldown = now.addingTimeInterval(retryableMetaAdapterDeferral)
+        guard let providerCooldown else {
+            return metaAdapterCooldown
+        }
+        return max(providerCooldown, metaAdapterCooldown)
+    }
+
+    static func smartAliasAvailabilityDeferralUntil(
+        failureClass: String?,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        bodyData: Data? = nil,
+        now: Date = Date()
+    ) -> Date? {
+        let providerDeferral = providerDeferralUntil(
+            statusCode: statusCode,
+            headers: headers,
+            bodyData: bodyData,
+            now: now
+        )
+
+        guard failureClass?.lowercased() == "classified_retryable_400_meta_adapter" else {
+            return providerDeferral
+        }
+
+        let metaAdapterDeferral = now.addingTimeInterval(retryableMetaAdapterDeferral)
+        guard let providerDeferral else {
+            return metaAdapterDeferral
+        }
+        return max(providerDeferral, metaAdapterDeferral)
     }
 
     static func failureClassFor429(
@@ -10622,12 +10706,14 @@ class ThinkingProxy {
                             headers: responseHeaders,
                             bodyData: responseBody
                     )
-                    let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
+                    let cooldownUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                        failureClass: telemetryEvent.failureClass,
                         statusCode: statusCode,
                         headers: responseHeaders,
                         bodyData: responseBody
                     )
-                    if let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                    if let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                        failureClass: telemetryEvent.failureClass,
                         statusCode: statusCode,
                         headers: responseHeaders,
                         bodyData: responseBody
@@ -10681,13 +10767,15 @@ class ThinkingProxy {
                     path: path
                 ).shouldFailover {
                     let cooldownUntil = attempt.response.map {
-                        OpenAICompatTemporaryShim.providerCooldownUntil(
+                        OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                            failureClass: telemetryEvent.failureClass,
                             statusCode: statusCode,
                             headers: $0.allHeaderFields
                         )
                     } ?? nil
                     if let response = attempt.response,
-                       let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+                       let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                        failureClass: telemetryEvent.failureClass,
                         statusCode: statusCode,
                         headers: response.allHeaderFields
                        ) {
@@ -10844,12 +10932,14 @@ class ThinkingProxy {
                     bodyData: responseData
                 )
             }
-            let cooldownUntil = OpenAICompatTemporaryShim.providerCooldownUntil(
+            let cooldownUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                failureClass: failureClass,
                 statusCode: statusCode,
                 headers: response.allHeaderFields,
                 bodyData: responseData
             )
-            if let deferredUntil = OpenAICompatTemporaryShim.providerDeferralUntil(
+            if let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                failureClass: failureClass,
                 statusCode: statusCode,
                 headers: response.allHeaderFields,
                 bodyData: responseData

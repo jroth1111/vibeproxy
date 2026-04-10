@@ -1548,6 +1548,88 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("meta-incompatible worker transcript shapes exclude muse-spark before candidate selection", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredError: String?
+                var seenModels: [String] = []
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    recorder.recordFailure("muse-spark should be excluded before selection for meta-incompatible transcript shapes, but attempted \(publicModel)")
+                    return ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil)
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"\(model)"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {"role": "system", "content": "You are a worker."},
+                            {"role": "assistant", "content": {"type": "tool_result", "text": "Already read the repo."}},
+                            {"role": "user", "content": "Return exactly: OK"}
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("meta-incompatible worker transcript shapes should still deliver through a later compatible lane")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "meta-incompatible worker transcript shapes should still succeed on a later compatible lane", recorder: recorder)
+                expectEqual(deliveredError, nil, "meta-incompatible worker transcript shapes should not surface a terminal error", recorder: recorder)
+                expectEqual(seenModels, ["glm5-nvidia"], "meta-incompatible worker transcript shapes should exclude muse-spark before attempting candidates", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("provider endpoint parsing captures per-provider proxy-url when set", recorder: recorder) {
             withMergedConfig(
                 [
@@ -6089,8 +6171,207 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenModels, ["muse-spark", "glm-5.1-ollama-pro"], "worker should fail over from muse-spark to the next remaining fallback after a retryable meta adapter 400", recorder: recorder)
                 expectEqual(deliveredBody?.contains("\"content\":\"OK\""), true, "worker should deliver the later fallback response after the meta adapter 400", recorder: recorder)
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["muse-spark"]?.status, .suspect, "retryable meta adapter 400s should penalize the muse-spark lane so it is deprioritized on later turns", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.status, .open, "retryable meta adapter 400s should temporarily open the muse-spark lane so repeated incompatible turns stop reselecting it immediately", recorder: recorder)
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.failureClass, "classified_retryable_400_meta_adapter", "route health should retain the retryable meta adapter failure class for diagnostics", recorder: recorder)
+                let deferralUntil = OpenAICompatTemporaryShim.routeAvailabilityDeferralUntilForTesting(requestModel: "muse-spark")
+                expectEqual(deferralUntil != nil, true, "retryable meta adapter 400s should create a short availability deferral for muse-spark", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary worker smart alias replays the observed 429 and meta-400 failure chain through to nvidia", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: String?
+                var deliveredError: String?
+                var seenModels: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    switch model {
+                    case "glm-5.1-zai", "glm-5.1-ollama-pro":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"message\":\"Too many concurrent requests\"}}".utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "1"
+                                ]
+                            ),
+                            error: nil
+                        ))
+                    case "minimax-m2.7-ollama-pro":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"message\":\"Quota window exhausted\"}}".utf8),
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "600"
+                                ]
+                            ),
+                            error: nil
+                        ))
+                    case "glm5-nvidia":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"glm5-nvidia"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        ))
+                    default:
+                        recorder.recordFailure("unexpected proxied candidate during replay chain: \(model)")
+                        completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
+                    }
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    seenModels.append(publicModel)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"error":{"message":"Meta web adapter synthetic tool mode required a tool call, but Meta returned plain text instead."}}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 400, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = String(data: body, encoding: .utf8)
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("observed retryable worker failure chain should still deliver a later nvidia success")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(
+                    seenModels,
+                    ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"],
+                    "the observed worker failure mix should perform the bounded ZAI concurrency retry, then traverse the fallback chain before landing on nvidia",
+                    recorder: recorder
+                )
+                expectEqual(deliveredStatus, 200, "observed retryable worker failure chains should not surface a terminal error when nvidia later succeeds", recorder: recorder)
+                expectEqual(deliveredError, nil, "observed retryable worker failure chains should fail over silently", recorder: recorder)
+                expectEqual(deliveredBody?.contains("\"content\":\"OK\""), true, "the replay chain should deliver the later nvidia success body", recorder: recorder)
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["muse-spark"]?.status, .open, "the replayed meta adapter failure should temporarily open muse-spark", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("temporary worker smart alias replays the observed z.ai and ollama 502 chain through to nvidia", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: now.addingTimeInterval(300))
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: now.addingTimeInterval(300))
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: String?
+                var deliveredError: String?
+                var seenModels: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    switch model {
+                    case "glm-5.1-zai", "glm-5.1-ollama-pro":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"message\":\"upstream bad gateway\"}}".utf8),
+                            response: httpURLResponse(statusCode: 502, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        ))
+                    case "glm5-nvidia":
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"glm5-nvidia"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        ))
+                    default:
+                        recorder.recordFailure("unexpected proxied candidate during 502 replay chain: \(model)")
+                        completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
+                    }
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    recorder.recordFailure("muse-spark should be unavailable during the 502 replay chain, but attempted \(publicModel)")
+                    return ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil)
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = String(data: body, encoding: .utf8)
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("observed 502 worker failure chain should still deliver a later nvidia success")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(
+                    seenModels,
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "glm5-nvidia"],
+                    "the observed 502 chain should fall from z.ai to ollama to nvidia",
+                    recorder: recorder
+                )
+                expectEqual(deliveredStatus, 200, "observed 502 worker failure chains should not surface a terminal error when nvidia later succeeds", recorder: recorder)
+                expectEqual(deliveredError, nil, "observed 502 worker failure chains should fail over silently", recorder: recorder)
+                expectEqual(deliveredBody?.contains("\"content\":\"OK\""), true, "the replayed 502 chain should deliver the later nvidia success body", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
