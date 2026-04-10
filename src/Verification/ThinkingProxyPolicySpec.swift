@@ -7692,6 +7692,66 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("canary 429 window preserves provider reset cooldown and suppresses immediate reprobe", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withRouteHealthPath { _ in
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm-5.1-ollama-pro",
+                        until: Date().addingTimeInterval(60)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    var invocationCount = 0
+                    var seenRequestModel: String?
+                    proxy.nvidiaCanaryTransportForTesting = { requestModel, _, completion in
+                        invocationCount += 1
+                        seenRequestModel = requestModel
+                        let response = HTTPURLResponse(
+                            url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                            statusCode: 429,
+                            httpVersion: nil,
+                            headerFields: [
+                                "Content-Type": "application/json",
+                                "Retry-After": "600"
+                            ]
+                        )
+                        completion(Data("{\"error\":\"rate limited\"}".utf8), response, nil)
+                    }
+
+                    let firstSemaphore = DispatchSemaphore(value: 0)
+                    proxy.performCanariesOnce {
+                        firstSemaphore.signal()
+                    }
+                    let firstWaitResult = firstSemaphore.wait(timeout: .now() + 2)
+                    expectEqual(firstWaitResult, .success, "quota-window canary runtime sweep should complete promptly", recorder: recorder)
+                    expectEqual(invocationCount, 1, "first canary sweep should probe the open route exactly once", recorder: recorder)
+                    expectEqual(seenRequestModel, "glm-5.1-ollama-pro", "canary should probe the concrete ollama route request model", recorder: recorder)
+
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    expectEqual(snapshot["glm-5.1"]?.status, .open, "quota-window canary failures should keep the route open through the provider reset", recorder: recorder)
+                    expectEqual(snapshot["glm-5.1"]?.lastTelemetryEvent?.failureClass, "classified_429_window", "quota-window canary failures should preserve the reset-window classification", recorder: recorder)
+                    if let openUntil = snapshot["glm-5.1"]?.openUntil {
+                        if openUntil.timeIntervalSinceNow <= 500 {
+                            recorder.recordFailure("quota-window canary failures should preserve the upstream Retry-After window, not the shorter circuit-breaker cooldown")
+                        }
+                    } else {
+                        recorder.recordFailure("quota-window canary failures should preserve an openUntil reset window")
+                    }
+
+                    let secondSemaphore = DispatchSemaphore(value: 0)
+                    proxy.performCanariesOnce {
+                        secondSemaphore.signal()
+                    }
+                    let secondWaitResult = secondSemaphore.wait(timeout: .now() + 2)
+                    expectEqual(secondWaitResult, .success, "suppressed reprobe sweep should still complete promptly", recorder: recorder)
+                    expectEqual(invocationCount, 1, "quota-window canary failures should suppress immediate reprobes until the reset window expires", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("temporary nvidia deadline tracker fires first-byte timeout before payload and buffered timeout after payload", recorder: recorder) {
             var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
 

@@ -2366,7 +2366,11 @@ enum OpenAICompatTemporaryShim {
             }
 
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
-                guard shouldProbeRouteWithCanary(state: state, at: now) else {
+                guard shouldProbeRouteWithCanary(
+                    routeHealthKey: routeHealthKey,
+                    state: state,
+                    at: now
+                ) else {
                     return nil
                 }
                 if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
@@ -3333,10 +3337,8 @@ enum OpenAICompatTemporaryShim {
            !retryAfter.isEmpty {
             if let seconds = TimeInterval(retryAfter), seconds > 0 {
                 if seconds < concurrencyThreshold {
-                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After: %.0fs < %.0fs threshold) - classified as concurrency; adaptive route deferral may apply downstream", seconds, concurrencyThreshold)
                     return .concurrency(retryAfterSeconds: seconds)
                 }
-                NSLog("[ThinkingProxy] Provider 429 Retry-After: %.0fs — honoring full provider reset window", seconds)
                 return .quotaWindow(cooldownUntil: now.addingTimeInterval(seconds))
             }
             let formatter = DateFormatter()
@@ -3347,10 +3349,8 @@ enum OpenAICompatTemporaryShim {
                 let seconds = date.timeIntervalSince(now)
                 if seconds <= 0 { return .concurrency(retryAfterSeconds: nil) }
                 if seconds < concurrencyThreshold {
-                    NSLog("[ThinkingProxy] Concurrency 429 detected (Retry-After HTTP-date %.0fs < %.0fs threshold) - classified as concurrency; adaptive route deferral may apply downstream", seconds, concurrencyThreshold)
                     return .concurrency(retryAfterSeconds: seconds)
                 }
-                NSLog("[ThinkingProxy] Provider 429 Retry-After HTTP-date: %.0fs — honoring full provider reset window", seconds)
                 return .quotaWindow(cooldownUntil: date)
             }
         }
@@ -4134,18 +4134,26 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    private static func shouldProbeRouteWithCanary(state: RouteCircuitState, at now: Date) -> Bool {
-        guard state.status == .open else {
-            return false
-        }
+    private static func shouldProbeRouteWithCanary(
+        routeHealthKey: String,
+        state: RouteCircuitState,
+        at now: Date
+    ) -> Bool {
+        let activeQuotaWindowUntil = [
+            state.openUntil,
+            routeCooldownsByRouteHealthKey[routeHealthKey]
+        ]
+        .compactMap { $0 }
+        .filter { $0 > now }
+        .max()
 
-        if let openUntil = state.openUntil,
-           now < openUntil,
+        if let activeQuotaWindowUntil,
+           now < activeQuotaWindowUntil,
            state.lastTelemetryEvent?.failureClass?.lowercased() == "classified_429_window" {
             return false
         }
 
-        return true
+        return state.status == .open
     }
 
     /// Schedule a debounced persist of route health state.
@@ -12755,15 +12763,31 @@ class ThinkingProxy {
                         telemetryEvent: telemetryEvent
                     )
                 } else {
+                    let forcedOpenUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                        failureClass: telemetryEvent.failureClass,
+                        statusCode: statusCode,
+                        headers: response?.allHeaderFields ?? [:],
+                        bodyData: data
+                    )
                     OpenAICompatTemporaryShim.recordRouteFailure(
                         forRequestModel: requestModel,
-                        telemetryEvent: telemetryEvent
+                        telemetryEvent: telemetryEvent,
+                        forcedOpenUntil: forcedOpenUntil
                     )
                 }
             case .retry, .sendError:
+                let forcedOpenUntil = response.map {
+                    OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                        failureClass: telemetryEvent.failureClass,
+                        statusCode: $0.statusCode,
+                        headers: $0.allHeaderFields,
+                        bodyData: data
+                    )
+                } ?? nil
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: requestModel,
-                    telemetryEvent: telemetryEvent
+                    telemetryEvent: telemetryEvent,
+                    forcedOpenUntil: forcedOpenUntil
                 )
             }
 
