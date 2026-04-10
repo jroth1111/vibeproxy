@@ -765,7 +765,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia shim ignores unknown non-media typed segments while preserving text summaries", recorder: recorder) {
+        run("temporary nvidia shim ignores metadata-only typed segments while preserving visible text summaries", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
@@ -794,14 +794,14 @@ struct ThinkingProxyPolicySpec {
                 let messages = json["messages"] as? [[String: Any]]
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    #"Check repohidden chain of thought{"step":1}"#,
-                    "reasoning text and metadata_marker structured values should be preserved in flattened content",
+                    "Check repo",
+                    "reasoning and metadata_marker content should be dropped while preserving visible summary text",
                     recorder: recorder
                 )
             }
         }
 
-        run("temporary nvidia shim repairs metadata-only typed transcript content instead of failing preflight", recorder: recorder) {
+        run("temporary nvidia shim drops metadata-only typed transcript content without failing preflight", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
@@ -836,8 +836,8 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    #"hidden chain of thought{"step":1}"#,
-                    "metadata-only typed transcript content should preserve reasoning text and serialize metadata_marker values",
+                    "",
+                    "metadata-only typed transcript content should collapse to empty visible text instead of failing preflight",
                     recorder: recorder
                 )
                 expectNil(preflightError, "metadata-only typed transcript content should not fail NVIDIA preflight", recorder: recorder)
