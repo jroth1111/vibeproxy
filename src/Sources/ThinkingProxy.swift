@@ -4379,8 +4379,17 @@ enum OpenAICompatTemporaryShim {
         guard let content else {
             return .unchanged
         }
-        guard let segments = content as? [Any] else {
+        if content is String {
             return .unchanged
+        }
+        if let dictionary = content as? [String: Any] {
+            guard let flattened = flattenedTextMessageContent(from: dictionary) else {
+                return .unsupported
+            }
+            return .flattened(flattened)
+        }
+        guard let segments = content as? [Any] else {
+            return .unsupported
         }
 
         var collectedSegments: [String] = []
@@ -4393,17 +4402,10 @@ enum OpenAICompatTemporaryShim {
             guard let dictionary = segment as? [String: Any] else {
                 return .unsupported
             }
-
-            let type = (dictionary["type"] as? String)?.lowercased()
-            let textValue = dictionary["text"] as? String
-
-            if let textValue,
-               type == nil || type == "text" || type == "input_text" {
-                collectedSegments.append(textValue)
-                continue
+            guard let textValue = flattenedTextMessageContent(from: dictionary) else {
+                return .unsupported
             }
-
-            return .unsupported
+            collectedSegments.append(textValue)
         }
 
         guard !collectedSegments.isEmpty else {
@@ -4411,6 +4413,44 @@ enum OpenAICompatTemporaryShim {
         }
 
         return .flattened(collectedSegments.joined())
+    }
+
+    private static func flattenedTextMessageContent(from dictionary: [String: Any]) -> String? {
+        let type = (dictionary["type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if let textValue = normalizedTextMessageScalar(dictionary["text"]),
+           type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "tool_result" {
+            return textValue
+        }
+
+        if let outputText = normalizedTextMessageScalar(dictionary["output_text"]) {
+            return outputText
+        }
+
+        if let valueText = normalizedTextMessageScalar(dictionary["value"]) {
+            return valueText
+        }
+
+        if let nestedContent = dictionary["content"] {
+            switch normalizedContentResult(from: nestedContent) {
+            case .flattened(let flattened):
+                return flattened
+            case .unchanged, .unsupported:
+                break
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizedTextMessageScalar(_ value: Any?) -> String? {
+        guard let value = value as? String else {
+            return nil
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : value
     }
 
     fileprivate static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {

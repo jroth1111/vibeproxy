@@ -262,6 +262,38 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia shim flattens direct text content wrappers", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": {
+                        "type": "tool_result",
+                        "content": [
+                          {"type": "text", "text": "Cargo"},
+                          {"type": "text", "text": ".toml"}
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                expectEqual(messages?.first?["content"] as? String, "Cargo.toml", "direct wrapper-style text content should be flattened before NVIDIA routing", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia preflight rejects unsupported typed content arrays", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
