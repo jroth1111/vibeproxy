@@ -5275,6 +5275,181 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias delivers a coalesced raced winner to every joining request", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let firstConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let secondConnection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let startedMinimax = DispatchSemaphore(value: 0)
+                let startedKimi = DispatchSemaphore(value: 0)
+                let allowWinner = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var kimiCanceled = false
+                var deliveredResponseCount = 0
+                var modelInvocationCounts: [String: Int] = [:]
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+
+                    lock.lock()
+                    modelInvocationCounts[model, default: 0] += 1
+                    let invocationCount = modelInvocationCounts[model] ?? 0
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"rate limited\"}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "minimax-m2.5-nvidia":
+                        if invocationCount > 1 {
+                            recorder.recordFailure("coalesced raced winner should reuse the in-flight minimax NVIDIA attempt")
+                        }
+                        let workItem = DispatchWorkItem {
+                            _ = allowWinner.wait(timeout: .now() + 1)
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-race-coalesced-win",
+                                      "object": "chat.completion",
+                                      "model": "minimax-m2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        startedMinimax.signal()
+                        DispatchQueue.global().async(execute: workItem)
+                        return { workItem.cancel() }
+                    case "kimi-k2.5-nvidia":
+                        if invocationCount > 1 {
+                            recorder.recordFailure("coalesced raced loser should reuse the in-flight kimi NVIDIA attempt")
+                        }
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data("""
+                                    {
+                                      "id": "chatcmpl-race-coalesced-lose",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "SLOW"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8),
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        startedKimi.signal()
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25, execute: workItem)
+                        return {
+                            lock.lock()
+                            kimiCanceled = true
+                            lock.unlock()
+                            workItem.cancel()
+                        }
+                    default:
+                        return {}
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    lock.lock()
+                    deliveredResponseCount += 1
+                    let shouldSignal = deliveredResponseCount == 2
+                    lock.unlock()
+                    if shouldSignal {
+                        delivered.signal()
+                    }
+                }
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                  "stream": false
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        headers: [
+                            ("Authorization", "Bearer race-worker-1"),
+                            ("X-Factory-Session", "mission-race-1")
+                        ],
+                        body: requestJSON
+                    ),
+                    connection: firstConnection
+                )
+
+                guard startedMinimax.wait(timeout: .now() + 1) == .success,
+                      startedKimi.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("first worker request should reach the raced NVIDIA fallback set")
+                    return
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        headers: [
+                            ("Authorization", "Bearer race-worker-2"),
+                            ("X-Factory-Session", "mission-race-2")
+                        ],
+                        body: requestJSON
+                    ),
+                    connection: secondConnection
+                )
+
+                Thread.sleep(forTimeInterval: 0.05)
+                allowWinner.signal()
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("joining requests should both receive the winning raced NVIDIA response")
+                    return
+                }
+
+                expectEqual(deliveredResponseCount, 2, "coalesced raced winners should be delivered to both callers", recorder: recorder)
+                expectEqual(modelInvocationCounts["minimax-m2.5-nvidia"] ?? 0, 1, "winning raced NVIDIA lane should only open one upstream transport across both requests", recorder: recorder)
+                expectEqual(modelInvocationCounts["kimi-k2.5-nvidia"] ?? 0, 1, "losing raced NVIDIA lane should only open one upstream transport across both requests", recorder: recorder)
+                expectEqual(kimiCanceled, true, "winning a coalesced raced lane should still cancel the losing NVIDIA transport", recorder: recorder)
+            }
+        }
+
         run("temporary worker smart alias ignores fast invalid-success fallbacks and waits for a slower valid winner", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 let proxy = ThinkingProxy()

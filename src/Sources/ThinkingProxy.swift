@@ -9429,6 +9429,138 @@ class ThinkingProxy {
         var terminalOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
         let completionGate = DispatchSemaphore(value: 0)
 
+        func finalizeExhaustedRaceIfNeeded() {
+            guard remainingAttempts == 0, !coordinator.isFinished() else { return }
+            _ = coordinator.tryFinish(attemptLane: 0)
+
+            if !deferredCandidateModels.isEmpty {
+                self.attemptSmartAliasCandidate(
+                    method: method,
+                    path: path,
+                    headers: headers,
+                    currentBody: currentBody,
+                    publicAlias: publicAlias,
+                    remainingCandidateModels: deferredCandidateModels,
+                    forceProbeCandidateModels: forceProbeCandidateModels,
+                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                    failoverDepth: failoverDepth + raceTransitions.count,
+                    deadlineAt: deadlineAt,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
+                    exhaustedRetryableOutcome: nil,
+                    deliveryMode: deliveryMode,
+                    loopRetriesRemaining: loopRetriesRemaining
+                )
+                return
+            }
+
+            if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
+                self.deliverSmartAliasTerminalOutcome(
+                    terminalOutcome,
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+                return
+            }
+
+            self.attemptSmartAliasCandidate(
+                method: method,
+                path: path,
+                headers: headers,
+                currentBody: currentBody,
+                publicAlias: publicAlias,
+                remainingCandidateModels: [],
+                forceProbeCandidateModels: forceProbeCandidateModels,
+                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
+                failoverDepth: failoverDepth + raceTransitions.count,
+                deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                coalescingKey: coalescingKey,
+                terminalFallbackOutcome: nil,
+                exhaustedRetryableOutcome: nil,
+                deliveryMode: deliveryMode,
+                loopRetriesRemaining: loopRetriesRemaining
+            )
+        }
+
+        func handleRaceOutcome(
+            _ outcome: SmartAliasCandidateAttemptOutcome,
+            attemptLane: Int,
+            fanOutWaitersForModelKey: String?
+        ) {
+            guard !coordinator.isFinished() else { return }
+
+            switch outcome {
+            case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+                let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
+                    OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                        telemetryEvent,
+                        winnerAttemptLane: attemptLane
+                    ),
+                    requestedAlias: publicAlias,
+                    failoverDepth: failoverDepth,
+                    finalWinnerRequestModel: requestModel
+                )
+                guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: requestModel,
+                    telemetryEvent: winningTelemetryEvent
+                )
+                self.deliverSmartAliasSuccessfulResponse(
+                    defaultConnection: originalConnection,
+                    statusCode: statusCode,
+                    headers: responseHeaders,
+                    body: responseBody,
+                    publicAlias: publicAlias,
+                    resolvedRequestModel: requestModel,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode
+                )
+            case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: requestModel,
+                    telemetryEvent: telemetryEvent,
+                    forcedOpenUntil: cooldownUntil,
+                    healthSensitivity: healthSensitivity
+                )
+                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                remainingAttempts -= 1
+            case .terminalResponse(_, _, _, _, let telemetryEvent):
+                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                terminalOutcomesByLane[attemptLane] = outcome
+                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                remainingAttempts -= 1
+            case .terminalError(_, _, _, let telemetryEvent):
+                if let telemetryEvent {
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                }
+                terminalOutcomesByLane[attemptLane] = outcome
+                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                remainingAttempts -= 1
+            }
+
+            if let fanOutWaitersForModelKey {
+                let waiters = self.nvidiaInflightQueue.sync { () -> [(SmartAliasCandidateAttemptOutcome) -> Void] in
+                    self.nvidiaRaceWaiters.removeValue(forKey: fanOutWaitersForModelKey) ?? []
+                }
+                if !waiters.isEmpty {
+                    NSLog(
+                        "[ThinkingProxy] Delivering NVIDIA race outcome for %@ to %d coalesced waiter(s)",
+                        fanOutWaitersForModelKey,
+                        waiters.count
+                    )
+                    for waiter in waiters {
+                        waiter(outcome)
+                    }
+                }
+            }
+
+            finalizeExhaustedRaceIfNeeded()
+        }
+
         for (index, transition) in raceTransitions.enumerated() {
             let attemptLane = index + 1
             let controller = SmartAliasCandidateController()
@@ -9447,18 +9579,11 @@ class ThinkingProxy {
                         DispatchQueue.global(qos: .userInitiated).async {
                             completionGate.wait()
                             completionQueue.async {
-                            guard !coordinator.isFinished() else { return }
-                            switch outcome {
-                            case .success:
-                                guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
-                            case .retryableFailure:
-                                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                                remainingAttempts -= 1
-                            case .terminalResponse, .terminalError:
-                                terminalOutcomesByLane[attemptLane] = outcome
-                                coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                                remainingAttempts -= 1
-                            }
+                                handleRaceOutcome(
+                                    outcome,
+                                    attemptLane: attemptLane,
+                                    fanOutWaitersForModelKey: nil
+                                )
                             }
                         }
                     })
@@ -9495,125 +9620,14 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey,
                 controller: controller
             ) { [weak self] outcome in
-                guard let self else { return }
+                guard self != nil else { return }
                 DispatchQueue.global(qos: .userInitiated).async {
                     completionGate.wait()
                     completionQueue.async {
-                        guard !coordinator.isFinished() else { return }
-
-                        switch outcome {
-                        case .success(let requestModel, let statusCode, let headers, let body, let telemetryEvent):
-                            let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
-                                OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
-                                    telemetryEvent,
-                                    winnerAttemptLane: attemptLane
-                                ),
-                                requestedAlias: publicAlias,
-                                failoverDepth: failoverDepth,
-                                finalWinnerRequestModel: requestModel
-                            )
-                            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
-                            OpenAICompatTemporaryShim.recordRouteSuccess(
-                                forRequestModel: requestModel,
-                                telemetryEvent: winningTelemetryEvent
-                            )
-                            self.deliverSmartAliasSuccessfulResponse(
-                                defaultConnection: originalConnection,
-                                statusCode: statusCode,
-                                headers: headers,
-                                body: body,
-                                publicAlias: publicAlias,
-                                resolvedRequestModel: requestModel,
-                                coalescingKey: coalescingKey,
-                                deliveryMode: deliveryMode
-                            )
-                        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
-                            OpenAICompatTemporaryShim.recordRouteFailure(
-                                forRequestModel: requestModel,
-                                telemetryEvent: telemetryEvent,
-                                forcedOpenUntil: cooldownUntil,
-                                healthSensitivity: healthSensitivity
-                            )
-                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                            remainingAttempts -= 1
-                        case .terminalResponse(_, _, _, _, let telemetryEvent):
-                            OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                            terminalOutcomesByLane[attemptLane] = outcome
-                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                            remainingAttempts -= 1
-                        case .terminalError(_, _, _, let telemetryEvent):
-                            if let telemetryEvent {
-                                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                            }
-                            terminalOutcomesByLane[attemptLane] = outcome
-                            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-                            remainingAttempts -= 1
-                        }
-
-                        let waiters = self.nvidiaInflightQueue.sync { () -> [(SmartAliasCandidateAttemptOutcome) -> Void] in
-                            self.nvidiaRaceWaiters.removeValue(forKey: coalescingModelKey) ?? []
-                        }
-                        if !waiters.isEmpty {
-                            NSLog("[ThinkingProxy] Delivering NVIDIA race outcome for %@ to %d coalesced waiter(s)", transition.model, waiters.count)
-                            for waiter in waiters {
-                                waiter(outcome)
-                            }
-                        }
-
-                        guard remainingAttempts == 0, !coordinator.isFinished() else { return }
-                        _ = coordinator.tryFinish(attemptLane: 0)
-
-                        if !deferredCandidateModels.isEmpty {
-                            self.attemptSmartAliasCandidate(
-                                method: method,
-                                path: path,
-                                headers: headers,
-                                currentBody: currentBody,
-                                publicAlias: publicAlias,
-                                remainingCandidateModels: deferredCandidateModels,
-                                forceProbeCandidateModels: forceProbeCandidateModels,
-                                primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                                failoverDepth: failoverDepth + raceTransitions.count,
-                                deadlineAt: deadlineAt,
-                                originalConnection: originalConnection,
-                                coalescingKey: coalescingKey,
-                                terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
-                                exhaustedRetryableOutcome: nil,
-                                deliveryMode: deliveryMode,
-                                loopRetriesRemaining: loopRetriesRemaining
-                            )
-                            return
-                        }
-
-                        if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
-                            self.deliverSmartAliasTerminalOutcome(
-                                terminalOutcome,
-                                publicAlias: publicAlias,
-                                originalConnection: originalConnection,
-                                coalescingKey: coalescingKey,
-                                deliveryMode: deliveryMode
-                            )
-                            return
-                        }
-
-                        // Route through attemptSmartAliasCandidate so loop retry logic applies
-                        self.attemptSmartAliasCandidate(
-                            method: method,
-                            path: path,
-                            headers: headers,
-                            currentBody: currentBody,
-                            publicAlias: publicAlias,
-                            remainingCandidateModels: [],
-                            forceProbeCandidateModels: forceProbeCandidateModels,
-                            primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                            failoverDepth: failoverDepth + raceTransitions.count,
-                            deadlineAt: deadlineAt,
-                            originalConnection: originalConnection,
-                            coalescingKey: coalescingKey,
-                            terminalFallbackOutcome: nil,
-                            exhaustedRetryableOutcome: nil,
-                            deliveryMode: deliveryMode,
-                            loopRetriesRemaining: loopRetriesRemaining
+                        handleRaceOutcome(
+                            outcome,
+                            attemptLane: attemptLane,
+                            fanOutWaitersForModelKey: coalescingModelKey
                         )
                     }
                 }
