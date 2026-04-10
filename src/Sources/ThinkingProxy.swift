@@ -5764,30 +5764,44 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter requires tools to be an array.")
         }
 
-        if let parallelToolCalls = json["parallel_tool_calls"] as? Bool, parallelToolCalls {
-            throw Failure(statusCode: 501, message: "Meta web adapter synthetic tool mode only supports one tool call at a time; disable parallel_tool_calls or choose another provider.")
-        }
-
         var definitions: [ToolDefinition] = []
+        var seenToolNames: Set<String> = []
         for tool in tools {
-            guard let toolDictionary = tool as? [String: Any],
-                  let type = (toolDictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-                throw Failure(statusCode: 400, message: "Meta web adapter requires tools to be function definitions.")
+            guard let toolDictionary = tool as? [String: Any] else {
+                continue
             }
-            guard type == "function" else {
-                throw Failure(statusCode: 501, message: "Meta web adapter synthetic tool mode only supports function tools.")
+
+            let type = normalizedString(toolDictionary["type"] as? String)?.lowercased()
+            let inferredFunction = toolDictionary["function"] as? [String: Any]
+            let isFunctionTool = (type == nil && inferredFunction != nil) || type == "function"
+            guard isFunctionTool else {
+                continue
             }
-            guard let function = toolDictionary["function"] as? [String: Any],
+
+            guard let function = inferredFunction,
                   let rawName = function["name"] as? String,
                   let name = normalizedString(rawName) else {
-                throw Failure(statusCode: 400, message: "Meta web adapter requires each function tool to include a non-empty name.")
+                continue
+            }
+
+            guard !seenToolNames.contains(name) else {
+                continue
             }
 
             let parametersObject = function["parameters"] ?? ["type": "object", "properties": [String: Any]()]
             guard JSONSerialization.isValidJSONObject(parametersObject),
                   let parametersData = try? JSONSerialization.data(withJSONObject: parametersObject, options: [.sortedKeys]),
                   let parametersJSONString = String(data: parametersData, encoding: .utf8) else {
-                throw Failure(statusCode: 400, message: "Meta web adapter requires each function tool to expose JSON-schema parameters.")
+                let fallbackParametersJSONString = #"{"properties":{},"type":"object"}"#
+                definitions.append(
+                    ToolDefinition(
+                        name: name,
+                        description: normalizedString(function["description"] as? String),
+                        parametersJSONString: fallbackParametersJSONString
+                    )
+                )
+                seenToolNames.insert(name)
+                continue
             }
 
             definitions.append(
@@ -5797,11 +5811,7 @@ enum MetaAIWebAdapter {
                     parametersJSONString: parametersJSONString
                 )
             )
-        }
-
-        let dedupedNames = Set(definitions.map(\.name))
-        guard dedupedNames.count == definitions.count else {
-            throw Failure(statusCode: 400, message: "Meta web adapter requires function tool names to be unique.")
+            seenToolNames.insert(name)
         }
         return definitions
     }
@@ -5824,13 +5834,13 @@ enum MetaAIWebAdapter {
             case "required":
                 return .required
             default:
-                throw Failure(statusCode: 400, message: "Meta web adapter received an unsupported tool_choice string.")
+                return .auto
             }
         }
 
         guard let toolChoiceDictionary = toolChoice as? [String: Any],
               let type = (toolChoiceDictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-            throw Failure(statusCode: 400, message: "Meta web adapter received an invalid tool_choice object.")
+            return .auto
         }
 
         switch type {
@@ -5844,14 +5854,19 @@ enum MetaAIWebAdapter {
             let functionContainer = toolChoiceDictionary["function"] as? [String: Any]
             let rawName = (functionContainer?["name"] as? String) ?? (toolChoiceDictionary["name"] as? String)
             guard let functionName = normalizedString(rawName) else {
-                throw Failure(statusCode: 400, message: "Meta web adapter requires tool_choice.function.name for specific function selection.")
+                return toolDefinitions.count == 1 ? .specific(toolDefinitions[0].name) : .required
             }
-            guard toolDefinitions.contains(where: { $0.name == functionName }) else {
-                throw Failure(statusCode: 400, message: "Meta web adapter tool_choice.function.name must match one of the declared function tools.")
+            let allowedToolNames = Set(toolDefinitions.map(\.name))
+            guard let resolvedFunctionName = resolveSyntheticToolName(
+                rawName: functionName,
+                allowedToolNames: allowedToolNames,
+                requiredToolName: toolDefinitions.count == 1 ? toolDefinitions[0].name : nil
+            ) else {
+                return toolDefinitions.count == 1 ? .specific(toolDefinitions[0].name) : .required
             }
-            return .specific(functionName)
+            return .specific(resolvedFunctionName)
         default:
-            throw Failure(statusCode: 400, message: "Meta web adapter received an unsupported tool_choice type.")
+            return .auto
         }
     }
 
@@ -5957,40 +5972,9 @@ enum MetaAIWebAdapter {
                 continue
             }
 
-            let rawName = root["name"] ?? root["tool"] ?? root["tool_name"]
-            guard let toolName = normalizedString(rawName as? String) else {
-                continue
+            if let directive = try syntheticToolDirective(fromJSONObject: root, parsedRequest: parsedRequest) {
+                return directive
             }
-            guard allowedToolNames.contains(toolName) else {
-                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned undeclared tool \(toolName).")
-            }
-
-            if case .specific(let requiredName) = parsedRequest.toolChoice, requiredName != toolName {
-                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned tool \(toolName), but tool_choice required \(requiredName).")
-            }
-
-            let rawArguments = root["arguments"] ?? root["args"] ?? root["parameters"]
-            let argumentsObject: [String: Any]
-            switch rawArguments {
-            case let dictionary as [String: Any]:
-                argumentsObject = dictionary
-            case let string as String:
-                guard let stringData = string.data(using: .utf8),
-                      let parsedArguments = try? JSONSerialization.jsonObject(with: stringData) as? [String: Any] else {
-                    throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned non-object function arguments.")
-                }
-                argumentsObject = parsedArguments
-            default:
-                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode requires arguments to be a JSON object.")
-            }
-
-            guard JSONSerialization.isValidJSONObject(argumentsObject),
-                  let argumentsData = try? JSONSerialization.data(withJSONObject: argumentsObject, options: [.sortedKeys]),
-                  let argumentsJSONString = String(data: argumentsData, encoding: .utf8) else {
-                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode could not serialize function arguments.")
-            }
-
-            return SyntheticToolDirective(name: toolName, argumentsJSONString: argumentsJSONString)
         }
 
         if let heuristicDirective = try heuristicSyntheticToolDirective(
@@ -5999,6 +5983,75 @@ enum MetaAIWebAdapter {
             parsedRequest: parsedRequest
         ) {
             return heuristicDirective
+        }
+
+        return nil
+    }
+
+    private static func syntheticToolDirective(
+        fromJSONObject root: [String: Any],
+        parsedRequest: ParsedRequest
+    ) throws -> SyntheticToolDirective? {
+        let allowedToolNames = Set(parsedRequest.toolDefinitions.map(\.name))
+        let requiredToolName = requiredSyntheticToolName(for: parsedRequest.toolChoice)
+        let matchedTopLevelToolNames = root.keys.compactMap { key -> String? in
+            guard let normalized = normalizedString(key),
+                  let resolved = resolveSyntheticToolName(
+                    rawName: normalized,
+                    allowedToolNames: allowedToolNames,
+                    requiredToolName: requiredToolName
+                  ) else {
+                return nil
+            }
+            return resolved
+        }
+
+        let explicitToolName = normalizedString((root["name"] ?? root["tool"] ?? root["tool_name"]) as? String).flatMap {
+            resolveSyntheticToolName(rawName: $0, allowedToolNames: allowedToolNames, requiredToolName: requiredToolName)
+        }
+        if let explicitToolName {
+            try validateSyntheticToolChoice(toolName: explicitToolName, parsedRequest: parsedRequest, allowRepair: true)
+
+            if let argumentsJSONString = try normalizeSyntheticArguments(
+                from: root["arguments"] ?? root["args"] ?? root["parameters"]
+            ) {
+                return SyntheticToolDirective(name: explicitToolName, argumentsJSONString: argumentsJSONString)
+            }
+
+            let residualArguments = root.filter { key, _ in
+                !["name", "tool", "tool_name", "arguments", "args", "parameters", "type"].contains(key)
+            }
+            if let argumentsJSONString = try normalizeSyntheticArguments(from: residualArguments) {
+                return SyntheticToolDirective(name: explicitToolName, argumentsJSONString: argumentsJSONString)
+            }
+
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode required arguments for tool \(explicitToolName), but Meta returned no usable arguments object.")
+        }
+
+        if matchedTopLevelToolNames.count == 1,
+           let nestedToolName = matchedTopLevelToolNames.first {
+            try validateSyntheticToolChoice(toolName: nestedToolName, parsedRequest: parsedRequest, allowRepair: true)
+            if let argumentsJSONString = try normalizeSyntheticArguments(from: root[nestedToolName]) {
+                return SyntheticToolDirective(name: nestedToolName, argumentsJSONString: argumentsJSONString)
+            }
+        }
+
+        if let requiredToolName {
+            let conflictingToolNames = matchedTopLevelToolNames.filter { $0 != requiredToolName }
+            if !conflictingToolNames.isEmpty {
+                if let argumentsJSONString = try normalizeSyntheticArguments(from: root) {
+                    return SyntheticToolDirective(name: requiredToolName, argumentsJSONString: argumentsJSONString)
+                }
+            }
+
+            if let requiredWrapper = root[requiredToolName],
+               let argumentsJSONString = try normalizeSyntheticArguments(from: requiredWrapper) {
+                return SyntheticToolDirective(name: requiredToolName, argumentsJSONString: argumentsJSONString)
+            }
+
+            if let argumentsJSONString = try normalizeSyntheticArguments(from: root) {
+                return SyntheticToolDirective(name: requiredToolName, argumentsJSONString: argumentsJSONString)
+            }
         }
 
         return nil
@@ -6082,6 +6135,100 @@ enum MetaAIWebAdapter {
         }
 
         return nil
+    }
+
+    private static func requiredSyntheticToolName(for toolChoice: ToolChoice) -> String? {
+        switch toolChoice {
+        case .specific(let name):
+            return name
+        default:
+            return nil
+        }
+    }
+
+    private static func validateSyntheticToolChoice(
+        toolName: String,
+        parsedRequest: ParsedRequest,
+        allowRepair: Bool
+    ) throws {
+        if case .specific(let requiredName) = parsedRequest.toolChoice,
+           requiredName != toolName,
+           !allowRepair {
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned tool \(toolName), but tool_choice required \(requiredName).")
+        }
+    }
+
+    private static func resolveSyntheticToolName(
+        rawName: String,
+        allowedToolNames: Set<String>,
+        requiredToolName: String?
+    ) -> String? {
+        if allowedToolNames.contains(rawName) {
+            return rawName
+        }
+
+        if let requiredToolName,
+           canonicalSyntheticToolName(rawName) == canonicalSyntheticToolName(requiredToolName) {
+            return requiredToolName
+        }
+
+        let canonicalRawName = canonicalSyntheticToolName(rawName)
+        guard !canonicalRawName.isEmpty else {
+            return nil
+        }
+
+        let canonicalMatches = allowedToolNames.filter { canonicalSyntheticToolName($0) == canonicalRawName }
+        if canonicalMatches.count == 1 {
+            return canonicalMatches.first
+        }
+
+        let containsMatches = allowedToolNames.filter {
+            let candidate = canonicalSyntheticToolName($0)
+            return candidate.contains(canonicalRawName) || canonicalRawName.contains(candidate)
+        }
+        if containsMatches.count == 1 {
+            return containsMatches.first
+        }
+
+        if let requiredToolName {
+            return requiredToolName
+        }
+
+        return nil
+    }
+
+    private static func canonicalSyntheticToolName(_ rawName: String) -> String {
+        rawName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0.isLetter || $0.isNumber }
+    }
+
+    private static func normalizeSyntheticArguments(from rawValue: Any?) throws -> String? {
+        guard let rawValue else {
+            return nil
+        }
+
+        let argumentsObject: [String: Any]
+        switch rawValue {
+        case let dictionary as [String: Any]:
+            argumentsObject = dictionary
+        case let string as String:
+            guard let stringData = string.data(using: .utf8),
+                  let parsedArguments = try? JSONSerialization.jsonObject(with: stringData) as? [String: Any] else {
+                throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode returned non-object function arguments.")
+            }
+            argumentsObject = parsedArguments
+        default:
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode requires arguments to be a JSON object.")
+        }
+
+        guard JSONSerialization.isValidJSONObject(argumentsObject),
+              let argumentsData = try? JSONSerialization.data(withJSONObject: argumentsObject, options: [.sortedKeys]),
+              let argumentsJSONString = String(data: argumentsData, encoding: .utf8) else {
+            throw Failure(statusCode: 502, message: "Meta web adapter synthetic tool mode could not serialize function arguments.")
+        }
+        return argumentsJSONString
     }
 
     private static func extractArgumentsObject(pattern: String, from text: String) -> String? {

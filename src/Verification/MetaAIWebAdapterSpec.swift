@@ -355,6 +355,34 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter repairs parallel_tool_calls by degrading to single-tool mode", recorder: recorder) {
+            let request = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "hi"}
+              ],
+              "tools": [
+                {"type": "function", "function": {"name": "x", "parameters": {"type": "object"}}}
+              ],
+              "tool_choice": "required",
+              "parallel_tool_calls": true
+            }
+            """
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(parsed.toolDefinitions.map(\.name), ["x"], "parallel_tool_calls should be downgraded instead of rejected", recorder: recorder)
+                expectEqual(parsed.toolChoice, .required, "required tool choice should survive the downgrade to single-call mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should repair parallel_tool_calls instead of rejecting the request: \(error)")
+            }
+        }
+
         run("meta web adapter rejects unsupported typed message content instead of dropping it", recorder: recorder) {
             let request = """
             {
@@ -511,7 +539,7 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
-        run("meta web adapter rejects undeclared synthetic tool directives", recorder: recorder) {
+        run("meta web adapter repairs undeclared synthetic tool directives when the required tool is clear", recorder: recorder) {
             let parsedRequest = MetaAIWebAdapter.ParsedRequest(
                 surface: .chatCompletions,
                 prompt: "Find weather",
@@ -530,16 +558,180 @@ struct MetaAIWebAdapterSpec {
             )
 
             do {
-                _ = try MetaAIWebAdapter.syntheticToolDirective(
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
                     from: #"{"name":"browser.search","arguments":{"q":"weather Boston"}}"#,
                     parsedRequest: parsedRequest
                 )
-                recorder.recordFailure("meta web adapter should reject undeclared synthetic tool names")
-            } catch let failure as MetaAIWebAdapter.Failure {
-                expectEqual(failure.statusCode, 502, "undeclared tool names should fail closed", recorder: recorder)
-                expectContains(failure.message, "undeclared tool", "undeclared tool names should explain the contract violation", recorder: recorder)
+                expectEqual(directive?.name, "search", "repair-first mode should map undeclared near-miss tool names back to the required tool", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"q":"weather Boston"}"#, "repaired near-miss tools should preserve arguments", recorder: recorder)
             } catch {
-                recorder.recordFailure("meta web adapter should throw a typed failure for undeclared synthetic tools: \(error)")
+                recorder.recordFailure("meta web adapter should repair undeclared near-miss tool names when the required tool is clear: \(error)")
+            }
+        }
+
+        run("meta web adapter recovers a specific tool call from a bare arguments object", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Read Cargo.toml",
+                executionPrompt: "Read Cargo.toml",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Read",
+                        description: "Read a file from disk",
+                        parametersJSONString: #"{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}"#
+                    ),
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Grep",
+                        description: "Search file contents",
+                        parametersJSONString: #"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern","path"]}"#
+                    )
+                ],
+                toolChoice: .specific("Read"),
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"file_path":"Cargo.toml"}"#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "Read", "specific tool choice should recover bare argument objects as the required tool", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"file_path":"Cargo.toml"}"#, "bare arguments should be normalized for the required tool", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should recover a specific tool call from a bare arguments object: \(error)")
+            }
+        }
+
+        run("meta web adapter recovers a tool call from a top-level tool-name wrapper", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Read Cargo.toml",
+                executionPrompt: "Read Cargo.toml",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Read",
+                        description: "Read a file from disk",
+                        parametersJSONString: #"{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}"#
+                    ),
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Grep",
+                        description: "Search file contents",
+                        parametersJSONString: #"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern","path"]}"#
+                    )
+                ],
+                toolChoice: .required,
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"Read":{"file_path":"Cargo.toml"}}"#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "Read", "top-level tool-name wrappers should be accepted", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"file_path":"Cargo.toml"}"#, "wrapped arguments should be normalized", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should recover a tool call from a top-level tool-name wrapper: \(error)")
+            }
+        }
+
+        run("meta web adapter recovers explicit tool names with top-level parameter fields", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Search for TODO",
+                executionPrompt: "Search for TODO",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Grep",
+                        description: "Search file contents",
+                        parametersJSONString: #"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern","path"]}"#
+                    )
+                ],
+                toolChoice: .required,
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"name":"Grep","pattern":"TODO","path":"."}"#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "Grep", "explicit tool names with top-level parameter fields should be accepted", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"path":".","pattern":"TODO"}"#, "top-level parameter fields should be normalized into arguments", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should recover explicit tool names with top-level parameter fields: \(error)")
+            }
+        }
+
+        run("meta web adapter repairs near-miss tool names for specific tool choice", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Update todos",
+                executionPrompt: "Update todos",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "TodoWrite",
+                        description: "Update a todo list",
+                        parametersJSONString: #"{"type":"object","properties":{"todos":{"type":"array"}},"required":["todos"]}"#
+                    ),
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Read",
+                        description: "Read a file",
+                        parametersJSONString: #"{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}"#
+                    )
+                ],
+                toolChoice: .specific("TodoWrite"),
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"{"tool":"todo_write","todos":[{"content":"verify shim","status":"in_progress","priority":"high"}]}"#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "TodoWrite", "near-miss tool names should normalize to the required tool", recorder: recorder)
+                expectContains(directive?.argumentsJSONString ?? "", "\"todos\"", "near-miss repairs should preserve nested todo arguments", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should repair near-miss tool names: \(error)")
+            }
+        }
+
+        run("meta web adapter repairs near-miss tool_choice function names", recorder: recorder) {
+            let request = """
+            {
+              "model": "muse-spark",
+              "messages": [
+                {"role": "user", "content": "use TodoWrite"}
+              ],
+              "tools": [
+                {"function": {"name": "TodoWrite", "parameters": {"type": "object"}}},
+                {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}
+              ],
+              "tool_choice": {
+                "type": "function",
+                "function": {"name": "todo_write"}
+              }
+            }
+            """
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(parsed.toolDefinitions.map(\.name), ["TodoWrite", "Read"], "tool repair should infer function type and keep valid tool definitions", recorder: recorder)
+                expectEqual(parsed.toolChoice, .specific("TodoWrite"), "near-miss tool_choice names should resolve onto the declared tool", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should repair near-miss tool_choice function names: \(error)")
             }
         }
 
