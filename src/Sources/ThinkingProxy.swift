@@ -392,6 +392,24 @@ enum OpenAICompatTemporaryShim {
         let pressureStatus: String
     }
 
+    enum NVIDIAInferenceProbeStatus: String {
+        case success = "success"
+        case failure = "failure"
+    }
+
+    struct NVIDIAInferenceProbeState: Equatable {
+        let lastProbeAt: Date
+        let lastStatus: NVIDIAInferenceProbeStatus
+        let lastSuccessAt: Date?
+        let lastFailureAt: Date?
+        let lastFailureClass: String?
+        let lastTimeoutStage: DeadlineStage
+        let lastUpstreamHTTPStatus: Int?
+        let lastTransportOutcome: String
+        let lastFirstByteLatencyMilliseconds: Int?
+        let lastTotalLatencyMilliseconds: Int?
+    }
+
     private static func percentileLatencyMilliseconds(_ samples: [Int], percentile: Double) -> Int? {
         guard !samples.isEmpty else { return nil }
         let sorted = samples.sorted()
@@ -414,6 +432,7 @@ enum OpenAICompatTemporaryShim {
         let lastSuccessRequestID: String?
         let lastFailureAt: Date?
         let lastFailureClass: String?
+        let nvidiaInferenceProbe: NVIDIAInferenceProbeState?
 
         init(
             status: RouteHealthStatus,
@@ -428,7 +447,8 @@ enum OpenAICompatTemporaryShim {
             lastSuccessAt: Date? = nil,
             lastSuccessRequestID: String? = nil,
             lastFailureAt: Date? = nil,
-            lastFailureClass: String? = nil
+            lastFailureClass: String? = nil,
+            nvidiaInferenceProbe: NVIDIAInferenceProbeState? = nil
         ) {
             self.status = status
             self.failureScore = failureScore
@@ -443,6 +463,7 @@ enum OpenAICompatTemporaryShim {
             self.lastSuccessRequestID = lastSuccessRequestID
             self.lastFailureAt = lastFailureAt
             self.lastFailureClass = lastFailureClass
+            self.nvidiaInferenceProbe = nvidiaInferenceProbe
         }
 
         private static let momentumBaseBonus: Double = 50.0
@@ -761,6 +782,7 @@ enum OpenAICompatTemporaryShim {
     private static let fastCanaryInterval: TimeInterval = 30
     private static let defaultCanaryInterval: TimeInterval = 60
     private static let defaultSuspectHedgeDelay: TimeInterval = 45
+    fileprivate static let nvidiaInferenceProbeFreshnessWindow: TimeInterval = 300
     private static let routeFailureScoreDecayInterval: TimeInterval = 180
     private static let concurrency429RepeatWindow: TimeInterval = 10 * 60
     private static let concurrency429Deferral: TimeInterval = 15
@@ -3031,6 +3053,11 @@ enum OpenAICompatTemporaryShim {
                 let enrichedTelemetryEvent = telemetryEvent.map {
                     enrichTelemetryEvent($0, from: currentStatus, to: currentStatus)
                 }
+                let probeState = updatedNVIDIAInferenceProbeState(
+                    current: current?.nvidiaInferenceProbe,
+                    route: route,
+                    telemetryEvent: enrichedTelemetryEvent
+                )
                 let preservedState = routeCircuitState(
                     current ?? RouteCircuitState(
                         status: .closed,
@@ -3043,7 +3070,8 @@ enum OpenAICompatTemporaryShim {
                         emaMetrics: .empty,
                         recoveredAt: nil
                     ),
-                    replacingLastTelemetryEvent: enrichedTelemetryEvent
+                    replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                    replacingNVIDIAInferenceProbe: probeState
                 )
                 routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = preservedState
                 if let cooldownUntil = adaptiveConcurrencyDeferralUntil(
@@ -3094,9 +3122,15 @@ enum OpenAICompatTemporaryShim {
             let enrichedTelemetryEvent = telemetryEvent.map {
                 enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
             }
+            let probeState = updatedNVIDIAInferenceProbeState(
+                current: current?.nvidiaInferenceProbe,
+                route: route,
+                telemetryEvent: enrichedTelemetryEvent
+            )
             nextState = routeCircuitState(
                 nextState,
-                replacingLastTelemetryEvent: enrichedTelemetryEvent
+                replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                replacingNVIDIAInferenceProbe: probeState
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
             if let cooldownUntil = adaptiveConcurrencyDeferralUntil(
@@ -3155,9 +3189,15 @@ enum OpenAICompatTemporaryShim {
             let enrichedTelemetryEvent = telemetryEvent.map {
                 enrichTelemetryEvent($0, from: current?.status ?? .closed, to: nextState.status)
             }
+            let probeState = updatedNVIDIAInferenceProbeState(
+                current: current?.nvidiaInferenceProbe,
+                route: route,
+                telemetryEvent: enrichedTelemetryEvent
+            )
             nextState = routeCircuitState(
                 nextState,
-                replacingLastTelemetryEvent: enrichedTelemetryEvent
+                replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                replacingNVIDIAInferenceProbe: probeState
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
             concurrencyRegistry.recordSuccess(routeHealthKey: route.routeHealthKey)
@@ -3210,7 +3250,8 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: nil,
                 rollingMetrics: .empty,
                 emaMetrics: .empty,
-                recoveredAt: nil
+                recoveredAt: nil,
+                nvidiaInferenceProbe: routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.nvidiaInferenceProbe
             )
             persistRouteHealthLocked()
         }
@@ -3315,6 +3356,47 @@ enum OpenAICompatTemporaryShim {
             }
             return now.timeIntervalSince(lastSuccessAt) <= maxAge
         }
+    }
+
+    static func nvidiaInferenceProbeState(
+        forRequestModel requestModel: String
+    ) -> NVIDIAInferenceProbeState? {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
+              route.providerID == "nvidia" else {
+            return nil
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.nvidiaInferenceProbe
+        }
+    }
+
+    static func hasRecentNVIDIAInferenceProbeSuccess(
+        forRequestModel requestModel: String,
+        maxAge: TimeInterval = nvidiaInferenceProbeFreshnessWindow,
+        at now: Date = Date()
+    ) -> Bool {
+        guard let probe = nvidiaInferenceProbeState(forRequestModel: requestModel),
+              probe.lastStatus == .success else {
+            return false
+        }
+        return now.timeIntervalSince(probe.lastProbeAt) <= maxAge
+    }
+
+    static func hasRecentNVIDIAInferenceEvidence(
+        forRequestModel requestModel: String,
+        maxAge: TimeInterval = nvidiaInferenceProbeFreshnessWindow,
+        at now: Date = Date()
+    ) -> Bool {
+        hasRecentInferenceSuccess(
+            forRequestModel: requestModel,
+            maxAge: maxAge,
+            at: now
+        ) || hasRecentNVIDIAInferenceProbeSuccess(
+            forRequestModel: requestModel,
+            maxAge: maxAge,
+            at: now
+        )
     }
 
     static func routeHealthSnapshot() -> [String: RouteCircuitState] {
@@ -4309,9 +4391,38 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
+    private static func updatedNVIDIAInferenceProbeState(
+        current: NVIDIAInferenceProbeState?,
+        route: RouteIdentity,
+        telemetryEvent: RouteTelemetryEvent?
+    ) -> NVIDIAInferenceProbeState? {
+        guard route.providerID == "nvidia" else { return nil }
+        guard let telemetryEvent, telemetryEvent.source == "canary" else {
+            return current
+        }
+
+        let isSuccess = telemetryEvent.transportOutcome == "send_response" &&
+            telemetryEvent.failureClass == nil &&
+            telemetryEvent.upstreamHTTPStatus.map { (200..<300).contains($0) } == true
+
+        return NVIDIAInferenceProbeState(
+            lastProbeAt: telemetryEvent.timestamp,
+            lastStatus: isSuccess ? .success : .failure,
+            lastSuccessAt: isSuccess ? telemetryEvent.timestamp : current?.lastSuccessAt,
+            lastFailureAt: isSuccess ? current?.lastFailureAt : telemetryEvent.timestamp,
+            lastFailureClass: isSuccess ? current?.lastFailureClass : telemetryEvent.failureClass,
+            lastTimeoutStage: telemetryEvent.timeoutStage,
+            lastUpstreamHTTPStatus: telemetryEvent.upstreamHTTPStatus,
+            lastTransportOutcome: telemetryEvent.transportOutcome,
+            lastFirstByteLatencyMilliseconds: telemetryEvent.firstByteLatencyMilliseconds,
+            lastTotalLatencyMilliseconds: telemetryEvent.totalLatencyMilliseconds
+        )
+    }
+
     private static func routeCircuitState(
         _ state: RouteCircuitState,
-        replacingLastTelemetryEvent telemetryEvent: RouteTelemetryEvent?
+        replacingLastTelemetryEvent telemetryEvent: RouteTelemetryEvent?,
+        replacingNVIDIAInferenceProbe nvidiaInferenceProbe: NVIDIAInferenceProbeState? = nil
     ) -> RouteCircuitState {
         RouteCircuitState(
             status: state.status,
@@ -4326,7 +4437,8 @@ enum OpenAICompatTemporaryShim {
             lastSuccessAt: state.lastSuccessAt,
             lastSuccessRequestID: state.lastSuccessRequestID,
             lastFailureAt: state.lastFailureAt,
-            lastFailureClass: state.lastFailureClass
+            lastFailureClass: state.lastFailureClass,
+            nvidiaInferenceProbe: nvidiaInferenceProbe ?? state.nvidiaInferenceProbe
         )
     }
 
@@ -4561,7 +4673,7 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 6,
+              let version = json["version"] as? Int, version >= 1, version <= 7,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -4617,7 +4729,8 @@ enum OpenAICompatTemporaryShim {
                 lastSuccessAt: lastSuccessAt,
                 lastSuccessRequestID: lastSuccessRequestID,
                 lastFailureAt: lastFailureAt,
-                lastFailureClass: lastFailureClass
+                lastFailureClass: lastFailureClass,
+                nvidiaInferenceProbe: parseNVIDIAInferenceProbeState(entry["nvidia_inference_probe"])
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
@@ -4625,7 +4738,7 @@ enum OpenAICompatTemporaryShim {
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
         concurrencyRegistry.loadLocked(from: json, persistedVersion: version)
-        if prunedUnknownEntries || normalizedPersistedAvailability || version < 6 {
+        if prunedUnknownEntries || normalizedPersistedAvailability || version < 7 {
             persistRouteHealthLocked()
         }
 
@@ -4695,7 +4808,8 @@ enum OpenAICompatTemporaryShim {
                 lastTelemetryEvent: state.lastTelemetryEvent,
                 rollingMetrics: state.rollingMetrics,
                 emaMetrics: state.emaMetrics,
-                recoveredAt: now
+                recoveredAt: now,
+                nvidiaInferenceProbe: state.nvidiaInferenceProbe
             )
             healedAny = true
         }
@@ -4731,7 +4845,16 @@ enum OpenAICompatTemporaryShim {
             return false
         }
 
-        return state.status == .open
+        if state.status == .open {
+            return true
+        }
+
+        if routeHealthKey.hasPrefix("nvidia::"),
+           state.status == .suspect || state.status == .halfOpen {
+            return true
+        }
+
+        return false
     }
 
     /// Schedule a debounced persist of route health state.
@@ -4796,12 +4919,15 @@ enum OpenAICompatTemporaryShim {
             if let lastFailureClass = state.lastFailureClass {
                 entry["last_failure_class"] = lastFailureClass
             }
+            if let nvidiaInferenceProbe = state.nvidiaInferenceProbe {
+                entry["nvidia_inference_probe"] = nvidiaInferenceProbeStateDictionary(nvidiaInferenceProbe)
+            }
             routes[routeHealthKey] = entry
         }
 
         let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
-            "version": 6,
+            "version": 7,
             "routes": routes,
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns
@@ -4940,6 +5066,34 @@ enum OpenAICompatTemporaryShim {
         ]
     }
 
+    private static func nvidiaInferenceProbeStateDictionary(_ probe: NVIDIAInferenceProbeState) -> [String: Any] {
+        var dict: [String: Any] = [
+            "last_probe_at": iso8601String(from: probe.lastProbeAt),
+            "last_status": probe.lastStatus.rawValue,
+            "last_timeout_stage": probe.lastTimeoutStage.rawValue,
+            "last_transport_outcome": probe.lastTransportOutcome
+        ]
+        if let lastSuccessAt = probe.lastSuccessAt {
+            dict["last_success_at"] = iso8601String(from: lastSuccessAt)
+        }
+        if let lastFailureAt = probe.lastFailureAt {
+            dict["last_failure_at"] = iso8601String(from: lastFailureAt)
+        }
+        if let lastFailureClass = probe.lastFailureClass {
+            dict["last_failure_class"] = lastFailureClass
+        }
+        if let lastUpstreamHTTPStatus = probe.lastUpstreamHTTPStatus {
+            dict["last_upstream_http_status"] = lastUpstreamHTTPStatus
+        }
+        if let lastFirstByteLatencyMilliseconds = probe.lastFirstByteLatencyMilliseconds {
+            dict["last_first_byte_latency_ms"] = lastFirstByteLatencyMilliseconds
+        }
+        if let lastTotalLatencyMilliseconds = probe.lastTotalLatencyMilliseconds {
+            dict["last_total_latency_ms"] = lastTotalLatencyMilliseconds
+        }
+        return dict
+    }
+
     private static func parseRollingMetrics(_ rawValue: Any?) -> RouteRollingMetrics {
         guard let dict = rawValue as? [String: Any] else {
             return .empty
@@ -4966,6 +5120,31 @@ enum OpenAICompatTemporaryShim {
             successRate: successRate,
             averageLatencyMs: averageLatencyMs,
             observationCount: observationCount
+        )
+    }
+
+    private static func parseNVIDIAInferenceProbeState(_ rawValue: Any?) -> NVIDIAInferenceProbeState? {
+        guard let dict = rawValue as? [String: Any],
+              let lastProbeAt = parseISO8601Date(dict["last_probe_at"]),
+              let lastStatusRaw = dict["last_status"] as? String,
+              let lastStatus = NVIDIAInferenceProbeStatus(rawValue: lastStatusRaw),
+              let timeoutStageRaw = dict["last_timeout_stage"] as? String,
+              let lastTimeoutStage = DeadlineStage(rawValue: timeoutStageRaw),
+              let lastTransportOutcome = dict["last_transport_outcome"] as? String else {
+            return nil
+        }
+
+        return NVIDIAInferenceProbeState(
+            lastProbeAt: lastProbeAt,
+            lastStatus: lastStatus,
+            lastSuccessAt: parseISO8601Date(dict["last_success_at"]),
+            lastFailureAt: parseISO8601Date(dict["last_failure_at"]),
+            lastFailureClass: dict["last_failure_class"] as? String,
+            lastTimeoutStage: lastTimeoutStage,
+            lastUpstreamHTTPStatus: integerValue(dict["last_upstream_http_status"]),
+            lastTransportOutcome: lastTransportOutcome,
+            lastFirstByteLatencyMilliseconds: integerValue(dict["last_first_byte_latency_ms"]),
+            lastTotalLatencyMilliseconds: integerValue(dict["last_total_latency_ms"])
         )
     }
 
@@ -15996,6 +16175,50 @@ self.forwardNvidiaReasoningRequestWithRetry(
                     routePayload["route_health_key"] = route.routeHealthKey
                     routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: route.routeHealthKey)
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
+                    if route.providerID == "nvidia" {
+                        let recentLiveSuccess = OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: requestModel) &&
+                            state.lastTelemetryEvent?.source != "canary"
+                        routePayload["nvidia_stream_diagnostics"] = [
+                            "transport_protocol": Self.nvidiaDirectTransportPolicy.protocolPreference.rawValue,
+                            "inter_chunk_read_timeout_seconds": Int(Self.nvidiaDirectTransportPolicy.interChunkReadTimeoutSeconds),
+                            "downstream_keepalives_enabled": Self.nvidiaDirectTransportPolicy.sinkPolicy.emitsDownstreamKeepalives,
+                            "downstream_keepalive_interval_seconds": Int(Self.nvidiaDirectTransportPolicy.sinkPolicy.keepaliveIntervalSeconds)
+                        ]
+                        var livenessPayload: [String: Any] = [
+                            "trusted": OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: requestModel),
+                            "recent_live_success": recentLiveSuccess,
+                            "recent_probe_success": OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceProbeSuccess(forRequestModel: requestModel),
+                            "freshness_window_seconds": Int(OpenAICompatTemporaryShim.nvidiaInferenceProbeFreshnessWindow)
+                        ]
+                        if let probe = state.nvidiaInferenceProbe {
+                            var probePayload: [String: Any] = [
+                                "last_probe_at": ISO8601DateFormatter().string(from: probe.lastProbeAt),
+                                "last_status": probe.lastStatus.rawValue,
+                                "last_timeout_stage": probe.lastTimeoutStage.rawValue,
+                                "last_transport_outcome": probe.lastTransportOutcome
+                            ]
+                            if let lastSuccessAt = probe.lastSuccessAt {
+                                probePayload["last_success_at"] = ISO8601DateFormatter().string(from: lastSuccessAt)
+                            }
+                            if let lastFailureAt = probe.lastFailureAt {
+                                probePayload["last_failure_at"] = ISO8601DateFormatter().string(from: lastFailureAt)
+                            }
+                            if let lastFailureClass = probe.lastFailureClass {
+                                probePayload["last_failure_class"] = lastFailureClass
+                            }
+                            if let lastUpstreamHTTPStatus = probe.lastUpstreamHTTPStatus {
+                                probePayload["last_upstream_http_status"] = lastUpstreamHTTPStatus
+                            }
+                            if let lastFirstByteLatencyMilliseconds = probe.lastFirstByteLatencyMilliseconds {
+                                probePayload["last_first_byte_latency_ms"] = lastFirstByteLatencyMilliseconds
+                            }
+                            if let lastTotalLatencyMilliseconds = probe.lastTotalLatencyMilliseconds {
+                                probePayload["last_total_latency_ms"] = lastTotalLatencyMilliseconds
+                            }
+                            livenessPayload["probe"] = probePayload
+                        }
+                        routePayload["nvidia_inference_liveness"] = livenessPayload
+                    }
                 }
                 if let cooldownUntil = OpenAICompatTemporaryShim.routeCooldownUntil(forRequestModel: requestModel) {
                     routePayload["cooldown_until"] = ISO8601DateFormatter().string(from: cooldownUntil)
@@ -16467,10 +16690,16 @@ self.forwardNvidiaReasoningRequestWithRetry(
             return false
         }
 
-        if let routeStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel),
-           routeStatus == .open || routeStatus == .suspect || routeStatus == .halfOpen,
-           !OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: candidateModel) {
-            return false
+        if let routeState = OpenAICompatTemporaryShim.routeHealthState(forRequestModel: candidateModel),
+           routeState.status == .open || routeState.status == .suspect || routeState.status == .halfOpen {
+            if let candidateRoute = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
+               candidateRoute.providerID == "nvidia" {
+                guard OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: candidateModel) else {
+                    return false
+                }
+            } else if !OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: candidateModel) {
+                return false
+            }
         }
 
         return OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(

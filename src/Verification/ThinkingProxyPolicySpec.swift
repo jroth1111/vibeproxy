@@ -11378,6 +11378,171 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("suspect nvidia routes remain canary-probeable and record probe evidence", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now.addingTimeInterval(-20),
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "live_request",
+                        firstByteLatencyMilliseconds: 240_000,
+                        totalLatencyMilliseconds: 300_000
+                    ),
+                    at: now.addingTimeInterval(-20)
+                )
+
+                let canaryModels = OpenAICompatTemporaryShim.canaryProbeRequestModels(at: now)
+                expectEqual(canaryModels.contains("glm5-nvidia"), true, "suspect NVIDIA lanes should stay probeable by the real-inference canary sweep", recorder: recorder)
+
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_response",
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "canary",
+                        firstByteLatencyMilliseconds: 1_234,
+                        totalLatencyMilliseconds: 4_321
+                    ),
+                    at: now
+                )
+
+                let probe = OpenAICompatTemporaryShim.nvidiaInferenceProbeState(forRequestModel: "glm5-nvidia")
+                expectEqual(OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceProbeSuccess(forRequestModel: "glm5-nvidia", at: now), true, "successful canary inference should become recent NVIDIA liveness evidence", recorder: recorder)
+                expectEqual(probe?.lastStatus, .success, "the probe state should record the successful canary outcome", recorder: recorder)
+                expectEqual(probe?.lastFirstByteLatencyMilliseconds, 1_234, "the probe state should preserve first-byte latency diagnostics", recorder: recorder)
+                expectEqual(probe?.lastTotalLatencyMilliseconds, 4_321, "the probe state should preserve total latency diagnostics", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("healthz surfaces nvidia probe diagnostics and trusts probe-backed worker recovery", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let now = Date()
+                    let nvidiaFailureAt = now.addingTimeInterval(-45)
+                    let nvidiaProbeAt = now.addingTimeInterval(-5)
+
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm-5.1-zai",
+                        until: now.addingTimeInterval(120)
+                    )
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm-5.1-ollama-pro",
+                        until: now.addingTimeInterval(120)
+                    )
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "minimax-m2.7-ollama-pro",
+                        until: now.addingTimeInterval(120)
+                    )
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "muse-spark",
+                        until: now.addingTimeInterval(120)
+                    )
+
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: nvidiaFailureAt,
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: selfRoutedGenericCompatFactoryWorkerContract.workerModelID,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_error",
+                            failureClass: "transport_timeout",
+                            timeoutStage: .firstResponse,
+                            upstreamHTTPStatus: nil,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: 240_000,
+                            totalLatencyMilliseconds: 300_000
+                        ),
+                        at: nvidiaFailureAt
+                    )
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: nvidiaProbeAt,
+                            requestModel: "glm5-nvidia",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "canary",
+                            firstByteLatencyMilliseconds: 777,
+                            totalLatencyMilliseconds: 9_999
+                        ),
+                        at: nvidiaProbeAt
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("probe-backed healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let routeHealth = payload["route_health"] as? [String: Any]
+                    let routes = routeHealth?["routes"] as? [String: Any]
+                    let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                    let nvidiaLiveness = glm5Route?["nvidia_inference_liveness"] as? [String: Any]
+                    let nvidiaProbe = nvidiaLiveness?["probe"] as? [String: Any]
+                    let streamDiagnostics = glm5Route?["nvidia_stream_diagnostics"] as? [String: Any]
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should trust a suspect NVIDIA lane once a recent real canary probe proves inference still works", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should expose the recovered NVIDIA worker provider", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker ready when probe-backed NVIDIA recovery is the only dispatchable lane", recorder: recorder)
+                    expectEqual(nvidiaLiveness?["trusted"] as? Bool, true, "healthz should report NVIDIA inference liveness as trusted after a recent probe success", recorder: recorder)
+                    expectEqual(nvidiaLiveness?["recent_probe_success"] as? Bool, true, "healthz should surface that the current NVIDIA liveness evidence comes from a recent probe", recorder: recorder)
+                    expectEqual(nvidiaLiveness?["recent_live_success"] as? Bool, false, "healthz should distinguish probe-backed recovery from live request success", recorder: recorder)
+                    expectEqual(nvidiaProbe?["last_status"] as? String, "success", "healthz should expose the latest NVIDIA probe status", recorder: recorder)
+                    expectEqual(nvidiaProbe?["last_first_byte_latency_ms"] as? Int, 777, "healthz should expose NVIDIA probe first-byte latency", recorder: recorder)
+                    expectEqual(nvidiaProbe?["last_total_latency_ms"] as? Int, 9_999, "healthz should expose NVIDIA probe total latency", recorder: recorder)
+                    expectEqual(streamDiagnostics?["transport_protocol"] as? String, "http1Only", "healthz should expose the dedicated NVIDIA transport protocol policy", recorder: recorder)
+                    expectEqual(streamDiagnostics?["inter_chunk_read_timeout_seconds"] as? Int, 300, "healthz should expose the NVIDIA inter-chunk read timeout budget", recorder: recorder)
+                    expectEqual(streamDiagnostics?["downstream_keepalives_enabled"] as? Bool, true, "healthz should expose whether the NVIDIA streamed sink injects keepalives", recorder: recorder)
+                    expectEqual(streamDiagnostics?["downstream_keepalive_interval_seconds"] as? Int, 8, "healthz should expose the NVIDIA keepalive cadence", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz keeps provider-sibling worker lanes separate instead of collapsing them onto one canonical model id", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
