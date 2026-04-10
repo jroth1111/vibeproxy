@@ -11102,9 +11102,9 @@ struct ThinkingProxyPolicySpec {
                             upstreamHTTPStatus: 200,
                             retryCount: 0,
                             source: "smart_alias",
+                            totalLatencyMilliseconds: 42,
                             callerRequestID: "live-worker-req",
-                            requestShape: "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content",
-                            totalLatencyMilliseconds: 42
+                            requestShape: "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content"
                         )
                     )
                     OpenAICompatTemporaryShim.recordRouteSuccess(
