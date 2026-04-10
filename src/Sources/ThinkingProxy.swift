@@ -1543,11 +1543,12 @@ enum OpenAICompatTemporaryShim {
             path: path,
             jsonString: candidateBody
         ) ?? candidateBody
+        // Preflight checks are only applied to incoming request characteristics, not the rewritten candidate model
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
-            jsonString: transformedCandidateBody
+            jsonString: currentBody
            ) {
             return .providerPreflightBlocked(
                 reason: "provider_preflight_\(preflightError.statusCode)",
@@ -1588,15 +1589,37 @@ enum OpenAICompatTemporaryShim {
                 )
             case .skipped(let reason):
                 skippedReasons.append((nextCandidateModel, reason))
-            case .providerPreflightBlocked(let reason, let error):
+            case .providerPreflightBlocked(let reason, _):
                 skippedReasons.append((nextCandidateModel, reason))
-                if remainingCandidateModels.isEmpty {
-                    terminalPreflightError = error
-                }
+                recordRouteFailure(forRequestModel: nextCandidateModel)
             }
         }
 
         NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
+
+        // Fallback to rescue route when all pool candidates are exhausted
+        if let rescueCandidateBody = rewrittenRequestJSON(
+            method: method,
+            path: path,
+            replacingRequestModelIn: currentBody,
+            with: proxyPoolToolWorkerPrimaryCandidate
+        ) {
+            let transformedRequestJSON = transformRequest(
+                method: method,
+                path: path,
+                jsonString: rescueCandidateBody
+            ) ?? rescueCandidateBody
+            NSLog("[ThinkingProxy] Falling back to rescue route candidate %@", proxyPoolToolWorkerPrimaryCandidate)
+            return SmartAliasCandidateSelectionResult(
+                transition: SmartAliasCandidateTransition(
+                    body: transformedRequestJSON,
+                    model: proxyPoolToolWorkerPrimaryCandidate,
+                    remainingCandidateModels: []
+                ),
+                terminalPreflightError: nil
+            )
+        }
+
         return SmartAliasCandidateSelectionResult(
             transition: nil,
             terminalPreflightError: terminalPreflightError
@@ -4605,6 +4628,19 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
+    private static func hasVisibleStructuredPayloadField(_ dictionary: [String: Any]) -> Bool {
+        let visiblePayloadKeys: Set<String> = [
+            "text",
+            "output_text",
+            "value",
+            "json",
+            "result",
+            "arguments",
+            "content"
+        ]
+        return visiblePayloadKeys.contains { dictionary[$0] != nil }
+    }
+
     private static func isIgnorableNonMediaTypedContent(_ dictionary: [String: Any]) -> Bool {
         guard !containsUnsupportedMediaPayload(dictionary) else {
             return false
@@ -4627,6 +4663,13 @@ enum OpenAICompatTemporaryShim {
             // Opaque non-media dictionaries without a type marker still show up in live worker
             // transcripts. For text-only fallback lanes, degrade them to empty-string context
             // rather than excluding the route outright.
+            return true
+        }
+
+        if !hasVisibleStructuredPayloadField(dictionary) {
+            // Some providers and SDKs emit metadata-only wrappers such as `tool_result` with
+            // identifiers but no visible payload. These should not exclude text-only fallback
+            // routes when the surrounding transcript still has usable visible context.
             return true
         }
 
@@ -6289,7 +6332,23 @@ enum MetaAIWebAdapter {
         guard let type = normalizedString(dictionary["type"] as? String)?.lowercased() else {
             return true
         }
+        if !hasVisibleStructuredPayloadField(dictionary) {
+            return true
+        }
         return !nonIgnorableTypes.contains(type)
+    }
+
+    private static func hasVisibleStructuredPayloadField(_ dictionary: [String: Any]) -> Bool {
+        let visiblePayloadKeys: Set<String> = [
+            "text",
+            "output_text",
+            "value",
+            "json",
+            "result",
+            "arguments",
+            "content"
+        ]
+        return visiblePayloadKeys.contains { dictionary[$0] != nil }
     }
 
     private static func containsUnsupportedMediaContent(_ dictionary: [String: Any]) -> Bool {
@@ -11678,7 +11737,7 @@ class ThinkingProxy {
         return nil
     }
 
-    private func classifySmartAliasSuccessBodyFailure(path: String, bodyData: Data) -> String? {
+    private func classifySmartAliasSuccessBodyFailure(path: String, bodyData: Data, requiredToolParameters: [String: [String]]? = nil) -> String? {
         if bodyData.isEmpty {
             return "empty_body"
         }
@@ -11694,7 +11753,7 @@ class ThinkingProxy {
             return "missing_choices"
         }
         let message = choices[0]["message"] as? [String: Any] ?? [:]
-        switch OpenAICompatTemporaryShim.validateToolCalls(in: message) {
+        switch OpenAICompatTemporaryShim.validateToolCalls(in: message, requiredToolParameters: requiredToolParameters) {
         case .invalid:
             return "malformed_tool_arguments"
         case .valid:
