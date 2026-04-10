@@ -2311,7 +2311,11 @@ enum OpenAICompatTemporaryShim {
         attempt: NVIDIAAttemptResult,
         outcome: NVIDIARuntimeOutcome,
         source: String,
-        attemptLane: Int = 1
+        attemptLane: Int = 1,
+        proxyRequestID: String? = nil,
+        callerRequestID: String? = nil,
+        callerSessionID: String? = nil,
+        requestShape: String? = nil
     ) -> RouteTelemetryEvent {
         let canonicalModelID = resolveConfiguredRoute(forRequestModel: state.model)?.canonicalModelID ?? state.model
         let retryCount = max(0, state.initialTransportRetries - state.transportRetriesRemaining) +
@@ -2339,7 +2343,11 @@ enum OpenAICompatTemporaryShim {
                 retryCount: retryCount,
                 source: source,
                 firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds,
+                proxyRequestID: proxyRequestID,
+                callerRequestID: callerRequestID,
+                callerSessionID: callerSessionID,
+                requestShape: requestShape
             )
         }
 
@@ -2372,7 +2380,11 @@ enum OpenAICompatTemporaryShim {
                 retryCount: retryCount,
                 source: source,
                 firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds,
+                proxyRequestID: proxyRequestID,
+                callerRequestID: callerRequestID,
+                callerSessionID: callerSessionID,
+                requestShape: requestShape
             )
         }
 
@@ -2400,7 +2412,11 @@ enum OpenAICompatTemporaryShim {
                     retryCount: retryCount,
                     source: source,
                     firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
-                    totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+                    totalLatencyMilliseconds: attempt.totalLatencyMilliseconds,
+                    proxyRequestID: proxyRequestID,
+                    callerRequestID: callerRequestID,
+                    callerSessionID: callerSessionID,
+                    requestShape: requestShape
                 )
             }
 
@@ -2421,7 +2437,11 @@ enum OpenAICompatTemporaryShim {
                 retryCount: retryCount,
                 source: source,
                 firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+                totalLatencyMilliseconds: attempt.totalLatencyMilliseconds,
+                proxyRequestID: proxyRequestID,
+                callerRequestID: callerRequestID,
+                callerSessionID: callerSessionID,
+                requestShape: requestShape
             )
         }
 
@@ -2437,7 +2457,11 @@ enum OpenAICompatTemporaryShim {
             retryCount: retryCount,
             source: source,
             firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
-            totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+            totalLatencyMilliseconds: attempt.totalLatencyMilliseconds,
+            proxyRequestID: proxyRequestID,
+            callerRequestID: callerRequestID,
+            callerSessionID: callerSessionID,
+            requestShape: requestShape
         )
     }
 
@@ -2704,6 +2728,21 @@ enum OpenAICompatTemporaryShim {
             }
             return cooldownUntil
         }
+    }
+
+    static func nextRetryHint(
+        forRequestModel requestModel: String,
+        at now: Date = Date()
+    ) -> (seconds: Int, reason: String)? {
+        if let cooldownUntil = routeCooldownUntil(forRequestModel: requestModel, at: now),
+           cooldownUntil > now {
+            return (max(1, Int(ceil(cooldownUntil.timeIntervalSince(now)))), "cooldown")
+        }
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel),
+              concurrencyRegistry.isAtCapacity(routeHealthKey: route.routeHealthKey) else {
+            return nil
+        }
+        return (1, "concurrency")
     }
 
     static func latencyDiagnostics(forRequestModel requestModel: String) -> RouteLatencyDiagnostics? {
@@ -3183,6 +3222,24 @@ enum OpenAICompatTemporaryShim {
                 }
 
             return freshestObservedWinner?.requestModel
+        }
+    }
+
+    static func hasRecentInferenceSuccess(
+        forRequestModel requestModel: String,
+        maxAge: TimeInterval = 300,
+        at now: Date = Date()
+    ) -> Bool {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return false
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey],
+                  let lastSuccessAt = state.lastSuccessAt else {
+                return false
+            }
+            return now.timeIntervalSince(lastSuccessAt) <= maxAge
         }
     }
 
@@ -8954,24 +9011,25 @@ class ThinkingProxy {
     }
 
     private static let directPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.direct-session-pool")
-    private static var directSessionPool: [String: (session: URLSession, lastUsed: Date)] = [:]
+    private static var directSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
     private static let directPoolMaxSize = 8
     private static let directPoolIdleEviction: TimeInterval = 300
 
-    static func acquireDirectSession(key: String) -> URLSession? {
+    private static func acquireDirectSession(key: String) -> (URLSession, MultiplexedSessionDelegate)? {
         directPoolQueue.sync {
             evictIdleDirectSessionsLocked()
 
             if let existing = directSessionPool[key] {
-                directSessionPool[key] = (existing.session, lastUsed: Date())
-                return existing.session
+                directSessionPool[key] = (existing.session, existing.delegate, lastUsed: Date())
+                return (existing.session, existing.delegate)
             }
 
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
             configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(360)
             configuration.waitsForConnectivity = true
-            let session = URLSession(configuration: configuration, delegate: nil, delegateQueue: nil)
+            let delegate = MultiplexedSessionDelegate()
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
 
             if directSessionPool.count >= directPoolMaxSize {
                 if let oldestKey = directSessionPool.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
@@ -8980,27 +9038,24 @@ class ThinkingProxy {
                 }
             }
 
-            directSessionPool[key] = (session, lastUsed: Date())
-            return session
+            directSessionPool[key] = (session, delegate, lastUsed: Date())
+            return (session, delegate)
         }
     }
 
-    /// Remove a session from the pool and invalidate it.  Call this in the
-    /// completion handler of a data task that was obtained from
-    /// ``acquireDirectSession(key:)`` so that a subsequent request never
-    /// picks up an already-invalidated session from the pool.
-    static func removeDirectSession(key: String, session: URLSession) {
+    static func evictDirectSession(key: String, session: URLSession? = nil) {
         directPoolQueue.sync {
-            // Only remove if the pooled entry is the exact same session instance.
-            if directSessionPool[key]?.session === session {
-                directSessionPool.removeValue(forKey: key)
+            guard let existing = directSessionPool[key] else { return }
+            if let session, existing.session !== session {
+                return
             }
+            existing.session.finishTasksAndInvalidate()
+            directSessionPool.removeValue(forKey: key)
         }
-        session.finishTasksAndInvalidate()
     }
 
     static func acquireDirectSessionForTesting(key: String) -> URLSession? {
-        acquireDirectSession(key: key)
+        acquireDirectSession(key: key)?.0
     }
 
     private static func evictIdleDirectSessionsLocked() {
@@ -9478,12 +9533,30 @@ class ThinkingProxy {
                 path: rewrittenPath,
                 jsonString: modifiedBody
             ) {
-                NSLog("[ThinkingProxy] NVIDIA preflight mitigation blocked request for \(rewrittenPath): \(preflightError.message)")
+                if let reasonCode = preflightError.reasonCode {
+                    NSLog(
+                        "[ThinkingProxy] NVIDIA preflight mitigation blocked request [%@] for %@: %@ (%@)",
+                        requestTrace.proxyRequestID,
+                        rewrittenPath,
+                        preflightError.message,
+                        reasonCode
+                    )
+                } else {
+                    NSLog(
+                        "[ThinkingProxy] NVIDIA preflight mitigation blocked request [%@] for %@: %@",
+                        requestTrace.proxyRequestID,
+                        rewrittenPath,
+                        preflightError.message
+                    )
+                }
                 sendError(
                     to: connection,
                     statusCode: preflightError.statusCode,
                     message: preflightError.message,
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: preflightFailureHeaders(
+                        for: preflightError,
+                        requestTrace: requestTrace
+                    )
                 )
                 return
             }
@@ -10107,7 +10180,10 @@ class ThinkingProxy {
                     statusCode: terminalPreflightError.statusCode,
                     message: terminalPreflightError.message,
                     coalescingKey: coalescingKey,
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: preflightFailureHeaders(
+                        for: terminalPreflightError,
+                        requestTrace: requestTrace
+                    )
                 )
                 return
             }
@@ -10163,7 +10239,10 @@ class ThinkingProxy {
                 statusCode: exhaustionSummary?.statusCode ?? 503,
                 message: exhaustionSummary?.clientFacingMessage(publicAlias: publicAlias) ?? "All configured worker backends are currently unavailable.",
                 coalescingKey: coalescingKey,
-                overridingHeaders: requestTrace.responseHeaders
+                overridingHeaders: smartAliasExhaustionHeaders(
+                    for: exhaustionSummary,
+                    requestTrace: requestTrace
+                )
             )
             return
         }
@@ -11905,7 +11984,11 @@ class ThinkingProxy {
                     attempt: attempt,
                     outcome: outcome,
                     source: telemetrySource,
-                    attemptLane: attemptLane
+                    attemptLane: attemptLane,
+                    proxyRequestID: requestTrace.proxyRequestID,
+                    callerRequestID: requestTrace.callerRequestID,
+                    callerSessionID: requestTrace.callerSessionID,
+                    requestShape: requestTrace.requestShape
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -12389,6 +12472,36 @@ class ThinkingProxy {
         return nil
     }
 
+    private func mergingResponseHeaders(
+        _ headers: [String: String],
+        with requestTrace: RequestTraceContext? = nil
+    ) -> [String: String] {
+        guard let requestTrace else { return headers }
+        return headers.merging(requestTrace.responseHeaders) { current, _ in current }
+    }
+
+    private func preflightFailureHeaders(
+        for failure: OpenAICompatTemporaryShim.ClientFacingNVIDIAFailure,
+        requestTrace: RequestTraceContext? = nil
+    ) -> [String: String] {
+        var headers: [String: String] = [:]
+        if let reasonCode = failure.reasonCode {
+            headers["X-VibeProxy-Preflight-Reason"] = reasonCode
+        }
+        return mergingResponseHeaders(headers, with: requestTrace)
+    }
+
+    private func smartAliasExhaustionHeaders(
+        for exhaustionSummary: OpenAICompatTemporaryShim.SmartAliasExhaustionSummary?,
+        requestTrace: RequestTraceContext? = nil
+    ) -> [String: String] {
+        var headers: [String: String] = [:]
+        if let exhaustionSummary {
+            headers["X-VibeProxy-Smart-Alias-Exhaustion"] = exhaustionSummary.classification
+        }
+        return mergingResponseHeaders(headers, with: requestTrace)
+    }
+
     private func smartAliasTelemetrySource(headers: [(String, String)]) -> String {
         guard let probeHeader = requestHeaderValue("X-VibeProxy-Probe", in: headers)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -12421,7 +12534,12 @@ class ThinkingProxy {
             retryCount: event.retryCount,
             source: event.source,
             firstByteLatencyMilliseconds: event.firstByteLatencyMilliseconds,
-            totalLatencyMilliseconds: event.totalLatencyMilliseconds
+            totalLatencyMilliseconds: event.totalLatencyMilliseconds,
+            inflightAtRequest: event.inflightAtRequest,
+            proxyRequestID: event.proxyRequestID,
+            callerRequestID: event.callerRequestID,
+            callerSessionID: event.callerSessionID,
+            requestShape: event.requestShape
         )
     }
 
@@ -13693,7 +13811,12 @@ class ThinkingProxy {
         guard !coordinator.isFinished() else { return }
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
             if coordinator.tryFinish(attemptLane: attemptLane) {
-                sendError(to: originalConnection, statusCode: 500, message: "Internal Server Error")
+                sendError(
+                    to: originalConnection,
+                    statusCode: 500,
+                    message: "Internal Server Error",
+                    overridingHeaders: requestTrace.responseHeaders
+                )
             }
             return
         }
@@ -13730,20 +13853,28 @@ class ThinkingProxy {
         request.setValue("close", forHTTPHeaderField: "Connection")
 
         let sessionKey = "direct:127.0.0.1:\(targetPort)"
-        let pooledSession = ThinkingProxy.acquireDirectSession(key: sessionKey)
+        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+            permit.release()
+            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+            self.deliverBufferedError(
+                defaultConnection: originalConnection,
+                statusCode: 502,
+                message: "upstream session unavailable",
+                coalescingKey: state.coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
+            )
+            return
+        }
         let responseProgress = ResponseProgressDelegate()
-        let session: URLSession = pooledSession ?? URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let taskHolder = TaskIdHolder()
         let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { [weak self] (data: Data?, response: URLResponse?, error: Error?) in
             guard let self else { return }
             defer {
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
+                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
                 responseProgress.finish()
-                if pooledSession != nil {
-                    ThinkingProxy.removeDirectSession(key: sessionKey, session: session)
-                } else {
-                    session.finishTasksAndInvalidate()
-                }
             }
             guard requestController.isCancelled() != true else { return }
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
@@ -13765,7 +13896,11 @@ class ThinkingProxy {
                 attempt: attempt,
                 outcome: outcome,
                 source: "live_request",
-                attemptLane: attemptLane
+                attemptLane: attemptLane,
+                proxyRequestID: requestTrace.proxyRequestID,
+                callerRequestID: requestTrace.callerRequestID,
+                callerSessionID: requestTrace.callerSessionID,
+                requestShape: requestTrace.requestShape
             )
 
             switch outcome {
@@ -13843,7 +13978,8 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     headers: headers,
                     body: bodyData,
-                    coalescingKey: state.coalescingKey
+                    coalescingKey: state.coalescingKey,
+                    overridingHeaders: requestTrace.responseHeaders
                 )
             case .sendError(let statusCode, let message):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -13870,17 +14006,14 @@ class ThinkingProxy {
                     defaultConnection: originalConnection,
                     statusCode: statusCode,
                     message: message,
-                    coalescingKey: state.coalescingKey
+                    coalescingKey: state.coalescingKey,
+                    overridingHeaders: requestTrace.responseHeaders
                 )
             }
         }
         guard let task else {
             NSLog("[SafeDataTask] forwardNvidiaReasoningRequestWithRetry: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
-            if pooledSession != nil {
-                ThinkingProxy.removeDirectSession(key: sessionKey, session: session)
-            } else {
-                session.finishTasksAndInvalidate()
-            }
+            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
             permit.release()
             coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -13888,10 +14021,13 @@ class ThinkingProxy {
                 defaultConnection: originalConnection,
                 statusCode: 502,
                 message: "upstream session invalidated",
-                coalescingKey: state.coalescingKey
+                coalescingKey: state.coalescingKey,
+                overridingHeaders: requestTrace.responseHeaders
             )
             return
         }
+        directPoolDelegate.register(task: task, delegate: responseProgress)
+        taskHolder.taskIdentifier = task.taskIdentifier
         coordinator.registerAttempt(attemptLane: attemptLane) {
             permit.release()
             task.cancel()
@@ -14834,17 +14970,30 @@ self.forwardNvidiaReasoningRequestWithRetry(
                     routePayload["last_failure_class"] = lastFailureClass
                 }
                 if let lastEvent = state.lastTelemetryEvent {
-                    routePayload["last_event"] = [
+                    var lastEventPayload: [String: Any] = [
                         "timestamp": ISO8601DateFormatter().string(from: lastEvent.timestamp),
                         "request_model": lastEvent.requestModel,
-                        "failure_class": lastEvent.failureClass as Any,
-                        "transport_outcome": lastEvent.transportOutcome,
-                        "upstream_http_status": lastEvent.upstreamHTTPStatus as Any,
-                        "proxy_request_id": lastEvent.proxyRequestID as Any,
-                        "caller_request_id": lastEvent.callerRequestID as Any,
-                        "caller_session_id": lastEvent.callerSessionID as Any,
-                        "request_shape": lastEvent.requestShape as Any
+                        "transport_outcome": lastEvent.transportOutcome
                     ]
+                    if let failureClass = lastEvent.failureClass {
+                        lastEventPayload["failure_class"] = failureClass
+                    }
+                    if let upstreamHTTPStatus = lastEvent.upstreamHTTPStatus {
+                        lastEventPayload["upstream_http_status"] = upstreamHTTPStatus
+                    }
+                    if let proxyRequestID = lastEvent.proxyRequestID {
+                        lastEventPayload["proxy_request_id"] = proxyRequestID
+                    }
+                    if let callerRequestID = lastEvent.callerRequestID {
+                        lastEventPayload["caller_request_id"] = callerRequestID
+                    }
+                    if let callerSessionID = lastEvent.callerSessionID {
+                        lastEventPayload["caller_session_id"] = callerSessionID
+                    }
+                    if let requestShape = lastEvent.requestShape {
+                        lastEventPayload["request_shape"] = requestShape
+                    }
+                    routePayload["last_event"] = lastEventPayload
                 }
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
                     routePayload["provider"] = route.providerID
@@ -14855,6 +15004,10 @@ self.forwardNvidiaReasoningRequestWithRetry(
                 }
                 if let cooldownUntil = OpenAICompatTemporaryShim.routeCooldownUntil(forRequestModel: requestModel) {
                     routePayload["cooldown_until"] = ISO8601DateFormatter().string(from: cooldownUntil)
+                }
+                if let retryHint = OpenAICompatTemporaryShim.nextRetryHint(forRequestModel: requestModel) {
+                    routePayload["retry_after_seconds"] = retryHint.seconds
+                    routePayload["retry_hint_reason"] = retryHint.reason
                 }
                 if let latencyDiagnostics = OpenAICompatTemporaryShim.latencyDiagnostics(forRequestModel: requestModel) {
                     routePayload["latency_pressure_status"] = latencyDiagnostics.pressureStatus
@@ -15226,18 +15379,28 @@ self.forwardNvidiaReasoningRequestWithRetry(
             smartAlias: smartAlias
         )
 
-        if let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
-            method: "POST",
-            path: "/v1/chat/completions",
-            currentBody: syntheticWorkerRequest,
-            candidateModelsRemaining: orderedCandidateModels
-        ) {
-            return transition.model
+        for candidateModel in orderedCandidateModels {
+            if factoryWorkerHealthCandidateIsDispatchable(
+                candidateModel: candidateModel,
+                routeModel: routeModel,
+                requestSurface: requestSurface
+            ) {
+                return candidateModel
+            }
         }
 
-        return OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
+        if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
             forRequestedAlias: routeModel
-        )
+        ),
+        factoryWorkerHealthCandidateIsDispatchable(
+            candidateModel: recentObservedCandidate,
+            routeModel: routeModel,
+            requestSurface: requestSurface
+        ) {
+            return recentObservedCandidate
+        }
+
+        return nil
     }
 
     private static func syntheticFactoryWorkerHealthRequest(routeModel: String) -> String {
@@ -15288,6 +15451,12 @@ self.forwardNvidiaReasoningRequestWithRetry(
         )
 
         guard orderedCandidateModels.contains(candidateModel) else {
+            return false
+        }
+
+        if let routeStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel),
+           routeStatus == .suspect || routeStatus == .halfOpen,
+           !OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: candidateModel) {
             return false
         }
 

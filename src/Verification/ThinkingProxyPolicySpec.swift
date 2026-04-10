@@ -8381,6 +8381,25 @@ struct ThinkingProxyPolicySpec {
             ThinkingProxy.clearDirectSessionPoolForTesting()
         }
 
+        run("temporary nvidia direct session pool reuses the dedicated client for the same upstream key", recorder: recorder) {
+            ThinkingProxy.clearDirectSessionPoolForTesting()
+            guard let firstSession = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
+                recorder.recordFailure("expected the first nvidia direct session to be created")
+                return
+            }
+            guard let secondSession = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
+                recorder.recordFailure("expected the second nvidia direct session lookup to succeed")
+                return
+            }
+            expectEqual(
+                firstSession === secondSession,
+                true,
+                "nvidia direct requests should reuse the same dedicated pooled client instead of rebuilding a fresh session each time",
+                recorder: recorder
+            )
+            ThinkingProxy.clearDirectSessionPoolForTesting()
+        }
+
         run("temporary nvidia preflight rejects quarantined hosted routes before spending timeout budget", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -8709,6 +8728,64 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(event.failureClass, "classified_429_concurrency", "classified upstream failures should carry their normalized 429 subtype", recorder: recorder)
                 expectEqual(event.upstreamHTTPStatus, 429, "telemetry should preserve the upstream HTTP status when available", recorder: recorder)
                 expectEqual(event.retryCount, 1, "telemetry should count prior transport retries", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia telemetry preserves request-trace correlation fields", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm5",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 0,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+                let event = OpenAICompatTemporaryShim.telemetryEvent(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: Data("""
+                        {
+                          "id": "chatcmpl_trace",
+                          "object": "chat.completion",
+                          "created": 1,
+                          "model": "glm5",
+                          "choices": [
+                            {
+                              "index": 0,
+                              "message": {"role": "assistant", "content": "OK"},
+                              "finish_reason": "stop"
+                            }
+                          ]
+                        }
+                        """.utf8),
+                        response: response,
+                        error: nil,
+                        deadlineStage: .none,
+                        firstByteLatencyMilliseconds: 12_000,
+                        totalLatencyMilliseconds: 24_000
+                    ),
+                    outcome: .sendResponse(statusCode: 200, headers: response?.allHeaderFields ?? [:], body: Data()),
+                    source: "live_request",
+                    proxyRequestID: "proxy-trace-1",
+                    callerRequestID: "caller-trace-2",
+                    callerSessionID: "session-trace-3",
+                    requestShape: "POST:chat:glm5:buffered:tools=1:strict_tool_choice:string_content"
+                )
+
+                expectEqual(event.proxyRequestID, "proxy-trace-1", "telemetry should preserve the proxy request id for log correlation", recorder: recorder)
+                expectEqual(event.callerRequestID, "caller-trace-2", "telemetry should preserve the caller request id when available", recorder: recorder)
+                expectEqual(event.callerSessionID, "session-trace-3", "telemetry should preserve the caller session id when available", recorder: recorder)
+                expectEqual(event.requestShape, "POST:chat:glm5:buffered:tools=1:strict_tool_choice:string_content", "telemetry should preserve the derived request-shape summary", recorder: recorder)
             }
         }
 
@@ -10325,6 +10402,120 @@ struct ThinkingProxyPolicySpec {
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
+            }
+        }
+
+        run("healthz exposes route cooldown, latency, and request-trace diagnostics", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                let successAt = now.addingTimeInterval(-90)
+                let failureAt = now.addingTimeInterval(-30)
+                let cooldownUntil = now.addingTimeInterval(300)
+                let expectedSlowTotalThresholdMilliseconds = Int(
+                    (OpenAICompatTemporaryShim.attemptTimeout(forRequestModel: "glm5-nvidia") ?? 0) * 1000
+                )
+                let expectedLatencyPressureStatus: String
+                if 300_000 >= Int(Double(expectedSlowTotalThresholdMilliseconds) * 0.9) {
+                    expectedLatencyPressureStatus = "severe"
+                } else if 300_000 >= Int(Double(expectedSlowTotalThresholdMilliseconds) * 0.75) {
+                    expectedLatencyPressureStatus = "elevated"
+                } else {
+                    expectedLatencyPressureStatus = "normal"
+                }
+
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: successAt,
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_response",
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "live_request",
+                        proxyRequestID: "proxy-success-1"
+                    ),
+                    at: successAt
+                )
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: failureAt,
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "live_request",
+                        firstByteLatencyMilliseconds: 240_000,
+                        totalLatencyMilliseconds: 300_000,
+                        proxyRequestID: "proxy-failure-2",
+                        callerRequestID: "caller-failure-3",
+                        callerSessionID: "session-failure-4",
+                        requestShape: "POST:chat:glm5:buffered:tools=0:tool_choice_auto:string_content"
+                    ),
+                    at: failureAt
+                )
+                OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                    forRequestModel: "glm5-nvidia",
+                    until: cooldownUntil,
+                    at: failureAt
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredBody: Data?
+
+                proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                    deliveredBody = body
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("route diagnostics healthz should return a response")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                let routeHealth = payload["route_health"] as? [String: Any]
+                let routes = routeHealth?["routes"] as? [String: Any]
+                let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                let lastEvent = glm5Route?["last_event"] as? [String: Any]
+                let retryAfterSeconds = glm5Route?["retry_after_seconds"] as? Int
+
+                expectEqual(glm5Route?["last_success_request_id"] as? String, "proxy-success-1", "healthz should surface the last successful proxy request id for each route", recorder: recorder)
+                expectEqual(glm5Route?["last_failure_class"] as? String, "transport_timeout", "healthz should surface the last failure class for each route", recorder: recorder)
+                expectEqual((glm5Route?["cooldown_until"] as? String)?.isEmpty ?? true, false, "healthz should surface an active cooldown deadline when present", recorder: recorder)
+                if let retryAfterSeconds {
+                    if retryAfterSeconds < 295 || retryAfterSeconds > 300 {
+                        recorder.recordFailure("healthz should surface a near-current retry delay for cooled-down routes: expected 295...300, got \(retryAfterSeconds)")
+                    }
+                } else {
+                    recorder.recordFailure("healthz should surface the earliest retry delay for cooled-down routes")
+                }
+                expectEqual(glm5Route?["retry_hint_reason"] as? String, "cooldown", "healthz should explain whether the retry delay is from cooldown or concurrency pressure", recorder: recorder)
+                expectEqual(glm5Route?["recent_average_total_latency_ms"] as? Int, 300_000, "healthz should surface recent average total latency per route", recorder: recorder)
+                expectEqual(glm5Route?["recent_p95_total_latency_ms"] as? Int, 300_000, "healthz should surface recent p95 total latency per route", recorder: recorder)
+                expectEqual(glm5Route?["slow_total_threshold_ms"] as? Int, expectedSlowTotalThresholdMilliseconds, "healthz should surface the configured slow-total threshold for the route", recorder: recorder)
+                expectEqual(glm5Route?["latency_pressure_status"] as? String, expectedLatencyPressureStatus, "healthz should classify route latency pressure against the scaled timeout budget", recorder: recorder)
+                expectEqual(lastEvent?["proxy_request_id"] as? String, "proxy-failure-2", "healthz should expose the most recent proxy request id in the last-event summary", recorder: recorder)
+                expectEqual(lastEvent?["caller_request_id"] as? String, "caller-failure-3", "healthz should expose the caller request id in the last-event summary", recorder: recorder)
+                expectEqual(lastEvent?["caller_session_id"] as? String, "session-failure-4", "healthz should expose the caller session id in the last-event summary", recorder: recorder)
+                expectEqual(lastEvent?["request_shape"] as? String, "POST:chat:glm5:buffered:tools=0:tool_choice_auto:string_content", "healthz should expose the recent request-shape summary for the route", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
