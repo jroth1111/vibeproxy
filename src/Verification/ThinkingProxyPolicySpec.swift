@@ -233,6 +233,38 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("request cancellation controller cancels registered work when the client connection is cancelled", recorder: recorder) {
+            let controller = ThinkingProxy.RequestCancellationController()
+            let cancelled = DispatchSemaphore(value: 0)
+
+            controller.registerCurrentCancel {
+                cancelled.signal()
+            }
+            controller.observeConnectionState(.cancelled)
+
+            guard cancelled.wait(timeout: .now() + 1) == .success else {
+                recorder.recordFailure("client cancellation should invoke the registered upstream cancel closure")
+                return
+            }
+
+            expectEqual(controller.isCancelled(), true, "controller should remain cancelled after a client disconnect", recorder: recorder)
+        }
+
+        run("request cancellation controller suppresses scheduled retries after disconnect", recorder: recorder) {
+            let controller = ThinkingProxy.RequestCancellationController()
+            let fired = DispatchSemaphore(value: 0)
+
+            controller.scheduleRetry(after: .milliseconds(50)) {
+                fired.signal()
+            }
+            controller.observeConnectionState(.failed(NWError.posix(.ECONNRESET)))
+
+            if fired.wait(timeout: .now() + 0.2) == .success {
+                recorder.recordFailure("scheduled retries should be cancelled when the client disconnects")
+            }
+            expectEqual(controller.isCancelled(), true, "disconnect-triggered cancellation should block later retry work", recorder: recorder)
+        }
+
         run("temporary nvidia shim flattens text-only typed content arrays", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
