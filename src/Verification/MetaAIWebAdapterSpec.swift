@@ -1019,6 +1019,18 @@ struct MetaAIWebAdapterSpec {
             expectContains(parsed.errorMessage ?? "", #"Variable "$requestedToolCall" got invalid value"#, "top-level SSE error frames should be surfaced directly", recorder: recorder)
         }
 
+        run("meta web adapter rejects oversized event-stream frames", recorder: recorder) {
+            let oversizedContent = String(repeating: "x", count: 262_200)
+            let oversizedStream = """
+            event: next
+            data: {"data":{"sendMessageStream":{"content":"\(oversizedContent)"}}}
+            """
+
+            let parsed = MetaAIWebAdapter.parseEventStream(Data(oversizedStream.utf8))
+            expectEqual(parsed.assistantText, nil, "oversized event-stream frames should not produce assistant text", recorder: recorder)
+            expectContains(parsed.errorMessage ?? "", "oversized event-stream frame", "oversized frames should fail cleanly instead of being parsed unboundedly", recorder: recorder)
+        }
+
         run("meta web adapter translates GraphQL event-stream errors into a clean upstream failure", recorder: recorder) {
             let errorStream = #"""
             event: next
