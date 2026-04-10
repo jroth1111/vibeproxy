@@ -555,6 +555,47 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter ignores unknown non-media typed segments while preserving text summary content", recorder: recorder) {
+            let request = #"""
+            {
+              "model": "muse-spark",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "content": [
+                    {"type": "input_text", "text": "Checked "},
+                    {"type": "summary_text", "text": "repo"},
+                    {"type": "reasoning", "text": "hidden chain of thought"},
+                    {"type": "metadata_marker", "value": {"step": 1}}
+                  ]
+                },
+                {"role": "user", "content": "Answer briefly"}
+              ]
+            }
+            """#
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(
+                    parsed.prompt,
+                    """
+                    Assistant: Checked repo
+
+                    User: Answer briefly
+                    """,
+                    "unknown non-media typed segments should be skipped while preserving summary text",
+                    recorder: recorder
+                )
+                expectEqual(parsed.isNewThread, false, "summary-bearing assistant context should keep the request in follow-up mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should skip unknown non-media typed segments while preserving text: \(error)")
+            }
+        }
+
         run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {

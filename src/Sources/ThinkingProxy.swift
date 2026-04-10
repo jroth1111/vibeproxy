@@ -4485,8 +4485,11 @@ enum OpenAICompatTemporaryShim {
             guard let dictionary = segment as? [String: Any] else {
                 return .unsupported
             }
-            guard let textValue = flattenedTextMessageContent(from: dictionary) else {
+            if containsUnsupportedMediaPayload(dictionary) {
                 return .unsupported
+            }
+            guard let textValue = flattenedTextMessageContent(from: dictionary) else {
+                continue
             }
             collectedSegments.append(textValue)
         }
@@ -4502,33 +4505,41 @@ enum OpenAICompatTemporaryShim {
         let type = (dictionary["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
 
         if let textValue = normalizedTextMessageScalar(dictionary["text"]),
-           type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "tool_result" {
+           allowsDirectText {
             return textValue
         }
 
-        if let outputText = normalizedTextMessageScalar(dictionary["output_text"]) {
+        if let outputText = normalizedTextMessageScalar(dictionary["output_text"]),
+           allowsDirectText || type == "output_json" {
             return outputText
         }
 
-        if let valueText = normalizedTextMessageScalar(dictionary["value"]) {
+        if let valueText = normalizedTextMessageScalar(dictionary["value"]),
+           allowsStructuredPayload {
             return valueText
         }
 
-        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]) {
+        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]),
+           allowsStructuredPayload {
             return structuredJSON
         }
 
-        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]) {
+        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]),
+           allowsStructuredPayload {
             return structuredResult
         }
 
-        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]) {
+        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]),
+           allowsStructuredPayload {
             return structuredArguments
         }
 
-        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]) {
+        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]),
+           allowsStructuredPayload {
             return structuredValue
         }
 
@@ -6060,8 +6071,11 @@ enum MetaAIWebAdapter {
             guard let dictionary = segment as? [String: Any] else {
                 throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
             }
-            guard let text = try flattenedText(fromContentDictionary: dictionary) else {
+            if containsUnsupportedMediaContent(dictionary) {
                 throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
+            }
+            guard let text = try flattenedText(fromContentDictionary: dictionary) else {
+                continue
             }
             parts.append(text)
         }
@@ -6076,29 +6090,39 @@ enum MetaAIWebAdapter {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
 
-        if let text = normalizedString(dictionary["text"] as? String) {
+        let type = normalizedString(dictionary["type"] as? String)?.lowercased()
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
+        if let text = normalizedContentText(dictionary["text"]),
+           allowsDirectText {
             return text
         }
-        if let outputText = normalizedString(dictionary["output_text"] as? String) {
+        if let outputText = normalizedContentText(dictionary["output_text"]),
+           allowsDirectText || type == "output_json" {
             return outputText
         }
-        if let valueText = normalizedString(dictionary["value"] as? String) {
+        if let valueText = normalizedContentText(dictionary["value"]),
+           allowsStructuredPayload {
             return valueText
         }
 
-        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]) {
+        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]),
+           allowsStructuredPayload {
             return structuredJSON
         }
 
-        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]) {
+        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]),
+           allowsStructuredPayload {
             return structuredResult
         }
 
-        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]) {
+        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]),
+           allowsStructuredPayload {
             return structuredArguments
         }
 
-        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]) {
+        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]),
+           allowsStructuredPayload {
             return structuredValue
         }
 
@@ -6159,6 +6183,14 @@ enum MetaAIWebAdapter {
             return nil
         }
         return trimmed
+    }
+
+    private static func normalizedContentText(_ value: Any?) -> String? {
+        guard let stringValue = value as? String,
+              !stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return stringValue
     }
 
     private static func normalizedStructuredPayloadString(_ value: Any?) -> String? {
