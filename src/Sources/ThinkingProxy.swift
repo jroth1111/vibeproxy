@@ -1261,7 +1261,75 @@ enum OpenAICompatTemporaryShim {
         // healthy: ZAI GLM first, then Ollama GLM, then the MiniMax fallback. When a lane degrades,
         // only health bucket ordering may move it back; latency/EMA scoring must not leapfrog a
         // lower-priority backend ahead of a healthy preferred sibling.
-        return availabilityRankedSmartAliasCandidateModels(smartAlias.candidates)
+        let availabilityRankedCandidates = availabilityRankedSmartAliasCandidateModels(smartAlias.candidates)
+        return requestShapeAdjustedSmartAliasCandidateModels(
+            availabilityRankedCandidates,
+            method: method,
+            path: path,
+            jsonString: jsonString
+        )
+    }
+
+    private static func requestShapeAdjustedSmartAliasCandidateModels(
+        _ candidateModels: [String],
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> [String] {
+        guard metaBridgeShouldYieldToNativeToolLanes(
+            method: method,
+            path: path,
+            jsonString: jsonString
+        ) else {
+            return candidateModels
+        }
+
+        return moveCandidate(
+            MetaAIWebAdapter.modelAlias,
+            after: "glm5-nvidia",
+            in: candidateModels
+        )
+    }
+
+    private static func metaBridgeShouldYieldToNativeToolLanes(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> Bool {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let tools = json["tools"] as? [Any],
+              !tools.isEmpty else {
+            return false
+        }
+
+        // muse-spark relies on a prompt-mediated synthetic tool bridge. It works well enough for
+        // auto/plain tool planning, but exact function/required tool_choice still has materially
+        // worse reliability than the native tool lanes. Keep Meta in the pool, but only after the
+        // native fallbacks for turns that require strict tool semantics.
+        return hasStrictToolChoice(in: json)
+    }
+
+    private static func moveCandidate(
+        _ candidateModel: String,
+        after anchorModel: String,
+        in candidateModels: [String]
+    ) -> [String] {
+        guard let candidateIndex = candidateModels.firstIndex(of: candidateModel),
+              let anchorIndex = candidateModels.firstIndex(of: anchorModel),
+              candidateIndex < anchorIndex else {
+            return candidateModels
+        }
+
+        var reordered = candidateModels
+        let candidate = reordered.remove(at: candidateIndex)
+        guard let refreshedAnchorIndex = reordered.firstIndex(of: anchorModel) else {
+            return candidateModels
+        }
+        reordered.insert(candidate, at: refreshedAnchorIndex + 1)
+        return reordered
     }
 
     private static func availabilityRankedSmartAliasCandidateModels(_ candidateModels: [String]) -> [String] {
@@ -8831,12 +8899,18 @@ class ThinkingProxy {
 
         NSLog("[ThinkingProxy] Resolved smart alias %@ to candidate %@ at depth %d", publicAlias, transition.model, failoverDepth)
 
-        if let preflightError = OpenAICompatTemporaryShim.preflightError(
+        if let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
             method: method,
             path: path,
             jsonString: transition.body
         ) {
-            if preflightError.statusCode == 503 {
+            if !transition.remainingCandidateModels.isEmpty {
+                NSLog(
+                    "[ThinkingProxy] Skipping smart alias candidate %@ at depth %d due to provider-aware preflight: %@",
+                    transition.model,
+                    failoverDepth,
+                    preflightError.message
+                )
                 attemptSmartAliasCandidate(
                     method: method,
                     path: path,

@@ -1445,6 +1445,109 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("strict tool-choice worker requests demote muse-spark behind nvidia and silently skip incompatible preflight lanes", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
+                    recorder.recordFailure("proxy-worker-smart-router should inherit the worker pool definition")
+                    return
+                }
+
+                let requestJSON = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+                  "messages": [{"role": "user", "content": "Call the lookup tool."}]
+                }
+                """
+
+                let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "proxy-worker-smart-router",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(
+                    candidates,
+                    ["glm5-nvidia", "muse-spark", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    "strict tool-choice worker turns should still availability-rank healthy candidates first while keeping muse-spark behind nvidia within the compatible closed bucket",
+                    recorder: recorder
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: String?
+                var deliveredError: String?
+                var metaSeenModels: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, _ in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    recorder.recordFailure("strict tool-choice worker requests should skip incompatible preflight candidates before transport; unexpectedly attempted \(model)")
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    metaSeenModels.append(publicModel)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-meta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"id":"call_lookup","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"model":"\(publicModel)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = String(data: body, encoding: .utf8)
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("strict tool-choice worker requests should fall through incompatible preflight lanes and still return a later candidate response")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "strict tool-choice worker requests should succeed after silently skipping incompatible preflight lanes", recorder: recorder)
+                expectEqual(deliveredError, nil, "strict tool-choice worker requests should not surface the skipped lane as a terminal error", recorder: recorder)
+                expectEqual(metaSeenModels, ["muse-spark"], "strict tool-choice worker requests should eventually fall through to muse-spark after skipping the incompatible native preflight lane", recorder: recorder)
+                expectEqual(deliveredBody?.contains("\"tool_calls\""), true, "the later fallback response should be delivered to the caller", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("provider endpoint parsing captures per-provider proxy-url when set", recorder: recorder) {
             withMergedConfig(
                 [
