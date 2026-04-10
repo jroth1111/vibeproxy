@@ -10454,6 +10454,7 @@ class ThinkingProxy {
         }
 
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let telemetrySource = smartAliasTelemetrySource(headers: headers)
         let concurrencyRetryUntil = Date().addingTimeInterval(1)
         let concurrencyLimitedTelemetry = annotatedSmartAliasTelemetryEvent(
             OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -10468,7 +10469,7 @@ class ThinkingProxy {
                 timeoutStage: .none,
                 upstreamHTTPStatus: 429,
                 retryCount: 0,
-                source: "smart_alias",
+                source: telemetrySource,
                 firstByteLatencyMilliseconds: nil,
                 totalLatencyMilliseconds: nil,
                 inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
@@ -10525,6 +10526,7 @@ class ThinkingProxy {
             handleSmartAliasBufferedCandidateResult(
                 metaBufferedResponse,
                 path: path,
+                headers: headers,
                 publicAlias: publicAlias,
                 candidateModel: candidateModel,
                 failoverDepth: failoverDepth,
@@ -10571,6 +10573,7 @@ class ThinkingProxy {
                 self.handleSmartAliasBufferedCandidateResult(
                     bufferedResponse,
                     path: path,
+                    headers: headers,
                     publicAlias: publicAlias,
                     candidateModel: candidateModel,
                     failoverDepth: failoverDepth,
@@ -10601,6 +10604,7 @@ class ThinkingProxy {
             self.handleSmartAliasBufferedCandidateResult(
                 bufferedResponse,
                 path: path,
+                headers: headers,
                 publicAlias: publicAlias,
                 candidateModel: candidateModel,
                 failoverDepth: failoverDepth,
@@ -10647,6 +10651,7 @@ class ThinkingProxy {
             remainingBudget
         )
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let telemetrySource = smartAliasTelemetrySource(headers: headers)
         let concurrencyRetryUntil = Date().addingTimeInterval(1)
         let concurrencyLimitedTelemetry = annotatedSmartAliasTelemetryEvent(
             OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -10661,7 +10666,7 @@ class ThinkingProxy {
                 timeoutStage: .none,
                 upstreamHTTPStatus: 429,
                 retryCount: 0,
-                source: "smart_alias",
+                source: telemetrySource,
                 firstByteLatencyMilliseconds: nil,
                 totalLatencyMilliseconds: nil,
                 inflightAtRequest: route.map { OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey) }
@@ -10712,7 +10717,7 @@ class ThinkingProxy {
                     state: state,
                     attempt: attempt,
                     outcome: outcome,
-                    source: "smart_alias",
+                    source: telemetrySource,
                     attemptLane: attemptLane
                 ),
                 requestedAlias: publicAlias,
@@ -10876,6 +10881,7 @@ class ThinkingProxy {
     private func handleSmartAliasBufferedCandidateResult(
         _ bufferedResponse: BufferedProxyResponse,
         path: String,
+        headers: [(String, String)],
         publicAlias: String,
         candidateModel: String,
         failoverDepth: Int,
@@ -10884,6 +10890,7 @@ class ThinkingProxy {
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
+        let telemetrySource = smartAliasTelemetrySource(headers: headers)
 
         if let error = bufferedResponse.error {
             let telemetryEvent = annotatedSmartAliasTelemetryEvent(
@@ -10899,7 +10906,7 @@ class ThinkingProxy {
                     timeoutStage: .none,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
-                    source: "smart_alias",
+                    source: telemetrySource,
                     firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                     totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
                 ),
@@ -10932,7 +10939,7 @@ class ThinkingProxy {
                     timeoutStage: .none,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
-                    source: "smart_alias",
+                    source: telemetrySource,
                     firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                     totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
                 ),
@@ -10975,7 +10982,7 @@ class ThinkingProxy {
                 timeoutStage: .none,
                 upstreamHTTPStatus: statusCode,
                 retryCount: 0,
-                source: "smart_alias",
+                source: telemetrySource,
                 firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
                 totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
             ),
@@ -11162,6 +11169,24 @@ class ThinkingProxy {
             return "transport_timeout"
         }
         return "transport_error"
+    }
+
+    private func requestHeaderValue(_ name: String, in headers: [(String, String)]) -> String? {
+        for (headerName, headerValue) in headers.reversed() {
+            if headerName.caseInsensitiveCompare(name) == .orderedSame {
+                return headerValue
+            }
+        }
+        return nil
+    }
+
+    private func smartAliasTelemetrySource(headers: [(String, String)]) -> String {
+        guard let probeHeader = requestHeaderValue("X-VibeProxy-Probe", in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !probeHeader.isEmpty else {
+            return "smart_alias"
+        }
+        return "smart_alias_probe"
     }
 
     private func annotatedSmartAliasTelemetryEvent(
@@ -13450,7 +13475,34 @@ class ThinkingProxy {
             return routeModel
         }
 
-        let syntheticWorkerRequest = """
+        let syntheticWorkerRequest = syntheticFactoryWorkerHealthRequest(
+            routeModel: routeModel
+        )
+
+        let orderedCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+            forPublicAlias: routeModel,
+            method: "POST",
+            path: "/v1/chat/completions",
+            jsonString: syntheticWorkerRequest,
+            smartAlias: smartAlias
+        )
+
+        if let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+            method: "POST",
+            path: "/v1/chat/completions",
+            currentBody: syntheticWorkerRequest,
+            candidateModelsRemaining: orderedCandidateModels
+        ) {
+            return transition.model
+        }
+
+        return OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
+            forRequestedAlias: routeModel
+        )
+    }
+
+    private static func syntheticFactoryWorkerHealthRequest(routeModel: String) -> String {
+        """
         {
           "model": "\(routeModel)",
           "messages": [
@@ -13473,7 +13525,21 @@ class ThinkingProxy {
           ]
         }
         """
+    }
 
+    private static func factoryWorkerHealthCandidateIsDispatchable(
+        candidateModel: String,
+        routeModel: String,
+        requestSurface: String
+    ) -> Bool {
+        guard requestSurface == "chat_completions",
+              let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) else {
+            return candidateModel == routeModel
+        }
+
+        let syntheticWorkerRequest = syntheticFactoryWorkerHealthRequest(
+            routeModel: routeModel
+        )
         let orderedCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
             forPublicAlias: routeModel,
             method: "POST",
@@ -13482,18 +13548,16 @@ class ThinkingProxy {
             smartAlias: smartAlias
         )
 
-        if let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+        guard orderedCandidateModels.contains(candidateModel) else {
+            return false
+        }
+
+        return OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
             method: "POST",
             path: "/v1/chat/completions",
             currentBody: syntheticWorkerRequest,
-            candidateModelsRemaining: orderedCandidateModels
-        ) {
-            return transition.model
-        }
-
-        return OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
-            forRequestedAlias: routeModel
-        )
+            candidateModelsRemaining: [candidateModel]
+        ) != nil
     }
 
     private static func effectiveFactoryContractHealthStatus(
@@ -13545,6 +13609,16 @@ class ThinkingProxy {
     ) -> String {
         if requestSurface == "chat_completions",
            let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) {
+            if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
+                forRequestedAlias: routeModel
+            ),
+            factoryWorkerHealthCandidateIsDispatchable(
+                candidateModel: recentObservedCandidate,
+                routeModel: routeModel,
+                requestSurface: requestSurface
+            ) {
+                return recentObservedCandidate
+            }
             if let dispatchableCandidate = dispatchableFactoryWorkerCandidateModel(
                 routeModel: routeModel,
                 requestSurface: requestSurface

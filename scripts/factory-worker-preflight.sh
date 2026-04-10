@@ -157,6 +157,7 @@ case "$worker_request_surface" in
       -D "$worker_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
+      -H "X-VibeProxy-Probe: factory-worker-preflight" \
       --max-time 45 \
       "$FRONTEND_URL/v1/chat/completions" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"noop\",\"description\":\"No-op verification tool\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}],\"tool_choice\":\"none\",\"max_tokens\":32}" \
@@ -169,6 +170,7 @@ case "$worker_request_surface" in
       -D "$worker_probe_headers" \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer $API_KEY" \
+      -H "X-VibeProxy-Probe: factory-worker-preflight" \
       --max-time 45 \
       "$FRONTEND_URL/v1/responses" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"input\":\"Return exactly: OK\",\"max_output_tokens\":32}" \
@@ -182,6 +184,7 @@ case "$worker_request_surface" in
       -H "Content-Type: application/json" \
       -H "x-api-key: $API_KEY" \
       -H "anthropic-version: 2023-06-01" \
+      -H "X-VibeProxy-Probe: factory-worker-preflight" \
       --max-time 45 \
       "$FRONTEND_URL/v1/messages" \
       -d "{\"model\":\"$FACTORY_WORKER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Return exactly: OK\"}],\"max_tokens\":32}" \

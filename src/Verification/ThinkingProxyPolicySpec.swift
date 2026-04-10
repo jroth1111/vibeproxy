@@ -8327,6 +8327,130 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz prefers the recent observed worker winner when it is still dispatchable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: selfRoutedGenericCompatFactoryWorkerContract.workerModelID,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("recent-observed healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should prefer the recent observed worker winner instead of a momentary synthetic dispatch pick", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the recent observed worker provider when that lane remains dispatchable", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz ignores synthetic worker preflight probe winners when a recent live worker winner exists", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(-5),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: alias,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "muse-spark",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "muse-spark",
+                            requestedAlias: alias,
+                            canonicalModelID: "muse-spark",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias_probe",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("probe-filtered healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should ignore synthetic probe winners when reporting the recent live worker lane", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider instead of a probe-only winner", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("self-routed worker requests try the healthy GLM sibling before a suspect primary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
