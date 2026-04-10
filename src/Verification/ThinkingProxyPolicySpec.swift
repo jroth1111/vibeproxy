@@ -2805,6 +2805,22 @@ struct ThinkingProxyPolicySpec {
                         error: nil
                     ))
                 }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? "?"
+                    seenModels.append(model)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                            """.utf8)],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
                     delivered.signal()
@@ -2884,6 +2900,26 @@ struct ThinkingProxyPolicySpec {
                         response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
                         error: nil
                     ))
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let json = (String(data: request.httpBody ?? Data(), encoding: .utf8)).map {
+                        parseJSONObject($0, recorder: recorder)
+                    } ?? [:]
+                    let model = json["model"] as? String ?? "?"
+                    let messages = json["messages"] as? [[String: Any]]
+                    let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                    seenModels.append(model)
+                    seenContents.append(assistantContent)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                            """.utf8)],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                    return {}
                 }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
@@ -2967,6 +3003,26 @@ struct ThinkingProxyPolicySpec {
                             response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
                             error: nil
                         ))
+                    }
+                    proxy.nvidiaDirectTransportForTesting = { request, completion in
+                        let json = (String(data: request.httpBody ?? Data(), encoding: .utf8)).map {
+                            parseJSONObject($0, recorder: recorder)
+                        } ?? [:]
+                        let model = json["model"] as? String ?? "?"
+                        let messages = json["messages"] as? [[String: Any]]
+                        let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                        seenModels.append(model)
+                        seenContents.append(assistantContent)
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {"id":"chatcmpl-self-routed-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                                error: nil
+                            )
+                        )
+                        return {}
                     }
                     proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                         deliveredStatus = statusCode
@@ -5546,6 +5602,140 @@ struct ThinkingProxyPolicySpec {
                         )
                     }
                 }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("{\"error\":\"bad request\"}".utf8)],
+                                response: httpURLResponse(statusCode: 400),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("{\"error\":\"unauthorized\"}".utf8)],
+                                response: httpURLResponse(statusCode: 401),
+                                error: nil
+                            )
+                        )
+                    default:
+                        recorder.recordFailure("unexpected terminal NVIDIA direct candidate: \(model)")
+                    }
+                    return {}
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {
+                                  "id": "chatcmpl-fallback-valid",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5-nvidia",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "MINIMAX OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5-nvidia":
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-kimi-slower",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "KIMI OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                    default:
+                        recorder.recordFailure("unexpected malformed-primary NVIDIA direct candidate: \(model)")
+                    }
+                    return {}
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {
+                                  "id": "chatcmpl-invalid",
+                                  "object": "chat.completion",
+                                  "model": "minimax-m2.5-nvidia",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "<think>hidden reasoning only"},
+                                      "finish_reason": "length"
+                                    }
+                                  ]
+                                }
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5-nvidia":
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-valid-kimi",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "KIMI OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                    default:
+                        recorder.recordFailure("unexpected invalid-success NVIDIA direct candidate: \(model)")
+                    }
+                    return {}
+                }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
                     deliveredStatus = statusCode
                     deliveredHeaders = headers
@@ -5826,32 +6016,6 @@ struct ThinkingProxyPolicySpec {
                             response: httpURLResponse(statusCode: 200),
                             error: nil
                         ))
-                    case "minimax-m2.5-nvidia":
-                        completion(ThinkingProxy.BufferedProxyResponse(
-                            data: Data("""
-                            {
-                              "id": "chatcmpl-minimax",
-                              "object": "chat.completion",
-                              "model": "minimaxai/minimax-m2.5",
-                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
-                            }
-                            """.utf8),
-                            response: httpURLResponse(statusCode: 200),
-                            error: nil
-                        ))
-                    case "kimi-k2.5-nvidia":
-                        completion(ThinkingProxy.BufferedProxyResponse(
-                            data: Data("""
-                            {
-                              "id": "chatcmpl-kimi",
-                              "object": "chat.completion",
-                              "model": "moonshotai/kimi-k2.5",
-                              "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
-                            }
-                            """.utf8),
-                            response: httpURLResponse(statusCode: 200),
-                            error: nil
-                        ))
                     default:
                         completion(ThinkingProxy.BufferedProxyResponse(
                             data: Data("{\"error\":\"unexpected model\"}".utf8),
@@ -5859,6 +6023,49 @@ struct ThinkingProxyPolicySpec {
                             error: nil
                         ))
                     }
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {
+                                  "id": "chatcmpl-minimax",
+                                  "object": "chat.completion",
+                                  "model": "minimaxai/minimax-m2.5",
+                                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                                }
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    case "kimi-k2.5-nvidia":
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {
+                                  "id": "chatcmpl-kimi",
+                                  "object": "chat.completion",
+                                  "model": "moonshotai/kimi-k2.5",
+                                  "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
+                                }
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    default:
+                        recorder.recordFailure("unexpected NVIDIA direct candidate in reasoning-only fallback test: \(model)")
+                    }
+                    return {}
                 }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
                     deliveredStatus = statusCode
@@ -6407,6 +6614,71 @@ struct ThinkingProxyPolicySpec {
                         return {}
                     }
                 }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-race-win",
+                                      "object": "chat.completion",
+                                      "model": "minimax-m2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.02, execute: workItem)
+                        return { workItem.cancel() }
+                    case "kimi-k2.5-nvidia":
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-race-loser",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "SLOW"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.20, execute: workItem)
+                        return {
+                            lock.lock()
+                            kimiCanceled = true
+                            lock.unlock()
+                            workItem.cancel()
+                        }
+                    default:
+                        recorder.recordFailure("unexpected raced NVIDIA direct candidate: \(model)")
+                        return {}
+                    }
+                }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
                     deliveredStatus = statusCode
                     deliveredBody = body
@@ -6549,6 +6821,84 @@ struct ThinkingProxyPolicySpec {
                             workItem.cancel()
                         }
                     default:
+                        return {}
+                    }
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    lock.lock()
+                    modelInvocationCounts[model, default: 0] += 1
+                    let invocationCount = modelInvocationCounts[model] ?? 0
+                    lock.unlock()
+                    switch model {
+                    case "minimax-m2.5-nvidia":
+                        if invocationCount > 1 {
+                            recorder.recordFailure("coalesced raced winner should reuse the in-flight minimax NVIDIA attempt")
+                        }
+                        let workItem = DispatchWorkItem {
+                            _ = allowWinner.wait(timeout: .now() + 1)
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-race-coalesced-win",
+                                      "object": "chat.completion",
+                                      "model": "minimax-m2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "OK"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        startedMinimax.signal()
+                        DispatchQueue.global().async(execute: workItem)
+                        return { workItem.cancel() }
+                    case "kimi-k2.5-nvidia":
+                        if invocationCount > 1 {
+                            recorder.recordFailure("coalesced raced loser should reuse the in-flight kimi NVIDIA attempt")
+                        }
+                        let workItem = DispatchWorkItem {
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data("""
+                                    {
+                                      "id": "chatcmpl-race-coalesced-lose",
+                                      "object": "chat.completion",
+                                      "model": "kimi-k2.5-nvidia",
+                                      "choices": [
+                                        {
+                                          "index": 0,
+                                          "message": {"role": "assistant", "content": "SLOW"},
+                                          "finish_reason": "stop"
+                                        }
+                                      ]
+                                    }
+                                    """.utf8)],
+                                    response: httpURLResponse(statusCode: 200),
+                                    error: nil
+                                )
+                            )
+                        }
+                        startedKimi.signal()
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25, execute: workItem)
+                        return {
+                            lock.lock()
+                            kimiCanceled = true
+                            lock.unlock()
+                            workItem.cancel()
+                        }
+                    default:
+                        recorder.recordFailure("unexpected coalesced NVIDIA direct candidate: \(model)")
                         return {}
                     }
                 }
@@ -7645,6 +7995,28 @@ struct ThinkingProxyPolicySpec {
                         )
                     )
                 }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("{\"error\":\"busy\"}".utf8)],
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "3600"
+                                ]
+                            ),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
                 proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
                     lock.lock()
                     seenModels.append(publicModel)
@@ -7811,6 +8183,29 @@ struct ThinkingProxyPolicySpec {
                         response: httpURLResponse(statusCode: 429, headerFields: ["Retry-After": "0.1"]),
                         error: nil
                     )
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("{\"error\":\"busy\"}".utf8)],
+                            response: httpURLResponse(
+                                statusCode: 429,
+                                headerFields: [
+                                    "Content-Type": "application/json",
+                                    "Retry-After": "0.1"
+                                ]
+                            ),
+                            error: nil
+                        )
+                    )
+                    return {}
                 }
                 proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
                     deliveredStatus = statusCode
@@ -8186,6 +8581,22 @@ struct ThinkingProxyPolicySpec {
                         completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
                     }
                 }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    seenModels.append(model)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"glm5-nvidia"}
+                            """.utf8)],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
                 proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
                     seenModels.append(publicModel)
                     return ThinkingProxy.BufferedProxyResponse(
@@ -8280,6 +8691,22 @@ struct ThinkingProxyPolicySpec {
                         recorder.recordFailure("unexpected proxied candidate during 502 replay chain: \(model)")
                         completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
                     }
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? ""
+                    seenModels.append(model)
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("""
+                            {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"glm5-nvidia"}
+                            """.utf8)],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                    return {}
                 }
                 proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
                     recorder.recordFailure("muse-spark should be unavailable during the 502 replay chain, but attempted \(publicModel)")
@@ -12211,6 +12638,28 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                     }
+                    proxy.nvidiaDirectTransportForTesting = { request, completion in
+                        let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                            parseJSONObject($0, recorder: recorder)["model"] as? String
+                        } ?? ""
+                        lock.lock()
+                        seenModels.append(model)
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("{\"error\":\"rate limited\"}".utf8)],
+                                response: httpURLResponse(
+                                    statusCode: 429,
+                                    headerFields: [
+                                        "Content-Type": "application/json",
+                                        "Retry-After": "3600"
+                                    ]
+                                ),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    }
                     proxy.deliveredHTTPResponseForTesting = { _, _, _ in
                         delivered.signal()
                     }
@@ -12343,6 +12792,28 @@ struct ThinkingProxyPolicySpec {
                             ),
                             error: nil
                         )
+                    }
+                    proxy.nvidiaDirectTransportForTesting = { request, completion in
+                        let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                            parseJSONObject($0, recorder: recorder)["model"] as? String
+                        } ?? ""
+                        lock.lock()
+                        seenModels.append(model)
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("{\"error\":\"rate limited\"}".utf8)],
+                                response: httpURLResponse(
+                                    statusCode: 429,
+                                    headerFields: [
+                                        "Content-Type": "application/json",
+                                        "Retry-After": "3600"
+                                    ]
+                                ),
+                                error: nil
+                            )
+                        )
+                        return {}
                     }
                     proxy.deliveredErrorForTesting = { statusCode, message in
                         deliveredStatus = statusCode

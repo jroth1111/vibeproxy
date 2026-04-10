@@ -10058,7 +10058,7 @@ class ThinkingProxy {
                     return
                 }
             }
-                forwardNvidiaReasoningRequest(
+            forwardNVIDIAStreamingRequest(
                     method: method,
                     path: rewrittenPath,
                     headers: headers,
@@ -12389,211 +12389,6 @@ class ThinkingProxy {
             )
             return
         }
-        if nvidiaDirectStreamingTransportForTesting == nil,
-           nvidiaDirectTransportForTesting == nil,
-           (bufferedProxyCancelableTransportForTesting != nil || bufferedProxyTransportForTesting != nil) {
-            let cancel = sendBufferedProxyRequest(
-                method: method,
-                path: path,
-                headers: headers,
-                body: body,
-                timeoutInterval: timeoutInterval,
-                firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
-                bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
-            ) { [weak self] bufferedResponse in
-                permit.release()
-                guard let self, controller?.isCancelled() != true else { return }
-
-                let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
-                    data: bufferedResponse.data,
-                    response: bufferedResponse.response,
-                    error: bufferedResponse.error,
-                    deadlineStage: bufferedResponse.deadlineStage,
-                    firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
-                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
-                )
-                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
-                    path: path,
-                    state: state,
-                    attempt: attempt
-                )
-                let telemetryEvent = self.annotatedSmartAliasTelemetryEvent(
-                    OpenAICompatTemporaryShim.telemetryEvent(
-                        path: path,
-                        state: state,
-                        attempt: attempt,
-                        outcome: outcome,
-                        source: telemetrySource,
-                        attemptLane: attemptLane,
-                        proxyRequestID: requestTrace.proxyRequestID,
-                        callerRequestID: requestTrace.callerRequestID,
-                        callerSessionID: requestTrace.callerSessionID,
-                        requestShape: requestTrace.requestShape
-                    ),
-                    requestedAlias: publicAlias,
-                    failoverDepth: failoverDepth,
-                    finalWinnerRequestModel: nil
-                )
-
-                switch outcome {
-                case .retry(let nextState):
-                    if let response = attempt.response {
-                        OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
-                            routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest,
-                            statusCode: response.statusCode,
-                            headers: response.allHeaderFields,
-                            bodyData: attempt.data
-                        )
-                    }
-                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                    let delay = DispatchTimeInterval.milliseconds(
-                        OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(nextState.retryBackoffMilliseconds)
-                    )
-                    let retryBlock = { [weak self] in
-                        guard let self, controller?.isCancelled() != true else { return }
-                        self.executeSmartAliasMitigatedCandidate(
-                            method: method,
-                            path: path,
-                            headers: headers,
-                            body: body,
-                            publicAlias: publicAlias,
-                            candidateModel: candidateModel,
-                            failoverDepth: failoverDepth,
-                            attemptLane: attemptLane,
-                            deadlineAt: deadlineAt,
-                            controller: controller,
-                            onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
-                            state: nextState,
-                            requestTrace: requestTrace,
-                            completion: completion
-                        )
-                    }
-                    if nextState.retryBackoffMilliseconds > 0 {
-                        controller?.scheduleRetry(after: delay, block: retryBlock)
-                    } else {
-                        retryBlock()
-                    }
-                case .sendResponse(let statusCode, let responseHeaders, let responseBody):
-                    if self.classifySmartAliasCandidateFailure(
-                        statusCode: statusCode,
-                        headers: responseHeaders,
-                        bodyData: responseBody,
-                        path: path,
-                        requiredToolParameters: state.requiredToolParameters
-                    ).shouldFailover {
-                        OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
-                            routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest,
-                            statusCode: statusCode,
-                            headers: responseHeaders,
-                            bodyData: responseBody
-                        )
-                        let cooldownUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
-                            failureClass: telemetryEvent.failureClass,
-                            statusCode: statusCode,
-                            headers: responseHeaders,
-                            bodyData: responseBody
-                        )
-                        if let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
-                            failureClass: telemetryEvent.failureClass,
-                            statusCode: statusCode,
-                            headers: responseHeaders,
-                            bodyData: responseBody
-                        ) {
-                            OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
-                                forRequestModel: candidateModel,
-                                until: deferredUntil
-                            )
-                        }
-                        completion(
-                            .retryableFailure(
-                                requestModel: candidateModel,
-                                telemetryEvent: telemetryEvent,
-                                cooldownUntil: cooldownUntil
-                            )
-                        )
-                        return
-                    }
-
-                    if statusCode >= 200 && statusCode < 300 {
-                        OpenAICompatTemporaryShim.recordConcurrencySuccess(
-                            routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest
-                        )
-                        completion(
-                            .success(
-                                requestModel: candidateModel,
-                                statusCode: statusCode,
-                                headers: responseHeaders,
-                                body: responseBody,
-                                telemetryEvent: telemetryEvent
-                            )
-                        )
-                        return
-                    }
-
-                    completion(
-                        .terminalResponse(
-                            requestModel: candidateModel,
-                            statusCode: statusCode,
-                            headers: responseHeaders,
-                            body: responseBody,
-                            telemetryEvent: telemetryEvent
-                        )
-                    )
-                case .sendError(let statusCode, let message):
-                    if self.classifySmartAliasCandidateFailure(
-                        statusCode: statusCode,
-                        headers: attempt.response?.allHeaderFields ?? [:],
-                        bodyData: nil,
-                        path: path,
-                        requiredToolParameters: state.requiredToolParameters
-                    ).shouldFailover {
-                        let cooldownUntil = attempt.response.map {
-                            OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
-                                failureClass: telemetryEvent.failureClass,
-                                statusCode: statusCode,
-                                headers: $0.allHeaderFields
-                            )
-                        } ?? nil
-                        if let response = attempt.response,
-                           let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
-                            failureClass: telemetryEvent.failureClass,
-                            statusCode: statusCode,
-                            headers: response.allHeaderFields
-                           ) {
-                            OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
-                                forRequestModel: candidateModel,
-                                until: deferredUntil
-                            )
-                        }
-                        completion(
-                            .retryableFailure(
-                                requestModel: candidateModel,
-                                telemetryEvent: telemetryEvent,
-                                cooldownUntil: cooldownUntil
-                            )
-                        )
-                        return
-                    }
-
-                    completion(
-                        .terminalError(
-                            requestModel: candidateModel,
-                            statusCode: statusCode,
-                            message: message,
-                            telemetryEvent: telemetryEvent
-                        )
-                    )
-                }
-            }
-            controller?.registerCurrentCancel {
-                permit.release()
-                cancel()
-            }
-            return
-        }
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
             permit.release()
             completion(
@@ -12648,7 +12443,7 @@ class ThinkingProxy {
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
 
-            let processedAttempt = self.processNVIDIADirectTransportResponse(
+            let processedAttempt = self.processNVIDIAStreamingAttemptResponse(
                 transportResponse,
                 state: state,
                 attemptLane: attemptLane,
@@ -12850,30 +12645,15 @@ class ThinkingProxy {
             }
         }
 
-        if let nvidiaDirectStreamingTransportForTesting {
-            let cancel = nvidiaDirectStreamingTransportForTesting(
-                request,
-                lockMeaningfulOutputIfNeeded,
-                handleTransportResponse
-            )
-            controller?.registerCurrentCancel {
-                permit.release()
-                cancel()
-            }
-            return
-        }
-
-        if let nvidiaDirectTransportForTesting {
-            let cancel = nvidiaDirectTransportForTesting(request, handleTransportResponse)
-            controller?.registerCurrentCancel {
-                permit.release()
-                cancel()
-            }
-            return
-        }
-
         let sessionKey = "direct:127.0.0.1:\(targetPort)"
-        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+        guard let cancel = startNVIDIATransportAttempt(
+            request: request,
+            sessionKey: sessionKey,
+            requestJSON: body,
+            requestModel: candidateModel,
+            onChunk: lockMeaningfulOutputIfNeeded,
+            completion: handleTransportResponse
+        ) else {
             permit.release()
             completion(
                 .terminalError(
@@ -12885,64 +12665,10 @@ class ThinkingProxy {
             )
             return
         }
-
-        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-smart-alias-chunks")
-        var responseChunks: [Data] = []
-        let responseProgress = ResponseProgressDelegate { chunk, receivedAt in
-            responseChunksQueue.sync {
-                responseChunks.append(chunk)
-            }
-            lockMeaningfulOutputIfNeeded(chunk, receivedAt)
-        }
-        let taskHolder = TaskIdHolder()
-        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
-            defer {
-                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
-                responseProgress.finish()
-            }
-            let chunks = responseChunksQueue.sync {
-                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
-            }
-            handleTransportResponse(
-                NVIDIADirectTransportResponse(
-                    chunks: chunks,
-                    response: response as? HTTPURLResponse,
-                    error: error,
-                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
-                    deadlineStage: responseProgress.currentDeadlineStage()
-                )
-            )
-        }
-        guard let task else {
-            NSLog("[SafeDataTask] executeSmartAliasMitigatedCandidate: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
-            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
-            permit.release()
-            completion(
-                .terminalError(
-                    requestModel: candidateModel,
-                    statusCode: 502,
-                    message: "upstream session invalidated",
-                    telemetryEvent: nil
-                )
-            )
-            return
-        }
-        directPoolDelegate.register(task: task, delegate: responseProgress)
-        taskHolder.taskIdentifier = task.taskIdentifier
         controller?.registerCurrentCancel {
             permit.release()
-            task.cancel()
+            cancel()
         }
-        responseProgress.installDeadlines(
-            firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
-                forRequestJSON: body,
-                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel)
-            ),
-            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body),
-            for: task
-        )
-        task.resume()
     }
 
     private func handleSmartAliasBufferedCandidateResult(
@@ -14754,7 +14480,7 @@ class ThinkingProxy {
         return try? JSONSerialization.data(withJSONObject: reducedResponse)
     }
 
-    private func processNVIDIADirectTransportResponse(
+    private func processNVIDIAStreamingAttemptResponse(
         _ transportResponse: NVIDIADirectTransportResponse,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         attemptLane: Int,
@@ -14859,7 +14585,81 @@ class ThinkingProxy {
         )
     }
 
-    private func forwardNvidiaReasoningRequest(
+    @discardableResult
+    private func startNVIDIATransportAttempt(
+        request: URLRequest,
+        sessionKey: String,
+        requestJSON: String,
+        requestModel: String,
+        onChunk: ((Data, Date) -> Void)? = nil,
+        completion: @escaping (NVIDIADirectTransportResponse) -> Void
+    ) -> (() -> Void)? {
+        if let nvidiaDirectStreamingTransportForTesting {
+            return nvidiaDirectStreamingTransportForTesting(
+                request,
+                onChunk ?? { _, _ in },
+                completion
+            )
+        }
+
+        if let nvidiaDirectTransportForTesting {
+            return nvidiaDirectTransportForTesting(request, completion)
+        }
+
+        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+            return nil
+        }
+
+        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-chunks")
+        var responseChunks: [Data] = []
+        let responseProgress = ResponseProgressDelegate { chunk, receivedAt in
+            responseChunksQueue.sync {
+                responseChunks.append(chunk)
+            }
+            onChunk?(chunk, receivedAt)
+        }
+        let taskHolder = TaskIdHolder()
+        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
+            defer {
+                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
+                responseProgress.finish()
+            }
+            let chunks = responseChunksQueue.sync {
+                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
+            }
+            completion(
+                NVIDIADirectTransportResponse(
+                    chunks: chunks,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
+                    deadlineStage: responseProgress.currentDeadlineStage()
+                )
+            )
+        }
+        guard let task else {
+            NSLog("[SafeDataTask] startNVIDIATransportAttempt: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
+            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
+            return nil
+        }
+        directPoolDelegate.register(task: task, delegate: responseProgress)
+        taskHolder.taskIdentifier = task.taskIdentifier
+        responseProgress.installDeadlines(
+            firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                forRequestJSON: requestJSON,
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: requestModel)
+            ),
+            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: requestJSON),
+            for: task
+        )
+        task.resume()
+        return {
+            task.cancel()
+        }
+    }
+
+    private func forwardNVIDIAStreamingRequest(
         method: String,
         path: String,
         headers: [(String, String)],
@@ -14878,7 +14678,7 @@ class ThinkingProxy {
             jsonString: body,
             routeHealthStatus: routeHealthStatus
         )
-        forwardNvidiaReasoningRequestWithRetry(
+        executeNVIDIADirectAttempt(
             method: method,
             path: path,
             headers: headers,
@@ -14893,7 +14693,7 @@ class ThinkingProxy {
         )
     }
 
-    private func forwardNvidiaReasoningRequestWithRetry(
+    private func executeNVIDIADirectAttempt(
         method: String,
         path: String,
         headers: [(String, String)],
@@ -14936,7 +14736,7 @@ class ThinkingProxy {
             )
             requestController.scheduleRetry(after: retryDelay) { [weak self] in
                 guard let self, !coordinator.isFinished() else { return }
-                self.forwardNvidiaReasoningRequestWithRetry(
+                self.executeNVIDIADirectAttempt(
                     method: method,
                     path: path,
                     headers: headers,
@@ -14958,6 +14758,13 @@ class ThinkingProxy {
             request.setValue(value, forHTTPHeaderField: name)
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
+        let attemptStateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-attempt-state")
+        var attemptReceivedPayload = false
+        let markAttemptPayloadReceived: (Data, Date) -> Void = { _, _ in
+            attemptStateQueue.sync {
+                attemptReceivedPayload = true
+            }
+        }
 
         let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             guard let self else { return }
@@ -14967,7 +14774,7 @@ class ThinkingProxy {
             }
             guard requestController.isCancelled() != true else { return }
 
-            let processedAttempt = self.processNVIDIADirectTransportResponse(
+            let processedAttempt = self.processNVIDIAStreamingAttemptResponse(
                 transportResponse,
                 state: state,
                 attemptLane: attemptLane,
@@ -15008,7 +14815,7 @@ class ThinkingProxy {
                    hedgeEligible,
                    coordinator.shouldStartHedge() {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                    self.forwardNvidiaReasoningRequestWithRetry(
+                    self.executeNVIDIADirectAttempt(
                         method: method,
                         path: path,
                         headers: headers,
@@ -15024,7 +14831,7 @@ class ThinkingProxy {
                     return
                 }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
-                self.scheduleNvidiaReasoningRetry(
+                self.scheduleNVIDIADirectRetry(
                     method: method,
                     path: path,
                     headers: headers,
@@ -15129,21 +14936,15 @@ class ThinkingProxy {
                 )
             }
         }
-
-        if let nvidiaDirectTransportForTesting {
-            let cancel = nvidiaDirectTransportForTesting(request, handleTransportResponse)
-            coordinator.registerAttempt(attemptLane: attemptLane) {
-                permit.release()
-                cancel()
-            }
-            requestController.registerCurrentCancel {
-                _ = coordinator.tryFinish(attemptLane: 0)
-            }
-            return
-        }
-
         let sessionKey = "direct:127.0.0.1:\(targetPort)"
-        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+        guard let cancel = startNVIDIATransportAttempt(
+            request: request,
+            sessionKey: sessionKey,
+            requestJSON: body,
+            requestModel: state.model,
+            onChunk: markAttemptPayloadReceived,
+            completion: handleTransportResponse
+        ) else {
             permit.release()
             coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -15156,68 +14957,24 @@ class ThinkingProxy {
             )
             return
         }
-        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-chunks")
-        var responseChunks: [Data] = []
-        let responseProgress = ResponseProgressDelegate { chunk, _ in
-            responseChunksQueue.sync {
-                responseChunks.append(chunk)
-            }
-        }
-        let taskHolder = TaskIdHolder()
-        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
-            defer {
-                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
-                responseProgress.finish()
-            }
-            let chunks = responseChunksQueue.sync {
-                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
-            }
-            handleTransportResponse(
-                NVIDIADirectTransportResponse(
-                    chunks: chunks,
-                    response: response as? HTTPURLResponse,
-                    error: error,
-                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
-                    deadlineStage: responseProgress.currentDeadlineStage()
-                )
-            )
-        }
-        guard let task else {
-            NSLog("[SafeDataTask] forwardNvidiaReasoningRequestWithRetry: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
-            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
-            permit.release()
-            coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
-            guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
-            self.deliverBufferedError(
-                defaultConnection: originalConnection,
-                statusCode: 502,
-                message: "upstream session invalidated",
-                coalescingKey: state.coalescingKey,
-                overridingHeaders: requestTrace.responseHeaders
-            )
-            return
-        }
-        directPoolDelegate.register(task: task, delegate: responseProgress)
-        taskHolder.taskIdentifier = task.taskIdentifier
         coordinator.registerAttempt(attemptLane: attemptLane) {
             permit.release()
-            task.cancel()
+            cancel()
         }
         requestController.registerCurrentCancel {
             _ = coordinator.tryFinish(attemptLane: 0)
         }
         if attemptLane == 1, hedgeEligible {
             let hedgeDelay = OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: state.model)
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self, weak responseProgress] in
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self] in
+                let payloadAlreadyStarted = attemptStateQueue.sync { attemptReceivedPayload }
                 guard let self,
-                      let responseProgress,
                       requestController.isCancelled() != true,
                       !coordinator.isFinished(),
-                      !responseProgress.hasReceivedPayload(),
+                      !payloadAlreadyStarted,
                       coordinator.shouldStartHedge() else { return }
                 NSLog("[ThinkingProxy] Starting hedged NVIDIA attempt for suspect route %@ after %.2fs without first byte", state.model, hedgeDelay)
-self.forwardNvidiaReasoningRequestWithRetry(
+                self.executeNVIDIADirectAttempt(
                     method: method,
                     path: path,
                     headers: headers,
@@ -15232,15 +14989,6 @@ self.forwardNvidiaReasoningRequestWithRetry(
                 )
             }
         }
-        responseProgress.installDeadlines(
-            firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
-                forRequestJSON: body,
-                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
-            ),
-            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body),
-            for: task
-        )
-        task.resume()
     }
 
     private func forwardModelListRequest(
@@ -15505,7 +15253,7 @@ self.forwardNvidiaReasoningRequestWithRetry(
         """
     }
 
-    private func scheduleNvidiaReasoningRetry(
+    private func scheduleNVIDIADirectRetry(
         method: String,
         path: String,
         headers: [(String, String)],
@@ -15523,7 +15271,7 @@ self.forwardNvidiaReasoningRequestWithRetry(
         )
         requestController.scheduleRetry(after: delay) { [weak self] in
             guard let self, !coordinator.isFinished() else { return }
-            self.forwardNvidiaReasoningRequestWithRetry(
+            self.executeNVIDIADirectAttempt(
                 method: method,
                 path: path,
                 headers: headers,
