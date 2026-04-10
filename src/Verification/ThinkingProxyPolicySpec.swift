@@ -5889,6 +5889,110 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary worker smart alias treats meta adapter 400s as retryable lane failures and falls through", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: now.addingTimeInterval(300))
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: now.addingTimeInterval(300))
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: now.addingTimeInterval(300))
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-ollama-pro",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm-5.1-ollama-pro",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "smart_alias"
+                    ),
+                    at: now
+                )
+
+                let proxy = ThinkingProxy()
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: String?
+                var deliveredError: String?
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    lock.lock()
+                    seenModels.append(publicModel)
+                    lock.unlock()
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"error":{"message":"Meta web adapter synthetic tool mode required tool Read, but Meta did not return a valid tool directive.","type":"server_error","code":"internal_server_error"}}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 400, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"\(model)"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = String(data: body, encoding: .utf8)
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should fall through a retryable meta adapter 400 and still deliver a later candidate success")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should not surface the meta adapter 400 when a later fallback succeeds", recorder: recorder)
+                expectEqual(deliveredError, nil, "worker should not treat the retryable meta adapter 400 as terminal", recorder: recorder)
+                expectEqual(seenModels, ["muse-spark", "glm-5.1-ollama-pro"], "worker should fail over from muse-spark to the next remaining fallback after a retryable meta adapter 400", recorder: recorder)
+                expectEqual(deliveredBody?.contains("\"content\":\"OK\""), true, "worker should deliver the later fallback response after the meta adapter 400", recorder: recorder)
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["muse-spark"]?.status, .suspect, "retryable meta adapter 400s should penalize the muse-spark lane so it is deprioritized on later turns", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.failureClass, "classified_retryable_400_meta_adapter", "route health should retain the retryable meta adapter failure class for diagnostics", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary worker smart alias stays hidden from /v1/models even while candidate routes are healthy", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()

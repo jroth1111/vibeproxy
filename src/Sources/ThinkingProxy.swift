@@ -10874,7 +10874,19 @@ class ThinkingProxy {
         let code = String(describing: error["code"] ?? "").lowercased()
         let looksLikeRetryableNetworkMask = message.contains("network error")
             && (message.contains("please contact customer service") || message.contains("error id:") || code == "1234")
-        return looksLikeRetryableNetworkMask ? "classified_retryable_400_network_error" : nil
+        if looksLikeRetryableNetworkMask {
+            return "classified_retryable_400_network_error"
+        }
+
+        // The Meta web bridge returns 400 when the adapter cannot coerce a given
+        // worker turn into a valid synthetic tool invocation. That is lane-specific
+        // incompatibility, not a caller bug, so the worker pool should fail over
+        // and penalize the route instead of surfacing a terminal 400.
+        if message.contains("meta web adapter") {
+            return "classified_retryable_400_meta_adapter"
+        }
+
+        return nil
     }
 
     private func classifySmartAliasSuccessBodyFailure(path: String, bodyData: Data) -> String? {
