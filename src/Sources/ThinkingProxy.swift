@@ -3214,16 +3214,16 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func latestObservedSmartAliasResolvedModel(
+    static func latestObservedSmartAliasResolvedWinner(
         forRequestedAlias requestedAlias: String,
         maxAge: TimeInterval = 30,
         at now: Date = Date()
-    ) -> String? {
+    ) -> RecentObservedSmartAliasWinner? {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let freshestObservedWinner = routeCircuitStatesByRouteHealthKey.values
                 .compactMap(\.lastTelemetryEvent)
-                .compactMap { event -> (timestamp: Date, requestModel: String)? in
+                .compactMap { event -> RecentObservedSmartAliasWinner? in
                     guard event.requestedAlias == requestedAlias,
                           event.source == "smart_alias",
                           now.timeIntervalSince(event.timestamp) <= maxAge else {
@@ -3231,7 +3231,13 @@ enum OpenAICompatTemporaryShim {
                     }
 
                     if let finalWinnerRequestModel = event.finalWinnerRequestModel {
-                        return (event.timestamp, finalWinnerRequestModel)
+                        return RecentObservedSmartAliasWinner(
+                            timestamp: event.timestamp,
+                            requestModel: finalWinnerRequestModel,
+                            requestShape: event.requestShape,
+                            callerRequestID: event.callerRequestID,
+                            callerSessionID: event.callerSessionID
+                        )
                     }
 
                     guard event.transportOutcome == "send_response",
@@ -3241,14 +3247,32 @@ enum OpenAICompatTemporaryShim {
                         return nil
                     }
 
-                    return (event.timestamp, event.requestModel)
+                    return RecentObservedSmartAliasWinner(
+                        timestamp: event.timestamp,
+                        requestModel: event.requestModel,
+                        requestShape: event.requestShape,
+                        callerRequestID: event.callerRequestID,
+                        callerSessionID: event.callerSessionID
+                    )
                 }
                 .max { lhs, rhs in
                     lhs.timestamp < rhs.timestamp
                 }
 
-            return freshestObservedWinner?.requestModel
+            return freshestObservedWinner
         }
+    }
+
+    static func latestObservedSmartAliasResolvedModel(
+        forRequestedAlias requestedAlias: String,
+        maxAge: TimeInterval = 30,
+        at now: Date = Date()
+    ) -> String? {
+        latestObservedSmartAliasResolvedWinner(
+            forRequestedAlias: requestedAlias,
+            maxAge: maxAge,
+            at: now
+        )?.requestModel
     }
 
     static func hasRecentInferenceSuccess(
@@ -8431,6 +8455,12 @@ class ThinkingProxy {
         let requestSurface: String
         let effectiveRouteModel: String
         let effectiveRouteProvider: String?
+        let recentLiveRouteModel: String?
+        let recentLiveRouteProvider: String?
+        let recentLiveRequestShape: String?
+        let recentLiveRouteAt: Date?
+        let recentLiveCallerRequestID: String?
+        let recentLiveCallerSessionID: String?
         let displayName: String?
         let baseURL: String?
         let routeHealthStatus: String?
@@ -8461,6 +8491,14 @@ class ThinkingProxy {
         var ready: Bool {
             routeHealthStatus == nil
         }
+    }
+
+    private struct RecentObservedSmartAliasWinner {
+        let timestamp: Date
+        let requestModel: String
+        let requestShape: String?
+        let callerRequestID: String?
+        let callerSessionID: String?
     }
 
     fileprivate struct FactoryModelBinding {
@@ -15238,6 +15276,24 @@ self.forwardNvidiaReasoningRequestWithRetry(
         if let effectiveRouteProvider = contract.effectiveRouteProvider {
             dict["effective_route_provider"] = effectiveRouteProvider
         }
+        if let recentLiveRouteModel = contract.recentLiveRouteModel {
+            dict["recent_live_route_model"] = recentLiveRouteModel
+        }
+        if let recentLiveRouteProvider = contract.recentLiveRouteProvider {
+            dict["recent_live_route_provider"] = recentLiveRouteProvider
+        }
+        if let recentLiveRequestShape = contract.recentLiveRequestShape {
+            dict["recent_live_request_shape"] = recentLiveRequestShape
+        }
+        if let recentLiveRouteAt = contract.recentLiveRouteAt {
+            dict["recent_live_route_at"] = ISO8601DateFormatter().string(from: recentLiveRouteAt)
+        }
+        if let recentLiveCallerRequestID = contract.recentLiveCallerRequestID {
+            dict["recent_live_caller_request_id"] = recentLiveCallerRequestID
+        }
+        if let recentLiveCallerSessionID = contract.recentLiveCallerSessionID {
+            dict["recent_live_caller_session_id"] = recentLiveCallerSessionID
+        }
         if let latencyDiagnostics = OpenAICompatTemporaryShim.latencyDiagnostics(forRequestModel: contract.effectiveRouteModel) {
             dict["effective_route_latency_pressure_status"] = latencyDiagnostics.pressureStatus
             if let p95Total = latencyDiagnostics.p95TotalLatencyMilliseconds {
@@ -15700,8 +15756,14 @@ self.forwardNvidiaReasoningRequestWithRetry(
             routeProvider: routeProvider,
             requestSurface: requestSurface
         )
+        let recentLiveRoute = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedWinner(
+            forRequestedAlias: routeModel
+        )
         let effectiveRouteProvider =
             OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: effectiveRouteModel)?.providerID
+        let recentLiveRouteProvider = recentLiveRoute.flatMap {
+            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: $0.requestModel)?.providerID
+        }
 
         let snapshotDriftPaths = factoryWorkerSnapshotDriftPaths(
             settingsPath: settingsPath,
@@ -15726,6 +15788,12 @@ self.forwardNvidiaReasoningRequestWithRetry(
             requestSurface: requestSurface,
             effectiveRouteModel: effectiveRouteModel,
             effectiveRouteProvider: effectiveRouteProvider,
+            recentLiveRouteModel: recentLiveRoute?.requestModel,
+            recentLiveRouteProvider: recentLiveRouteProvider,
+            recentLiveRequestShape: recentLiveRoute?.requestShape,
+            recentLiveRouteAt: recentLiveRoute?.timestamp,
+            recentLiveCallerRequestID: recentLiveRoute?.callerRequestID,
+            recentLiveCallerSessionID: recentLiveRoute?.callerSessionID,
             displayName: workerModel["displayName"] as? String,
             baseURL: workerModel["baseUrl"] as? String,
             routeHealthStatus: effectiveFactoryContractHealthStatus(

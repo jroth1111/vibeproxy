@@ -11102,6 +11102,8 @@ struct ThinkingProxyPolicySpec {
                             upstreamHTTPStatus: 200,
                             retryCount: 0,
                             source: "smart_alias",
+                            callerRequestID: "live-worker-req",
+                            requestShape: "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content",
                             totalLatencyMilliseconds: 42
                         )
                     )
@@ -11148,6 +11150,9 @@ struct ThinkingProxyPolicySpec {
 
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should ignore synthetic probe winners when reporting the recent live worker lane", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider instead of a probe-only winner", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should expose the recent live worker lane when it exists", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should expose the recent live worker caller request id for correlation", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_request_shape"] as? String, "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content", "healthz should expose the recent live worker request shape for correlation", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -11219,6 +11224,9 @@ struct ThinkingProxyPolicySpec {
 
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should fall back to the next dispatchable worker lane when the recent live winner is at concurrency capacity", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should report the provider for the current dispatchable worker lane instead of the saturated recent winner", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner separately from the next dispatchable lane", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should expose the provider for the recent live worker winner", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_caller_request_id"] == nil, true, "healthz should omit a recent live caller request id when telemetry did not include one", recorder: recorder)
 
                     OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
