@@ -16,7 +16,8 @@ SRC_DIR="$PROJECT_DIR/src"
 APP_NAME="VibeProxy"
 BUNDLE_ID="com.cliproxyapi.menubar"
 BUILD_DIR="$SRC_DIR/.build/release"
-APP_DIR="$PROJECT_DIR/$APP_NAME.app"
+FINAL_APP_DIR="$PROJECT_DIR/$APP_NAME.app"
+APP_DIR="$PROJECT_DIR/.${APP_NAME}.app.tmp"
 VERIFY_APP_BUNDLE_SCRIPT="$PROJECT_DIR/scripts/verify-app-bundle.sh"
 
 ensure_rpath() {
@@ -45,7 +46,8 @@ echo -e "${GREEN}✅ Build complete${NC}"
 
 # Create .app structure
 echo -e "${BLUE}Creating .app bundle structure...${NC}"
-rm -rf "$APP_DIR"
+rm -rf "$APP_DIR" "$FINAL_APP_DIR"
+trap 'rm -rf "$APP_DIR"' EXIT
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 mkdir -p "$APP_DIR/Contents/Frameworks"
@@ -219,9 +221,13 @@ fi
 echo -e "${BLUE}Verifying app bundle runtime dependencies...${NC}"
 "$VERIFY_APP_BUNDLE_SCRIPT" "$APP_DIR"
 
+rm -rf "$FINAL_APP_DIR"
+mv "$APP_DIR" "$FINAL_APP_DIR"
+trap - EXIT
+
 echo -e "${GREEN}✅ App bundle created successfully!${NC}"
 echo ""
-echo -e "${GREEN}Location: $APP_DIR${NC}"
+echo -e "${GREEN}Location: $FINAL_APP_DIR${NC}"
 echo ""
 echo "To install:"
 echo "  1. Drag '$APP_NAME.app' to /Applications"

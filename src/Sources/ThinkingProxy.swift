@@ -15517,6 +15517,10 @@ self.forwardNvidiaReasoningRequestWithRetry(
     ) -> String {
         if requestSurface == "chat_completions",
            let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) {
+            let candidateModels = effectiveFactoryWorkerCandidateModels(
+                routeModel: routeModel,
+                requestSurface: requestSurface
+            )
             if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
                 forRequestedAlias: routeModel
             ),
@@ -15535,10 +15539,13 @@ self.forwardNvidiaReasoningRequestWithRetry(
             }
             if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
                 forRequestedAlias: routeModel
-            ) {
+            ),
+            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: recentObservedCandidate) == nil {
                 return recentObservedCandidate
             }
-            return smartAlias.candidates.first ?? routeModel
+            return firstAvailableFactoryWorkerCandidateModel(from: candidateModels)
+                ?? smartAlias.candidates.first
+                ?? routeModel
         }
         let candidateModels = effectiveFactoryCandidateModels(
             routeModel: routeModel,

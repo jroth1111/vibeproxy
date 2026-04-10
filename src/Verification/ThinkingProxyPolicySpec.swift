@@ -10877,6 +10877,67 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz ignores a recent observed worker winner when that lane is currently open", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: alias,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: "glm5-nvidia",
+                        until: Date().addingTimeInterval(60)
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("open recent-winner healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should not reuse a recent observed worker winner once that lane is open", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should promote the healthy worker sibling instead of the stale open winner", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should keep worker readiness healthy when a closed sibling remains available", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker pool ready when a stale recent winner is open but a healthy sibling remains", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz ignores synthetic worker preflight probe winners when a recent live worker winner exists", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
