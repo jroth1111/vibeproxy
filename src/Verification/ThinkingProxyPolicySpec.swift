@@ -6736,6 +6736,7 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary worker smart alias fails over when a primary tool-call response omits required arguments", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
@@ -6857,6 +6858,7 @@ struct ThinkingProxyPolicySpec {
 
                 guard delivered.wait(timeout: .now() + 2) == .success else {
                     recorder.recordFailure("worker should fail over after a primary tool-call omits required arguments")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     return
                 }
 
@@ -6864,6 +6866,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "worker should succeed once a fallback returns a valid response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String, "OLLAMA OK", "worker should return the fallback response after rejecting the malformed primary tool-call payload", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
