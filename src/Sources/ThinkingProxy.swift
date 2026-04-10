@@ -8014,6 +8014,34 @@ class ThinkingProxy {
             }
             controller.observeConnectionState(state)
         }
+        monitorClientDisconnect(on: connection, controller: controller)
+    }
+
+    func installClientDisconnectCancellationForTesting(
+        on connection: NWConnection,
+        controller: RequestCancellationController
+    ) {
+        installClientDisconnectCancellation(on: connection, controller: controller)
+    }
+
+    private func monitorClientDisconnect(
+        on connection: NWConnection,
+        controller: RequestCancellationController
+    ) {
+        guard controller.isCancelled() != true else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            if let error {
+                NSLog("[ThinkingProxy] Client connection receive failed before proxy delivery completed: \(error)")
+                controller.cancel()
+                return
+            }
+            if isComplete || (data?.isEmpty ?? true) {
+                controller.cancel()
+                return
+            }
+            self.monitorClientDisconnect(on: connection, controller: controller)
+        }
     }
 
     private final class ResponseProgressDelegate: NSObject, URLSessionDataDelegate {

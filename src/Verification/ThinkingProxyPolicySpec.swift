@@ -306,6 +306,79 @@ struct ThinkingProxyPolicySpec {
             expectEqual(controller.isCancelled(), true, "disconnect-triggered cancellation should block later retry work", recorder: recorder)
         }
 
+        run("request cancellation controller detects remote client EOF on an active socket", recorder: recorder) {
+            #if DEBUG
+            let proxy = ThinkingProxy()
+            let accepted = DispatchSemaphore(value: 0)
+            let clientReady = DispatchSemaphore(value: 0)
+            let cancelled = DispatchSemaphore(value: 0)
+            let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.listener")
+            let connectionQueue = DispatchQueue(label: "thinkingproxy-policy.connection")
+            var serverConnection: NWConnection?
+
+            guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                recorder.recordFailure("should create a local listener for EOF cancellation testing")
+                return
+            }
+
+            listener.newConnectionHandler = { connection in
+                serverConnection = connection
+                connection.start(queue: connectionQueue)
+                accepted.signal()
+            }
+            listener.start(queue: listenerQueue)
+
+            guard let port = listener.port else {
+                recorder.recordFailure("listener should expose an ephemeral port for EOF cancellation testing")
+                listener.cancel()
+                return
+            }
+
+            let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+            client.stateUpdateHandler = { state in
+                if case .ready = state {
+                    clientReady.signal()
+                }
+            }
+            client.start(queue: connectionQueue)
+
+            guard clientReady.wait(timeout: .now() + 2) == .success else {
+                recorder.recordFailure("client should connect to the local listener before cancellation")
+                client.cancel()
+                listener.cancel()
+                return
+            }
+
+            guard accepted.wait(timeout: .now() + 2) == .success,
+                  let serverConnection else {
+                recorder.recordFailure("listener should accept the local client connection before cancellation")
+                client.cancel()
+                listener.cancel()
+                return
+            }
+
+            let controller = ThinkingProxy.RequestCancellationController()
+            controller.registerCurrentCancel {
+                cancelled.signal()
+            }
+            proxy.installClientDisconnectCancellationForTesting(on: serverConnection, controller: controller)
+
+            client.cancel()
+
+            guard cancelled.wait(timeout: .now() + 2) == .success else {
+                recorder.recordFailure("remote client EOF should invoke the registered upstream cancel closure")
+                serverConnection.cancel()
+                listener.cancel()
+                return
+            }
+
+            expectEqual(controller.isCancelled(), true, "remote client EOF should leave the controller cancelled", recorder: recorder)
+
+            serverConnection.cancel()
+            listener.cancel()
+            #endif
+        }
+
         run("temporary nvidia shim flattens text-only typed content arrays", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
