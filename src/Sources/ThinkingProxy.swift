@@ -3214,16 +3214,16 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func latestObservedSmartAliasResolvedWinner(
+    fileprivate static func latestObservedSmartAliasResolvedWinner(
         forRequestedAlias requestedAlias: String,
         maxAge: TimeInterval = 30,
         at now: Date = Date()
-    ) -> RecentObservedSmartAliasWinner? {
+    ) -> ThinkingProxy.RecentObservedSmartAliasWinner? {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let freshestObservedWinner = routeCircuitStatesByRouteHealthKey.values
                 .compactMap(\.lastTelemetryEvent)
-                .compactMap { event -> RecentObservedSmartAliasWinner? in
+                .compactMap { event -> ThinkingProxy.RecentObservedSmartAliasWinner? in
                     guard event.requestedAlias == requestedAlias,
                           event.source == "smart_alias",
                           now.timeIntervalSince(event.timestamp) <= maxAge else {
@@ -3231,7 +3231,7 @@ enum OpenAICompatTemporaryShim {
                     }
 
                     if let finalWinnerRequestModel = event.finalWinnerRequestModel {
-                        return RecentObservedSmartAliasWinner(
+                        return ThinkingProxy.RecentObservedSmartAliasWinner(
                             timestamp: event.timestamp,
                             requestModel: finalWinnerRequestModel,
                             requestShape: event.requestShape,
@@ -3247,7 +3247,7 @@ enum OpenAICompatTemporaryShim {
                         return nil
                     }
 
-                    return RecentObservedSmartAliasWinner(
+                    return ThinkingProxy.RecentObservedSmartAliasWinner(
                         timestamp: event.timestamp,
                         requestModel: event.requestModel,
                         requestShape: event.requestShape,
@@ -8493,7 +8493,7 @@ class ThinkingProxy {
         }
     }
 
-    private struct RecentObservedSmartAliasWinner {
+    fileprivate struct RecentObservedSmartAliasWinner {
         let timestamp: Date
         let requestModel: String
         let requestShape: String?
