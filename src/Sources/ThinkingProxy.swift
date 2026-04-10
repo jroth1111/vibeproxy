@@ -1482,6 +1482,117 @@ enum OpenAICompatTemporaryShim {
         return true
     }
 
+    fileprivate struct SmartAliasCandidateTransition {
+        let body: String
+        let model: String
+        let remainingCandidateModels: [String]
+    }
+
+    fileprivate struct SmartAliasCandidateSelectionResult {
+        let transition: SmartAliasCandidateTransition?
+        let terminalPreflightError: ClientFacingNVIDIAFailure?
+    }
+
+    private enum SmartAliasCandidateEvaluation {
+        case available(body: String)
+        case skipped(reason: String)
+        case providerPreflightBlocked(reason: String, error: ClientFacingNVIDIAFailure)
+    }
+
+    private static func evaluateSmartAliasCandidate(
+        method: String,
+        path: String,
+        currentBody: String,
+        candidateModel: String,
+        forceAllowClosedModels: Set<String> = [],
+        applyProviderAwarePreflight: Bool = true
+    ) -> SmartAliasCandidateEvaluation {
+        guard resolveConfiguredRoute(forRequestModel: candidateModel) != nil else {
+            return .skipped(reason: "no_route")
+        }
+        guard let candidateBody = rewrittenRequestJSON(
+            method: method,
+            path: path,
+            replacingRequestModelIn: currentBody,
+            with: candidateModel
+        ) else {
+            return .skipped(reason: "rewrite_failed")
+        }
+        if isConfiguredRouteOpen(forRequestModel: candidateModel) &&
+            !forceAllowClosedModels.contains(candidateModel) {
+            return .skipped(reason: "route_closed")
+        }
+        if !forceAllowClosedModels.contains(candidateModel),
+           let candidateRoute = resolveConfiguredRoute(forRequestModel: candidateModel),
+           let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
+           Date() < cooldownUntil {
+            return .skipped(reason: "provider_cooldown")
+        }
+        if !forceAllowClosedModels.contains(candidateModel),
+           let candidateRoute = resolveConfiguredRoute(forRequestModel: candidateModel),
+           Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
+            return .skipped(reason: "concurrency_capacity")
+        }
+        if applyProviderAwarePreflight,
+           let preflightError = configuredRoutePreflightError(
+            method: method,
+            path: path,
+            jsonString: candidateBody
+           ) {
+            return .providerPreflightBlocked(
+                reason: "provider_preflight_\(preflightError.statusCode)",
+                error: preflightError
+            )
+        }
+        return .available(body: candidateBody)
+    }
+
+    fileprivate static func nextSmartAliasCandidateSelection(
+        method: String,
+        path: String,
+        currentBody: String,
+        candidateModelsRemaining: [String],
+        forceAllowClosedModels: Set<String> = []
+    ) -> SmartAliasCandidateSelectionResult {
+        var remainingCandidateModels = candidateModelsRemaining
+        var skippedReasons: [(model: String, reason: String)] = []
+        var terminalPreflightError: ClientFacingNVIDIAFailure?
+
+        while !remainingCandidateModels.isEmpty {
+            let nextCandidateModel = remainingCandidateModels.removeFirst()
+            switch evaluateSmartAliasCandidate(
+                method: method,
+                path: path,
+                currentBody: currentBody,
+                candidateModel: nextCandidateModel,
+                forceAllowClosedModels: forceAllowClosedModels
+            ) {
+            case .available(let candidateBody):
+                return SmartAliasCandidateSelectionResult(
+                    transition: SmartAliasCandidateTransition(
+                        body: candidateBody,
+                        model: nextCandidateModel,
+                        remainingCandidateModels: remainingCandidateModels
+                    ),
+                    terminalPreflightError: nil
+                )
+            case .skipped(let reason):
+                skippedReasons.append((nextCandidateModel, reason))
+            case .providerPreflightBlocked(let reason, let error):
+                skippedReasons.append((nextCandidateModel, reason))
+                if remainingCandidateModels.isEmpty {
+                    terminalPreflightError = error
+                }
+            }
+        }
+
+        NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
+        return SmartAliasCandidateSelectionResult(
+            transition: nil,
+            terminalPreflightError: terminalPreflightError
+        )
+    }
+
     static func nextSmartAliasCandidateTransition(
         method: String,
         path: String,
@@ -1489,47 +1600,17 @@ enum OpenAICompatTemporaryShim {
         candidateModelsRemaining: [String],
         forceAllowClosedModels: Set<String> = []
     ) -> (body: String, model: String, remainingCandidateModels: [String])? {
-        var remainingCandidateModels = candidateModelsRemaining
-        var skippedReasons: [(model: String, reason: String)] = []
-
-        while !remainingCandidateModels.isEmpty {
-            let nextCandidateModel = remainingCandidateModels.removeFirst()
-            guard resolveConfiguredRoute(forRequestModel: nextCandidateModel) != nil else {
-                skippedReasons.append((nextCandidateModel, "no_route"))
-                continue
-            }
-            guard let candidateBody = rewrittenRequestJSON(
-                method: method,
-                path: path,
-                replacingRequestModelIn: currentBody,
-                    with: nextCandidateModel
-            ) else {
-                skippedReasons.append((nextCandidateModel, "rewrite_failed"))
-                continue
-            }
-            if isConfiguredRouteOpen(forRequestModel: nextCandidateModel) &&
-                !forceAllowClosedModels.contains(nextCandidateModel) {
-                skippedReasons.append((nextCandidateModel, "route_closed"))
-                continue
-            }
-            if !forceAllowClosedModels.contains(nextCandidateModel),
-               let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
-               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
-               Date() < cooldownUntil {
-                skippedReasons.append((nextCandidateModel, "provider_cooldown"))
-                continue
-            }
-            if !forceAllowClosedModels.contains(nextCandidateModel),
-               let candidateRoute = resolveConfiguredRoute(forRequestModel: nextCandidateModel),
-               Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
-                skippedReasons.append((nextCandidateModel, "concurrency_capacity"))
-                continue
-            }
-            return (candidateBody, nextCandidateModel, remainingCandidateModels)
+        let selection = nextSmartAliasCandidateSelection(
+            method: method,
+            path: path,
+            currentBody: currentBody,
+            candidateModelsRemaining: candidateModelsRemaining,
+            forceAllowClosedModels: forceAllowClosedModels
+        )
+        guard let transition = selection.transition else {
+            return nil
         }
-
-        NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
-        return nil
+        return (transition.body, transition.model, transition.remainingCandidateModels)
     }
 
     static func nextSmartAliasRetryDelay(
@@ -1566,24 +1647,18 @@ enum OpenAICompatTemporaryShim {
         forceAllowClosedModels: Set<String> = []
     ) -> [(body: String, model: String)] {
         candidateModelsRemaining.compactMap { candidateModel in
-            guard resolveConfiguredRoute(forRequestModel: candidateModel) != nil,
-                  (!isConfiguredRouteOpen(forRequestModel: candidateModel) ||
-                    forceAllowClosedModels.contains(candidateModel)),
-                  let candidateBody = rewrittenRequestJSON(
-                    method: method,
-                    path: path,
-                    replacingRequestModelIn: currentBody,
-                    with: candidateModel
-                  ) else {
+            switch evaluateSmartAliasCandidate(
+                method: method,
+                path: path,
+                currentBody: currentBody,
+                candidateModel: candidateModel,
+                forceAllowClosedModels: forceAllowClosedModels
+            ) {
+            case .available(let candidateBody):
+                return (candidateBody, candidateModel)
+            case .skipped, .providerPreflightBlocked:
                 return nil
             }
-            if !forceAllowClosedModels.contains(candidateModel),
-               let route = resolveConfiguredRoute(forRequestModel: candidateModel),
-               let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
-               Date() < cooldownUntil {
-                return nil
-            }
-            return (candidateBody, candidateModel)
         }
     }
 
@@ -9122,13 +9197,14 @@ class ThinkingProxy {
             )
         }
 
-        guard let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+        let selection = OpenAICompatTemporaryShim.nextSmartAliasCandidateSelection(
             method: method,
             path: path,
             currentBody: currentBody,
             candidateModelsRemaining: remainingCandidateModels,
             forceAllowClosedModels: forceProbeCandidateModels
-        ) else {
+        )
+        guard let transition = selection.transition else {
             let poolRetryDelay = effectiveCandidateModels.flatMap {
                 OpenAICompatTemporaryShim.nextSmartAliasRetryDelay(
                     forCandidateModels: $0,
@@ -9190,6 +9266,16 @@ class ThinkingProxy {
                 }
             }
 
+            if let terminalPreflightError = selection.terminalPreflightError {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: terminalPreflightError.statusCode,
+                    message: terminalPreflightError.message,
+                    coalescingKey: coalescingKey
+                )
+                return
+            }
+
             if let terminalFallbackOutcome {
                 deliverSmartAliasTerminalOutcome(
                     terminalFallbackOutcome,
@@ -9242,47 +9328,6 @@ class ThinkingProxy {
         }
 
         NSLog("[ThinkingProxy] Resolved smart alias %@ to candidate %@ at depth %d", publicAlias, transition.model, failoverDepth)
-
-        if let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
-            method: method,
-            path: path,
-            jsonString: transition.body
-        ) {
-            if !transition.remainingCandidateModels.isEmpty {
-                NSLog(
-                    "[ThinkingProxy] Skipping smart alias candidate %@ at depth %d due to provider-aware preflight: %@",
-                    transition.model,
-                    failoverDepth,
-                    preflightError.message
-                )
-                attemptSmartAliasCandidate(
-                    method: method,
-                    path: path,
-                    headers: headers,
-                    currentBody: transition.body,
-                    publicAlias: publicAlias,
-                    remainingCandidateModels: transition.remainingCandidateModels,
-                    forceProbeCandidateModels: forceProbeCandidateModels,
-                    primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
-                    failoverDepth: failoverDepth + 1,
-                    deadlineAt: deadlineAt,
-                    originalConnection: originalConnection,
-                    coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalFallbackOutcome,
-                    exhaustedRetryableOutcome: exhaustedRetryableOutcome,
-                    deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
-                )
-                return
-            }
-            deliverBufferedError(
-                defaultConnection: originalConnection,
-                statusCode: preflightError.statusCode,
-                message: preflightError.message,
-                coalescingKey: coalescingKey
-            )
-            return
-        }
 
         executeSmartAliasCandidate(
             method: method,

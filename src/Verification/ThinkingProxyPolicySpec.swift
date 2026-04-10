@@ -1622,6 +1622,80 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("raceable candidate transitions exclude provider-aware preflight-incompatible lanes before launch", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let requestJSON = """
+                {
+                  "model": "worker",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+                  ],
+                  "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+                  "messages": [{"role": "user", "content": "Call the lookup tool."}]
+                }
+                """
+
+                let transitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: requestJSON,
+                    candidateModelsRemaining: ["glm5-nvidia", "muse-spark"]
+                )
+
+                expectEqual(
+                    transitions.map(\.model),
+                    ["muse-spark"],
+                    "raced fallback selection should drop strict-tool incompatible native lanes before launching transport attempts",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("raceable candidate transitions skip candidates already at learned concurrency capacity", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                guard let nvidiaRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia") else {
+                    recorder.recordFailure("glm5-nvidia route should resolve for concurrency-capacity race filtering")
+                    return
+                }
+
+                for _ in 0..<3 {
+                    OpenAICompatTemporaryShim.recordConcurrency429(
+                        routeHealthKey: nvidiaRoute.routeHealthKey,
+                        inflightAtRequest: 2
+                    )
+                }
+                let acquired = OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
+                expectEqual(acquired, true, "test setup should acquire the only learned NVIDIA concurrency slot", recorder: recorder)
+
+                let requestJSON = """
+                {"model":"worker","messages":[{"role":"user","content":"Return exactly: OK"}],"stream":false}
+                """
+
+                let transitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: requestJSON,
+                    candidateModelsRemaining: ["glm5-nvidia", "muse-spark"]
+                )
+
+                expectEqual(
+                    transitions.map(\.model),
+                    ["muse-spark"],
+                    "raced fallback selection should not launch already-saturated lanes",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("text-bearing wrapper transcript shapes keep muse-spark eligible for worker routing", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -8794,6 +8868,78 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should ignore synthetic probe winners when reporting the recent live worker lane", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider instead of a probe-only winner", recorder: recorder)
 
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz ignores a recent worker winner that is currently saturated", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: alias,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42
+                        )
+                    )
+
+                    guard let nvidiaRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia") else {
+                        recorder.recordFailure("glm5-nvidia route should resolve for saturated-health reporting")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    for _ in 0..<3 {
+                        OpenAICompatTemporaryShim.recordConcurrency429(
+                            routeHealthKey: nvidiaRoute.routeHealthKey,
+                            inflightAtRequest: 2
+                        )
+                    }
+                    let acquired = OpenAICompatTemporaryShim.acquireConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
+                    expectEqual(acquired, true, "test setup should acquire the only learned NVIDIA concurrency slot", recorder: recorder)
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("saturated recent-winner healthz should return a response")
+                        OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should fall back to the next dispatchable worker lane when the recent live winner is at concurrency capacity", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should report the provider for the current dispatchable worker lane instead of the saturated recent winner", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.releaseConcurrencySlot(routeHealthKey: nvidiaRoute.routeHealthKey)
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
