@@ -64,6 +64,10 @@ run_thinking_proxy_policy_spec() {
     prepare_stable_sources \
         "$TMP_BUILD_DIR/$name-sources" \
         "Sources/ObjCExceptionCatcher.swift" \
+        "Sources/NVIDIAStreamParser.swift" \
+        "Sources/NVIDIAStreamEngine.swift" \
+        "Sources/NVIDIAStreamSink.swift" \
+        "Sources/NVIDIAStreamTransport.swift" \
         "Sources/ThinkingProxy.swift" \
         "Sources/ProviderCatalog.swift" \
         "Verification/ThinkingProxyPolicySpec.swift"
@@ -98,6 +102,10 @@ run_meta_ai_web_adapter_spec() {
     prepare_stable_sources \
         "$TMP_BUILD_DIR/$name-sources" \
         "Sources/ObjCExceptionCatcher.swift" \
+        "Sources/NVIDIAStreamParser.swift" \
+        "Sources/NVIDIAStreamEngine.swift" \
+        "Sources/NVIDIAStreamSink.swift" \
+        "Sources/NVIDIAStreamTransport.swift" \
         "Sources/ThinkingProxy.swift" \
         "Sources/ProviderCatalog.swift" \
         "Verification/MetaAIWebAdapterSpec.swift"
@@ -143,10 +151,19 @@ run_spec \
 run_spec \
     "NVIDIAStreamEngineSpec" \
     "Sources/NVIDIAStreamParser.swift" \
+    "Sources/NVIDIAStreamTransport.swift" \
     "Sources/NVIDIAStreamEngine.swift" \
     "Sources/NVIDIAStreamSink.swift" \
     "Verification/NVIDIAStreamSpecSupport.swift" \
     "Verification/NVIDIAStreamEngineSpec.swift"
+
+run_spec \
+    "NVIDIAStreamTransportSpec" \
+    "Sources/NVIDIAStreamTransport.swift" \
+    "Sources/NVIDIAStreamSink.swift" \
+    "Sources/NVIDIAStreamParser.swift" \
+    "Verification/NVIDIAStreamSpecSupport.swift" \
+    "Verification/NVIDIAStreamTransportSpec.swift"
 
 run_spec \
     "ZAIAPIKeyStoreSpec" \

@@ -1221,6 +1221,57 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia typed-content fallback stays dispatchable without quarantining the healthy route", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+                    let currentBody = """
+                    {
+                      "model": "worker",
+                      "stream": false,
+                      "messages": [
+                        {
+                          "role": "assistant",
+                          "content": [
+                            {"type": "input_text", "text": "Checked "},
+                            {"type": "summary_text", "text": "repo"},
+                            {"type": "reasoning", "text": "hidden chain of thought"},
+                            {"type": "metadata_marker", "value": {"step": 1}}
+                          ]
+                        },
+                        {"role": "user", "content": "Return exactly OK"}
+                      ]
+                    }
+                    """
+                    let allCandidates = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")?.candidates ?? []
+                    let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        currentBody: currentBody,
+                        candidateModelsRemaining: allCandidates
+                    )
+
+                    expectEqual(
+                        transition?.model,
+                        "glm5-nvidia",
+                        "typed-content worker requests should stay dispatchable when NVIDIA is the only remaining worker fallback",
+                        recorder: recorder
+                    )
+
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    expectNil(snapshot["z-ai/glm5"]?.status, "typed-content fallback selection should leave an otherwise healthy NVIDIA route untouched", recorder: recorder)
+                    expectNil(snapshot["z-ai/glm5"]?.failureScore, "typed-content fallback selection should not create a failure score entry for the healthy NVIDIA route", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("temporary nvidia rolling metrics keep flaky suspect routes degraded until they prove stability", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -8432,25 +8483,38 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary nvidia direct session pool matches the slow-success timeout budget", recorder: recorder) {
             ThinkingProxy.clearDirectSessionPoolForTesting()
+            let policy = ThinkingProxy.nvidiaDirectTransportPolicyForTesting()
             guard let session = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
                 recorder.recordFailure("expected a direct testing session for nvidia requests")
                 return
             }
             expectEqual(
+                policy.protocolPreference,
+                .http1Only,
+                "nvidia direct sessions should advertise the dedicated http/1.1 transport preference",
+                recorder: recorder
+            )
+            expectEqual(
+                Int(policy.interChunkReadTimeoutSeconds),
+                300,
+                "nvidia direct transport should preserve the long inter-chunk timeout budget",
+                recorder: recorder
+            )
+            expectEqual(
                 Int(session.configuration.timeoutIntervalForRequest),
-                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(300)),
+                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(policy.requestTimeoutSeconds)),
                 "nvidia direct sessions should inherit the full slow-success request timeout",
                 recorder: recorder
             )
             expectEqual(
                 Int(session.configuration.timeoutIntervalForResource),
-                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(360)),
+                Int(OpenAICompatTemporaryShim.scaledRequestTimeout(policy.resourceTimeoutSeconds)),
                 "nvidia direct sessions should allow total resource time beyond the request timeout",
                 recorder: recorder
             )
             expectEqual(
                 session.configuration.waitsForConnectivity,
-                true,
+                policy.waitsForConnectivity,
                 "nvidia direct sessions should wait briefly for connectivity instead of failing immediately on transient path issues",
                 recorder: recorder
             )
@@ -10256,6 +10320,53 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("nvidia reasoning evaluation repairs dict-shaped tool arguments into native string form", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": {
+                                "file_path": "/tmp/test.txt"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8),
+                    requiredToolParameters: ["Read": ["file_path"]]
+                )
+
+                expectNil(evaluation.retryReason, "dict-shaped tool arguments should be repaired instead of treated as malformed", recorder: recorder)
+                expectEqual(evaluation.repairedBodyData == nil, false, "dict-shaped tool arguments should produce a repaired body", recorder: recorder)
+
+                let repaired = parseDataJSONObject(evaluation.repairedBodyData ?? Data(), recorder: recorder)
+                let choices = repaired["choices"] as? [[String: Any]]
+                let message = choices?.first?["message"] as? [String: Any]
+                let toolCalls = message?["tool_calls"] as? [[String: Any]]
+                let function = toolCalls?.first?["function"] as? [String: Any]
+
+                expectEqual(function?["arguments"] as? String, "{\"file_path\":\"/tmp/test.txt\"}", "repaired tool-call arguments should be serialized back to the provider-native string form", recorder: recorder)
+            }
+        }
+
         run("schema-aware validation passes tool calls with all required parameters", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let response = """
@@ -10360,6 +10471,139 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectNil(evaluation.retryReason, "without schema, valid JSON arguments should pass through", recorder: recorder)
+            }
+        }
+
+        run("native dict arguments are accepted and repaired to string format", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": {"file_path": "/etc/hosts"}
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "native dict arguments should not be classified as malformed", recorder: recorder)
+                expectEqual(evaluation.repairedBodyData == nil, false, "dict arguments should produce a repaired body with string arguments", recorder: recorder)
+
+                if let repaired = evaluation.repairedBodyData,
+                   let repairedJSON = try? JSONSerialization.jsonObject(with: repaired) as? [String: Any],
+                   let choices = repairedJSON["choices"] as? [[String: Any]],
+                   let toolCalls = choices[0]["message"] as? [String: Any],
+                   let calls = toolCalls["tool_calls"] as? [[String: Any]],
+                   let fn = calls[0]["function"] as? [String: Any],
+                   let args = fn["arguments"] as? String {
+                    if let argsData = args.data(using: .utf8),
+                       let argsJSON = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+                        expectEqual(argsJSON["file_path"] as? String, "/etc/hosts", "repaired arguments should preserve the original payload when re-encoded", recorder: recorder)
+                    } else {
+                        recorder.recordFailure("repaired body should contain JSON-stringified tool arguments")
+                    }
+                } else {
+                    recorder.recordFailure("repaired body should have string-format arguments")
+                }
+            }
+        }
+
+        run("native dict arguments pass schema validation with required params", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_def",
+                            "type": "function",
+                            "function": {
+                              "name": "Grep",
+                              "arguments": {"pattern": "TODO", "path": "/src"}
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8),
+                    requiredToolParameters: ["Grep": ["pattern"]]
+                )
+
+                expectNil(evaluation.retryReason, "dict arguments with all required params should pass validation", recorder: recorder)
+            }
+        }
+
+        run("mixed string and dict arguments across multiple tool calls", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_mixed_1",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": {"file_path": "/tmp/a.txt"}
+                            }
+                          },
+                          {
+                            "id": "call_mixed_2",
+                            "type": "function",
+                            "function": {
+                              "name": "Grep",
+                              "arguments": "{\\"pattern\\":\\"TODO\\"}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "mixed string/dict arguments should not be classified as malformed", recorder: recorder)
+                expectEqual(evaluation.repairedBodyData == nil, false, "mixed arguments should produce a repaired body", recorder: recorder)
             }
         }
 

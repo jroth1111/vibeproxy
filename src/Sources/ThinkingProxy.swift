@@ -5400,14 +5400,15 @@ enum OpenAICompatTemporaryShim {
         }
 
         for i in toolCalls.indices {
-            guard var function = toolCalls[i]["function"] as? [String: Any] else { continue }
+            var toolCall = toolCalls[i]
+            guard var function = toolCall["function"] as? [String: Any] else { continue }
             if function["arguments"] is String { continue }
             guard let dict = function["arguments"] as? [String: Any],
                   let data = try? JSONSerialization.data(withJSONObject: dict),
                   let str = String(data: data, encoding: .utf8) else { continue }
-            function["arguments"] = str
-            toolCalls[i] = (toolCalls[i] as NSDictionary).mutableCopy() as! NSMutableDictionary as! [String: Any]
-            toolCalls[i]["function"] = function
+            function["arguments"] = str.replacingOccurrences(of: "\\/", with: "/")
+            toolCall["function"] = function
+            toolCalls[i] = toolCall
             modified = true
         }
 
@@ -9160,6 +9161,7 @@ class ThinkingProxy {
     private static var directSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
     private static let directPoolMaxSize = 8
     private static let directPoolIdleEviction: TimeInterval = 300
+    private static let nvidiaDirectTransportPolicy = NVIDIATransportPolicy.direct
 
     private static func acquireDirectSession(key: String) -> (URLSession, MultiplexedSessionDelegate)? {
         directPoolQueue.sync {
@@ -9170,10 +9172,9 @@ class ThinkingProxy {
                 return (existing.session, existing.delegate)
             }
 
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = OpenAICompatTemporaryShim.scaledRequestTimeout(300)
-            configuration.timeoutIntervalForResource = OpenAICompatTemporaryShim.scaledRequestTimeout(360)
-            configuration.waitsForConnectivity = true
+            let configuration = nvidiaDirectTransportPolicy.sessionConfiguration(
+                scaleTimeout: OpenAICompatTemporaryShim.scaledRequestTimeout
+            )
             let delegate = MultiplexedSessionDelegate()
             let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
 
@@ -9202,6 +9203,10 @@ class ThinkingProxy {
 
     static func acquireDirectSessionForTesting(key: String) -> URLSession? {
         acquireDirectSession(key: key)?.0
+    }
+
+    static func nvidiaDirectTransportPolicyForTesting() -> NVIDIATransportPolicy {
+        nvidiaDirectTransportPolicy
     }
 
     private static func evictIdleDirectSessionsLocked() {
