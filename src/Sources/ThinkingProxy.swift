@@ -642,7 +642,7 @@ enum OpenAICompatTemporaryShim {
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
     private static let routeCircuitBreakerPolicy = RouteCircuitBreakerPolicy(
         failureThreshold: 4,
-        cooldown: 120,
+        cooldown: 10,
         recoverySuccessThreshold: 1
     )
     private static let routeRollingWindow = 8
@@ -658,7 +658,8 @@ enum OpenAICompatTemporaryShim {
     private static let retryableMetaAdapterDeferral: TimeInterval = 60
     private static let legacyRequestModelRewrites: [String: String] = [
         "glm-5": "glm-5.1",
-        "glm-5-turbo": "glm-5.1"
+        "glm-5-turbo": "glm-5.1",
+        "glm5-nvidia": "z-ai/glm5"
     ]
     #if DEBUG
     private static let _assertLegacyRewritesHaveNoDuplicates: Void = {
@@ -4505,7 +4506,7 @@ enum OpenAICompatTemporaryShim {
         let type = (dictionary["type"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "metadata_marker" || type == "tool_result"
         let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
 
         if let textValue = normalizedTextMessageScalar(dictionary["text"]),
@@ -6091,7 +6092,7 @@ enum MetaAIWebAdapter {
         }
 
         let type = normalizedString(dictionary["type"] as? String)?.lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "tool_result"
+        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "metadata_marker" || type == "tool_result"
         let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json"
         if let text = normalizedContentText(dictionary["text"]),
            allowsDirectText {
@@ -7937,7 +7938,7 @@ class ThinkingProxy {
         }
     }
 
-    final class SmartAliasCandidateController {
+    final class RequestCancellationController {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-candidate")
         private var cancelled = false
         private var currentCancel: (() -> Void)?
@@ -7990,6 +7991,27 @@ class ThinkingProxy {
 
         func isCancelled() -> Bool {
             stateQueue.sync { cancelled }
+        }
+
+        func observeConnectionState(_ state: NWConnection.State) {
+            switch state {
+            case .failed, .cancelled:
+                cancel()
+            default:
+                break
+            }
+        }
+    }
+
+    private func installClientDisconnectCancellation(
+        on connection: NWConnection,
+        controller: RequestCancellationController
+    ) {
+        connection.stateUpdateHandler = { state in
+            if case .failed(let error) = state {
+                NSLog("[ThinkingProxy] Client connection failed before proxy delivery completed: \(error)")
+            }
+            controller.observeConnectionState(state)
         }
     }
 
@@ -8851,6 +8873,8 @@ class ThinkingProxy {
         coalescingKey: String?,
         deliveryMode: SmartAliasDeliveryMode
     ) {
+        let requestController = RequestCancellationController()
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         attemptSmartAliasCandidate(
             method: method,
             path: path,
@@ -8867,7 +8891,8 @@ class ThinkingProxy {
             terminalFallbackOutcome: nil,
             exhaustedRetryableOutcome: nil,
             deliveryMode: deliveryMode,
-            loopRetriesRemaining: smartAliasLoopRetryLimitOverrideForTesting ?? smartAliasMaxLoopRetries
+            loopRetriesRemaining: smartAliasLoopRetryLimitOverrideForTesting ?? smartAliasMaxLoopRetries,
+            requestController: requestController
         )
     }
 
@@ -8880,6 +8905,8 @@ class ThinkingProxy {
         deliveryMode: FactoryBoundDeliveryMode = .bufferedJSON,
         originalConnection: NWConnection
     ) {
+        let requestController = RequestCancellationController()
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let resolvedRequestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body) ?? binding.routeModel
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: binding.incomingModelID,
@@ -8929,7 +8956,7 @@ class ThinkingProxy {
             permit = p
         }
 
-        sendBufferedProxyRequest(
+        let cancel = sendBufferedProxyRequest(
             method: method,
             path: upstreamPath,
             headers: effectiveHeaders,
@@ -8938,6 +8965,8 @@ class ThinkingProxy {
         ) { [weak self] bufferedResponse in
             permit?.release()
             guard let self else { return }
+            requestController.clearCurrentCancel()
+            guard requestController.isCancelled() != true else { return }
 
             if let error = bufferedResponse.error {
                 let nsError = error as NSError
@@ -9062,6 +9091,10 @@ class ThinkingProxy {
                 overridingHeaders: resolutionHeaders
             )
         }
+        requestController.registerCurrentCancel {
+            permit?.release()
+            cancel()
+        }
     }
 
     private func factoryBoundExecutionPlan(
@@ -9165,7 +9198,8 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
-        loopRetriesRemaining: Int = 0
+        loopRetriesRemaining: Int = 0,
+        requestController: RequestCancellationController
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
@@ -9222,7 +9256,8 @@ class ThinkingProxy {
                 terminalFallbackOutcome: terminalFallbackOutcome,
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
-                loopRetriesRemaining: loopRetriesRemaining
+                loopRetriesRemaining: loopRetriesRemaining,
+                requestController: requestController
             )
             return
         }
@@ -9275,7 +9310,8 @@ class ThinkingProxy {
                         loopRetriesRemaining: loopRetriesRemaining,
                         retryDelaySeconds: retryDelay,
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
-                        deliveryMode: deliveryMode
+                        deliveryMode: deliveryMode,
+                        requestController: requestController
                     )
                     return
                 }
@@ -9380,7 +9416,7 @@ class ThinkingProxy {
             attemptLane: 1,
             deadlineAt: deadlineAt,
             coalescingKey: coalescingKey,
-            controller: nil
+            controller: requestController
         ) { [weak self] outcome in
             guard let self else { return }
             self.handleSmartAliasSerialCandidateOutcome(
@@ -9400,7 +9436,8 @@ class ThinkingProxy {
                 terminalFallbackOutcome: terminalFallbackOutcome,
                 exhaustedRetryableOutcome: nil,
                 deliveryMode: deliveryMode,
-                loopRetriesRemaining: loopRetriesRemaining
+                loopRetriesRemaining: loopRetriesRemaining,
+                requestController: requestController
             )
         }
     }
@@ -9423,7 +9460,8 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
-        loopRetriesRemaining: Int = 0
+        loopRetriesRemaining: Int = 0,
+        requestController: RequestCancellationController
     ) {
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels, healthSensitivity: healthSensitivity)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
@@ -9451,7 +9489,8 @@ class ThinkingProxy {
                 terminalFallbackOutcome: terminalFallbackOutcome,
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
-                loopRetriesRemaining: loopRetriesRemaining
+                loopRetriesRemaining: loopRetriesRemaining,
+                requestController: requestController
             )
             return
         }
@@ -9468,6 +9507,9 @@ class ThinkingProxy {
         var remainingAttempts = raceTransitions.count
         var terminalOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
         let completionGate = DispatchSemaphore(value: 0)
+        requestController.registerCurrentCancel {
+            _ = coordinator.tryFinish(attemptLane: 0)
+        }
 
         func finalizeExhaustedRaceIfNeeded() {
             guard remainingAttempts == 0, !coordinator.isFinished() else { return }
@@ -9490,7 +9532,8 @@ class ThinkingProxy {
                     terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
                     exhaustedRetryableOutcome: nil,
                     deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
+                    loopRetriesRemaining: loopRetriesRemaining,
+                    requestController: requestController
                 )
                 return
             }
@@ -9522,7 +9565,8 @@ class ThinkingProxy {
                 terminalFallbackOutcome: nil,
                 exhaustedRetryableOutcome: nil,
                 deliveryMode: deliveryMode,
-                loopRetriesRemaining: loopRetriesRemaining
+                loopRetriesRemaining: loopRetriesRemaining,
+                requestController: requestController
             )
         }
 
@@ -9603,7 +9647,7 @@ class ThinkingProxy {
 
         for (index, transition) in raceTransitions.enumerated() {
             let attemptLane = index + 1
-            let controller = SmartAliasCandidateController()
+            let controller = RequestCancellationController()
             coordinator.registerAttempt(attemptLane: attemptLane) {
                 controller.cancel()
             }
@@ -9673,7 +9717,6 @@ class ThinkingProxy {
                 }
             }
         }
-
         for _ in raceTransitions {
             completionGate.signal()
         }
@@ -9696,7 +9739,8 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
-        loopRetriesRemaining: Int = 0
+        loopRetriesRemaining: Int = 0,
+        requestController: RequestCancellationController
     ) {
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
@@ -9736,7 +9780,7 @@ class ThinkingProxy {
             let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
             if primaryProbeRetriesRemaining > 0,
                remainingBudget > retryDelay {
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .seconds(1)) { [weak self] in
+                requestController.scheduleRetry(after: .seconds(1)) { [weak self] in
                     guard let self else { return }
                     self.attemptSmartAliasCandidate(
                         method: method,
@@ -9754,14 +9798,15 @@ class ThinkingProxy {
                         terminalFallbackOutcome: terminalFallbackOutcome,
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                         deliveryMode: deliveryMode,
-                        loopRetriesRemaining: loopRetriesRemaining
+                        loopRetriesRemaining: loopRetriesRemaining,
+                        requestController: requestController
                     )
                 }
                 return
             }
             if !remainingCandidateModels.isEmpty {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self else { return }
+                    guard let self, requestController.isCancelled() != true else { return }
                     self.attemptSmartAliasCandidate(
                         method: method,
                         path: path,
@@ -9782,7 +9827,8 @@ class ThinkingProxy {
                             cooldownUntil: cooldownUntil
                         ),
                         deliveryMode: deliveryMode,
-                        loopRetriesRemaining: loopRetriesRemaining
+                        loopRetriesRemaining: loopRetriesRemaining,
+                        requestController: requestController
                     )
                 }
                 return
@@ -9814,7 +9860,7 @@ class ThinkingProxy {
             let remainingBudget = max(0, deadlineAt.timeIntervalSinceNow)
             if primaryProbeRetriesRemaining > 0,
                remainingBudget > retryDelay {
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+                requestController.scheduleRetry(after: .milliseconds(max(0, Int(retryDelay * 1000)))) { [weak self] in
                     guard let self else { return }
                     self.attemptSmartAliasCandidate(
                         method: method,
@@ -9832,14 +9878,15 @@ class ThinkingProxy {
                         terminalFallbackOutcome: terminalFallbackOutcome,
                         exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                         deliveryMode: deliveryMode,
-                        loopRetriesRemaining: loopRetriesRemaining
+                        loopRetriesRemaining: loopRetriesRemaining,
+                        requestController: requestController
                     )
                 }
                 return
             }
             if !remainingCandidateModels.isEmpty {
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    guard let self else { return }
+                    guard let self, requestController.isCancelled() != true else { return }
                     self.attemptSmartAliasCandidate(
                         method: method,
                         path: path,
@@ -9860,7 +9907,8 @@ class ThinkingProxy {
                             cooldownUntil: cooldownUntil
                         ),
                         deliveryMode: deliveryMode,
-                        loopRetriesRemaining: loopRetriesRemaining
+                        loopRetriesRemaining: loopRetriesRemaining,
+                        requestController: requestController
                     )
                 }
                 return
@@ -9903,7 +9951,7 @@ class ThinkingProxy {
                 healthSensitivity: healthSensitivity
             )
             let backoffMs = min(500 * (failoverDepth + 1), 2000)
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(backoffMs)) { [weak self] in
+            requestController.scheduleRetry(after: .milliseconds(backoffMs)) { [weak self] in
                 guard let self else { return }
                 self.attemptSmartAliasCandidate(
                     method: method,
@@ -9921,7 +9969,8 @@ class ThinkingProxy {
                     terminalFallbackOutcome: terminalFallbackOutcome,
                     exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
+                    loopRetriesRemaining: loopRetriesRemaining,
+                    requestController: requestController
                 )
             }
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
@@ -9932,7 +9981,7 @@ class ThinkingProxy {
                 healthSensitivity: healthSensitivity
             )
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self else { return }
+                guard let self, requestController.isCancelled() != true else { return }
                 self.attemptSmartAliasCandidate(
                     method: method,
                     path: path,
@@ -9955,7 +10004,8 @@ class ThinkingProxy {
                         )
                         : exhaustedRetryableOutcome,
                     deliveryMode: deliveryMode,
-                    loopRetriesRemaining: loopRetriesRemaining
+                    loopRetriesRemaining: loopRetriesRemaining,
+                    requestController: requestController
                 )
             }
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -9996,7 +10046,8 @@ class ThinkingProxy {
         loopRetriesRemaining: Int,
         retryDelaySeconds: TimeInterval = 1,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        requestController: RequestCancellationController
     ) {
         guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias) else {
             deliverBufferedError(
@@ -10032,7 +10083,7 @@ class ThinkingProxy {
         }
         let attempt = smartAliasMaxLoopRetries - loopRetriesRemaining + 1
         NSLog("[ThinkingProxy] Smart alias %@ loop retry %d/%d", publicAlias, attempt, smartAliasMaxLoopRetries)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + retryDelaySeconds) { [weak self] in
+        requestController.scheduleRetry(after: .milliseconds(max(0, Int(retryDelaySeconds * 1000)))) { [weak self] in
             guard let self else { return }
             self.attemptSmartAliasCandidate(
                 method: method,
@@ -10050,7 +10101,8 @@ class ThinkingProxy {
                 terminalFallbackOutcome: nil,
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
-                loopRetriesRemaining: loopRetriesRemaining - 1
+                loopRetriesRemaining: loopRetriesRemaining - 1,
+                requestController: requestController
             )
         }
     }
@@ -10158,7 +10210,7 @@ class ThinkingProxy {
                 )
             }
         }
-    }
+        }
 
     private func deliverSmartAliasSuccessfulResponse(
         defaultConnection: NWConnection,
@@ -10733,7 +10785,7 @@ class ThinkingProxy {
         attemptLane: Int,
         deadlineAt: Date,
         coalescingKey: String?,
-        controller: SmartAliasCandidateController?,
+        controller: RequestCancellationController?,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
@@ -10925,7 +10977,7 @@ class ThinkingProxy {
         failoverDepth: Int,
         attemptLane: Int,
         deadlineAt: Date,
-        controller: SmartAliasCandidateController?,
+        controller: RequestCancellationController?,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
@@ -11704,6 +11756,8 @@ class ThinkingProxy {
         endpoint: OpenAICompatTemporaryShim.ProviderEndpoint,
         originalConnection: NWConnection
     ) {
+        let requestController = RequestCancellationController()
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: candidateModel) else {
@@ -11720,17 +11774,21 @@ class ThinkingProxy {
             )
             return
         }
-        _ = sendDirectProxiedRequest(
+        let cancel = sendDirectProxiedRequest(
             method: method,
             path: path,
             headers: effectiveHeaders,
             body: body,
             candidateModel: candidateModel,
             timeoutInterval: timeoutInterval,
-            endpoint: endpoint
+            endpoint: endpoint,
+            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self else { return }
+            requestController.clearCurrentCancel()
+            guard requestController.isCancelled() != true else { return }
             if let error = bufferedResponse.error {
                 let nsError = error as NSError
                 let statusCode = (nsError.domain == NSURLErrorDomain && nsError.code == URLError.timedOut.rawValue) ? 504 : 502
@@ -11759,6 +11817,10 @@ class ThinkingProxy {
                 coalescingKey: nil,
                 overridingModel: overridingModel
             )
+        }
+        requestController.registerCurrentCancel {
+            permit.release()
+            cancel()
         }
     }
 
@@ -12344,6 +12406,8 @@ class ThinkingProxy {
         state: OpenAICompatTemporaryShim.NVIDIARetryState
     ) {
         let coordinator = NVIDIAAttemptCoordinator()
+        let requestController = RequestCancellationController()
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let routeHealthStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
         let hedgeEligible = OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
             method: method,
@@ -12359,6 +12423,7 @@ class ThinkingProxy {
             originalConnection: originalConnection,
             state: state,
             coordinator: coordinator,
+            requestController: requestController,
             attemptLane: 1,
             hedgeEligible: hedgeEligible
         )
@@ -12372,9 +12437,11 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         coordinator: NVIDIAAttemptCoordinator,
+        requestController: RequestCancellationController,
         attemptLane: Int,
         hedgeEligible: Bool
     ) {
+        guard requestController.isCancelled() != true else { return }
         guard !coordinator.isFinished() else { return }
         guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
             if coordinator.tryFinish(attemptLane: attemptLane) {
@@ -12389,7 +12456,7 @@ class ThinkingProxy {
         request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: state.model) else {
             guard attemptLane == 1 else { return }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+            requestController.scheduleRetry(after: .milliseconds(250)) { [weak self] in
                 guard let self, !coordinator.isFinished() else { return }
                 self.forwardNvidiaReasoningRequestWithRetry(
                     method: method,
@@ -12399,6 +12466,7 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     state: state,
                     coordinator: coordinator,
+                    requestController: requestController,
                     attemptLane: attemptLane,
                     hedgeEligible: hedgeEligible
                 )
@@ -12428,6 +12496,8 @@ class ThinkingProxy {
                     session.finishTasksAndInvalidate()
                 }
             }
+            requestController.clearCurrentCancel()
+            guard requestController.isCancelled() != true else { return }
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
                 data: data,
                 response: response as? HTTPURLResponse,
@@ -12474,6 +12544,7 @@ class ThinkingProxy {
                         originalConnection: originalConnection,
                         state: nextState,
                         coordinator: coordinator,
+                        requestController: requestController,
                         attemptLane: 2,
                         hedgeEligible: false
                     )
@@ -12488,6 +12559,7 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     state: nextState,
                     coordinator: coordinator,
+                    requestController: requestController,
                     attemptLane: attemptLane,
                     hedgeEligible: hedgeEligible
                 )
@@ -12572,16 +12644,20 @@ class ThinkingProxy {
             permit.release()
             task.cancel()
         }
+        requestController.registerCurrentCancel {
+            _ = coordinator.tryFinish(attemptLane: 0)
+        }
         if attemptLane == 1, hedgeEligible {
             let hedgeDelay = OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: state.model)
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + hedgeDelay) { [weak self, weak responseProgress] in
                 guard let self,
                       let responseProgress,
+                      requestController.isCancelled() != true,
                       !coordinator.isFinished(),
                       !responseProgress.hasReceivedPayload(),
                       coordinator.shouldStartHedge() else { return }
                 NSLog("[ThinkingProxy] Starting hedged NVIDIA attempt for suspect route %@ after %.2fs without first byte", state.model, hedgeDelay)
-                self.forwardNvidiaReasoningRequestWithRetry(
+self.forwardNvidiaReasoningRequestWithRetry(
                     method: method,
                     path: path,
                     headers: headers,
@@ -12589,6 +12665,7 @@ class ThinkingProxy {
                     originalConnection: originalConnection,
                     state: state,
                     coordinator: coordinator,
+                    requestController: requestController,
                     attemptLane: 2,
                     hedgeEligible: false
                 )
@@ -12875,11 +12952,12 @@ class ThinkingProxy {
         originalConnection: NWConnection,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         coordinator: NVIDIAAttemptCoordinator,
+        requestController: RequestCancellationController,
         attemptLane: Int,
         hedgeEligible: Bool
     ) {
         let delay = DispatchTimeInterval.milliseconds(max(0, state.retryBackoffMilliseconds))
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) { [weak self] in
+        requestController.scheduleRetry(after: delay) { [weak self] in
             guard let self, !coordinator.isFinished() else { return }
             self.forwardNvidiaReasoningRequestWithRetry(
                 method: method,
@@ -12889,6 +12967,7 @@ class ThinkingProxy {
                 originalConnection: originalConnection,
                 state: state,
                 coordinator: coordinator,
+                requestController: requestController,
                 attemptLane: attemptLane,
                 hedgeEligible: hedgeEligible
             )
