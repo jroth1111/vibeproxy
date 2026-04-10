@@ -4979,35 +4979,20 @@ enum MetaAIWebAdapter {
         defer { session.finishTasksAndInvalidate() }
 
         do {
-            var eventStreamData: Data?
-            for plannedRequest in plannedRequests {
-                do {
-                    let responseData = try postGraphQL(session: session, request: plannedRequest.request)
-                    if plannedRequest.kind == .sendMessage {
-                        eventStreamData = responseData
-                    }
-                } catch let failure as Failure {
-                    if plannedRequest.isBestEffort {
-                        NSLog("[ThinkingProxy] Meta AI web adapter ignored best-effort \(plannedRequest.kind) failure (\(failure.statusCode)): \(failure.message)")
-                        continue
-                    }
-                    throw failure
-                }
-            }
-
-            guard let eventStreamData else {
-                throw Failure(statusCode: 500, message: "Meta web adapter did not produce a send-message GraphQL request.")
-            }
-
-            let parsedEventStream = parseEventStream(eventStreamData)
+            let parsedEventStream = try executePromptSequence(
+                plannedRequests: plannedRequests,
+                session: session
+            )
             if let assistantText = parsedEventStream.assistantText?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !assistantText.isEmpty {
                 let renderedAssistantOutput: RenderedAssistantOutput
                 do {
-                    renderedAssistantOutput = try renderAssistantOutput(
+                    renderedAssistantOutput = try renderAssistantOutputWithRepair(
                         assistantText: assistantText,
-                        parsedRequest: parsedRequest
+                        parsedRequest: parsedRequest,
+                        authSnapshot: authSnapshot,
+                        session: session
                     )
                 } catch let failure as Failure {
                     return .failure(failure)
@@ -5074,6 +5059,33 @@ enum MetaAIWebAdapter {
         } catch {
             return .failure(Failure(statusCode: 502, message: "Meta web adapter failed while executing the GraphQL request sequence."))
         }
+    }
+
+    private static func executePromptSequence(
+        plannedRequests: [PlannedGraphQLRequest],
+        session: URLSession
+    ) throws -> ParsedEventStream {
+        var eventStreamData: Data?
+        for plannedRequest in plannedRequests {
+            do {
+                let responseData = try postGraphQL(session: session, request: plannedRequest.request)
+                if plannedRequest.kind == .sendMessage {
+                    eventStreamData = responseData
+                }
+            } catch let failure as Failure {
+                if plannedRequest.isBestEffort {
+                    NSLog("[ThinkingProxy] Meta AI web adapter ignored best-effort \(plannedRequest.kind) failure (\(failure.statusCode)): \(failure.message)")
+                    continue
+                }
+                throw failure
+            }
+        }
+
+        guard let eventStreamData else {
+            throw Failure(statusCode: 500, message: "Meta web adapter did not produce a send-message GraphQL request.")
+        }
+
+        return parseEventStream(eventStreamData)
     }
 
     static func parseRequest(path: String, body: String, publicModel: String) throws -> ParsedRequest {
@@ -5907,7 +5919,17 @@ enum MetaAIWebAdapter {
         Any prose outside the tool directive will be discarded as a failure.
         The only valid tool directive format is a single raw JSON object with this exact shape:
         {"name":"tool_name","arguments":{"key":"value"}}
+        Valid example:
+        {"name":"\(toolDefinitions[0].name)","arguments":{}}
+        Invalid examples:
+        [{"name":"\(toolDefinitions[0].name)","arguments":{}}]
+        {"tool_calls":[{"name":"\(toolDefinitions[0].name)","arguments":{}}]}
+        Here is the JSON:
+        {"name":"\(toolDefinitions[0].name)","arguments":{}}
         Do not wrap the JSON in markdown unless absolutely necessary.
+        Do not return a JSON array.
+        Do not return an OpenAI tool_calls wrapper.
+        Do not stringify the arguments object.
         Do not invent tool names.
         Arguments must be a JSON object.
 
@@ -5916,6 +5938,31 @@ enum MetaAIWebAdapter {
 
         Conversation transcript:
         \(basePrompt)
+        """
+    }
+
+    static func buildSyntheticToolRepairPrompt(
+        basePrompt: String,
+        assistantText: String,
+        toolDefinitions: [ToolDefinition],
+        toolChoice: ToolChoice
+    ) -> String {
+        let originalPrompt = buildExecutionPrompt(
+            basePrompt: basePrompt,
+            toolDefinitions: toolDefinitions,
+            toolChoice: toolChoice
+        )
+        let trimmedAssistantText = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        \(originalPrompt)
+
+        Your previous reply was malformed for tool-use mode:
+        \(trimmedAssistantText)
+
+        Repair instructions:
+        Preserve the same intent and arguments, but rewrite the reply into exactly one valid raw JSON tool directive object.
+        Do not add any explanation, apology, markdown fence, label, or surrounding prose.
+        If the intent was to call a tool, emit only the corrected JSON object now.
         """
     }
 
@@ -5944,6 +5991,91 @@ enum MetaAIWebAdapter {
             return .text(assistantText)
         case .none:
             return .text(assistantText)
+        }
+    }
+
+    private static func renderAssistantOutputWithRepair(
+        assistantText: String,
+        parsedRequest: ParsedRequest,
+        authSnapshot: HARAuthSnapshot,
+        session: URLSession
+    ) throws -> RenderedAssistantOutput {
+        do {
+            return try renderAssistantOutput(assistantText: assistantText, parsedRequest: parsedRequest)
+        } catch let failure as Failure {
+            guard shouldAttemptSyntheticToolRepair(
+                failure: failure,
+                assistantText: assistantText,
+                parsedRequest: parsedRequest
+            ) else {
+                throw failure
+            }
+
+            let repairPrompt = buildSyntheticToolRepairPrompt(
+                basePrompt: parsedRequest.prompt,
+                assistantText: assistantText,
+                toolDefinitions: parsedRequest.toolDefinitions,
+                toolChoice: parsedRequest.toolChoice
+            )
+            NSLog("[ThinkingProxy] Meta AI web adapter retrying malformed synthetic tool output with repair prompt. Original assistant text: %@", assistantText)
+
+            let repairRequests = try buildExecutionRequests(
+                authSnapshot: authSnapshot,
+                conversationID: UUID().uuidString,
+                prompt: repairPrompt
+            )
+            let repairedEventStream = try executePromptSequence(
+                plannedRequests: repairRequests,
+                session: session
+            )
+
+            guard let repairedAssistantText = repairedEventStream.assistantText?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !repairedAssistantText.isEmpty else {
+                let errorMessage = repairedEventStream.errorMessage?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                throw Failure(
+                    statusCode: 502,
+                    message: errorMessage?.isEmpty == false
+                        ? errorMessage!
+                        : "Meta web adapter repair turn received no assistant output from the GraphQL stream."
+                )
+            }
+
+            do {
+                return try renderAssistantOutput(
+                    assistantText: repairedAssistantText,
+                    parsedRequest: parsedRequest
+                )
+            } catch let repairFailure as Failure {
+                NSLog("[ThinkingProxy] Meta AI web adapter repair turn still produced invalid synthetic tool output. Repaired assistant text: %@", repairedAssistantText)
+                throw repairFailure
+            }
+        }
+    }
+
+    private static func shouldAttemptSyntheticToolRepair(
+        failure: Failure,
+        assistantText: String,
+        parsedRequest: ParsedRequest
+    ) -> Bool {
+        guard !parsedRequest.toolDefinitions.isEmpty, parsedRequest.toolChoice != .none else {
+            return false
+        }
+        let trimmedAssistantText = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAssistantText.isEmpty else {
+            return false
+        }
+
+        switch parsedRequest.toolChoice {
+        case .required, .specific:
+            return true
+        case .auto:
+            return looksLikeSyntheticToolDirective(trimmedAssistantText)
+                || failure.message.contains("tool directive")
+                || failure.message.contains("tool call")
+        case .none:
+            return false
         }
     }
 
@@ -6081,6 +6213,8 @@ enum MetaAIWebAdapter {
             }
         }
 
+        candidates.append(contentsOf: balancedJSONObjectStrings(in: trimmed))
+
         var deduped: [String] = []
         var seen: Set<String> = []
         for candidate in candidates {
@@ -6089,6 +6223,51 @@ enum MetaAIWebAdapter {
             }
         }
         return deduped
+    }
+
+    private static func balancedJSONObjectStrings(in text: String) -> [String] {
+        var results: [String] = []
+        var stackDepth = 0
+        var objectStart: String.Index?
+        var isInsideString = false
+        var isEscaped = false
+
+        var index = text.startIndex
+        while index < text.endIndex {
+            let character = text[index]
+
+            if isInsideString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    isInsideString = false
+                }
+            } else {
+                if character == "\"" {
+                    isInsideString = true
+                } else if character == "{" {
+                    if stackDepth == 0 {
+                        objectStart = index
+                    }
+                    stackDepth += 1
+                } else if character == "}", stackDepth > 0 {
+                    stackDepth -= 1
+                    if stackDepth == 0, let objectStart {
+                        let nextIndex = text.index(after: index)
+                        let candidate = String(text[objectStart..<nextIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !candidate.isEmpty {
+                            results.append(candidate)
+                        }
+                    }
+                }
+            }
+
+            index = text.index(after: index)
+        }
+
+        return results
     }
 
     private static func heuristicSyntheticToolDirective(

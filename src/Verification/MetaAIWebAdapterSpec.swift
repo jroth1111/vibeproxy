@@ -569,6 +569,36 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter extracts a valid tool directive from prose-wrapped output", recorder: recorder) {
+            let parsedRequest = MetaAIWebAdapter.ParsedRequest(
+                surface: .chatCompletions,
+                prompt: "Find weather",
+                executionPrompt: "Find weather",
+                stream: false,
+                publicModel: "muse-spark",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "search",
+                        description: "Look up information",
+                        parametersJSONString: #"{"type":"object","properties":{"q":{"type":"string"}}}"#
+                    )
+                ],
+                toolChoice: .required,
+                isNewThread: true
+            )
+
+            do {
+                let directive = try MetaAIWebAdapter.syntheticToolDirective(
+                    from: #"I will use the search tool now. {"name":"search","arguments":{"q":"weather Boston"}} Done."#,
+                    parsedRequest: parsedRequest
+                )
+                expectEqual(directive?.name, "search", "balanced JSON extraction should recover directives embedded in prose", recorder: recorder)
+                expectEqual(directive?.argumentsJSONString, #"{"q":"weather Boston"}"#, "prose-wrapped directives should preserve arguments", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should recover prose-wrapped directives: \(error)")
+            }
+        }
+
         run("meta web adapter recovers a specific tool call from a bare arguments object", recorder: recorder) {
             let parsedRequest = MetaAIWebAdapter.ParsedRequest(
                 surface: .chatCompletions,
@@ -733,6 +763,24 @@ struct MetaAIWebAdapterSpec {
             } catch {
                 recorder.recordFailure("meta web adapter should repair near-miss tool_choice function names: \(error)")
             }
+        }
+
+        run("meta web adapter builds a repair prompt for malformed tool output", recorder: recorder) {
+            let repairPrompt = MetaAIWebAdapter.buildSyntheticToolRepairPrompt(
+                basePrompt: "User: Read Cargo.toml",
+                assistantText: "Here is the JSON: {\"name\":\"Read\",\"arguments\":{\"file_path\":\"Cargo.toml\"}}",
+                toolDefinitions: [
+                    MetaAIWebAdapter.ToolDefinition(
+                        name: "Read",
+                        description: "Read a file from disk",
+                        parametersJSONString: #"{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}"#
+                    )
+                ],
+                toolChoice: .specific("Read")
+            )
+            expectContains(repairPrompt, "Your previous reply was malformed for tool-use mode:", "repair prompt should explain why the retry exists", recorder: recorder)
+            expectContains(repairPrompt, "Preserve the same intent and arguments", "repair prompt should ask Meta to normalize instead of changing semantics", recorder: recorder)
+            expectContains(repairPrompt, #"{"name":"Read","arguments":{}}"#, "repair prompt should restate the exact raw JSON directive format", recorder: recorder)
         }
 
         run("meta web adapter extracts assistant text and sources from the GraphQL event stream", recorder: recorder) {
