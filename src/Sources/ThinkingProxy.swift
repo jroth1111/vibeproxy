@@ -1543,12 +1543,11 @@ enum OpenAICompatTemporaryShim {
             path: path,
             jsonString: candidateBody
         ) ?? candidateBody
-        // Preflight checks are only applied to incoming request characteristics, not the rewritten candidate model
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
-            jsonString: currentBody
+            jsonString: transformedCandidateBody
            ) {
             return .providerPreflightBlocked(
                 reason: "provider_preflight_\(preflightError.statusCode)",
@@ -1568,6 +1567,7 @@ enum OpenAICompatTemporaryShim {
         var remainingCandidateModels = candidateModelsRemaining
         var skippedReasons: [(model: String, reason: String)] = []
         var terminalPreflightError: ClientFacingNVIDIAFailure?
+        var sawNonPreflightSkip = false
 
         while !remainingCandidateModels.isEmpty {
             let nextCandidateModel = remainingCandidateModels.removeFirst()
@@ -1588,41 +1588,20 @@ enum OpenAICompatTemporaryShim {
                     terminalPreflightError: nil
                 )
             case .skipped(let reason):
+                sawNonPreflightSkip = true
                 skippedReasons.append((nextCandidateModel, reason))
-            case .providerPreflightBlocked(let reason, _):
+            case .providerPreflightBlocked(let reason, let error):
                 skippedReasons.append((nextCandidateModel, reason))
+                terminalPreflightError = terminalPreflightError ?? error
                 recordRouteFailure(forRequestModel: nextCandidateModel)
             }
         }
 
         NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
 
-        // Fallback to rescue route when all pool candidates are exhausted
-        if let rescueCandidateBody = rewrittenRequestJSON(
-            method: method,
-            path: path,
-            replacingRequestModelIn: currentBody,
-            with: proxyPoolToolWorkerPrimaryCandidate
-        ) {
-            let transformedRequestJSON = transformRequest(
-                method: method,
-                path: path,
-                jsonString: rescueCandidateBody
-            ) ?? rescueCandidateBody
-            NSLog("[ThinkingProxy] Falling back to rescue route candidate %@", proxyPoolToolWorkerPrimaryCandidate)
-            return SmartAliasCandidateSelectionResult(
-                transition: SmartAliasCandidateTransition(
-                    body: transformedRequestJSON,
-                    model: proxyPoolToolWorkerPrimaryCandidate,
-                    remainingCandidateModels: []
-                ),
-                terminalPreflightError: nil
-            )
-        }
-
         return SmartAliasCandidateSelectionResult(
             transition: nil,
-            terminalPreflightError: terminalPreflightError
+            terminalPreflightError: sawNonPreflightSkip ? nil : terminalPreflightError
         )
     }
 
