@@ -542,7 +542,7 @@ enum OpenAICompatTemporaryShim {
         "z-ai/glm5": RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
-            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
             attemptTimeout: scaledRequestTimeout(300),
             firstResponseDeadline: scaledRequestTimeout(240),
             bufferedResponseDeadline: scaledRequestTimeout(285),
@@ -560,7 +560,7 @@ enum OpenAICompatTemporaryShim {
         "moonshotai/kimi-k2.5": RequestPolicy(
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
-            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
             attemptTimeout: scaledRequestTimeout(180),
             firstResponseDeadline: scaledRequestTimeout(120),
             bufferedResponseDeadline: scaledRequestTimeout(150),
@@ -578,7 +578,7 @@ enum OpenAICompatTemporaryShim {
         "minimaxai/minimax-m2.5": RequestPolicy(
             minimumMaxTokens: 128,
             maximumMaxTokens: 65536,
-            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos"],
+            strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
             attemptTimeout: scaledRequestTimeout(300),
             firstResponseDeadline: scaledRequestTimeout(240),
             bufferedResponseDeadline: scaledRequestTimeout(285),
@@ -1132,6 +1132,16 @@ enum OpenAICompatTemporaryShim {
             }
             if normalizedAnyMessage {
                 json["messages"] = normalizedMessages
+                modified = true
+            }
+        }
+
+        if json["max_tokens"] == nil {
+            if let aliasedMaxTokens = integerValue(json["max_completion_tokens"]) {
+                json["max_tokens"] = aliasedMaxTokens
+                modified = true
+            } else if let aliasedMaxTokens = integerValue(json["max_output_tokens"]) {
+                json["max_tokens"] = aliasedMaxTokens
                 modified = true
             }
         }
@@ -5551,6 +5561,17 @@ enum OpenAICompatTemporaryShim {
             }
         }
 
+        func normalizedProviderAPIKey(_ rawValue: String?) -> String? {
+            guard var normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !normalized.isEmpty else {
+                return nil
+            }
+            if normalized.count >= 7, normalized.prefix(7).caseInsensitiveCompare("Bearer ") == .orderedSame {
+                normalized = String(normalized.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return normalized.isEmpty ? nil : normalized
+        }
+
         func finalizeCurrentModel() {
             guard currentProvider != nil else {
                 currentModel = ParsedModel()
@@ -5655,7 +5676,7 @@ enum OpenAICompatTemporaryShim {
                         providerID: providerID,
                         baseURL: endpointBaseURL,
                         proxyURL: proxyURL,
-                        apiKey: provider.apiKey
+                        apiKey: normalizedProviderAPIKey(provider.apiKey)
                     )
                 }
             }
@@ -5808,6 +5829,12 @@ enum OpenAICompatTemporaryShim {
 
             if indent == 2, trimmed.hasPrefix("proxy-url: "), let value = scalarValue(from: trimmed) {
                 currentProvider?.proxyURL = value
+                continue
+            }
+
+            if indent == 2, trimmed.hasPrefix("api-key: "), let value = scalarValue(from: trimmed),
+               currentProvider?.apiKey == nil {
+                currentProvider?.apiKey = value
                 continue
             }
 
@@ -15455,7 +15482,7 @@ self.forwardNvidiaReasoningRequestWithRetry(
         }
 
         if let routeStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel),
-           routeStatus == .suspect || routeStatus == .halfOpen,
+           routeStatus == .open || routeStatus == .suspect || routeStatus == .halfOpen,
            !OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: candidateModel) {
             return false
         }

@@ -86,6 +86,32 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary nvidia shims normalize token aliases before floors and strip stream-only fields", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "minimax-m2.5-nvidia",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "max_completion_tokens": 16,
+                  "stream_options": {"include_usage": true}
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                expectEqual(json["max_tokens"] as? Int, 128, "nvidia shims should normalize aliased token budgets before applying minimax floors", recorder: recorder)
+                expectNil(json["max_completion_tokens"], "nvidia shims should strip max_completion_tokens after normalization", recorder: recorder)
+                expectNil(json["stream_options"], "nvidia shims should strip stream-only fields for buffered NVIDIA routes", recorder: recorder)
+            }
+        }
+
         run("worker-pool entrypoints floor tiny max_tokens budgets before fallback", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let publicAliasRequest = """
@@ -9041,6 +9067,75 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.failureClass, "transport_timeout", "direct proxied timeouts should record transport_timeout", recorder: recorder)
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.timeoutStage, .firstResponse, "direct proxied timeouts should preserve the first-response deadline stage", recorder: recorder)
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied timeouts should remain attributed to live requests", recorder: recorder)
+            }
+        }
+
+        run("direct proxied requests normalize configured bearer credentials before forwarding", recorder: recorder) {
+            withMergedConfig(
+                [
+                    "openai-compatibility:",
+                    "- name: opencode",
+                    "  base-url: https://opencode.ai/zen/v1",
+                    "  proxy-url: socks5://127.0.0.1:4000",
+                    "  api-key: \"  Bearer test-proxy-key  \"",
+                    "  models:",
+                    "  - alias: mimo-v2-pro-opencode",
+                    "    name: mimo-v2-pro-free"
+                ].joined(separator: "\n")
+            ) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var capturedAuthorization: String?
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.directProxiedTransportForTesting = { request, endpoint, completion in
+                    expectEqual(endpoint.baseURL, "https://opencode.ai/zen/v1", "direct proxied bearer normalization should resolve the configured provider endpoint", recorder: recorder)
+                    capturedAuthorization = request.value(forHTTPHeaderField: "Authorization")
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"id\":\"chatcmpl-test\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"mimo-v2-pro-free\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}".utf8),
+                            response: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 10,
+                            totalLatencyMilliseconds: 20
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct proxied bearer normalization should not fail: \(statusCode) \(message)")
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "mimo-v2-pro-opencode",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct proxied bearer normalization should deliver a response")
+                    return
+                }
+
+                expectEqual(capturedAuthorization, "Bearer test-proxy-key", "direct proxied requests should strip duplicate Bearer prefixes and surrounding whitespace before forwarding", recorder: recorder)
             }
         }
 
