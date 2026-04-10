@@ -8754,6 +8754,7 @@ class ThinkingProxy {
     private let coalescedReplayWindow: TimeInterval = 5
     var nvidiaCanaryTransportForTesting: ((String, String, @escaping (Data?, HTTPURLResponse?, Error?) -> Void) -> Void)?
     var nvidiaDirectTransportForTesting: ((URLRequest, @escaping (NVIDIADirectTransportResponse) -> Void) -> (() -> Void))?
+    var nvidiaDirectStreamingTransportForTesting: ((URLRequest, @escaping (Data, Date) -> Void, @escaping (NVIDIADirectTransportResponse) -> Void) -> (() -> Void))?
     var bufferedProxyTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> Void)?
     var bufferedProxyCancelableTransportForTesting: ((String, String, [(String, String)], String, TimeInterval, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
     var directProxiedTransportForTesting: ((URLRequest, OpenAICompatTemporaryShim.ProviderEndpoint, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
@@ -8798,6 +8799,9 @@ class ThinkingProxy {
         func registerAttempt(attemptLane: Int, cancel: @escaping () -> Void) {
             let cancelImmediately: (() -> Void)? = stateQueue.sync {
                 if finished {
+                    return cancel
+                }
+                if let winnerAttemptLane, winnerAttemptLane != attemptLane {
                     return cancel
                 }
                 cancelersByAttemptLane[attemptLane] = cancel
@@ -8856,12 +8860,33 @@ class ThinkingProxy {
         func tryFinish(attemptLane: Int) -> Bool {
             let losersToCancel: [() -> Void]? = stateQueue.sync {
                 guard !finished else { return nil }
+                if let winnerAttemptLane, winnerAttemptLane != attemptLane {
+                    return nil
+                }
                 finished = true
                 winnerAttemptLane = attemptLane
                 let losers = cancelersByAttemptLane.compactMap { lane, canceler in
                     lane == attemptLane ? nil : canceler
                 }
                 cancelersByAttemptLane.removeAll()
+                return losers
+            }
+            losersToCancel?.forEach { $0() }
+            return losersToCancel != nil
+        }
+
+        func claimMeaningfulOutput(attemptLane: Int) -> Bool {
+            let losersToCancel: [() -> Void]? = stateQueue.sync {
+                guard !finished else { return nil }
+                if let winnerAttemptLane {
+                    guard winnerAttemptLane == attemptLane else { return nil }
+                    return []
+                }
+                winnerAttemptLane = attemptLane
+                let losers = cancelersByAttemptLane.compactMap { lane, canceler in
+                    lane == attemptLane ? nil : canceler
+                }
+                cancelersByAttemptLane = cancelersByAttemptLane.filter { $0.key == attemptLane }
                 return losers
             }
             losersToCancel?.forEach { $0() }
@@ -10472,6 +10497,7 @@ class ThinkingProxy {
             deadlineAt: deadlineAt,
             coalescingKey: coalescingKey,
             controller: requestController,
+            onNVIDIAMeaningfulOutput: nil,
             requestTrace: requestTrace
         ) { [weak self] outcome in
             guard let self else { return }
@@ -10638,7 +10664,13 @@ class ThinkingProxy {
             attemptLane: Int,
             fanOutWaitersForModelKey: String?
         ) {
-            guard !coordinator.isFinished() else { return }
+            if let winnerAttemptLane = coordinator.winnerAttemptLaneValue(),
+               winnerAttemptLane != attemptLane {
+                return
+            } else if coordinator.isFinished(),
+                      coordinator.winnerAttemptLaneValue() == nil {
+                return
+            }
 
             switch outcome {
             case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
@@ -10716,9 +10748,18 @@ class ThinkingProxy {
 
         for (index, transition) in raceTransitions.enumerated() {
             let attemptLane = index + 1
+            if let winnerAttemptLane = coordinator.winnerAttemptLaneValue(),
+               winnerAttemptLane != attemptLane {
+                remainingAttempts -= 1
+                continue
+            }
             let controller = RequestCancellationController()
             coordinator.registerAttempt(attemptLane: attemptLane) {
                 controller.cancel()
+            }
+            if controller.isCancelled() {
+                remainingAttempts -= 1
+                continue
             }
 
             // NVIDIA race coalescing: if a race for this model is already inflight,
@@ -10772,6 +10813,9 @@ class ThinkingProxy {
                 deadlineAt: deadlineAt,
                 coalescingKey: coalescingKey,
                 controller: controller,
+                onNVIDIAMeaningfulOutput: {
+                    _ = coordinator.claimMeaningfulOutput(attemptLane: attemptLane)
+                },
                 requestTrace: requestTrace
             ) { [weak self] outcome in
                 guard self != nil else { return }
@@ -11899,6 +11943,7 @@ class ThinkingProxy {
         deadlineAt: Date,
         coalescingKey: String?,
         controller: RequestCancellationController?,
+        onNVIDIAMeaningfulOutput: (() -> Void)? = nil,
         requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
@@ -11965,6 +12010,7 @@ class ThinkingProxy {
                 attemptLane: attemptLane,
                 deadlineAt: deadlineAt,
                 controller: controller,
+                onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: candidateModel,
                     requiredToolParameters: requiredToolParameters,
@@ -12103,6 +12149,7 @@ class ThinkingProxy {
         attemptLane: Int,
         deadlineAt: Date,
         controller: RequestCancellationController?,
+        onNVIDIAMeaningfulOutput: (() -> Void)?,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
@@ -12163,37 +12210,299 @@ class ThinkingProxy {
             )
             return
         }
-        let cancel = sendBufferedProxyRequest(
-            method: method,
-            path: path,
-            headers: headers,
-            body: body,
-            timeoutInterval: timeoutInterval,
-            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
-            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
-        ) { [weak self] bufferedResponse in
+        if nvidiaDirectStreamingTransportForTesting == nil,
+           nvidiaDirectTransportForTesting == nil,
+           (bufferedProxyCancelableTransportForTesting != nil || bufferedProxyTransportForTesting != nil) {
+            let cancel = sendBufferedProxyRequest(
+                method: method,
+                path: path,
+                headers: headers,
+                body: body,
+                timeoutInterval: timeoutInterval,
+                firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
+                bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
+            ) { [weak self] bufferedResponse in
+                permit.release()
+                guard let self, controller?.isCancelled() != true else { return }
+
+                let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                    data: bufferedResponse.data,
+                    response: bufferedResponse.response,
+                    error: bufferedResponse.error,
+                    deadlineStage: bufferedResponse.deadlineStage,
+                    firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
+                    totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
+                )
+                let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: path,
+                    state: state,
+                    attempt: attempt
+                )
+                let telemetryEvent = self.annotatedSmartAliasTelemetryEvent(
+                    OpenAICompatTemporaryShim.telemetryEvent(
+                        path: path,
+                        state: state,
+                        attempt: attempt,
+                        outcome: outcome,
+                        source: telemetrySource,
+                        attemptLane: attemptLane,
+                        proxyRequestID: requestTrace.proxyRequestID,
+                        callerRequestID: requestTrace.callerRequestID,
+                        callerSessionID: requestTrace.callerSessionID,
+                        requestShape: requestTrace.requestShape
+                    ),
+                    requestedAlias: publicAlias,
+                    failoverDepth: failoverDepth,
+                    finalWinnerRequestModel: nil
+                )
+
+                switch outcome {
+                case .retry(let nextState):
+                    if let response = attempt.response {
+                        OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
+                            routeHealthKey: permit.routeHealthKey,
+                            inflightAtRequest: permit.inflightAtRequest,
+                            statusCode: response.statusCode,
+                            headers: response.allHeaderFields,
+                            bodyData: attempt.data
+                        )
+                    }
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    let delay = DispatchTimeInterval.milliseconds(
+                        OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(nextState.retryBackoffMilliseconds)
+                    )
+                    let retryBlock = { [weak self] in
+                        guard let self, controller?.isCancelled() != true else { return }
+                        self.executeSmartAliasMitigatedCandidate(
+                            method: method,
+                            path: path,
+                            headers: headers,
+                            body: body,
+                            publicAlias: publicAlias,
+                            candidateModel: candidateModel,
+                            failoverDepth: failoverDepth,
+                            attemptLane: attemptLane,
+                            deadlineAt: deadlineAt,
+                            controller: controller,
+                            onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
+                            state: nextState,
+                            requestTrace: requestTrace,
+                            completion: completion
+                        )
+                    }
+                    if nextState.retryBackoffMilliseconds > 0 {
+                        controller?.scheduleRetry(after: delay, block: retryBlock)
+                    } else {
+                        retryBlock()
+                    }
+                case .sendResponse(let statusCode, let responseHeaders, let responseBody):
+                    if self.classifySmartAliasCandidateFailure(
+                        statusCode: statusCode,
+                        headers: responseHeaders,
+                        bodyData: responseBody,
+                        path: path,
+                        requiredToolParameters: state.requiredToolParameters
+                    ).shouldFailover {
+                        OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
+                            routeHealthKey: permit.routeHealthKey,
+                            inflightAtRequest: permit.inflightAtRequest,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            bodyData: responseBody
+                        )
+                        let cooldownUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                            failureClass: telemetryEvent.failureClass,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            bodyData: responseBody
+                        )
+                        if let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                            failureClass: telemetryEvent.failureClass,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            bodyData: responseBody
+                        ) {
+                            OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                                forRequestModel: candidateModel,
+                                until: deferredUntil
+                            )
+                        }
+                        completion(
+                            .retryableFailure(
+                                requestModel: candidateModel,
+                                telemetryEvent: telemetryEvent,
+                                cooldownUntil: cooldownUntil
+                            )
+                        )
+                        return
+                    }
+
+                    if statusCode >= 200 && statusCode < 300 {
+                        OpenAICompatTemporaryShim.recordConcurrencySuccess(
+                            routeHealthKey: permit.routeHealthKey,
+                            inflightAtRequest: permit.inflightAtRequest
+                        )
+                        completion(
+                            .success(
+                                requestModel: candidateModel,
+                                statusCode: statusCode,
+                                headers: responseHeaders,
+                                body: responseBody,
+                                telemetryEvent: telemetryEvent
+                            )
+                        )
+                        return
+                    }
+
+                    completion(
+                        .terminalResponse(
+                            requestModel: candidateModel,
+                            statusCode: statusCode,
+                            headers: responseHeaders,
+                            body: responseBody,
+                            telemetryEvent: telemetryEvent
+                        )
+                    )
+                case .sendError(let statusCode, let message):
+                    if self.classifySmartAliasCandidateFailure(
+                        statusCode: statusCode,
+                        headers: attempt.response?.allHeaderFields ?? [:],
+                        bodyData: nil,
+                        path: path,
+                        requiredToolParameters: state.requiredToolParameters
+                    ).shouldFailover {
+                        let cooldownUntil = attempt.response.map {
+                            OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                                failureClass: telemetryEvent.failureClass,
+                                statusCode: statusCode,
+                                headers: $0.allHeaderFields
+                            )
+                        } ?? nil
+                        if let response = attempt.response,
+                           let deferredUntil = OpenAICompatTemporaryShim.smartAliasAvailabilityDeferralUntil(
+                            failureClass: telemetryEvent.failureClass,
+                            statusCode: statusCode,
+                            headers: response.allHeaderFields
+                           ) {
+                            OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                                forRequestModel: candidateModel,
+                                until: deferredUntil
+                            )
+                        }
+                        completion(
+                            .retryableFailure(
+                                requestModel: candidateModel,
+                                telemetryEvent: telemetryEvent,
+                                cooldownUntil: cooldownUntil
+                            )
+                        )
+                        return
+                    }
+
+                    completion(
+                        .terminalError(
+                            requestModel: candidateModel,
+                            statusCode: statusCode,
+                            message: message,
+                            telemetryEvent: telemetryEvent
+                        )
+                    )
+                }
+            }
+            controller?.registerCurrentCancel {
+                permit.release()
+                cancel()
+            }
+            return
+        }
+        guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
+            permit.release()
+            completion(
+                .terminalError(
+                    requestModel: candidateModel,
+                    statusCode: 500,
+                    message: "Internal Server Error",
+                    telemetryEvent: nil
+                )
+            )
+            return
+        }
+
+        let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
+        let internalStreaming = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = timeoutInterval
+        let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+        for (name, value) in effectiveHeaders where !excludedHeaders.contains(name.lowercased()) {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        request.setValue("close", forHTTPHeaderField: "Connection")
+
+        let lockingQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-smart-alias-locking")
+        var lockingEngine = NVIDIAStreamEngine()
+        var meaningfulOutputLocked = false
+
+        let lockMeaningfulOutputIfNeeded: (Data, Date) -> Void = { chunk, receivedAt in
+            guard internalStreaming else { return }
+            lockingQueue.sync {
+                guard !meaningfulOutputLocked else { return }
+                do {
+                    _ = try lockingEngine.ingest(
+                        chunk,
+                        receivedAt: receivedAt,
+                        surface: .smartAlias,
+                        attemptLane: attemptLane
+                    )
+                    if lockingEngine.ownsMeaningfulOutput(surface: .smartAlias, attemptLane: attemptLane) {
+                        meaningfulOutputLocked = true
+                        onNVIDIAMeaningfulOutput?()
+                    }
+                } catch {
+                    return
+                }
+            }
+        }
+
+        let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
 
-            let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
-                data: bufferedResponse.data,
-                response: bufferedResponse.response,
-                error: bufferedResponse.error,
-                deadlineStage: bufferedResponse.deadlineStage,
-                firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds
+            let processedAttempt = self.processNVIDIADirectTransportResponse(
+                transportResponse,
+                state: state,
+                attemptLane: attemptLane,
+                clientRequestedStream: false,
+                surface: .smartAlias
             )
-            let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+            let attempt = processedAttempt.attempt
+            let rawOutcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
                 state: state,
                 attempt: attempt
             )
+            let effectiveOutcome: OpenAICompatTemporaryShim.NVIDIARuntimeOutcome
+            if meaningfulOutputLocked,
+               case .retry = rawOutcome {
+                var exhaustedState = state
+                exhaustedState.transportRetriesRemaining = 0
+                exhaustedState.semanticRetriesRemaining = 0
+                effectiveOutcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
+                    path: path,
+                    state: exhaustedState,
+                    attempt: attempt
+                )
+            } else {
+                effectiveOutcome = rawOutcome
+            }
+
             let telemetryEvent = self.annotatedSmartAliasTelemetryEvent(
                 OpenAICompatTemporaryShim.telemetryEvent(
                     path: path,
                     state: state,
                     attempt: attempt,
-                    outcome: outcome,
+                    outcome: effectiveOutcome,
                     source: telemetrySource,
                     attemptLane: attemptLane,
                     proxyRequestID: requestTrace.proxyRequestID,
@@ -12206,7 +12515,7 @@ class ThinkingProxy {
                 finalWinnerRequestModel: nil
             )
 
-            switch outcome {
+            switch effectiveOutcome {
             case .retry(let nextState):
                 if let response = attempt.response {
                     OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
@@ -12234,6 +12543,7 @@ class ThinkingProxy {
                         attemptLane: attemptLane,
                         deadlineAt: deadlineAt,
                         controller: controller,
+                        onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
                         state: nextState,
                         requestTrace: requestTrace,
                         completion: completion
@@ -12245,19 +12555,20 @@ class ThinkingProxy {
                     retryBlock()
                 }
             case .sendResponse(let statusCode, let responseHeaders, let responseBody):
-                if self.classifySmartAliasCandidateFailure(
+                let classifiedFailure = self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
                     headers: responseHeaders,
                     bodyData: responseBody,
                     path: path,
                     requiredToolParameters: state.requiredToolParameters
-                ).shouldFailover {
+                )
+                if classifiedFailure.shouldFailover, !meaningfulOutputLocked {
                     OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
-                            routeHealthKey: permit.routeHealthKey,
-                            inflightAtRequest: permit.inflightAtRequest,
-                            statusCode: statusCode,
-                            headers: responseHeaders,
-                            bodyData: responseBody
+                        routeHealthKey: permit.routeHealthKey,
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: statusCode,
+                        headers: responseHeaders,
+                        bodyData: responseBody
                     )
                     let cooldownUntil = OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
                         failureClass: telemetryEvent.failureClass,
@@ -12313,13 +12624,14 @@ class ThinkingProxy {
                     )
                 )
             case .sendError(let statusCode, let message):
-                if self.classifySmartAliasCandidateFailure(
+                let classifiedFailure = self.classifySmartAliasCandidateFailure(
                     statusCode: statusCode,
                     headers: attempt.response?.allHeaderFields ?? [:],
                     bodyData: nil,
                     path: path,
                     requiredToolParameters: state.requiredToolParameters
-                ).shouldFailover {
+                )
+                if classifiedFailure.shouldFailover, !meaningfulOutputLocked {
                     let cooldownUntil = attempt.response.map {
                         OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
                             failureClass: telemetryEvent.failureClass,
@@ -12358,10 +12670,100 @@ class ThinkingProxy {
                 )
             }
         }
+
+        if let nvidiaDirectStreamingTransportForTesting {
+            let cancel = nvidiaDirectStreamingTransportForTesting(
+                request,
+                lockMeaningfulOutputIfNeeded,
+                handleTransportResponse
+            )
+            controller?.registerCurrentCancel {
+                permit.release()
+                cancel()
+            }
+            return
+        }
+
+        if let nvidiaDirectTransportForTesting {
+            let cancel = nvidiaDirectTransportForTesting(request, handleTransportResponse)
+            controller?.registerCurrentCancel {
+                permit.release()
+                cancel()
+            }
+            return
+        }
+
+        let sessionKey = "direct:127.0.0.1:\(targetPort)"
+        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
+            permit.release()
+            completion(
+                .terminalError(
+                    requestModel: candidateModel,
+                    statusCode: 502,
+                    message: "upstream session unavailable",
+                    telemetryEvent: nil
+                )
+            )
+            return
+        }
+
+        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-smart-alias-chunks")
+        var responseChunks: [Data] = []
+        let responseProgress = ResponseProgressDelegate { chunk, receivedAt in
+            responseChunksQueue.sync {
+                responseChunks.append(chunk)
+            }
+            lockMeaningfulOutputIfNeeded(chunk, receivedAt)
+        }
+        let taskHolder = TaskIdHolder()
+        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
+            defer {
+                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
+                responseProgress.finish()
+            }
+            let chunks = responseChunksQueue.sync {
+                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
+            }
+            handleTransportResponse(
+                NVIDIADirectTransportResponse(
+                    chunks: chunks,
+                    response: response as? HTTPURLResponse,
+                    error: error,
+                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
+                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
+                    deadlineStage: responseProgress.currentDeadlineStage()
+                )
+            )
+        }
+        guard let task else {
+            NSLog("[SafeDataTask] executeSmartAliasMitigatedCandidate: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
+            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
+            permit.release()
+            completion(
+                .terminalError(
+                    requestModel: candidateModel,
+                    statusCode: 502,
+                    message: "upstream session invalidated",
+                    telemetryEvent: nil
+                )
+            )
+            return
+        }
+        directPoolDelegate.register(task: task, delegate: responseProgress)
+        taskHolder.taskIdentifier = task.taskIdentifier
         controller?.registerCurrentCancel {
             permit.release()
-            cancel()
+            task.cancel()
         }
+        responseProgress.installDeadlines(
+            firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                forRequestJSON: body,
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel)
+            ),
+            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body),
+            for: task
+        )
+        task.resume()
     }
 
     private func handleSmartAliasBufferedCandidateResult(
@@ -13988,11 +14390,197 @@ class ThinkingProxy {
         return Data((lines.joined(separator: "\n") + "\n\n").utf8)
     }
 
+    private func normalizedNVIDIAChatCompletionsBody(
+        fromStreamMessages messages: [NVIDIAStreamMessage],
+        fallbackBody rawBodyData: Data?,
+        requestModel: String
+    ) -> Data? {
+        guard !messages.isEmpty else { return rawBodyData }
+
+        var lastCompleteResponse: [String: Any]?
+        var responseID: String?
+        var responseCreated: Int?
+        var responseModel: String?
+        var responseUsage: [String: Any]?
+
+        struct ToolCallAccumulator {
+            var id: String?
+            var type: String?
+            var functionName = ""
+            var functionArguments = ""
+        }
+
+        struct ChoiceAccumulator {
+            var role = "assistant"
+            var content = ""
+            var refusal = ""
+            var finishReason: Any?
+            var toolCalls: [Int: ToolCallAccumulator] = [:]
+        }
+
+        var accumulatedChoices: [Int: ChoiceAccumulator] = [:]
+
+        for message in messages {
+            let payload = message.joinedData.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !payload.isEmpty,
+                  let payloadData = payload.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else {
+                continue
+            }
+
+            if let id = object["id"] as? String, !id.isEmpty {
+                responseID = id
+            }
+            if let created = OpenAICompatTemporaryShim.integerValue(object["created"]) {
+                responseCreated = created
+            }
+            if let model = object["model"] as? String, !model.isEmpty {
+                responseModel = model
+            }
+            if let usage = object["usage"] as? [String: Any] {
+                responseUsage = usage
+            }
+
+            if let choices = object["choices"] as? [[String: Any]], !choices.isEmpty {
+                let containsFullMessage = choices.contains { choice in
+                    (choice["message"] as? [String: Any]) != nil
+                }
+                if containsFullMessage {
+                    lastCompleteResponse = object
+                }
+
+                for (fallbackIndex, choice) in choices.enumerated() {
+                    let choiceIndex = OpenAICompatTemporaryShim.integerValue(choice["index"]) ?? fallbackIndex
+                    var accumulator = accumulatedChoices[choiceIndex] ?? ChoiceAccumulator()
+
+                    if let message = choice["message"] as? [String: Any] {
+                        if let role = message["role"] as? String, !role.isEmpty {
+                            accumulator.role = role
+                        }
+                        if let content = message["content"] as? String {
+                            accumulator.content = content
+                        }
+                        if let refusal = message["refusal"] as? String {
+                            accumulator.refusal = refusal
+                        }
+                        if let toolCalls = message["tool_calls"] as? [[String: Any]] {
+                            for (toolFallbackIndex, toolCall) in toolCalls.enumerated() {
+                                let toolIndex = OpenAICompatTemporaryShim.integerValue(toolCall["index"]) ?? toolFallbackIndex
+                                var toolAccumulator = accumulator.toolCalls[toolIndex] ?? ToolCallAccumulator()
+                                toolAccumulator.id = (toolCall["id"] as? String) ?? toolAccumulator.id
+                                toolAccumulator.type = (toolCall["type"] as? String) ?? toolAccumulator.type
+                                if let function = toolCall["function"] as? [String: Any] {
+                                    if let name = function["name"] as? String {
+                                        toolAccumulator.functionName = name
+                                    }
+                                    if let arguments = function["arguments"] as? String {
+                                        toolAccumulator.functionArguments = arguments
+                                    }
+                                }
+                                accumulator.toolCalls[toolIndex] = toolAccumulator
+                            }
+                        }
+                    }
+
+                    if let delta = choice["delta"] as? [String: Any] {
+                        if let role = delta["role"] as? String, !role.isEmpty {
+                            accumulator.role = role
+                        }
+                        if let content = delta["content"] as? String, !content.isEmpty {
+                            accumulator.content += content
+                        }
+                        if let refusal = delta["refusal"] as? String, !refusal.isEmpty {
+                            accumulator.refusal += refusal
+                        }
+                        if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                            for (toolFallbackIndex, toolCall) in toolCalls.enumerated() {
+                                let toolIndex = OpenAICompatTemporaryShim.integerValue(toolCall["index"]) ?? toolFallbackIndex
+                                var toolAccumulator = accumulator.toolCalls[toolIndex] ?? ToolCallAccumulator()
+                                toolAccumulator.id = (toolCall["id"] as? String) ?? toolAccumulator.id
+                                toolAccumulator.type = (toolCall["type"] as? String) ?? toolAccumulator.type
+                                if let function = toolCall["function"] as? [String: Any] {
+                                    if let name = function["name"] as? String, !name.isEmpty {
+                                        toolAccumulator.functionName += name
+                                    }
+                                    if let arguments = function["arguments"] as? String, !arguments.isEmpty {
+                                        toolAccumulator.functionArguments += arguments
+                                    }
+                                }
+                                accumulator.toolCalls[toolIndex] = toolAccumulator
+                            }
+                        }
+                    }
+
+                    if let finishReason = choice["finish_reason"], !(finishReason is NSNull) {
+                        accumulator.finishReason = finishReason
+                    }
+                    accumulatedChoices[choiceIndex] = accumulator
+                }
+            }
+        }
+
+        if var lastCompleteResponse {
+            if let usage = responseUsage {
+                lastCompleteResponse["usage"] = usage
+            }
+            return try? JSONSerialization.data(withJSONObject: lastCompleteResponse)
+        }
+
+        let sortedChoices = accumulatedChoices.keys.sorted()
+        guard !sortedChoices.isEmpty else { return rawBodyData }
+
+        let reducedChoices: [[String: Any]] = sortedChoices.map { choiceIndex in
+            let accumulator = accumulatedChoices[choiceIndex] ?? ChoiceAccumulator()
+            var message: [String: Any] = [
+                "role": accumulator.role,
+                "content": accumulator.content
+            ]
+            if !accumulator.refusal.isEmpty {
+                message["refusal"] = accumulator.refusal
+            }
+            if !accumulator.toolCalls.isEmpty {
+                let mergedToolCalls = accumulator.toolCalls.keys.sorted().map { toolIndex -> [String: Any] in
+                    let toolAccumulator = accumulator.toolCalls[toolIndex] ?? ToolCallAccumulator()
+                    return [
+                        "id": toolAccumulator.id ?? "call_\(toolIndex)",
+                        "type": toolAccumulator.type ?? "function",
+                        "function": [
+                            "name": toolAccumulator.functionName,
+                            "arguments": toolAccumulator.functionArguments
+                        ]
+                    ]
+                }
+                message["tool_calls"] = mergedToolCalls
+            }
+
+            let derivedFinishReason: Any = accumulator.finishReason
+                ?? (!accumulator.toolCalls.isEmpty ? "tool_calls" : "stop")
+            return [
+                "index": choiceIndex,
+                "message": message,
+                "finish_reason": derivedFinishReason
+            ]
+        }
+
+        var reducedResponse: [String: Any] = [
+            "id": responseID ?? "chatcmpl_nvidia_\(UUID().uuidString)",
+            "object": "chat.completion",
+            "created": responseCreated ?? Int(Date().timeIntervalSince1970),
+            "model": responseModel ?? requestModel,
+            "choices": reducedChoices
+        ]
+        if let usage = responseUsage {
+            reducedResponse["usage"] = usage
+        }
+        return try? JSONSerialization.data(withJSONObject: reducedResponse)
+    }
+
     private func processNVIDIADirectTransportResponse(
         _ transportResponse: NVIDIADirectTransportResponse,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         attemptLane: Int,
-        clientRequestedStream: Bool
+        clientRequestedStream: Bool,
+        surface: NVIDIAExecutionSurface = .direct
     ) -> NVIDIADirectAttemptExecutionResult {
         guard transportResponse.error == nil,
               let response = transportResponse.response,
@@ -14033,7 +14621,7 @@ class ThinkingProxy {
                 for chunk in parserChunks {
                     let outputs = try engine.ingest(
                         chunk,
-                        surface: .direct,
+                        surface: surface,
                         attemptLane: attemptLane
                     )
                     for output in outputs {
@@ -14045,7 +14633,7 @@ class ThinkingProxy {
                     }
                 }
                 let trailingOutputs = try engine.finish(
-                    surface: .direct,
+                    surface: surface,
                     attemptLane: attemptLane
                 )
                 for output in trailingOutputs {
@@ -14055,8 +14643,11 @@ class ThinkingProxy {
                         streamedSink = sink
                     }
                 }
-                if let finalMessage = bufferedSink.messages.last,
-                   let finalData = finalMessage.joinedData.data(using: .utf8) {
+                if let finalData = normalizedNVIDIAChatCompletionsBody(
+                    fromStreamMessages: bufferedSink.messages,
+                    fallbackBody: rawBodyData,
+                    requestModel: state.model
+                ) {
                     normalizedBodyData = finalData
                 }
                 if var sink = streamedSink, !sink.terminalReceived {
