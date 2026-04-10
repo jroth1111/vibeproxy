@@ -1801,7 +1801,10 @@ enum OpenAICompatTemporaryShim {
             case .providerPreflightBlocked(let reason, let error):
                 skippedReasons.append((nextCandidateModel, reason))
                 terminalPreflightError = terminalPreflightError ?? error
-                recordRouteFailure(forRequestModel: nextCandidateModel)
+                // Preflight rejections are content-compatibility checks, not upstream failures.
+                // Recording them as route failures would quarantine routes that are healthy but
+                // cannot handle specific request shapes (e.g., typed content arrays on NVIDIA).
+                break
             }
         }
 
@@ -3369,10 +3372,11 @@ enum OpenAICompatTemporaryShim {
                 normalizedBodyData: nil
             )
         case .valid:
+            let argumentRepairedBody = repairNativeToolCallArguments(in: json)
             return NvidiaReasoningEvaluation(
                 failureClass: nil,
-                repairedBodyData: nil,
-                normalizedBodyData: normalizedBodyData
+                repairedBodyData: argumentRepairedBody,
+                normalizedBodyData: argumentRepairedBody ?? normalizedBodyData
             )
         case .none:
             break
@@ -5340,18 +5344,12 @@ enum OpenAICompatTemporaryShim {
         }
 
         for toolCall in toolCalls {
-            guard let function = toolCall["function"] as? [String: Any],
-                  let arguments = function["arguments"] as? String else {
+            guard let function = toolCall["function"] as? [String: Any] else {
                 return .invalid
             }
 
-            let trimmedArguments = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedArguments.isEmpty else {
-                return .invalid
-            }
-            guard let argumentsData = trimmedArguments.data(using: .utf8),
-                  let jsonObject = try? JSONSerialization.jsonObject(with: argumentsData),
-                  let argsDict = jsonObject as? [String: Any] else {
+            let argsDict = resolveArgsDict(from: function)
+            guard let argsDict else {
                 return .invalid
             }
 
@@ -5367,6 +5365,61 @@ enum OpenAICompatTemporaryShim {
         }
 
         return .valid
+    }
+
+    private static func resolveArgsDict(from function: [String: Any]) -> [String: Any]? {
+        if let arguments = function["arguments"] as? String {
+            let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let data = trimmed.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data),
+                  let dict = obj as? [String: Any] else {
+                return nil
+            }
+            return dict
+        }
+        if let dict = function["arguments"] as? [String: Any] {
+            return dict
+        }
+        return nil
+    }
+
+    private static func repairNativeToolCallArguments(in json: [String: Any]) -> Data? {
+        guard var choices = json["choices"] as? [[String: Any]],
+              !choices.isEmpty else {
+            return nil
+        }
+
+        var modified = false
+        var firstChoice = choices[0]
+        var message = firstChoice["message"] as? [String: Any] ?? [:]
+
+        guard var toolCalls = message["tool_calls"] as? [[String: Any]],
+              !toolCalls.isEmpty else {
+            return nil
+        }
+
+        for i in toolCalls.indices {
+            guard var function = toolCalls[i]["function"] as? [String: Any] else { continue }
+            if function["arguments"] is String { continue }
+            guard let dict = function["arguments"] as? [String: Any],
+                  let data = try? JSONSerialization.data(withJSONObject: dict),
+                  let str = String(data: data, encoding: .utf8) else { continue }
+            function["arguments"] = str
+            toolCalls[i] = (toolCalls[i] as NSDictionary).mutableCopy() as! NSMutableDictionary as! [String: Any]
+            toolCalls[i]["function"] = function
+            modified = true
+        }
+
+        guard modified else { return nil }
+
+        message["tool_calls"] = toolCalls
+        firstChoice["message"] = message
+        choices[0] = firstChoice
+
+        var repaired = json
+        repaired["choices"] = choices
+        return try? JSONSerialization.data(withJSONObject: repaired)
     }
 
     private static func stripLeadingThinkBlock(from content: String) -> String? {
