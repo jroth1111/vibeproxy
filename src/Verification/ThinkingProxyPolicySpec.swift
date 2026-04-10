@@ -1162,6 +1162,34 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary retry backoff jitter only widens delays within a capped positive range", recorder: recorder) {
+            OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting()
+            defer { OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting() }
+
+            OpenAICompatTemporaryShim.retryBackoffJitterProviderForTesting = { _ in 999 }
+            expectEqual(
+                OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(250),
+                312,
+                "retry jitter should cap positive widening at 25%% of the base delay",
+                recorder: recorder
+            )
+
+            OpenAICompatTemporaryShim.retryBackoffJitterProviderForTesting = { _ in -50 }
+            expectEqual(
+                OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(250),
+                250,
+                "retry jitter should never shorten the base delay",
+                recorder: recorder
+            )
+
+            expectEqual(
+                OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(0),
+                0,
+                "zero retry delays should remain immediate",
+                recorder: recorder
+            )
+        }
+
         run("temporary nvidia route circuit degrades to suspect before quarantine, then closes immediately on recovery", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
