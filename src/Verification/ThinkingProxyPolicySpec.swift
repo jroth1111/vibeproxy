@@ -6329,6 +6329,49 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("generic route telemetry classifies non-nvidia 429 responses", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let body = Data("""
+                {
+                  "error": {
+                    "message": "The service may be temporarily overloaded, please try again later"
+                  }
+                }
+                """.utf8)
+                let response = HTTPURLResponse(
+                    url: URL(string: "http://127.0.0.1:8318/v1/chat/completions")!,
+                    statusCode: 429,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )
+                let state = OpenAICompatTemporaryShim.NVIDIARetryState(
+                    model: "glm-5.1-zai",
+                    initialTransportRetries: 0,
+                    initialSemanticRetries: 0,
+                    transportRetriesRemaining: 0,
+                    semanticRetriesRemaining: 0,
+                    retryBackoffMilliseconds: 0,
+                    salvagesBestEffortRepair: false,
+                    bestEffortRepairedBodyData: nil
+                )
+                let event = OpenAICompatTemporaryShim.telemetryEvent(
+                    path: "/v1/chat/completions",
+                    state: state,
+                    attempt: OpenAICompatTemporaryShim.NVIDIAAttemptResult(
+                        data: body,
+                        response: response,
+                        error: nil,
+                        deadlineStage: .none
+                    ),
+                    outcome: .sendResponse(statusCode: 429, headers: response?.allHeaderFields ?? [:], body: body),
+                    source: "canary"
+                )
+
+                expectEqual(event.failureClass, "classified_429_overload", "generic 429 responses should preserve their classified subtype in telemetry", recorder: recorder)
+                expectEqual(event.upstreamHTTPStatus, 429, "generic telemetry should preserve the upstream HTTP status", recorder: recorder)
+            }
+        }
+
         run("temporary nvidia canary success immediately closes quarantined routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 withRouteHealthPath { _ in
@@ -6462,6 +6505,50 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(lastEvent?.source, "canary", "failed canaries should record canary telemetry", recorder: recorder)
                     expectEqual(lastEvent?.failureClass, "transport_error_retryable", "failed canaries should preserve the route failure class", recorder: recorder)
                     expectEqual(snapshot["z-ai/glm5"]?.status, .open, "failed canaries should leave the route quarantined", recorder: recorder)
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("canary skips active quota-window routes until the provider cooldown expires", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withRouteHealthPath { _ in
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: "glm-5.1-zai",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "glm-5.1-zai",
+                            canonicalModelID: "glm-5.1",
+                            transportOutcome: "retry",
+                            failureClass: "classified_429_window",
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 429,
+                            retryCount: 0,
+                            source: "smart_alias"
+                        ),
+                        forcedOpenUntil: until
+                    )
+
+                    let proxy = ThinkingProxy()
+                    var invocationCount = 0
+                    proxy.nvidiaCanaryTransportForTesting = { _, _, _ in
+                        invocationCount += 1
+                    }
+
+                    let semaphore = DispatchSemaphore(value: 0)
+                    proxy.performCanariesOnce {
+                        semaphore.signal()
+                    }
+                    let waitResult = semaphore.wait(timeout: .now() + 2)
+                    expectEqual(waitResult, .success, "quota-window canary sweep should complete promptly", recorder: recorder)
+                    expectEqual(invocationCount, 0, "active quota-window routes should not be re-probed by canaries during the provider cooldown", recorder: recorder)
+
+                    let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                    expectEqual(snapshot["glm-5.1"]?.status, .open, "skipped quota-window canaries should preserve the open route state", recorder: recorder)
+                    expectEqual(snapshot["glm-5.1"]?.lastTelemetryEvent?.failureClass, "classified_429_window", "skipped quota-window canaries should preserve the quota-window evidence", recorder: recorder)
+
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
             }
@@ -8320,7 +8407,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("stale suspect route health auto-heals on reload", recorder: recorder) {
+        run("stale suspect route health stays suspect on reload without recovery evidence", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
@@ -8351,8 +8438,44 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
                 OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["glm-5.1"]?.status, .closed, "stale suspect routes should auto-heal to closed on startup reload", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.status, .suspect, "stale suspect routes without recovery evidence should remain suspect on startup reload", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("stale suspect route health auto-heals on reload when recovery evidence is strong", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let staleDate = Date().addingTimeInterval(-600)
+                for offset in stride(from: 12, through: 3, by: -1) {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm-5.1-zai",
+                        at: staleDate.addingTimeInterval(TimeInterval(-offset))
+                    )
+                }
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: staleDate,
+                        requestModel: "glm-5.1-zai",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "smart_alias"
+                    ),
+                    at: staleDate
+                )
+
+                OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
+                OpenAICompatTemporaryShim.reloadPersistedRouteHealthForTesting()
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "stale suspect routes with strong success evidence should auto-heal to closed on startup reload", recorder: recorder)
                 expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "healed routes should have zero failure score", recorder: recorder)
+
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -8484,7 +8607,7 @@ struct ThinkingProxyPolicySpec {
             expectEqual(proxy.isRunning, false, "isRunning must be false after stop()", recorder: recorder)
         }
 
-        run("maintenance route health pass heals stale suspect routes without restart", recorder: recorder) {
+        run("maintenance route health pass keeps stale suspect routes suspect without recovery evidence", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
@@ -8499,10 +8622,9 @@ struct ThinkingProxyPolicySpec {
                 // Run the maintenance pass (same code the background timer uses)
                 OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
 
-                // Verify the route was healed to closed
+                // Verify the route stays suspect without recovery evidence
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["glm-5.1"]?.status, .closed, "maintenance pass should heal stale suspect route to closed", recorder: recorder)
-                expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "healed route should have zero failure score", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.status, .suspect, "maintenance pass should keep stale suspect routes suspect when there is no recovery evidence", recorder: recorder)
 
                 // Verify recent-suspect routes are NOT healed
                 let recentDate = Date().addingTimeInterval(-60)
@@ -8512,6 +8634,42 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["glm-5.1"]?.status, .suspect, "maintenance pass should not heal recent suspect routes", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("maintenance route health pass heals stale suspect routes when recovery evidence is strong", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let staleDate = Date().addingTimeInterval(-600)
+                for offset in stride(from: 12, through: 3, by: -1) {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm-5.1-zai",
+                        at: staleDate.addingTimeInterval(TimeInterval(-offset))
+                    )
+                }
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: staleDate,
+                        requestModel: "glm-5.1-zai",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "send_error",
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "smart_alias"
+                    ),
+                    at: staleDate
+                )
+
+                OpenAICompatTemporaryShim.maintenanceRouteHealthPass()
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                expectEqual(snapshot["glm-5.1"]?.status, .closed, "maintenance pass should heal stale suspect routes when recovery evidence is strong", recorder: recorder)
+                expectEqual(snapshot["glm-5.1"]?.failureScore, 0, "maintenance-healed routes should have zero failure score", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }

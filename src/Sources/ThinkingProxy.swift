@@ -1987,6 +1987,32 @@ enum OpenAICompatTemporaryShim {
 
         if let response = attempt.response,
            let bodyData = attempt.data {
+            if !(200...299).contains(response.statusCode) {
+                let failureClass: String
+                if response.statusCode == 429 {
+                    failureClass = failureClassFor429(
+                        headers: response.allHeaderFields,
+                        bodyData: bodyData
+                    )
+                } else {
+                    failureClass = "classified_\(response.statusCode)"
+                }
+                return RouteTelemetryEvent(
+                    timestamp: Date(),
+                    requestModel: state.model,
+                    canonicalModelID: canonicalModelID,
+                    transportOutcome: outcomeTelemetryLabel(outcome),
+                    attemptLane: attemptLane,
+                    failureClass: failureClass,
+                    timeoutStage: attempt.deadlineStage,
+                    upstreamHTTPStatus: response.statusCode,
+                    retryCount: retryCount,
+                    source: source,
+                    firstByteLatencyMilliseconds: attempt.firstByteLatencyMilliseconds,
+                    totalLatencyMilliseconds: attempt.totalLatencyMilliseconds
+                )
+            }
+
             let evaluation = evaluateNvidiaReasoningResponse(
                 model: state.model,
                 statusCode: response.statusCode,
@@ -2143,6 +2169,29 @@ enum OpenAICompatTemporaryShim {
             }
             return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
                 guard state.isUnavailable(at: now) else { return nil }
+                if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
+                    return preferredRouteHealthDisplayRequestModel(
+                        from: candidates,
+                        routes: routes
+                    )
+                }
+                return routeHealthKey.components(separatedBy: "::").last
+            }.sorted()
+        }
+    }
+
+    static func canaryProbeRequestModels(at now: Date = Date()) -> [String] {
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            let routes = resolvedRoutesByRequestModel()
+            let requestModelsByRouteHealthKey = Dictionary(grouping: routes.keys) { requestModel in
+                routes[requestModel]?.routeHealthKey ?? requestModel
+            }
+
+            return routeCircuitStatesByRouteHealthKey.compactMap { routeHealthKey, state in
+                guard shouldProbeRouteWithCanary(state: state, at: now) else {
+                    return nil
+                }
                 if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
                     return preferredRouteHealthDisplayRequestModel(
                         from: candidates,
@@ -3795,11 +3844,14 @@ enum OpenAICompatTemporaryShim {
     /// Heal suspect routes whose last telemetry event is older than the stale threshold.
     /// Must be called on routeHealthQueue. Used by both startup load and background maintenance.
     /// Routes with strong EMA success rates (>80%) get a shorter threshold (60s) since a single
-    /// transient failure is unlikely to indicate a sustained outage.
+    /// transient failure is unlikely to indicate a sustained outage. Routes without meaningful
+    /// success evidence remain suspect until live traffic or canaries prove recovery.
     private static func healStaleSuspectRoutesLocked() {
         let defaultStaleThreshold: TimeInterval = 5 * 60  // 5 minutes
         let healthyEmaStaleThreshold: TimeInterval = 60    // 1 minute for historically healthy routes
         let healthyEmaThreshold: Double = 0.8
+        let minimumHealObservations = 3
+        let minimumHealSuccessRate = 0.2
         let now = Date()
         var healedAny = false
         for key in routeCircuitStatesByRouteHealthKey.keys {
@@ -3819,7 +3871,13 @@ enum OpenAICompatTemporaryShim {
             let staleThreshold = emaSuccessRate >= healthyEmaThreshold ? healthyEmaStaleThreshold : defaultStaleThreshold
 
             let age = now.timeIntervalSince(lastActivityDate)
+            let hasRecoveryEvidence =
+                state.emaMetrics.observationCount >= minimumHealObservations &&
+                emaSuccessRate >= minimumHealSuccessRate
             guard age > staleThreshold else {
+                continue
+            }
+            guard hasRecoveryEvidence else {
                 continue
             }
             NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds, EMA success rate: %.2f)", key, Int(age), emaSuccessRate)
@@ -3847,6 +3905,20 @@ enum OpenAICompatTemporaryShim {
             loadPersistedRouteHealthIfNeededLocked()
             healStaleSuspectRoutesLocked()
         }
+    }
+
+    private static func shouldProbeRouteWithCanary(state: RouteCircuitState, at now: Date) -> Bool {
+        guard state.status == .open else {
+            return false
+        }
+
+        if let openUntil = state.openUntil,
+           now < openUntil,
+           state.lastTelemetryEvent?.failureClass?.lowercased() == "classified_429_window" {
+            return false
+        }
+
+        return true
     }
 
     /// Schedule a debounced persist of route health state.
@@ -12091,7 +12163,7 @@ class ThinkingProxy {
             return
         }
 
-        let requestModels = OpenAICompatTemporaryShim.quarantinedRequestModels()
+        let requestModels = OpenAICompatTemporaryShim.canaryProbeRequestModels()
             .filter { model in
                 guard let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) else {
                     return true
