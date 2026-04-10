@@ -631,6 +631,45 @@ struct MetaAIWebAdapterSpec {
             }
         }
 
+        run("meta web adapter ignores opaque untyped structured transcript segments instead of rejecting the request", recorder: recorder) {
+            let request = #"""
+            {
+              "model": "muse-spark",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "content": [
+                    {"text": "I'll inspect the repo."},
+                    {"id": "call_1", "name": "Read", "input": {"file_path": "Cargo.toml"}}
+                  ]
+                },
+                {"role": "user", "content": "Answer briefly"}
+              ]
+            }
+            """#
+
+            do {
+                let parsed = try MetaAIWebAdapter.parseRequest(
+                    path: "/v1/chat/completions",
+                    body: request,
+                    publicModel: "muse-spark"
+                )
+                expectEqual(
+                    parsed.prompt,
+                    """
+                    Assistant: I'll inspect the repo.
+
+                    User: Answer briefly
+                    """,
+                    "opaque untyped non-media transcript segments should be ignored while preserving readable text context",
+                    recorder: recorder
+                )
+                expectEqual(parsed.isNewThread, false, "opaque untyped assistant context should keep the request in follow-up mode", recorder: recorder)
+            } catch {
+                recorder.recordFailure("meta web adapter should ignore opaque untyped structured transcript segments instead of rejecting the request: \(error)")
+            }
+        }
+
         run("meta web adapter preserves synthetic-tool preflight while still rejecting typed-content requests", recorder: recorder) {
             let toolRequest = """
             {

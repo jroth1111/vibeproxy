@@ -379,6 +379,289 @@ struct ThinkingProxyPolicySpec {
             #endif
         }
 
+        run("worker smart alias suppresses late successful delivery after client disconnect", recorder: recorder) {
+            #if DEBUG
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let accepted = DispatchSemaphore(value: 0)
+                let clientReady = DispatchSemaphore(value: 0)
+                let transportStarted = DispatchSemaphore(value: 0)
+                let upstreamCancelled = DispatchSemaphore(value: 0)
+                let unexpectedDelivery = DispatchSemaphore(value: 0)
+                let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.smart-alias.listener")
+                let connectionQueue = DispatchQueue(label: "thinkingproxy-policy.smart-alias.connection")
+                let lock = NSLock()
+                var serverConnection: NWConnection?
+                var successTelemetryCount = 0
+
+                guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                    recorder.recordFailure("should create a local listener for smart-alias disconnect testing")
+                    return
+                }
+
+                listener.newConnectionHandler = { connection in
+                    serverConnection = connection
+                    connection.start(queue: connectionQueue)
+                    accepted.signal()
+                }
+                listener.start(queue: listenerQueue)
+
+                guard let port = listener.port else {
+                    recorder.recordFailure("listener should expose an ephemeral port for smart-alias disconnect testing")
+                    listener.cancel()
+                    return
+                }
+
+                let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+                client.stateUpdateHandler = { state in
+                    if case .ready = state {
+                        clientReady.signal()
+                    }
+                }
+                client.start(queue: connectionQueue)
+
+                guard clientReady.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client should connect before smart-alias disconnect testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                guard accepted.wait(timeout: .now() + 2) == .success,
+                      let serverConnection else {
+                    recorder.recordFailure("listener should accept the client before smart-alias disconnect testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    if event.requestedAlias == "worker",
+                       event.transportOutcome == "send_response",
+                       event.upstreamHTTPStatus == 200 {
+                        successTelemetryCount += 1
+                    }
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, _, _, completion in
+                    transportStarted.signal()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-disconnected",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                    }
+                    return {
+                        upstreamCancelled.signal()
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    unexpectedDelivery.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    unexpectedDelivery.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: serverConnection
+                )
+
+                guard transportStarted.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("smart-alias request should reach the injected upstream transport before disconnect")
+                    client.cancel()
+                    serverConnection.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                client.cancel()
+
+                guard upstreamCancelled.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client disconnect should invoke the registered upstream cancel closure for smart-alias requests")
+                    serverConnection.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                if unexpectedDelivery.wait(timeout: .now() + 0.4) == .success {
+                    recorder.recordFailure("smart-alias requests should not deliver a late response after the client disconnects")
+                }
+
+                lock.lock()
+                let observedSuccessTelemetryCount = successTelemetryCount
+                lock.unlock()
+                expectEqual(observedSuccessTelemetryCount, 0, "smart-alias disconnects should suppress late success telemetry after cancellation", recorder: recorder)
+
+                serverConnection.cancel()
+                listener.cancel()
+            }
+            #endif
+        }
+
+        run("worker smart alias cancels pending retry and failover work after client disconnect", recorder: recorder) {
+            #if DEBUG
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let accepted = DispatchSemaphore(value: 0)
+                let clientReady = DispatchSemaphore(value: 0)
+                let firstAttemptStarted = DispatchSemaphore(value: 0)
+                let secondAttemptStarted = DispatchSemaphore(value: 0)
+                let unexpectedDelivery = DispatchSemaphore(value: 0)
+                let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.smart-alias-retry.listener")
+                let connectionQueue = DispatchQueue(label: "thinkingproxy-policy.smart-alias-retry.connection")
+                let lock = NSLock()
+                var serverConnection: NWConnection?
+                var transportInvocationCount = 0
+
+                guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                    recorder.recordFailure("should create a local listener for smart-alias retry cancellation testing")
+                    return
+                }
+
+                listener.newConnectionHandler = { connection in
+                    serverConnection = connection
+                    connection.start(queue: connectionQueue)
+                    accepted.signal()
+                }
+                listener.start(queue: listenerQueue)
+
+                guard let port = listener.port else {
+                    recorder.recordFailure("listener should expose an ephemeral port for smart-alias retry cancellation testing")
+                    listener.cancel()
+                    return
+                }
+
+                let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+                client.stateUpdateHandler = { state in
+                    if case .ready = state {
+                        clientReady.signal()
+                    }
+                }
+                client.start(queue: connectionQueue)
+
+                guard clientReady.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client should connect before smart-alias retry cancellation testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                guard accepted.wait(timeout: .now() + 2) == .success,
+                      let serverConnection else {
+                    recorder.recordFailure("listener should accept the client before smart-alias retry cancellation testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, _, _, completion in
+                    lock.lock()
+                    transportInvocationCount += 1
+                    let invocationCount = transportInvocationCount
+                    lock.unlock()
+
+                    if invocationCount == 1 {
+                        firstAttemptStarted.signal()
+                    } else {
+                        secondAttemptStarted.signal()
+                    }
+
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"code\":\"1305\",\"message\":\"The service may be temporarily overloaded, please try again later\"}}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    unexpectedDelivery.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    unexpectedDelivery.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: serverConnection
+                )
+
+                guard firstAttemptStarted.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("smart-alias request should reach the first upstream transport before disconnect")
+                    client.cancel()
+                    serverConnection.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                client.cancel()
+
+                if secondAttemptStarted.wait(timeout: .now() + 1.5) == .success {
+                    recorder.recordFailure("smart-alias should not open a retry or failover transport after the client disconnects")
+                }
+
+                if unexpectedDelivery.wait(timeout: .now() + 0.2) == .success {
+                    recorder.recordFailure("smart-alias should not deliver a response after the client disconnects during retry scheduling")
+                }
+
+                lock.lock()
+                let observedInvocationCount = transportInvocationCount
+                lock.unlock()
+                expectEqual(observedInvocationCount, 1, "client disconnect should stop later retry/failover transport attempts", recorder: recorder)
+
+                serverConnection.cancel()
+                listener.cancel()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+            #endif
+        }
+
         run("temporary nvidia shim flattens text-only typed content arrays", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
@@ -511,8 +794,8 @@ struct ThinkingProxyPolicySpec {
                 let messages = json["messages"] as? [[String: Any]]
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    "Check repo",
-                    "non-media typed segments should be skipped while preserving usable text summary content",
+                    #"Check repohidden chain of thought{"step":1}"#,
+                    "reasoning text and metadata_marker structured values should be preserved in flattened content",
                     recorder: recorder
                 )
             }
@@ -553,11 +836,54 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(
                     messages?.first?["content"] as? String,
-                    "",
-                    "metadata-only typed transcript content should be downgraded to an empty string so NVIDIA remains eligible",
+                    #"hidden chain of thought{"step":1}"#,
+                    "metadata-only typed transcript content should preserve reasoning text and serialize metadata_marker values",
                     recorder: recorder
                 )
                 expectNil(preflightError, "metadata-only typed transcript content should not fail NVIDIA preflight", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim ignores opaque untyped structured transcript segments instead of failing preflight", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"text": "I'll inspect the repo."},
+                        {"id": "call_1", "name": "Read", "input": {"file_path": "Cargo.toml"}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed ?? request, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: transformed ?? request
+                )
+
+                expectEqual(
+                    messages?.first?["content"] as? String,
+                    "I'll inspect the repo.",
+                    "opaque untyped non-media transcript segments should be ignored while preserving readable text context",
+                    recorder: recorder
+                )
+                expectNil(preflightError, "opaque untyped non-media transcript segments should not fail NVIDIA preflight", recorder: recorder)
             }
         }
 
@@ -2268,6 +2594,81 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "metadata-only assistant transcript shapes should still succeed", recorder: recorder)
                 expectEqual(deliveredError, nil, "metadata-only assistant transcript shapes should not surface a terminal error", recorder: recorder)
                 expectEqual(seenModels, ["muse-spark"], "metadata-only assistant transcript shapes should keep muse-spark eligible and selectable", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("opaque untyped structured worker transcript shapes keep glm5-nvidia eligible when native siblings are unavailable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let until = Date().addingTimeInterval(300)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredError: String?
+                var seenModels: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    seenModels.append(model)
+                    completion(ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    ))
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": false,
+                          "messages": [
+                            {"role": "system", "content": "You are a worker."},
+                            {
+                              "role": "assistant",
+                              "content": [
+                                {"text": "I'll inspect the repo."},
+                                {"id": "call_1", "name": "Read", "input": {"file_path": "Cargo.toml"}}
+                              ]
+                            },
+                            {"role": "user", "content": "Return exactly OK"}
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("opaque untyped worker transcript shapes should still deliver through glm5-nvidia when other lanes are unavailable")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "opaque untyped worker transcript shapes should still succeed", recorder: recorder)
+                expectEqual(deliveredError, nil, "opaque untyped worker transcript shapes should not surface a terminal routing error", recorder: recorder)
+                expectEqual(seenModels, ["glm5-nvidia"], "opaque untyped worker transcript shapes should keep glm5-nvidia eligible instead of preflight-skipping it", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -8939,6 +9340,149 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(evaluation.retryReason, "malformed_tool_arguments", "malformed tool-call payloads should be retried", recorder: recorder)
                 expectNil(evaluation.repairedBodyData, "malformed tool-call payloads should not be auto-repaired", recorder: recorder)
+            }
+        }
+
+        run("schema-aware validation retries tool calls missing required parameters", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": "{}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8),
+                    requiredToolParameters: ["Read": ["file_path"]]
+                )
+
+                expectEqual(evaluation.retryReason, "malformed_tool_arguments", "tool calls missing required parameters should be retried", recorder: recorder)
+            }
+        }
+
+        run("schema-aware validation passes tool calls with all required parameters", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": "{\\"file_path\\":\\"/tmp/test.txt\\"}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8),
+                    requiredToolParameters: ["Read": ["file_path"]]
+                )
+
+                expectNil(evaluation.retryReason, "tool calls with all required parameters should not be retried", recorder: recorder)
+            }
+        }
+
+        run("schema-aware validation ignores unknown tool names", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "custom_tool",
+                              "arguments": "{}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8),
+                    requiredToolParameters: ["Read": ["file_path"]]
+                )
+
+                expectNil(evaluation.retryReason, "unknown tool names should not trigger schema validation", recorder: recorder)
+            }
+        }
+
+        run("schema-aware validation is inert when no tool schema provided", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let response = """
+                {
+                  "choices": [
+                    {
+                      "finish_reason": "tool_calls",
+                      "message": {
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                              "name": "Read",
+                              "arguments": "{}"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+                """
+
+                let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
+                    model: "glm5",
+                    statusCode: 200,
+                    bodyData: Data(response.utf8)
+                )
+
+                expectNil(evaluation.retryReason, "without schema, valid JSON arguments should pass through", recorder: recorder)
             }
         }
 

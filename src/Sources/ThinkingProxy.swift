@@ -136,6 +136,7 @@ enum OpenAICompatTemporaryShim {
 
     struct NVIDIARetryState: Equatable {
         let model: String
+        let requiredToolParameters: [String: [String]]?
         let initialTransportRetries: Int
         let initialSemanticRetries: Int
         var transportRetriesRemaining: Int
@@ -147,6 +148,7 @@ enum OpenAICompatTemporaryShim {
 
         init(
             model: String,
+            requiredToolParameters: [String: [String]]? = nil,
             initialTransportRetries: Int,
             initialSemanticRetries: Int,
             transportRetriesRemaining: Int,
@@ -157,6 +159,7 @@ enum OpenAICompatTemporaryShim {
             coalescingKey: String? = nil
         ) {
             self.model = model
+            self.requiredToolParameters = requiredToolParameters
             self.initialTransportRetries = initialTransportRetries
             self.initialSemanticRetries = initialSemanticRetries
             self.transportRetriesRemaining = transportRetriesRemaining
@@ -2057,7 +2060,8 @@ enum OpenAICompatTemporaryShim {
         let evaluation = evaluateNvidiaReasoningResponse(
             model: state.model,
             statusCode: httpResponse.statusCode,
-            bodyData: bodyData
+            bodyData: bodyData,
+            requiredToolParameters: state.requiredToolParameters
         )
 
         if evaluation.shouldRetry {
@@ -2863,7 +2867,7 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data) -> NvidiaReasoningEvaluation {
+    static func evaluateNvidiaReasoningResponse(model: String, statusCode: Int, bodyData: Data, requiredToolParameters: [String: [String]]? = nil) -> NvidiaReasoningEvaluation {
         guard let policy = policy(forModel: model) else {
             return NvidiaReasoningEvaluation(failureClass: nil, repairedBodyData: nil, normalizedBodyData: nil)
         }
@@ -2895,7 +2899,7 @@ enum OpenAICompatTemporaryShim {
             contentOverride: nil,
             stripsReasoningField: policy.stripsReasoningFieldFromSuccess
         )
-        switch validateToolCalls(in: message) {
+        switch validateToolCalls(in: message, requiredToolParameters: requiredToolParameters) {
         case .invalid:
             return retryEvaluation(
                 for: .malformedToolArguments,
@@ -4467,6 +4471,10 @@ enum OpenAICompatTemporaryShim {
         if content is String {
             return .unchanged
         }
+        if !(content is [String: Any]) && !(content is [Any]),
+           let scalarText = normalizedStructuredPayloadString(content) {
+            return .flattened(scalarText)
+        }
         if let dictionary = content as? [String: Any] {
             if let flattened = flattenedTextMessageContent(from: dictionary) {
                 return .flattened(flattened)
@@ -4485,6 +4493,11 @@ enum OpenAICompatTemporaryShim {
         for segment in segments {
             if let textSegment = segment as? String {
                 collectedSegments.append(textSegment)
+                continue
+            }
+            if !(segment is [String: Any]),
+               let scalarText = normalizedStructuredPayloadString(segment) {
+                collectedSegments.append(scalarText)
                 continue
             }
 
@@ -4576,11 +4589,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static func isIgnorableNonMediaTypedContent(_ dictionary: [String: Any]) -> Bool {
-        guard !containsUnsupportedMediaPayload(dictionary),
-              let type = (dictionary["type"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-              !type.isEmpty else {
+        guard !containsUnsupportedMediaPayload(dictionary) else {
             return false
         }
 
@@ -4594,6 +4603,16 @@ enum OpenAICompatTemporaryShim {
             "input_json",
             "json"
         ]
+        guard let type = (dictionary["type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !type.isEmpty else {
+            // Opaque non-media dictionaries without a type marker still show up in live worker
+            // transcripts. For text-only fallback lanes, degrade them to empty-string context
+            // rather than excluding the route outright.
+            return true
+        }
+
         return !nonIgnorableTypes.contains(type)
     }
 
@@ -4686,7 +4705,29 @@ enum OpenAICompatTemporaryShim {
         return false
     }
 
-    fileprivate static func validateToolCalls(in message: [String: Any]) -> ToolCallValidation {
+    static func requiredToolParametersIndex(forRequestJSON jsonString: String) -> [String: [String]]? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let tools = json["tools"] as? [[String: Any]],
+              !tools.isEmpty else {
+            return nil
+        }
+
+        var index: [String: [String]] = [:]
+        for tool in tools {
+            guard let function = tool["function"] as? [String: Any],
+                  let name = function["name"] as? String,
+                  let parameters = function["parameters"] as? [String: Any],
+                  let required = parameters["required"] as? [String],
+                  !required.isEmpty else {
+                continue
+            }
+            index[name] = required
+        }
+        return index.isEmpty ? nil : index
+    }
+
+    fileprivate static func validateToolCalls(in message: [String: Any], requiredToolParameters: [String: [String]]? = nil) -> ToolCallValidation {
         guard let toolCalls = message["tool_calls"] as? [[String: Any]],
               !toolCalls.isEmpty else {
             return .none
@@ -4704,8 +4745,18 @@ enum OpenAICompatTemporaryShim {
             }
             guard let argumentsData = trimmedArguments.data(using: .utf8),
                   let jsonObject = try? JSONSerialization.jsonObject(with: argumentsData),
-                  jsonObject is [String: Any] else {
+                  let argsDict = jsonObject as? [String: Any] else {
                 return .invalid
+            }
+
+            if let requiredParams = requiredToolParameters,
+               let toolName = function["name"] as? String,
+               let required = requiredParams[toolName] {
+                for param in required {
+                    if argsDict[param] == nil {
+                        return .invalid
+                    }
+                }
             }
         }
 
@@ -6094,6 +6145,10 @@ enum MetaAIWebAdapter {
         if let stringValue = value as? String {
             return stringValue
         }
+        if !(value is [String: Any]) && !(value is [Any]),
+           let scalarText = normalizedStructuredPayloadString(value) {
+            return scalarText
+        }
         if let dictionaryValue = value as? [String: Any] {
             return try flattenedText(fromContentDictionary: dictionaryValue)
         }
@@ -6106,6 +6161,11 @@ enum MetaAIWebAdapter {
         for segment in segments {
             if let stringSegment = segment as? String {
                 parts.append(stringSegment)
+                continue
+            }
+            if !(segment is [String: Any]),
+               let scalarText = normalizedStructuredPayloadString(segment) {
+                parts.append(scalarText)
                 continue
             }
             guard let dictionary = segment as? [String: Any] else {
@@ -6195,8 +6255,7 @@ enum MetaAIWebAdapter {
     }
 
     private static func isIgnorableNonMediaContent(_ dictionary: [String: Any]) -> Bool {
-        guard !containsUnsupportedMediaContent(dictionary),
-              let type = normalizedString(dictionary["type"] as? String)?.lowercased() else {
+        guard !containsUnsupportedMediaContent(dictionary) else {
             return false
         }
 
@@ -6210,6 +6269,9 @@ enum MetaAIWebAdapter {
             "input_json",
             "json"
         ]
+        guard let type = normalizedString(dictionary["type"] as? String)?.lowercased() else {
+            return true
+        }
         return !nonIgnorableTypes.contains(type)
     }
 
@@ -8931,6 +8993,7 @@ class ThinkingProxy {
                 originalConnection: connection,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: model,
+                    requiredToolParameters: OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: modifiedBody),
                     initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
@@ -9065,7 +9128,6 @@ class ThinkingProxy {
         ) { [weak self] bufferedResponse in
             permit?.release()
             guard let self else { return }
-            requestController.clearCurrentCancel()
             guard requestController.isCancelled() != true else { return }
 
             if let error = bufferedResponse.error {
@@ -9301,6 +9363,7 @@ class ThinkingProxy {
         loopRetriesRemaining: Int = 0,
         requestController: RequestCancellationController
     ) {
+        guard requestController.isCancelled() != true else { return }
         let remainingBudget = remainingSmartAliasBudget(until: deadlineAt)
         guard remainingBudget > 0 else {
             deliverBufferedError(
@@ -9436,7 +9499,8 @@ class ThinkingProxy {
                         publicAlias: publicAlias,
                         originalConnection: originalConnection,
                         coalescingKey: coalescingKey,
-                        deliveryMode: deliveryMode
+                        deliveryMode: deliveryMode,
+                        requestController: requestController
                     )
                     return
                 }
@@ -9458,7 +9522,8 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    requestController: requestController
                 )
                 return
             }
@@ -9469,7 +9534,8 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    requestController: requestController
                 )
                 return
             }
@@ -9563,6 +9629,7 @@ class ThinkingProxy {
         loopRetriesRemaining: Int = 0,
         requestController: RequestCancellationController
     ) {
+        guard requestController.isCancelled() != true else { return }
         let rankedRaceCandidateModels = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(raceCandidateModels, healthSensitivity: healthSensitivity)
         let raceTransitions = OpenAICompatTemporaryShim.availableSmartAliasCandidateTransitions(
             method: method,
@@ -9644,7 +9711,8 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    requestController: requestController
                 )
                 return
             }
@@ -9679,6 +9747,10 @@ class ThinkingProxy {
 
             switch outcome {
             case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+                guard requestController.isCancelled() != true else {
+                    _ = coordinator.tryFinish(attemptLane: attemptLane)
+                    return
+                }
                 let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
                     OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                         telemetryEvent,
@@ -9701,7 +9773,8 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     resolvedRequestModel: requestModel,
                     coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    requestController: requestController
                 )
             case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
                 OpenAICompatTemporaryShim.recordRouteFailure(
@@ -9843,8 +9916,10 @@ class ThinkingProxy {
         requestController: RequestCancellationController
     ) {
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
+        guard requestController.isCancelled() != true else { return }
         switch outcome {
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            guard requestController.isCancelled() != true else { return }
             let winningTelemetryEvent = annotatedSmartAliasTelemetryEvent(
                 OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                     telemetryEvent,
@@ -9866,7 +9941,8 @@ class ThinkingProxy {
                 publicAlias: publicAlias,
                 resolvedRequestModel: requestModel,
                 coalescingKey: coalescingKey,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                requestController: requestController
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
             where telemetryEvent.failureClass == "classified_429_overload":
@@ -9942,7 +10018,8 @@ class ThinkingProxy {
                 publicAlias: publicAlias,
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                requestController: requestController
             )
             return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
@@ -10023,7 +10100,8 @@ class ThinkingProxy {
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    deliveryMode: deliveryMode
+                    deliveryMode: deliveryMode,
+                    requestController: requestController
                 )
                 return
             }
@@ -10036,7 +10114,8 @@ class ThinkingProxy {
                 publicAlias: publicAlias,
                 originalConnection: originalConnection,
                 coalescingKey: coalescingKey,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                requestController: requestController
             )
             return
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil)
@@ -10109,6 +10188,7 @@ class ThinkingProxy {
                 )
             }
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            guard requestController.isCancelled() != true else { return }
             OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
             deliverBufferedHTTPResponse(
                 defaultConnection: originalConnection,
@@ -10122,6 +10202,7 @@ class ThinkingProxy {
                 )
             )
         case .terminalError(_, let statusCode, let message, let telemetryEvent):
+            guard requestController.isCancelled() != true else { return }
             if let telemetryEvent {
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
             }
@@ -10212,8 +10293,10 @@ class ThinkingProxy {
         publicAlias: String,
         originalConnection: NWConnection,
         coalescingKey: String?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        requestController: RequestCancellationController? = nil
     ) {
+        guard requestController?.isCancelled() != true else { return }
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, _):
@@ -10236,6 +10319,7 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey
             )
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
+            guard requestController?.isCancelled() != true else { return }
             let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                 telemetryEvent,
                 winnerAttemptLane: telemetryEvent.attemptLane
@@ -10252,9 +10336,11 @@ class ThinkingProxy {
                 publicAlias: publicAlias,
                 resolvedRequestModel: requestModel,
                 coalescingKey: coalescingKey,
-                deliveryMode: deliveryMode
+                deliveryMode: deliveryMode,
+                requestController: requestController
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
+            guard requestController?.isCancelled() != true else { return }
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: requestModel,
                 telemetryEvent: telemetryEvent,
@@ -10320,8 +10406,10 @@ class ThinkingProxy {
         publicAlias: String,
         resolvedRequestModel: String,
         coalescingKey: String?,
-        deliveryMode: SmartAliasDeliveryMode
+        deliveryMode: SmartAliasDeliveryMode,
+        requestController: RequestCancellationController? = nil
     ) {
+        guard requestController?.isCancelled() != true else { return }
         let overridingHeaders = smartAliasResolutionHeaders(
             publicAlias: publicAlias,
             resolvedRequestModel: resolvedRequestModel
@@ -10948,6 +11036,7 @@ class ThinkingProxy {
                 controller: controller,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
                     model: candidateModel,
+                    requiredToolParameters: OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: body),
                     initialTransportRetries: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
                     initialSemanticRetries: retryBudget?.semantic ?? Config.nvidiaReasoningSemanticRetries,
                     transportRetriesRemaining: retryBudget?.transport ?? Config.nvidiaReasoningTransportRetries,
@@ -11017,7 +11106,6 @@ class ThinkingProxy {
             ) { [weak self] bufferedResponse in
                 permit.release()
                 guard let self, controller?.isCancelled() != true else { return }
-                controller?.clearCurrentCancel()
                 self.handleSmartAliasBufferedCandidateResult(
                     bufferedResponse,
                     path: path,
@@ -11048,7 +11136,6 @@ class ThinkingProxy {
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
-            controller?.clearCurrentCancel()
             self.handleSmartAliasBufferedCandidateResult(
                 bufferedResponse,
                 path: path,
@@ -11144,7 +11231,6 @@ class ThinkingProxy {
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
-            controller?.clearCurrentCancel()
 
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
                 data: bufferedResponse.data,
@@ -11887,7 +11973,6 @@ class ThinkingProxy {
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self else { return }
-            requestController.clearCurrentCancel()
             guard requestController.isCancelled() != true else { return }
             if let error = bufferedResponse.error {
                 let nsError = error as NSError
@@ -11930,6 +12015,8 @@ class ThinkingProxy {
         publicModel: String,
         originalConnection: NWConnection
     ) {
+        let requestController = RequestCancellationController()
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: publicModel,
             resolvedRequestModel: publicModel
@@ -11939,6 +12026,7 @@ class ThinkingProxy {
             body: body,
             publicModel: publicModel
         )
+        guard requestController.isCancelled() != true else { return }
         if let response = bufferedResponse.response,
            (200 ..< 300).contains(response.statusCode) {
             sendHTTPResponse(
@@ -12596,7 +12684,6 @@ class ThinkingProxy {
                     session.finishTasksAndInvalidate()
                 }
             }
-            requestController.clearCurrentCancel()
             guard requestController.isCancelled() != true else { return }
             let attempt = OpenAICompatTemporaryShim.NVIDIAAttemptResult(
                 data: data,
@@ -12665,6 +12752,7 @@ class ThinkingProxy {
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                guard requestController.isCancelled() != true else { return }
                 let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                     telemetryEvent,
                     winnerAttemptLane: attemptLane
@@ -12696,6 +12784,7 @@ class ThinkingProxy {
                 )
             case .sendError(let statusCode, let message):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                guard requestController.isCancelled() != true else { return }
                 let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                     telemetryEvent,
                     winnerAttemptLane: attemptLane
