@@ -1990,18 +1990,19 @@ enum OpenAICompatTemporaryShim {
         ) else {
             return .skipped(reason: "rewrite_failed")
         }
+        let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel)
         if isConfiguredRouteOpen(forRequestModel: candidateModel) &&
             !forceAllowClosedModels.contains(candidateModel) {
             return .skipped(reason: "route_closed")
         }
         if !forceAllowClosedModels.contains(candidateModel),
-           let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
+           let candidateRoute,
            let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
            Date() < cooldownUntil {
             return .skipped(reason: "provider_cooldown")
         }
         if !forceAllowClosedModels.contains(candidateModel),
-           let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
+           let candidateRoute,
            Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
             return .skipped(reason: "concurrency_capacity")
         }
@@ -2011,7 +2012,10 @@ enum OpenAICompatTemporaryShim {
             jsonString: candidateBody
         ) ?? candidateBody
         let preflightCandidateBody: String
-        if requestedStream(forRequestJSON: transformedCandidateBody),
+        let shouldBufferStreamingPreflight =
+            requestedStream(forRequestJSON: transformedCandidateBody) &&
+            !(candidateRoute?.providerID.hasPrefix("nvidia") ?? false)
+        if shouldBufferStreamingPreflight,
            let data = transformedCandidateBody.data(using: .utf8),
            var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             json["stream"] = false
@@ -2043,13 +2047,24 @@ enum OpenAICompatTemporaryShim {
         return .available(body: transformedCandidateBody)
     }
 
+    fileprivate static var smartAliasExhaustionLogSinkForTesting: ((String) -> Void)?
+
+    fileprivate static func emitSmartAliasExhaustionLog(_ message: String) {
+        if let sink = smartAliasExhaustionLogSinkForTesting {
+            sink(message)
+        } else {
+            NSLog("%@", message)
+        }
+    }
+
     fileprivate static func nextSmartAliasCandidateSelection(
         method: String,
         path: String,
         currentBody: String,
         candidateModelsRemaining: [String],
         forceAllowClosedModels: Set<String> = [],
-        proxyRequestID: String? = nil
+        proxyRequestID: String? = nil,
+        logExhaustion: Bool = true
     ) -> SmartAliasCandidateSelectionResult {
         var remainingCandidateModels = candidateModelsRemaining
         var skippedReasons: [(model: String, reason: String)] = []
@@ -2089,13 +2104,17 @@ enum OpenAICompatTemporaryShim {
         }
 
         let exhaustionSummary = smartAliasExhaustionSummary(for: skippedReasons)
-        let correlationPrefix = proxyRequestID.map { "proxy_request_id:\($0) " } ?? ""
-        let logSummary = smartAliasExhaustionLogSummaryForTesting(skippedReasons: skippedReasons)
-        if let jsonData = try? JSONSerialization.data(withJSONObject: logSummary, options: [.sortedKeys]),
-           let jsonString = String(data: jsonData, encoding: .utf8) {
-            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@%@", correlationPrefix, jsonString)
-        } else {
-            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@Skipped: %@", correlationPrefix, skippedReasons)
+        if logExhaustion {
+            let correlationPrefix = proxyRequestID.map { "proxy_request_id:\($0) " } ?? ""
+            let logSummary = smartAliasExhaustionLogSummaryForTesting(skippedReasons: skippedReasons)
+            let message: String
+            if let jsonData = try? JSONSerialization.data(withJSONObject: logSummary, options: [.sortedKeys]),
+               let jsonString = String(data: jsonData, encoding: .utf8) {
+                message = "[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. \(correlationPrefix)\(jsonString)"
+            } else {
+                message = "[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. \(correlationPrefix)Skipped: \(skippedReasons)"
+            }
+            emitSmartAliasExhaustionLog(message)
         }
 
         return SmartAliasCandidateSelectionResult(
@@ -2110,14 +2129,16 @@ enum OpenAICompatTemporaryShim {
         path: String,
         currentBody: String,
         candidateModelsRemaining: [String],
-        forceAllowClosedModels: Set<String> = []
+        forceAllowClosedModels: Set<String> = [],
+        logExhaustion: Bool = true
     ) -> (body: String, model: String, remainingCandidateModels: [String])? {
         let selection = nextSmartAliasCandidateSelection(
             method: method,
             path: path,
             currentBody: currentBody,
             candidateModelsRemaining: candidateModelsRemaining,
-            forceAllowClosedModels: forceAllowClosedModels
+            forceAllowClosedModels: forceAllowClosedModels,
+            logExhaustion: logExhaustion
         )
         guard let transition = selection.transition else {
             return nil
@@ -2262,6 +2283,15 @@ enum OpenAICompatTemporaryShim {
                 statusCode: 503,
                 message: "This NVIDIA route is temporarily quarantined by the proxy due to repeated upstream failures. Retry later or use another model.",
                 reasonCode: "route_quarantined"
+            )
+        }
+
+        if isChatCompletionsPath(path),
+           containsUnsupportedMediaMessageContent(in: json) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 400,
+                message: "NVIDIA hosted chat completions currently require text-only message content; media and file payloads are not supported on this route.",
+                reasonCode: "unsupported_media_content"
             )
         }
 
@@ -3662,6 +3692,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func clearRouteHealthForTesting() {
         disableFailureDedupForTesting = false
+        smartAliasExhaustionLogSinkForTesting = nil
         routeHealthQueue.sync {
             routeHealthPersistWorkItem?.cancel()
             routeHealthPersistWorkItem = nil
@@ -3677,6 +3708,10 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             recentFailureTimestampsByRoute = [:]
         }
         concurrencyRegistry.resetForTesting()
+    }
+
+    static func setSmartAliasExhaustionLogSinkForTesting(_ sink: ((String) -> Void)?) {
+        smartAliasExhaustionLogSinkForTesting = sink
     }
 
     static func routeAvailabilityDeferralUntilForTesting(requestModel: String) -> Date? {
@@ -4801,6 +4836,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
     }
 
+    private static func telemetryEventRepresentsHealthySuccess(_ telemetryEvent: RouteTelemetryEvent?) -> Bool {
+        guard let telemetryEvent else { return false }
+        guard telemetryEvent.transportOutcome == "send_response" else { return false }
+        guard telemetryEvent.failureClass == nil else { return false }
+        guard let upstreamHTTPStatus = telemetryEvent.upstreamHTTPStatus else { return false }
+        return (200..<300).contains(upstreamHTTPStatus)
+    }
+
     private static func nextRouteCircuitStateAfterSuccess(
         current: RouteCircuitState?,
         telemetryEvent: RouteTelemetryEvent?,
@@ -4828,7 +4871,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         let nextLastLiveSuccessAt = countsAsLiveTraffic ? now : current?.lastLiveSuccessAt
         let nextLastSuccessRequestID = telemetryEvent?.proxyRequestID ?? current?.lastSuccessRequestID
         let nextLastFailureAt = current?.lastFailureAt
-        let nextLastFailureClass = current?.lastFailureClass
+        let nextLastFailureClass: String? = nil
 
         switch current?.status ?? .closed {
         case .closed:
@@ -4967,16 +5010,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             return current
         }
 
-        let isSuccess = telemetryEvent.transportOutcome == "send_response" &&
-            telemetryEvent.failureClass == nil &&
-            telemetryEvent.upstreamHTTPStatus.map { (200..<300).contains($0) } == true
+        let isSuccess = telemetryEventRepresentsHealthySuccess(telemetryEvent)
 
         return NVIDIAInferenceProbeState(
             lastProbeAt: telemetryEvent.timestamp,
             lastStatus: isSuccess ? .success : .failure,
             lastSuccessAt: isSuccess ? telemetryEvent.timestamp : current?.lastSuccessAt,
             lastFailureAt: isSuccess ? current?.lastFailureAt : telemetryEvent.timestamp,
-            lastFailureClass: isSuccess ? current?.lastFailureClass : telemetryEvent.failureClass,
+            lastFailureClass: isSuccess ? nil : telemetryEvent.failureClass,
             lastTimeoutStage: telemetryEvent.timeoutStage,
             lastUpstreamHTTPStatus: telemetryEvent.upstreamHTTPStatus,
             lastTransportOutcome: telemetryEvent.transportOutcome,
@@ -5306,7 +5347,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             let lastFailureAt =
                 parseISO8601Date(entry["last_failure_at"])
                 ?? ((lastTelemetryEvent?.failureClass != nil) ? lastTelemetryEvent?.timestamp : nil)
-            let lastFailureClass = entry["last_failure_class"] as? String
+            let lastFailureClass = telemetryEventRepresentsHealthySuccess(lastTelemetryEvent)
+                ? nil
+                : (entry["last_failure_class"] as? String)
 
             if status == .open {
                 // Persisted open circuits are useful evidence, but they should not hard-quarantine
@@ -5800,7 +5843,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             lastStatus: lastStatus,
             lastSuccessAt: parseISO8601Date(dict["last_success_at"]),
             lastFailureAt: parseISO8601Date(dict["last_failure_at"]),
-            lastFailureClass: dict["last_failure_class"] as? String,
+            lastFailureClass: lastStatus == .success ? nil : (dict["last_failure_class"] as? String),
             lastTimeoutStage: lastTimeoutStage,
             lastUpstreamHTTPStatus: integerValue(dict["last_upstream_http_status"]),
             lastTransportOutcome: lastTransportOutcome,
@@ -5910,6 +5953,20 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
         for message in messages {
             if case .unsupported = normalizedContentResult(from: message["content"]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fileprivate static func containsUnsupportedMediaMessageContent(in json: [String: Any]) -> Bool {
+        guard let messages = json["messages"] as? [[String: Any]] else {
+            return false
+        }
+
+        for message in messages {
+            if let content = message["content"],
+               containsUnsupportedMediaPayload(content) {
                 return true
             }
         }
@@ -9437,6 +9494,7 @@ class ThinkingProxy {
         case plainChat = "plain_chat"
         case toolChat = "tool_string_content"
         case typedToolChat = "typed_tool_content"
+        case streamingTypedToolChat = "streaming_typed_tool_content"
     }
 
     private struct FactoryRoleContract {
@@ -18459,9 +18517,16 @@ class ThinkingProxy {
         let stream = (json["stream"] as? Bool) == true ? "stream" : "buffered"
         let toolsCount = (json["tools"] as? [Any])?.count ?? 0
         let strictToolChoice = OpenAICompatTemporaryShim.hasStrictToolChoice(in: json) ? "strict_tool_choice" : "tool_choice_auto"
-        let typedContent = OpenAICompatTemporaryShim.containsUnsupportedTypedMessageContent(in: json) ? "typed_content" : "string_content"
+        let contentClass: String
+        if OpenAICompatTemporaryShim.containsUnsupportedMediaMessageContent(in: json) {
+            contentClass = "multimodal_content"
+        } else if OpenAICompatTemporaryShim.containsUnsupportedTypedMessageContent(in: json) {
+            contentClass = "typed_content"
+        } else {
+            contentClass = "string_content"
+        }
         let surface = OpenAICompatTemporaryShim.isResponsesPath(path) ? "responses" : (OpenAICompatTemporaryShim.isChatCompletionsPath(path) ? "chat" : "other")
-        return "\(method):\(surface):\(model):\(stream):tools=\(toolsCount):\(strictToolChoice):\(typedContent)"
+        return "\(method):\(surface):\(model):\(stream):tools=\(toolsCount):\(strictToolChoice):\(contentClass)"
     }
 
     private func requestTraceContext(
@@ -18878,6 +18943,31 @@ class ThinkingProxy {
                 }
               ]
             """
+        case .streamingTypedToolChat:
+            contentJSON = """
+            [
+              {
+                "type": "input_text",
+                "text": "Hi"
+              }
+            ]
+            """
+            toolsJSON = """
+            ,
+              "stream": true,
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "noop",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {}
+                    }
+                  }
+                }
+              ]
+            """
         }
 
         return """
@@ -18945,7 +19035,8 @@ class ThinkingProxy {
             method: "POST",
             path: "/v1/chat/completions",
             currentBody: syntheticWorkerRequest,
-            candidateModelsRemaining: [candidateModel]
+            candidateModelsRemaining: [candidateModel],
+            logExhaustion: false
         ) != nil
     }
 
@@ -18980,7 +19071,8 @@ class ThinkingProxy {
             method: "POST",
             path: "/v1/chat/completions",
             currentBody: syntheticWorkerRequest,
-            candidateModelsRemaining: orderedCandidateModels
+            candidateModelsRemaining: orderedCandidateModels,
+            logExhaustion: false
         )
         if let exhaustionSummary = selection.exhaustionSummary {
             return exhaustionSummary.classification.rawValue
