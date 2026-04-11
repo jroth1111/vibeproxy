@@ -10101,6 +10101,130 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("worker smart alias live nvidia fallback streams through the direct transport boundary", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let deliveredChunk = DispatchSemaphore(value: 0)
+                let deliveredFinish = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var deliveredStatus: Int?
+                var deliveredHeaders: [AnyHashable: Any]?
+                var deliveredChunks: [Data] = []
+                var seenNvidiaModel: String?
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, _ in
+                    ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"error":{"message":"Meta web adapter synthetic tool mode required tool Read, but Meta did not return a valid tool directive.","type":"server_error","code":"internal_server_error"}}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 400, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    switch model {
+                    case "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"upstream unavailable\"}".utf8),
+                                response: httpURLResponse(statusCode: 502, headerFields: ["Content-Type": "application/json"]),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        return {}
+                    }
+                }
+                proxy.nvidiaDirectStreamingTransportForTesting = { request, onChunk, completion in
+                    let requestBody = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""
+                    seenNvidiaModel = parseJSONObject(requestBody, recorder: recorder)["model"] as? String
+                    let firstChunk = Data("data: {\"id\":\"chatcmpl-worker-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}],\"model\":\"glm5-nvidia\"}\n\n".utf8)
+                    let doneChunk = Data("data: [DONE]\n\n".utf8)
+                    let firstEmit = DispatchWorkItem {
+                        onChunk(firstChunk, Date())
+                    }
+                    let finish = DispatchWorkItem {
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [firstChunk, doneChunk],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                                error: nil,
+                                firstByteLatencyMilliseconds: 41,
+                                totalLatencyMilliseconds: 92
+                            )
+                        )
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.01, execute: firstEmit)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.20, execute: finish)
+                    return {
+                        firstEmit.cancel()
+                        finish.cancel()
+                    }
+                }
+                proxy.deliveredStreamingResponseStartForTesting = { statusCode, headers in
+                    deliveredStatus = statusCode
+                    deliveredHeaders = headers
+                }
+                proxy.deliveredStreamingResponseChunkForTesting = { chunk in
+                    lock.lock()
+                    deliveredChunks.append(chunk)
+                    lock.unlock()
+                    deliveredChunk.signal()
+                }
+                proxy.deliveredStreamingResponseFinishForTesting = {
+                    deliveredFinish.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("worker live NVIDIA fallback should not surface an error: \(statusCode) \(message)")
+                    deliveredFinish.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard deliveredChunk.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker live NVIDIA fallback should deliver a live chunk")
+                    return
+                }
+
+                guard deliveredFinish.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("worker live NVIDIA fallback should finish successfully")
+                    return
+                }
+
+                lock.lock()
+                let deliveredText = String(data: deliveredChunks.reduce(into: Data()) { $0.append($1) }, encoding: .utf8) ?? ""
+                lock.unlock()
+                expectEqual(deliveredStatus, 200, "worker live NVIDIA fallback should deliver a 200 response", recorder: recorder)
+                expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker live NVIDIA fallback should preserve SSE headers", recorder: recorder)
+                expectEqual(seenNvidiaModel, "glm5-nvidia", "worker live NVIDIA fallback should still hand the direct transport the concrete NVIDIA candidate", recorder: recorder)
+                expectEqual(deliveredText.contains("\"model\":\"worker\""), true, "worker live NVIDIA fallback should rewrite the streamed model field back to the outward worker alias", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "worker live NVIDIA fallback should terminate the SSE stream cleanly", recorder: recorder)
+            }
+        }
+
         run("nvidia-race smart alias locks the raced NVIDIA winner on early meaningful stream output and cancels the faster loser", recorder: recorder) {
             withMergedConfig(workerNvidiaRaceMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -10108,11 +10232,12 @@ struct ThinkingProxyPolicySpec {
                 let proxy = ThinkingProxy()
                 proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
-                let delivered = DispatchSemaphore(value: 0)
+                let deliveredChunk = DispatchSemaphore(value: 0)
+                let deliveredFinish = DispatchSemaphore(value: 0)
                 let lock = NSLock()
                 var deliveredStatus: Int?
                 var deliveredHeaders: [AnyHashable: Any]?
-                var deliveredBody: Data?
+                var deliveredChunks: [Data] = []
                 var kimiCanceled = false
                 var seenNvidiaModels: [String] = []
 
@@ -10204,15 +10329,22 @@ struct ThinkingProxyPolicySpec {
                         return {}
                     }
                 }
-                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                proxy.deliveredStreamingResponseStartForTesting = { statusCode, headers in
                     deliveredStatus = statusCode
                     deliveredHeaders = headers
-                    deliveredBody = body
-                    delivered.signal()
+                }
+                proxy.deliveredStreamingResponseChunkForTesting = { chunk in
+                    lock.lock()
+                    deliveredChunks.append(chunk)
+                    lock.unlock()
+                    deliveredChunk.signal()
+                }
+                proxy.deliveredStreamingResponseFinishForTesting = {
+                    deliveredFinish.signal()
                 }
                 proxy.deliveredErrorForTesting = { statusCode, message in
                     recorder.recordFailure("nvidia-race should not surface an error after the meaningful-output winner is locked: \(statusCode) \(message)")
-                    delivered.signal()
+                    deliveredFinish.signal()
                 }
 
                 proxy.processRequestForTesting(
@@ -10230,15 +10362,23 @@ struct ThinkingProxyPolicySpec {
                     connection: connection
                 )
 
-                guard delivered.wait(timeout: .now() + 3) == .success else {
-                    recorder.recordFailure("nvidia-race should still return the meaningful-output NVIDIA race winner")
+                guard deliveredChunk.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("nvidia-race should still stream the meaningful-output NVIDIA race winner")
                     return
                 }
 
-                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
-                expectEqual(deliveredStatus, 200, "nvidia-race should synthesize a successful streamed response from the meaningful-output winner", recorder: recorder)
+                guard deliveredFinish.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("nvidia-race should still finish the meaningful-output NVIDIA race winner")
+                    return
+                }
+
+                lock.lock()
+                let deliveredText = String(data: deliveredChunks.reduce(into: Data()) { $0.append($1) }, encoding: .utf8) ?? ""
+                lock.unlock()
+                expectEqual(deliveredStatus, 200, "nvidia-race should keep a successful live streamed response from the meaningful-output winner", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "nvidia-race should keep the caller-visible streaming surface", recorder: recorder)
                 expectEqual(deliveredText.contains("\"content\":\"OK\""), true, "nvidia-race should deliver the winner's content, not the canceled loser's payload", recorder: recorder)
+                expectEqual(deliveredText.contains("\"content\":\"SLOW\""), false, "nvidia-race should suppress the canceled loser's streamed content", recorder: recorder)
                 expectEqual(kimiCanceled, true, "nvidia-race should cancel the faster losing NVIDIA race lane after the first meaningful output locks the winner", recorder: recorder)
                 expectEqual(Set(seenNvidiaModels), Set(["minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]), "nvidia-race should still open the raced NVIDIA candidates before the winner lock cancels the loser", recorder: recorder)
             }
