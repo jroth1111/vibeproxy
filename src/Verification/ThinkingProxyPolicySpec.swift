@@ -9832,6 +9832,75 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("direct NVIDIA stream requests fail closed when no live SSE ever starts", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var streamedStartObserved = false
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectTransportForTesting = { _, completion in
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("data: {\"id\":\"chatcmpl-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n".utf8),
+                                Data("data: [DONE]\n\n".utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 80,
+                            totalLatencyMilliseconds: 140
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredStreamingResponseStartForTesting = { _, _ in
+                    streamedStartObserved = true
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    recorder.recordFailure("direct NVIDIA no-live-start path should not synthesize a buffered success: \(statusCode)")
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA no-live-start path should fail closed")
+                    return
+                }
+
+                expectEqual(streamedStartObserved, false, "direct NVIDIA no-live-start path should not claim to have started a live stream", recorder: recorder)
+                expectEqual(deliveredStatus, 502, "direct NVIDIA no-live-start path should fail as a bad gateway", recorder: recorder)
+                expectEqual(deliveredMessage, "Bad Gateway - NVIDIA stream finished without live SSE delivery", "direct NVIDIA no-live-start path should not synthesize SSE after completion", recorder: recorder)
+            }
+        }
+
         run("direct NVIDIA live streams enforce the inter-chunk timeout in the active transport path", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -10222,6 +10291,101 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenNvidiaModel, "glm5-nvidia", "worker live NVIDIA fallback should still hand the direct transport the concrete NVIDIA candidate", recorder: recorder)
                 expectEqual(deliveredText.contains("\"model\":\"worker\""), true, "worker live NVIDIA fallback should rewrite the streamed model field back to the outward worker alias", recorder: recorder)
                 expectEqual(deliveredText.contains("data: [DONE]"), true, "worker live NVIDIA fallback should terminate the SSE stream cleanly", recorder: recorder)
+            }
+        }
+
+        run("worker smart alias NVIDIA streams fail closed when no live SSE ever starts", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var streamedStartObserved = false
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.metaAIBufferedResponseForTesting = { _, _, _ in
+                    ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"error":{"message":"Meta web adapter synthetic tool mode required tool Read, but Meta did not return a valid tool directive.","type":"server_error","code":"internal_server_error"}}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 400, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    switch model {
+                    case "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"upstream unavailable\"}".utf8),
+                                response: httpURLResponse(statusCode: 502, headerFields: ["Content-Type": "application/json"]),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        return {}
+                    }
+                }
+                proxy.nvidiaDirectTransportForTesting = { _, completion in
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("data: {\"id\":\"chatcmpl-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n".utf8),
+                                Data("data: [DONE]\n\n".utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 80,
+                            totalLatencyMilliseconds: 140
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredStreamingResponseStartForTesting = { _, _ in
+                    streamedStartObserved = true
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    recorder.recordFailure("worker no-live-start path should not synthesize a buffered success: \(statusCode)")
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker no-live-start path should fail closed")
+                    return
+                }
+
+                expectEqual(streamedStartObserved, false, "worker no-live-start path should not claim to have started a live stream", recorder: recorder)
+                expectEqual(deliveredStatus, 502, "worker no-live-start path should fail as a bad gateway", recorder: recorder)
+                expectEqual(deliveredMessage, "Bad Gateway - NVIDIA stream finished without live SSE delivery", "worker no-live-start path should not synthesize SSE after completion", recorder: recorder)
             }
         }
 
