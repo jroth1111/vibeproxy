@@ -11775,8 +11775,8 @@ struct ThinkingProxyPolicySpec {
                     var seenRequestModel: String?
                     proxy.nvidiaCanaryTransportForTesting = { requestModel, requestJSON, completion in
                         seenRequestModel = requestModel
-                        if !requestJSON.contains("\"model\": \"glm5-nvidia-direct\"") {
-                            recorder.recordFailure("expected canary request JSON to use the concrete route request model so the proxy can route the quarantined lane precisely")
+                        if !requestJSON.contains("\"model\": \"glm5-nvidia\"") {
+                            recorder.recordFailure("expected canary request JSON to stay on the pooled NVIDIA alias so the proxy exercises the quarantined lane through the normal routed path")
                         }
                         let body = Data("""
                         {
@@ -11805,7 +11805,7 @@ struct ThinkingProxyPolicySpec {
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
-                    expectEqual(seenRequestModel, "glm5-nvidia-direct", "canary sweep should probe the concrete quarantined route request model exactly once", recorder: recorder)
+                    expectEqual(seenRequestModel, "glm5-nvidia", "canary sweep should probe the pooled NVIDIA alias model when available", recorder: recorder)
                     expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "one successful canary should immediately restore the route", recorder: recorder)
                     var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first successful canary should close the route immediately", recorder: recorder)
@@ -13444,7 +13444,8 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 let canaryModels = OpenAICompatTemporaryShim.canaryProbeRequestModels(at: now)
-                expectEqual(canaryModels.contains("glm5-nvidia-direct"), true, "suspect NVIDIA lanes should stay probeable by the real-inference canary sweep", recorder: recorder)
+                expectEqual(canaryModels.contains("glm5-nvidia"), true, "pooled NVIDIA lanes should remain probeable by the real-inference canary sweep", recorder: recorder)
+                expectEqual(canaryModels.contains("glm5-nvidia-direct"), false, "direct NVIDIA lanes should not be preferred for probe telemetry when pooled candidates exist", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5-nvidia",

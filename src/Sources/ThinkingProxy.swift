@@ -3037,7 +3037,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     return nil
                 }
                 if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
-                    return preferredRouteHealthDisplayRequestModel(
+                    return preferredCanaryProbeRequestModel(
                         from: candidates,
                         routes: routes
                     )
@@ -3060,6 +3060,13 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }) {
             return publicNVIDIADirectAlias
         }
+        return preferredConcreteRequestModel(from: candidates, routes: routes)
+    }
+
+    private static func preferredConcreteRequestModel(
+        from candidates: [String],
+        routes: [String: RouteIdentity]
+    ) -> String? {
         return candidates.sorted { lhs, rhs in
             let lhsIsSmartAlias = smartAliasDefinition(forRequestModel: lhs) != nil
             let rhsIsSmartAlias = smartAliasDefinition(forRequestModel: rhs) != nil
@@ -3084,6 +3091,36 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             }
             return lhs < rhs
         }.first
+    }
+
+    private static func preferredCanaryProbeRequestModel(
+        from candidates: [String],
+        routes: [String: RouteIdentity]
+    ) -> String? {
+        if candidates.contains(where: { candidate in
+            guard let route = routes[candidate] else { return false }
+            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
+        }) {
+            return publicNVIDIASmartAlias
+        }
+
+        let nonDirectCandidates = candidates.filter { $0 != publicNVIDIADirectAlias }
+        let hasNVIDIADirectAlias = candidates.contains(publicNVIDIADirectAlias)
+        let hasNonDirectNVIDIA = nonDirectCandidates.contains { candidate in
+            guard let route = routes[candidate] else { return false }
+            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
+        }
+        if hasNVIDIADirectAlias, hasNonDirectNVIDIA,
+           let preferredNonDirect = preferredConcreteRequestModel(
+            from: nonDirectCandidates,
+            routes: routes
+        ) {
+            return preferredNonDirect
+        }
+        return preferredRouteHealthDisplayRequestModel(
+            from: candidates,
+            routes: routes
+        )
     }
 
     fileprivate static func routeIdentityForHealthTracking(forRequestModel requestModel: String) -> RouteIdentity? {
