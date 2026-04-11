@@ -9626,42 +9626,63 @@ struct ThinkingProxyPolicySpec {
 
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
-                let delivered = DispatchSemaphore(value: 0)
+                let deliveredChunk = DispatchSemaphore(value: 0)
+                let deliveredFinish = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
                 var deliveredHeaders: [AnyHashable: Any]?
-                var deliveredBody: Data?
+                var deliveredChunks: [Data] = []
                 var upstreamBody: String?
+                let lock = NSLock()
+                var transportCompletionObserved = false
 
                 defer {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
 
-                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                proxy.nvidiaDirectStreamingTransportForTesting = { request, onChunk, completion in
                     upstreamBody = String(data: request.httpBody ?? Data(), encoding: .utf8)
-                    completion(
-                        ThinkingProxy.NVIDIADirectTransportResponse(
-                            chunks: [
-                                Data("""
-                                {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"glm5-nvidia"}
-                                """.utf8)
-                            ],
-                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
-                            error: nil,
-                            firstByteLatencyMilliseconds: 51,
-                            totalLatencyMilliseconds: 87
+                    let firstChunk = Data("data: {\"id\":\"chatcmpl-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n".utf8)
+                    let doneChunk = Data("data: [DONE]\n\n".utf8)
+                    let firstEmit = DispatchWorkItem {
+                        onChunk(firstChunk, Date())
+                    }
+                    let finish = DispatchWorkItem {
+                        lock.lock()
+                        transportCompletionObserved = true
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [firstChunk, doneChunk],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                                error: nil,
+                                firstByteLatencyMilliseconds: 51,
+                                totalLatencyMilliseconds: 87
+                            )
                         )
-                    )
-                    return {}
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.01, execute: firstEmit)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.20, execute: finish)
+                    return {
+                        firstEmit.cancel()
+                        finish.cancel()
+                    }
                 }
-                proxy.deliveredHTTPResponseForTesting = { statusCode, headers, body in
+                proxy.deliveredStreamingResponseStartForTesting = { statusCode, headers in
                     deliveredStatus = statusCode
                     deliveredHeaders = headers
-                    deliveredBody = body
-                    delivered.signal()
+                }
+                proxy.deliveredStreamingResponseChunkForTesting = { chunk in
+                    lock.lock()
+                    deliveredChunks.append(chunk)
+                    lock.unlock()
+                    deliveredChunk.signal()
+                }
+                proxy.deliveredStreamingResponseFinishForTesting = {
+                    deliveredFinish.signal()
                 }
                 proxy.deliveredErrorForTesting = { statusCode, message in
                     recorder.recordFailure("direct NVIDIA stream success should not surface an error: \(statusCode) \(message)")
-                    delivered.signal()
+                    deliveredFinish.signal()
                 }
 
                 proxy.processRequestForTesting(
@@ -9679,17 +9700,31 @@ struct ThinkingProxyPolicySpec {
                     connection: connection
                 )
 
-                guard delivered.wait(timeout: .now() + 2) == .success else {
+                guard deliveredChunk.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("direct NVIDIA stream requests should deliver a live chunk before completion")
+                    return
+                }
+
+                lock.lock()
+                let completedBeforeChunk = transportCompletionObserved
+                lock.unlock()
+                if completedBeforeChunk {
+                    recorder.recordFailure("direct NVIDIA stream requests should emit client-visible output before upstream completion")
+                }
+
+                guard deliveredFinish.wait(timeout: .now() + 2) == .success else {
                     recorder.recordFailure("direct NVIDIA stream requests should complete successfully")
                     return
                 }
 
                 let forwardedJSON = parseJSONObject(upstreamBody, recorder: recorder)
-                let deliveredText = String(data: deliveredBody ?? Data(), encoding: .utf8) ?? ""
+                lock.lock()
+                let deliveredText = String(data: deliveredChunks.reduce(into: Data()) { $0.append($1) }, encoding: .utf8) ?? ""
+                lock.unlock()
                 expectEqual(deliveredStatus, 200, "direct NVIDIA stream requests should deliver a 200 response", recorder: recorder)
-                expectEqual(forwardedJSON["stream"] as? Bool, false, "streamed direct NVIDIA requests should force a buffered upstream body while the downstream surface is being replaced", recorder: recorder)
+                expectEqual(forwardedJSON["stream"] as? Bool, true, "streamed direct NVIDIA requests should keep the upstream request in streaming mode", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streamed direct NVIDIA requests should deliver SSE headers", recorder: recorder)
-                expectEqual(deliveredText.contains("chat.completion.chunk"), true, "streamed direct NVIDIA requests should deliver chat-completion chunk frames", recorder: recorder)
+                expectEqual(deliveredText.contains("chat.completion.chunk"), true, "streamed direct NVIDIA requests should deliver live chat-completion chunk frames", recorder: recorder)
                 expectEqual(deliveredText.contains("data: [DONE]"), true, "streamed direct NVIDIA requests should terminate with the SSE done sentinel", recorder: recorder)
             }
         }

@@ -52,6 +52,15 @@ enum OpenAICompatTemporaryShim {
             return true
         }
 
+        mutating func interChunkReadDeadlineDidFire() -> Bool {
+            guard hasReceivedPayload, !isFinished else {
+                return false
+            }
+            deadlineExceeded = true
+            deadlineStage = .interChunkRead
+            return true
+        }
+
         mutating func payloadReceived() {
             hasReceivedPayload = true
         }
@@ -78,6 +87,7 @@ enum OpenAICompatTemporaryShim {
         case none = "none"
         case firstResponse = "first_response"
         case bufferedResponse = "buffered_response"
+        case interChunkRead = "inter_chunk_read"
     }
 
     struct RouteTelemetryEvent: Equatable {
@@ -8939,7 +8949,11 @@ class ThinkingProxy {
     var directProxiedTransportForTesting: ((URLRequest, OpenAICompatTemporaryShim.ProviderEndpoint, @escaping (BufferedProxyResponse) -> Void) -> (() -> Void))?
     var metaAIBufferedResponseForTesting: ((String, String, String) -> BufferedProxyResponse)?
     var deliveredHTTPResponseForTesting: ((Int, [AnyHashable: Any], Data) -> Void)?
+    var deliveredStreamingResponseStartForTesting: ((Int, [AnyHashable: Any]) -> Void)?
+    var deliveredStreamingResponseChunkForTesting: ((Data) -> Void)?
+    var deliveredStreamingResponseFinishForTesting: (() -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
+    var nvidiaDirectTransportPolicyOverrideForTesting: NVIDIATransportPolicy?
     var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
     var smartAliasLoopRetryLimitOverrideForTesting: Int?
     var forwardRequestInterceptorForTesting: ((String, String, String, [(String, String)], String, Bool, NWConnection, Bool) -> Bool)?
@@ -9198,6 +9212,8 @@ class ThinkingProxy {
         private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
         private var firstResponseDeadlineWorkItem: DispatchWorkItem?
         private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
+        private var interChunkDeadlineWorkItem: DispatchWorkItem?
+        private var interChunkReadSeconds: TimeInterval?
         private let startedAt = Date()
         private var firstPayloadAt: Date?
 
@@ -9208,6 +9224,7 @@ class ThinkingProxy {
         func installDeadlines(
             firstResponseSeconds: TimeInterval?,
             bufferedResponseSeconds: TimeInterval?,
+            interChunkReadSeconds: TimeInterval? = nil,
             for task: URLSessionTask
         ) {
             if let firstResponseSeconds, firstResponseSeconds > 0 {
@@ -9243,6 +9260,12 @@ class ThinkingProxy {
                 }
                 DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + bufferedResponseSeconds, execute: workItem)
             }
+
+            if let interChunkReadSeconds, interChunkReadSeconds > 0 {
+                stateQueue.sync {
+                    self.interChunkReadSeconds = interChunkReadSeconds
+                }
+            }
         }
 
         func finish() {
@@ -9250,8 +9273,11 @@ class ThinkingProxy {
                 tracker.finish()
                 firstResponseDeadlineWorkItem?.cancel()
                 bufferedResponseDeadlineWorkItem?.cancel()
+                interChunkDeadlineWorkItem?.cancel()
                 firstResponseDeadlineWorkItem = nil
                 bufferedResponseDeadlineWorkItem = nil
+                interChunkDeadlineWorkItem = nil
+                interChunkReadSeconds = nil
             }
         }
 
@@ -9291,6 +9317,27 @@ class ThinkingProxy {
             }
         }
 
+        func resetInterChunkDeadline(
+            seconds: TimeInterval?,
+            for task: URLSessionTask
+        ) {
+            guard let seconds, seconds > 0 else { return }
+            let workItem = DispatchWorkItem { [weak self, weak task] in
+                guard let self else { return }
+                let shouldCancel = self.stateQueue.sync { () -> Bool in
+                    self.tracker.interChunkReadDeadlineDidFire()
+                }
+                if shouldCancel {
+                    task?.cancel()
+                }
+            }
+            stateQueue.sync {
+                interChunkDeadlineWorkItem?.cancel()
+                interChunkDeadlineWorkItem = workItem
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds, execute: workItem)
+        }
+
         func urlSession(
             _ session: URLSession,
             dataTask: URLSessionDataTask,
@@ -9303,6 +9350,8 @@ class ThinkingProxy {
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
             guard !data.isEmpty else { return }
             markPayloadReceived()
+            let seconds = stateQueue.sync { interChunkReadSeconds }
+            resetInterChunkDeadline(seconds: seconds, for: dataTask)
             onDataReceived?(data, Date())
         }
     }
@@ -9471,6 +9520,10 @@ class ThinkingProxy {
 
     static func nvidiaDirectTransportPolicyForTesting() -> NVIDIATransportPolicy {
         nvidiaDirectTransportPolicy
+    }
+
+    private func effectiveNVIDIADirectTransportPolicy() -> NVIDIATransportPolicy {
+        nvidiaDirectTransportPolicyOverrideForTesting ?? Self.nvidiaDirectTransportPolicy
     }
 
     private static func evictIdleDirectSessionsLocked() {
@@ -14591,6 +14644,7 @@ class ThinkingProxy {
         sessionKey: String,
         requestJSON: String,
         requestModel: String,
+        clientRequestedStream: Bool,
         onChunk: ((Data, Date) -> Void)? = nil,
         completion: @escaping (NVIDIADirectTransportResponse) -> Void
     ) -> (() -> Void)? {
@@ -14650,7 +14704,9 @@ class ThinkingProxy {
                 forRequestJSON: requestJSON,
                 routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: requestModel)
             ),
-            bufferedResponseSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: requestJSON),
+            bufferedResponseSeconds: clientRequestedStream
+                ? nil
+                : OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: requestJSON),
             for: task
         )
         task.resume()
@@ -14721,9 +14777,7 @@ class ThinkingProxy {
         }
 
         let clientRequestedStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
-        let upstreamBody = clientRequestedStream
-            ? (forcingNonStreamChatRequestBody(from: body) ?? body)
-            : body
+        let upstreamBody = body
 
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -14760,9 +14814,70 @@ class ThinkingProxy {
         request.setValue("close", forHTTPHeaderField: "Connection")
         let attemptStateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-attempt-state")
         var attemptReceivedPayload = false
+        var liveStreamStarted = false
+        var liveStreamFailed = false
+        var liveStreamingEngine = NVIDIAStreamEngine()
+        var liveStreamingSink = NVIDIAEventStreamSink(policy: Self.nvidiaDirectTransportPolicy.sinkPolicy)
         let markAttemptPayloadReceived: (Data, Date) -> Void = { _, _ in
             attemptStateQueue.sync {
                 attemptReceivedPayload = true
+            }
+        }
+        let handleLiveStreamingChunk: (Data, Date) -> Void = { [weak self] chunk, receivedAt in
+            markAttemptPayloadReceived(chunk, receivedAt)
+            guard let self, clientRequestedStream else { return }
+
+            let emittedFrames: [Data]? = attemptStateQueue.sync {
+                guard !liveStreamFailed else { return nil }
+                do {
+                    let outputs = try liveStreamingEngine.ingest(
+                        chunk,
+                        receivedAt: receivedAt,
+                        surface: .direct,
+                        attemptLane: attemptLane
+                    )
+                    guard !outputs.isEmpty else { return [] }
+
+                    var frames: [Data] = []
+                    for output in outputs {
+                        let emittedFrame: String?
+                        switch output {
+                        case .comment:
+                            emittedFrame = nil
+                        case .message, .done:
+                            if !liveStreamStarted {
+                                let sseHeaders: [AnyHashable: Any] = [
+                                    "Content-Type": "text/event-stream; charset=utf-8",
+                                    "Cache-Control": "no-cache",
+                                    "X-Accel-Buffering": "no"
+                                ]
+                                self.startStreamingHTTPResponse(
+                                    to: originalConnection,
+                                    statusCode: 200,
+                                    headers: sseHeaders,
+                                    overridingHeaders: requestTrace.responseHeaders
+                                )
+                                liveStreamStarted = true
+                            }
+                            let previousFrameCount = liveStreamingSink.emittedFrames.count
+                            try liveStreamingSink.consume(output, receivedAt: receivedAt)
+                            let newFrames = liveStreamingSink.emittedFrames.dropFirst(previousFrameCount)
+                            emittedFrame = newFrames.last
+                        }
+                        if let emittedFrame {
+                            frames.append(Data(emittedFrame.utf8))
+                        }
+                    }
+                    return frames
+                } catch {
+                    liveStreamFailed = true
+                    return nil
+                }
+            }
+
+            guard let emittedFrames else { return }
+            for frame in emittedFrames {
+                self.sendStreamingHTTPChunk(to: originalConnection, chunk: frame)
             }
         }
 
@@ -14780,6 +14895,43 @@ class ThinkingProxy {
                 attemptLane: attemptLane,
                 clientRequestedStream: clientRequestedStream
             )
+            if clientRequestedStream {
+                let trailingFrames: [Data]? = attemptStateQueue.sync {
+                    guard liveStreamStarted, !liveStreamFailed else { return nil }
+                    do {
+                        let trailingOutputs = try liveStreamingEngine.finish(
+                            surface: .direct,
+                            attemptLane: attemptLane
+                        )
+                        var frames: [Data] = []
+                        for output in trailingOutputs {
+                            let previousFrameCount = liveStreamingSink.emittedFrames.count
+                            try liveStreamingSink.consume(output)
+                            let newFrames = liveStreamingSink.emittedFrames.dropFirst(previousFrameCount)
+                            if let emittedFrame = newFrames.last {
+                                frames.append(Data(emittedFrame.utf8))
+                            }
+                        }
+                        if !liveStreamingSink.terminalReceived {
+                            let previousFrameCount = liveStreamingSink.emittedFrames.count
+                            try liveStreamingSink.consume(.done)
+                            let newFrames = liveStreamingSink.emittedFrames.dropFirst(previousFrameCount)
+                            if let emittedFrame = newFrames.last {
+                                frames.append(Data(emittedFrame.utf8))
+                            }
+                        }
+                        return frames
+                    } catch {
+                        liveStreamFailed = true
+                        return nil
+                    }
+                }
+                if let trailingFrames {
+                    for frame in trailingFrames {
+                        self.sendStreamingHTTPChunk(to: originalConnection, chunk: frame)
+                    }
+                }
+            }
             let attempt = processedAttempt.attempt
             let outcome = OpenAICompatTemporaryShim.resolveNVIDIARuntimeOutcome(
                 path: path,
@@ -14831,6 +14983,10 @@ class ThinkingProxy {
                     return
                 }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                if attemptStateQueue.sync(execute: { liveStreamStarted }) {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    return
+                }
                 self.scheduleNVIDIADirectRetry(
                     method: method,
                     path: path,
@@ -14868,6 +15024,14 @@ class ThinkingProxy {
                     OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: winningTelemetryEvent)
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
+                }
+
+                if clientRequestedStream,
+                   attemptStateQueue.sync(execute: { liveStreamStarted }),
+                   statusCode >= 200,
+                   statusCode < 300 {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    return
                 }
 
                 if clientRequestedStream,
@@ -14927,6 +15091,10 @@ class ThinkingProxy {
                 } else {
                     OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(winningTelemetryEvent)
                 }
+                if attemptStateQueue.sync(execute: { liveStreamStarted }) {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    return
+                }
                 self.deliverBufferedError(
                     defaultConnection: originalConnection,
                     statusCode: statusCode,
@@ -14942,7 +15110,7 @@ class ThinkingProxy {
             sessionKey: sessionKey,
             requestJSON: body,
             requestModel: state.model,
-            onChunk: markAttemptPayloadReceived,
+            onChunk: handleLiveStreamingChunk,
             completion: handleTransportResponse
         ) else {
             permit.release()
@@ -15808,6 +15976,83 @@ class ThinkingProxy {
         responseData.append(body)
 
         connection.send(content: responseData, completion: .contentProcessed({ _ in
+            connection.cancel()
+        }))
+    }
+
+    private func startStreamingHTTPResponse(
+        to connection: NWConnection,
+        statusCode: Int,
+        headers: [AnyHashable: Any],
+        overridingHeaders: [String: String] = [:]
+    ) {
+        var effectiveOverridingHeaders = proxyMetadataHeaders()
+        for (name, value) in overridingHeaders {
+            effectiveOverridingHeaders[name] = value
+        }
+        if let deliveredStreamingResponseStartForTesting {
+            var deliveredHeaders = headers
+            for (name, value) in effectiveOverridingHeaders {
+                deliveredHeaders[name] = value
+            }
+            deliveredStreamingResponseStartForTesting(statusCode, deliveredHeaders)
+            return
+        }
+
+        var response = "HTTP/1.1 \(statusCode) \(HTTPURLResponse.localizedString(forStatusCode: statusCode).capitalized)\r\n"
+        var excludedHeaders: Set<String> = ["content-length", "connection", "transfer-encoding"]
+        excludedHeaders.formUnion(effectiveOverridingHeaders.keys.map { $0.lowercased() })
+
+        for (rawName, rawValue) in headers {
+            guard let name = rawName as? String,
+                  !excludedHeaders.contains(name.lowercased()) else {
+                continue
+            }
+            response += "\(name): \(String(describing: rawValue))\r\n"
+        }
+
+        for (name, value) in effectiveOverridingHeaders {
+            response += "\(name): \(value)\r\n"
+        }
+
+        response += "Connection: close\r\n"
+        response += "\r\n"
+
+        guard let headerData = response.data(using: .utf8) else {
+            connection.cancel()
+            return
+        }
+
+        connection.send(content: headerData, completion: .contentProcessed({ error in
+            if error != nil {
+                connection.cancel()
+            }
+        }))
+    }
+
+    private func sendStreamingHTTPChunk(
+        to connection: NWConnection,
+        chunk: Data
+    ) {
+        guard !chunk.isEmpty else { return }
+        if let deliveredStreamingResponseChunkForTesting {
+            deliveredStreamingResponseChunkForTesting(chunk)
+            return
+        }
+        connection.send(content: chunk, completion: .contentProcessed({ error in
+            if error != nil {
+                connection.cancel()
+            }
+        }))
+    }
+
+    private func finishStreamingHTTPResponse(to connection: NWConnection) {
+        if let deliveredStreamingResponseFinishForTesting {
+            deliveredStreamingResponseFinishForTesting()
+            connection.cancel()
+            return
+        }
+        connection.send(content: nil, isComplete: true, completion: .contentProcessed({ _ in
             connection.cancel()
         }))
     }
