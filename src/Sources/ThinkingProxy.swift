@@ -1911,6 +1911,19 @@ enum OpenAICompatTemporaryShim {
         )
     }
 
+    static func smartAliasExhaustionLogSummaryForTesting(
+        skippedReasons: [(model: String, reason: String)]
+    ) -> [String: Any] {
+        if let exhaustionSummary = smartAliasExhaustionSummary(for: skippedReasons) {
+            return exhaustionSummary.logSummary
+        }
+        return [
+            "classification": "empty_candidate_set",
+            "counts_by_reason": [:],
+            "skipped": []
+        ]
+    }
+
     private static func evaluateSmartAliasCandidate(
         method: String,
         path: String,
@@ -1950,11 +1963,25 @@ enum OpenAICompatTemporaryShim {
             path: path,
             jsonString: candidateBody
         ) ?? candidateBody
+        let preflightCandidateBody: String
+        if requestedStream(forRequestJSON: transformedCandidateBody),
+           let data = transformedCandidateBody.data(using: .utf8),
+           var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            json["stream"] = false
+            if let bufferedData = try? JSONSerialization.data(withJSONObject: json),
+               let bufferedBody = String(data: bufferedData, encoding: .utf8) {
+                preflightCandidateBody = bufferedBody
+            } else {
+                preflightCandidateBody = transformedCandidateBody
+            }
+        } else {
+            preflightCandidateBody = transformedCandidateBody
+        }
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
-            jsonString: transformedCandidateBody
+            jsonString: preflightCandidateBody
            ) {
             let reason = [
                 "provider_preflight_\(preflightError.statusCode)",
@@ -2015,8 +2042,8 @@ enum OpenAICompatTemporaryShim {
 
         let exhaustionSummary = smartAliasExhaustionSummary(for: skippedReasons)
         let correlationPrefix = proxyRequestID.map { "proxy_request_id:\($0) " } ?? ""
-        if let exhaustionSummary,
-           let jsonData = try? JSONSerialization.data(withJSONObject: exhaustionSummary.logSummary, options: [.sortedKeys]),
+        let logSummary = smartAliasExhaustionLogSummaryForTesting(skippedReasons: skippedReasons)
+        if let jsonData = try? JSONSerialization.data(withJSONObject: logSummary, options: [.sortedKeys]),
            let jsonString = String(data: jsonData, encoding: .utf8) {
             NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@%@", correlationPrefix, jsonString)
         } else {
@@ -2336,6 +2363,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     private static let minimumAttemptTimeout: TimeInterval = scaledRequestTimeout(300)
+    private static let untrustedNVIDIAProbeFirstResponseDeadline: TimeInterval = 15
+    private static let untrustedNVIDIAProbeBufferedResponseDeadline: TimeInterval = 20
+    private static var untrustedNVIDIAProbeDeadlineOverrideForTesting: (firstResponse: TimeInterval, bufferedResponse: TimeInterval)?
 
     private static func enforcedAttemptTimeout(_ timeout: TimeInterval?) -> TimeInterval? {
         guard let timeout else {
@@ -2356,6 +2386,50 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
+    private static func nvidiaUntrustedDeadlineCap(forRequestJSON jsonString: String) -> (firstResponse: TimeInterval, bufferedResponse: TimeInterval)? {
+        guard let requestModel = modelName(forRequestJSON: jsonString).map(normalizedRequestModel),
+              let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
+              route.providerID == "nvidia" else {
+            return nil
+        }
+        let hasRecentEvidence = routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else {
+                return false
+            }
+            if let lastSuccessAt = state.lastSuccessAt,
+               Date().timeIntervalSince(lastSuccessAt) <= nvidiaInferenceProbeFreshnessWindow {
+                return true
+            }
+            if let probe = state.nvidiaInferenceProbe,
+               probe.lastStatus == .success,
+               Date().timeIntervalSince(probe.lastProbeAt) <= nvidiaInferenceProbeFreshnessWindow {
+                return true
+            }
+            return false
+        }
+        guard !hasRecentEvidence else {
+            return nil
+        }
+        let deadlineOverride = untrustedNVIDIAProbeDeadlineOverrideForTesting
+        return (
+            firstResponse: deadlineOverride?.firstResponse ?? untrustedNVIDIAProbeFirstResponseDeadline,
+            bufferedResponse: deadlineOverride?.bufferedResponse ?? untrustedNVIDIAProbeBufferedResponseDeadline
+        )
+    }
+
+    static func untrustedNVIDIADirectRequestDeadline(
+        forRequestJSON jsonString: String
+    ) -> (seconds: TimeInterval, stage: DeadlineStage)? {
+        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+            return nil
+        }
+        if requestedStream(forRequestJSON: jsonString) {
+            return (seconds: cap.firstResponse, stage: .firstResponse)
+        }
+        return (seconds: cap.bufferedResponse, stage: .bufferedResponse)
+    }
+
     static func effectiveFirstResponseDeadline(
         forRequestJSON jsonString: String,
         routeHealthStatus: RouteHealthStatus?
@@ -2364,7 +2438,33 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         // That behavior caused premature timeouts on slow but valid NVIDIA lanes.
         // Now we preserve the base deadline regardless of health status - the circuit
         // breaker already handles route selection, so deadlines shouldn't shrink.
-        return firstResponseDeadline(forRequestJSON: jsonString)
+        let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString)
+        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+            return baseDeadline
+        }
+        return min(baseDeadline ?? cap.firstResponse, cap.firstResponse)
+    }
+
+    static func effectiveBufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
+        let baseDeadline = bufferedResponseDeadline(forRequestJSON: jsonString)
+        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+            return baseDeadline
+        }
+        return min(baseDeadline ?? cap.bufferedResponse, cap.bufferedResponse)
+    }
+
+    static func setUntrustedNVIDIAProbeDeadlineOverrideForTesting(
+        firstResponse: TimeInterval?,
+        bufferedResponse: TimeInterval?
+    ) {
+        if let firstResponse, let bufferedResponse {
+            untrustedNVIDIAProbeDeadlineOverrideForTesting = (
+                firstResponse: firstResponse,
+                bufferedResponse: bufferedResponse
+            )
+        } else {
+            untrustedNVIDIAProbeDeadlineOverrideForTesting = nil
+        }
     }
 
     static func bufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
@@ -4129,6 +4229,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard statusCode == 429 else { return nil }
 
         let concurrencyThreshold: TimeInterval = 300
+        let quotaExhaustionFallbackCooldown: TimeInterval = 15 * 60
 
         // --- Retry-After header ---
         if let retryAfter = headerValue("Retry-After", in: headers)?
@@ -4188,6 +4289,12 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 NSLog("[ThinkingProxy] GLM rate-limit 429: honoring cooldown until %@", timestamp)
                 return .quotaWindow(cooldownUntil: resetDate)
             }
+        }
+
+        if normalizedBody.contains("usage limit") ||
+            normalizedBody.contains("upgrade for higher limits") ||
+            normalizedBody.contains("quota exceeded") {
+            return .quotaWindow(cooldownUntil: now.addingTimeInterval(quotaExhaustionFallbackCooldown))
         }
 
         return .concurrency(retryAfterSeconds: nil)
@@ -4497,7 +4604,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             now: now
         )
         let reducedScore = max(0, decayedScore - 1)
-        let nextLastSuccessAt = telemetryEvent != nil ? now : current?.lastSuccessAt
+        let nextLastSuccessAt = now
         let nextLastSuccessRequestID = telemetryEvent?.proxyRequestID ?? current?.lastSuccessRequestID
         let nextLastFailureAt = current?.lastFailureAt
         let nextLastFailureClass = current?.lastFailureClass
@@ -9448,6 +9555,7 @@ class ThinkingProxy {
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-candidate")
         private var cancelled = false
         private var currentCancel: (() -> Void)?
+        private var cancelHooks: [() -> Void] = []
         private var scheduledRetryWorkItem: DispatchWorkItem?
 
         func registerCurrentCancel(_ cancel: @escaping () -> Void) {
@@ -9467,6 +9575,17 @@ class ThinkingProxy {
             }
         }
 
+        func registerCancelHook(_ hook: @escaping () -> Void) {
+            let runImmediately: (() -> Void)? = stateQueue.sync {
+                if cancelled {
+                    return hook
+                }
+                cancelHooks.append(hook)
+                return nil
+            }
+            runImmediately?()
+        }
+
         func scheduleRetry(after delay: DispatchTimeInterval, block: @escaping () -> Void) {
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self, !self.isCancelled() else { return }
@@ -9483,16 +9602,19 @@ class ThinkingProxy {
         }
 
         func cancel() {
-            let canceler: (() -> Void)? = stateQueue.sync {
+            let cancellationWork: (canceler: (() -> Void)?, hooks: [() -> Void])? = stateQueue.sync {
                 guard !cancelled else { return nil }
                 cancelled = true
                 let currentCancel = self.currentCancel
                 self.currentCancel = nil
+                let hooks = cancelHooks
+                cancelHooks.removeAll()
                 scheduledRetryWorkItem?.cancel()
                 scheduledRetryWorkItem = nil
-                return currentCancel
+                return (currentCancel, hooks)
             }
-            canceler?()
+            cancellationWork?.canceler?()
+            cancellationWork?.hooks.forEach { $0() }
         }
 
         func isCancelled() -> Bool {
@@ -9511,15 +9633,24 @@ class ThinkingProxy {
 
     private func installClientDisconnectCancellation(
         on connection: NWConnection,
-        controller: RequestCancellationController
+        controller: RequestCancellationController,
+        requestTrace: RequestTraceContext? = nil
     ) {
         connection.stateUpdateHandler = { state in
             if case .failed(let error) = state {
-                NSLog("[ThinkingProxy] Client connection failed before proxy delivery completed: \(error)")
+                if let requestTrace {
+                    NSLog(
+                        "[ThinkingProxy] Client connection failed before proxy delivery completed: proxy_request_id:%@ %@",
+                        requestTrace.proxyRequestID,
+                        "\(error)"
+                    )
+                } else {
+                    NSLog("[ThinkingProxy] Client connection failed before proxy delivery completed: \(error)")
+                }
             }
             controller.observeConnectionState(state)
         }
-        monitorClientDisconnect(on: connection, controller: controller)
+        monitorClientDisconnect(on: connection, controller: controller, requestTrace: requestTrace)
     }
 
     func installClientDisconnectCancellationForTesting(
@@ -9531,13 +9662,22 @@ class ThinkingProxy {
 
     private func monitorClientDisconnect(
         on connection: NWConnection,
-        controller: RequestCancellationController
+        controller: RequestCancellationController,
+        requestTrace: RequestTraceContext? = nil
     ) {
         guard controller.isCancelled() != true else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let error {
-                NSLog("[ThinkingProxy] Client connection receive failed before proxy delivery completed: \(error)")
+                if let requestTrace {
+                    NSLog(
+                        "[ThinkingProxy] Client connection receive failed before proxy delivery completed: proxy_request_id:%@ %@",
+                        requestTrace.proxyRequestID,
+                        "\(error)"
+                    )
+                } else {
+                    NSLog("[ThinkingProxy] Client connection receive failed before proxy delivery completed: \(error)")
+                }
                 controller.cancel()
                 return
             }
@@ -9545,7 +9685,7 @@ class ThinkingProxy {
                 controller.cancel()
                 return
             }
-            self.monitorClientDisconnect(on: connection, controller: controller)
+            self.monitorClientDisconnect(on: connection, controller: controller, requestTrace: requestTrace)
         }
     }
 
@@ -11100,7 +11240,7 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
-        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
         attemptSmartAliasCandidate(
             method: method,
             path: path,
@@ -11134,7 +11274,7 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
-        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
         let resolvedRequestModel = binding.routeModel
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: binding.incomingModelID,
@@ -11369,7 +11509,7 @@ class ThinkingProxy {
                 let clientStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
                 let finalBody: String
                 if clientStream {
-                    guard let bufferedBody = forcingNonStreamChatRequestBody(from: body) else {
+                    guard let bufferedBody = Self.forcingNonStreamChatRequestBody(from: body) else {
                         return nil
                     }
                     finalBody = bufferedBody
@@ -11389,7 +11529,7 @@ class ThinkingProxy {
             let clientStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
             let finalBody: String
             if clientStream {
-                guard let bufferedBody = forcingNonStreamChatRequestBody(from: chatBody) else {
+                guard let bufferedBody = Self.forcingNonStreamChatRequestBody(from: chatBody) else {
                     return nil
                 }
                 finalBody = bufferedBody
@@ -11403,7 +11543,7 @@ class ThinkingProxy {
             return (body: body, deliveryMode: .bufferedJSON)
         }
 
-        guard let bufferedBody = forcingNonStreamChatRequestBody(from: body) else {
+        guard let bufferedBody = Self.forcingNonStreamChatRequestBody(from: body) else {
             return nil
         }
 
@@ -11424,9 +11564,18 @@ class ThinkingProxy {
             ) else {
                 return nil
             }
+            let finalBody: String
+            if clientRequestedStream {
+                guard let bufferedBody = Self.forcingNonStreamChatRequestBody(from: chatBody) else {
+                    return nil
+                }
+                finalBody = bufferedBody
+            } else {
+                finalBody = chatBody
+            }
             return (
                 path: OpenAICompatTemporaryShim.chatCompletionsPath(matching: path),
-                body: chatBody,
+                body: finalBody,
                 deliveryMode: clientRequestedStream ? .syntheticResponsesSSE : .bufferedResponsesJSON
             )
         }
@@ -11435,10 +11584,18 @@ class ThinkingProxy {
             return nil
         }
 
+        if clientRequestedStream {
+            return (
+                path: path,
+                body: body,
+                deliveryMode: .syntheticSSE
+            )
+        }
+
         return (
             path: path,
             body: body,
-            deliveryMode: clientRequestedStream ? .syntheticSSE : .bufferedJSON
+            deliveryMode: .bufferedJSON
         )
     }
 
@@ -12771,7 +12928,7 @@ class ThinkingProxy {
         return result
     }
 
-    private func forcingNonStreamChatRequestBody(from jsonString: String) -> String? {
+    private static func forcingNonStreamChatRequestBody(from jsonString: String) -> String? {
         guard let data = jsonString.data(using: .utf8),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
@@ -13262,7 +13419,7 @@ class ThinkingProxy {
         let bufferedSyntheticBody: String = {
             switch deliveryMode {
             case .syntheticSSE, .syntheticResponsesSSE:
-                return forcingNonStreamChatRequestBody(from: body) ?? body
+                return Self.forcingNonStreamChatRequestBody(from: body) ?? body
             case .bufferedJSON, .bufferedResponsesJSON:
                 return body
             }
@@ -14699,7 +14856,7 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
-        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
         let timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: body) ?? Config.defaultMitigatedAttemptTimeout
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
         guard let permit = acquireRouteConcurrencyPermit(forRequestModel: candidateModel) else {
@@ -14838,7 +14995,7 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext
     ) {
         let requestController = RequestCancellationController()
-        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: publicModel,
             resolvedRequestModel: publicModel,
@@ -16020,11 +16177,18 @@ class ThinkingProxy {
             ),
             bufferedResponseSeconds: clientRequestedStream
                 ? nil
-                : OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: requestJSON),
+                : OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: requestJSON),
             onChunk: onChunk ?? { _, _ in },
             completion: completion
         )
-        return transportAttempt.start()
+        guard let cancel = transportAttempt.start() else {
+            return nil
+        }
+        return {
+            withExtendedLifetime(transportAttempt) {
+                cancel()
+            }
+        }
     }
 
     private func forwardNVIDIAStreamingRequest(
@@ -16038,7 +16202,80 @@ class ThinkingProxy {
     ) {
         let coordinator = NVIDIAAttemptCoordinator()
         let requestController = RequestCancellationController()
-        installClientDisconnectCancellation(on: originalConnection, controller: requestController)
+        installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
+        let requestDeadline = OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(forRequestJSON: body)
+        let requestDeadlineQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-request-deadline")
+        var requestDeadlineCompleted = false
+        var requestDeadlineWorkItem: DispatchWorkItem?
+        func cancelRequestDeadline() {
+            requestDeadlineQueue.sync {
+                requestDeadlineCompleted = true
+                requestDeadlineWorkItem?.cancel()
+                requestDeadlineWorkItem = nil
+            }
+        }
+        requestController.registerCancelHook {
+            cancelRequestDeadline()
+        }
+        if let requestDeadline, requestDeadline.seconds > 0 {
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                let shouldFire = requestDeadlineQueue.sync { () -> Bool in
+                    guard !requestDeadlineCompleted else { return false }
+                    requestDeadlineCompleted = true
+                    requestDeadlineWorkItem = nil
+                    return true
+                }
+                guard shouldFire else { return }
+                guard coordinator.tryFinish(attemptLane: 0) else { return }
+                let route = OpenAICompatTemporaryShim.routeIdentityForHealthTracking(forRequestModel: state.model)
+                let telemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                    timestamp: Date(),
+                    requestModel: state.model,
+                    canonicalModelID: route?.canonicalModelID ?? state.model,
+                    transportOutcome: "send_error",
+                    attemptLane: 1,
+                    failureClass: "transport_timeout",
+                    timeoutStage: requestDeadline.stage,
+                    upstreamHTTPStatus: nil,
+                    retryCount: 0,
+                    source: "live_request",
+                    firstByteLatencyMilliseconds: nil,
+                    totalLatencyMilliseconds: Int(requestDeadline.seconds * 1000),
+                    inflightAtRequest: route.map {
+                        OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: $0.routeHealthKey)
+                    },
+                    proxyRequestID: requestTrace.proxyRequestID,
+                    callerRequestID: requestTrace.callerRequestID,
+                    callerSessionID: requestTrace.callerSessionID,
+                    requestShape: requestTrace.requestShape
+                )
+                OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                NSLog(
+                    "[ThinkingProxy] Untrusted NVIDIA direct request exceeded %@ deadline after %.2fs. proxy_request_id:%@",
+                    requestDeadline.stage.rawValue,
+                    requestDeadline.seconds,
+                    requestTrace.proxyRequestID
+                )
+                let clientStillConnected = requestController.isCancelled() != true
+                requestController.cancel()
+                guard clientStillConnected else { return }
+                self.deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 504,
+                    message: "Gateway Timeout",
+                    coalescingKey: state.coalescingKey,
+                    overridingHeaders: requestTrace.responseHeaders
+                )
+            }
+            requestDeadlineQueue.sync {
+                requestDeadlineWorkItem = workItem
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + requestDeadline.seconds,
+                execute: workItem
+            )
+        }
         let routeHealthStatus = OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: state.model)
         let hedgeEligible = OpenAICompatTemporaryShim.allowsHedgedNVIDIARequest(
             method: method,
@@ -16057,7 +16294,9 @@ class ThinkingProxy {
             requestController: requestController,
             attemptLane: 1,
             hedgeEligible: hedgeEligible,
-            requestTrace: requestTrace
+            requestTrace: requestTrace,
+            onMeaningfulOutput: requestDeadline?.stage == .firstResponse ? cancelRequestDeadline : nil,
+            onAttemptCompletion: cancelRequestDeadline
         )
     }
 
@@ -16072,7 +16311,9 @@ class ThinkingProxy {
         requestController: RequestCancellationController,
         attemptLane: Int,
         hedgeEligible: Bool,
-        requestTrace: RequestTraceContext
+        requestTrace: RequestTraceContext,
+        onMeaningfulOutput: (() -> Void)? = nil,
+        onAttemptCompletion: (() -> Void)? = nil
     ) {
         guard requestController.isCancelled() != true else { return }
         guard !coordinator.isFinished() else { return }
@@ -16114,7 +16355,9 @@ class ThinkingProxy {
                     requestController: requestController,
                     attemptLane: attemptLane,
                     hedgeEligible: hedgeEligible,
-                    requestTrace: requestTrace
+                    requestTrace: requestTrace,
+                    onMeaningfulOutput: onMeaningfulOutput,
+                    onAttemptCompletion: onAttemptCompletion
                 )
             }
             return
@@ -16212,8 +16455,13 @@ class ThinkingProxy {
             }
         }
         let markAttemptPayloadReceived: (Data, Date) -> Void = { _, _ in
-            attemptStateQueue.sync {
+            let firstPayloadArrived = attemptStateQueue.sync { () -> Bool in
+                let firstPayload = !attemptReceivedPayload
                 attemptReceivedPayload = true
+                return firstPayload
+            }
+            if firstPayloadArrived {
+                onMeaningfulOutput?()
             }
         }
         let handleLiveStreamingChunk: (Data, Date) -> Void = { [weak self] chunk, receivedAt in
@@ -16281,6 +16529,7 @@ class ThinkingProxy {
         let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             guard let self else { return }
             defer {
+                onAttemptCompletion?()
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             }
@@ -16409,7 +16658,9 @@ class ThinkingProxy {
                         requestController: requestController,
                         attemptLane: 2,
                         hedgeEligible: false,
-                        requestTrace: requestTrace
+                        requestTrace: requestTrace,
+                        onMeaningfulOutput: onMeaningfulOutput,
+                        onAttemptCompletion: onAttemptCompletion
                     )
                     return
                 }
@@ -16429,7 +16680,9 @@ class ThinkingProxy {
                     requestController: requestController,
                     attemptLane: attemptLane,
                     hedgeEligible: hedgeEligible,
-                    requestTrace: requestTrace
+                    requestTrace: requestTrace,
+                    onMeaningfulOutput: onMeaningfulOutput,
+                    onAttemptCompletion: onAttemptCompletion
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -16582,7 +16835,9 @@ class ThinkingProxy {
                     requestController: requestController,
                     attemptLane: 2,
                     hedgeEligible: false,
-                    requestTrace: requestTrace
+                    requestTrace: requestTrace,
+                    onMeaningfulOutput: onMeaningfulOutput,
+                    onAttemptCompletion: onAttemptCompletion
                 )
             }
         }
@@ -16861,7 +17116,9 @@ class ThinkingProxy {
         requestController: RequestCancellationController,
         attemptLane: Int,
         hedgeEligible: Bool,
-        requestTrace: RequestTraceContext
+        requestTrace: RequestTraceContext,
+        onMeaningfulOutput: (() -> Void)? = nil,
+        onAttemptCompletion: (() -> Void)? = nil
     ) {
         let delay = DispatchTimeInterval.milliseconds(
             OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(state.retryBackoffMilliseconds)
@@ -16879,7 +17136,9 @@ class ThinkingProxy {
                 requestController: requestController,
                 attemptLane: attemptLane,
                 hedgeEligible: hedgeEligible,
-                requestTrace: requestTrace
+                requestTrace: requestTrace,
+                onMeaningfulOutput: onMeaningfulOutput,
+                onAttemptCompletion: onAttemptCompletion
             )
         }
     }

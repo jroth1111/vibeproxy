@@ -170,6 +170,41 @@ struct ThinkingProxyPolicySpec {
             expectEqual(tools?.count, 1, "factory worker health routing should still preserve the worker tool surface during candidate evaluation", recorder: recorder)
         }
 
+        run("smart worker streaming candidate selection keeps nvidia eligible without stripping live SSE intent", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "custom:Proxy-Worker-Smart-Router-8",
+                  "stream": true,
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "noop",
+                        "parameters": {"type": "object", "properties": {}}
+                      }
+                    }
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: request,
+                    candidateModelsRemaining: ["glm5-nvidia"]
+                )
+
+                expectEqual(transition?.model, "glm5-nvidia", "streaming worker requests should keep glm5-nvidia eligible even though NVIDIA preflight evaluates a buffered form", recorder: recorder)
+                let json = parseJSONObject(transition?.body, recorder: recorder)
+                expectEqual(json["stream"] as? Bool, true, "smart-worker execution should preserve the client streaming bit after candidate evaluation so the live SSE path still activates", recorder: recorder)
+            }
+        }
+
         run("static lookup deduplication keeps the first duplicate key instead of crashing", recorder: recorder) {
             let lookup = OpenAICompatTemporaryShim.deduplicatedStaticLookupForTesting(
                 [
@@ -1124,6 +1159,12 @@ struct ThinkingProxyPolicySpec {
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
+                let glm5DirectRequest = """
+                {
+                  "model": "glm5-nvidia",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
                 let gptRequest = """
                 {
                   "model": "gpt-5.4(high)",
@@ -1147,6 +1188,40 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: workerRequest), 540, "worker smart-router requests should use the tripled buffered-response deadline", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: gptRequest), 540, "direct GPT requests should use the tripled buffered-response deadline", recorder: recorder)
 
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(forRequestJSON: glm5DirectRequest, routeHealthStatus: nil),
+                    15,
+                    "direct NVIDIA routes without fresh live or probe evidence should fail fast instead of spending the full stale first-response budget",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
+                    20,
+                    "direct NVIDIA routes without fresh live or probe evidence should cap the stale buffered-response budget",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia")
+                expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia"),
+                    true,
+                    "recording a direct NVIDIA route success should immediately mark the lane as recently trusted even without a telemetry payload",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(forRequestJSON: glm5DirectRequest, routeHealthStatus: nil),
+                    720,
+                    "recently proven NVIDIA routes should regain the full first-response budget",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
+                    855,
+                    "recently proven NVIDIA routes should regain the full buffered-response budget",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
                 let kimiBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: kimiRequest)
                 let minimaxBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: minimaxRequest)
@@ -1163,12 +1238,14 @@ struct ThinkingProxyPolicySpec {
 
         run("temporary nvidia suspect routes keep the same first-byte deadline as healthy routes", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let glm5Request = """
                 {
-                  "model": "glm5",
+                  "model": "glm5-nvidia",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia")
 
                 expectEqual(
                     OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
@@ -1188,6 +1265,7 @@ struct ThinkingProxyPolicySpec {
                     "suspect routes should not shrink the first-byte deadline for slow NVIDIA models",
                     recorder: recorder
                 )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -1492,6 +1570,20 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(Int(cooldownUntil.timeIntervalSince(now)), 3600, "long Retry-After should classify as a quota/reset window", recorder: recorder)
             default:
                 recorder.recordFailure("expected quota-window 429 classification for long Retry-After")
+            }
+
+            switch OpenAICompatTemporaryShim.classifyProvider429Disposition(
+                statusCode: 429,
+                headers: [:],
+                bodyData: Data("""
+                {"error":"you (puremajik) have reached your weekly usage limit, upgrade for higher limits: https://ollama.com/upgrade"}
+                """.utf8),
+                now: now
+            ) {
+            case .quotaWindow(let cooldownUntil):
+                expectEqual(Int(cooldownUntil.timeIntervalSince(now)), 15 * 60, "explicit usage-limit 429s without a reset header should still become quota-window cooldowns", recorder: recorder)
+            default:
+                recorder.recordFailure("expected quota-window 429 classification for explicit usage-limit exhaustion")
             }
         }
 
@@ -2211,6 +2303,13 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
                 expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
             }
+        }
+
+        run("empty smart-alias candidate sets log an explicit exhaustion classification", recorder: recorder) {
+            let summary = OpenAICompatTemporaryShim.smartAliasExhaustionLogSummaryForTesting(skippedReasons: [])
+            expectEqual(summary["classification"] as? String, "empty_candidate_set", "terminal failover exhaustion should not degrade into an empty skipped tuple log", recorder: recorder)
+            expectEqual((summary["counts_by_reason"] as? [String: Int])?.isEmpty, true, "empty candidate logging should keep counts empty", recorder: recorder)
+            expectEqual((summary["skipped"] as? [[String: String]])?.isEmpty, true, "empty candidate logging should preserve an empty skipped list in JSON form", recorder: recorder)
         }
 
         run("neutral proxy worker smart router alias reuses the internal worker failover pool", recorder: recorder) {
@@ -10469,6 +10568,83 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("direct NVIDIA buffered requests fail on the untrusted outer deadline and still emit timeout telemetry", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.setUntrustedNVIDIAProbeDeadlineOverrideForTesting(
+                    firstResponse: 0.05,
+                    bufferedResponse: 0.08
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+
+                defer {
+                    OpenAICompatTemporaryShim.setUntrustedNVIDIAProbeDeadlineOverrideForTesting(
+                        firstResponse: nil,
+                        bufferedResponse: nil
+                    )
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                proxy.nvidiaDirectTransportForTesting = { _, _ in
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    recorder.recordFailure("hung direct NVIDIA requests should not surface a buffered success: \(statusCode)")
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("hung direct NVIDIA requests should fail on the untrusted outer deadline")
+                    return
+                }
+
+                lock.lock()
+                let timeoutEvent = recordedEvents.last(where: {
+                    $0.requestModel == "glm5-nvidia" &&
+                    $0.source == "live_request"
+                })
+                lock.unlock()
+
+                expectEqual(deliveredStatus, 504, "hung direct NVIDIA requests should now fail with a gateway timeout", recorder: recorder)
+                expectEqual(deliveredMessage, "Gateway Timeout", "hung direct NVIDIA requests should preserve the gateway-timeout message", recorder: recorder)
+                expectEqual(timeoutEvent?.failureClass, "transport_timeout", "hung direct NVIDIA requests should still emit transport_timeout telemetry", recorder: recorder)
+                expectEqual(timeoutEvent?.timeoutStage, .bufferedResponse, "hung direct NVIDIA requests should attribute the outer watchdog to the buffered-response deadline", recorder: recorder)
+            }
+        }
+
         run("worker smart alias buffered nvidia fallback executes through the direct streaming transport boundary", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -14817,6 +14993,182 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        // MARK: - Health-Ranked Pool: costFactor, Tier Weighting, Momentum
+
+        run("reasoning-tier model ranks above standard-tier model with equal health", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["glm5-nvidia", "glm-5.1-ollama-pro"]
+                )
+
+                // glm5-nvidia maps to z-ai/glm5 (tier .reasoning = 1.0)
+                // glm-5.1-ollama-pro maps to glm-5.1 (tier .standard = 0.85)
+                // Both are free (costFactor identical), so reasoning tier wins.
+                expectEqual(ranked.first, "glm5-nvidia", "reasoning-tier model should rank above standard-tier with equal health", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("closed route ranks above suspect route regardless of tier", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+
+                // Open the reasoning-tier model (healthPriority 3) while standard stays closed (0)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm5-nvidia",
+                    until: now.addingTimeInterval(300)
+                )
+
+                let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["glm5-nvidia", "glm-5.1-ollama-pro"]
+                )
+
+                // Closed standard (priority 0) beats open reasoning (priority 3)
+                expectEqual(ranked.first, "glm-5.1-ollama-pro", "closed standard-tier route should rank above open reasoning-tier route", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("cold-start ranking preserves original candidate order when health scores are tied", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["minimax-m2.5-nvidia", "glm5"]
+                )
+                expectEqual(
+                    ranked,
+                    ["minimax-m2.5-nvidia", "glm5"],
+                    "when candidate health scores are tied and there is no route telemetry yet, ranking should stay stable and preserve the configured input order",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("momentum bonus boosts recently-recovered route above stale peer", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+
+                // Record a recent success on glm-5.1-ollama-pro to give it EMA momentum
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm-5.1-ollama-pro",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm-5.1-ollama-pro",
+                        requestedAlias: "worker",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "send_response",
+                        attemptLane: 1,
+                        failoverDepth: 0,
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "smart_alias",
+                        firstByteLatencyMilliseconds: 100,
+                        totalLatencyMilliseconds: 200,
+                        inflightAtRequest: nil,
+                        proxyRequestID: "test-momentum",
+                        callerRequestID: nil,
+                        callerSessionID: nil,
+                        requestShape: nil
+                    )
+                )
+
+                let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro"]
+                )
+
+                // Both are standard-tier, same cost, same provider config.
+                // glm-5.1-ollama-pro has a recent success → higher EMA + momentum → ranks first.
+                expectEqual(ranked.first, "glm-5.1-ollama-pro", "route with recent success and momentum should rank above peer with no observations", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("proven-perfect route ranks above non-perfect peer at same health level", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+
+                // Give glm-5.1-ollama-pro enough consecutive successes to make it proven-perfect
+                for i in 0..<5 {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm-5.1-ollama-pro",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: now.addingTimeInterval(Double(i)),
+                            requestModel: "glm-5.1-ollama-pro",
+                            requestedAlias: "worker",
+                            canonicalModelID: "glm-5.1",
+                            transportOutcome: "send_response",
+                            attemptLane: 1,
+                            failoverDepth: 0,
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            firstByteLatencyMilliseconds: 100,
+                            totalLatencyMilliseconds: 200,
+                            inflightAtRequest: nil,
+                            proxyRequestID: "test-proven-\(i)",
+                            callerRequestID: nil,
+                            callerSessionID: nil,
+                            requestShape: nil
+                        )
+                    )
+                }
+
+                // Record a failure on glm-5.1-zai so it's NOT proven-perfect
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm-5.1-zai",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm-5.1-zai",
+                        requestedAlias: "worker",
+                        canonicalModelID: "glm-5.1",
+                        transportOutcome: "send_error",
+                        attemptLane: 1,
+                        failoverDepth: 0,
+                        failureClass: "classified_502",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 502,
+                        retryCount: 0,
+                        source: "smart_alias",
+                        firstByteLatencyMilliseconds: nil,
+                        totalLatencyMilliseconds: nil,
+                        inflightAtRequest: nil,
+                        proxyRequestID: "test-proven-fail",
+                        callerRequestID: nil,
+                        callerSessionID: nil,
+                        requestShape: nil
+                    ),
+                    forcedOpenUntil: nil,
+                    healthSensitivity: .balanced
+                )
+
+                let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro"]
+                )
+
+                // glm-5.1-ollama-pro is proven-perfect (5 successes, 0 failures)
+                // glm-5.1-zai has a failure → not proven-perfect
+                // isProvenPerfect is a tiebreaker before composite score
+                expectEqual(ranked.first, "glm-5.1-ollama-pro", "proven-perfect route should rank above route with failure history", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
@@ -14853,6 +15205,17 @@ private func expectEqual<T: Equatable>(
     let value = actual()
     guard value == expected else {
         recorder.recordFailure("\(message): expected \(expected), got \(value)")
+        return
+    }
+}
+
+private func expectTrue(
+    _ actual: @autoclosure () -> Bool,
+    _ message: String,
+    recorder: FailureRecorder
+) {
+    guard actual() else {
+        recorder.recordFailure("\(message): expected true, got false")
         return
     }
 }
