@@ -3020,7 +3020,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }) {
             return publicNVIDIADirectAlias
         }
-        candidates.sorted { lhs, rhs in
+        return candidates.sorted { lhs, rhs in
             let lhsIsSmartAlias = smartAliasDefinition(forRequestModel: lhs) != nil
             let rhsIsSmartAlias = smartAliasDefinition(forRequestModel: rhs) != nil
             if lhsIsSmartAlias != rhsIsSmartAlias {
