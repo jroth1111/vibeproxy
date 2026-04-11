@@ -1389,8 +1389,8 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .closed
                     ),
-                    720,
-                    "healthy routes should keep the baseline first-byte deadline",
+                    15,
+                    "a single unmeasured NVIDIA success should not unlock the direct lane's full first-byte budget",
                     recorder: recorder
                 )
                 expectEqual(
@@ -1398,8 +1398,8 @@ struct ThinkingProxyPolicySpec {
                         forRequestJSON: glm5Request,
                         routeHealthStatus: .suspect
                     ),
-                    720,
-                    "suspect routes should not shrink the first-byte deadline for slow NVIDIA models",
+                    15,
+                    "suspect routes should keep the capped first-byte deadline until NVIDIA proves stable again",
                     recorder: recorder
                 )
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -1558,7 +1558,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky suspect route", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky first-byte timeout history", recorder: recorder)
                 expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.recentOutcomes.contains(where: { $0.hasSuffix(":transport_timeout") }), true, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
@@ -2326,7 +2326,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "rolling metrics should retain caution without prematurely quarantining a slow route", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "repeated first-byte timeout pressure should now quarantine the slow NVIDIA route instead of leaving it merely suspect", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -2537,21 +2537,24 @@ struct ThinkingProxyPolicySpec {
                     recorder: recorder
                 )
 
-                OpenAICompatTemporaryShim.recordRouteSuccess(
-                    forRequestModel: "glm5-nvidia",
-                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
-                        timestamp: Date(),
-                        requestModel: "glm5-nvidia",
-                        canonicalModelID: "z-ai/glm5",
-                        transportOutcome: "send_response",
-                        failureClass: nil,
-                        timeoutStage: .none,
-                        upstreamHTTPStatus: 200,
-                        retryCount: 0,
-                        source: "live_request",
-                        totalLatencyMilliseconds: 12
+                for (offset, latency) in [2_000, 2_400, 2_700].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 200
+                        )
                     )
-                )
+                }
 
                 let trustedCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
                     forPublicAlias: "glm5-nvidia",
@@ -2563,7 +2566,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(
                     trustedCandidates,
                     ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"],
-                    "recent live NVIDIA success should re-promote the public glm5-nvidia alias back onto the direct lane first",
+                    "only repeated low-latency live NVIDIA successes should re-promote the public glm5-nvidia alias back onto the direct lane first",
                     recorder: recorder
                 )
                 expectEqual(

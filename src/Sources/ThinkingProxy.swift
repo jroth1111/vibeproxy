@@ -5039,7 +5039,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         let basePenalty: Double
         if failureClass.hasPrefix("transport_timeout"),
            telemetryEvent?.timeoutStage == .firstResponse {
-            basePenalty = 4
+            basePenalty = 3
         } else if failureClass == "transport_error" ||
             failureClass == "missing_response_material" ||
             failureClass.hasPrefix("classified_5") {
