@@ -251,7 +251,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("canonical z-ai/glm5 rewrites onto the exact nvidia alias without breaking glm5-nvidia routing", recorder: recorder) {
+        run("canonical z-ai/glm5 rewrites onto the explicit direct alias while public glm5-nvidia stays smart-routed", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let exactAliasRequest = """
                 {
@@ -269,6 +269,13 @@ struct ThinkingProxyPolicySpec {
                 )
                 expectNil(exactAliasRewrite, "the exact glm5-nvidia request-model alias should stay stable instead of being rewritten to a bare canonical name", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: exactAliasRequest), "glm5-nvidia", "glm5-nvidia requests should preserve the concrete routable alias", recorder: recorder)
+                expectNil(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia-direct"), "glm5-nvidia-direct should stay a hard-pinned direct lane instead of recursively entering the smart alias path", recorder: recorder)
+                expectEqual(
+                    OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia")?.candidates,
+                    ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"],
+                    "public glm5-nvidia should resolve through the smart alias failover contract",
+                    recorder: recorder
+                )
 
                 let canonicalRequest = """
                 {
@@ -284,11 +291,35 @@ struct ThinkingProxyPolicySpec {
                     path: "/v1/chat/completions",
                     jsonString: canonicalRequest
                 )
-                expectEqual(canonicalRewrite?.normalizedModel, "glm5-nvidia", "canonical z-ai/glm5 requests should normalize onto the concrete nvidia alias", recorder: recorder)
+                expectEqual(canonicalRewrite?.normalizedModel, "glm5-nvidia-direct", "canonical z-ai/glm5 requests should normalize onto the explicit direct nvidia alias", recorder: recorder)
                 let canonicalJSON = parseJSONObject(canonicalRewrite?.rewrittenJSONString, recorder: recorder)
-                expectEqual(canonicalJSON["model"] as? String, "glm5-nvidia", "canonical z-ai/glm5 requests should be rewritten to the exact routable alias", recorder: recorder)
+                expectEqual(canonicalJSON["model"] as? String, "glm5-nvidia-direct", "canonical z-ai/glm5 requests should be rewritten to the explicit direct alias instead of the public smart alias", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.providerID, "nvidia", "canonical z-ai/glm5 should still resolve onto the nvidia route", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.canonicalModelID, "z-ai/glm5", "canonical z-ai/glm5 should preserve the canonical model identity after alias normalization", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia-direct")?.providerID, "nvidia", "the explicit direct alias should still resolve onto the nvidia route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia-direct")?.canonicalModelID, "z-ai/glm5", "the explicit direct alias should preserve the canonical model identity", recorder: recorder)
+            }
+        }
+
+        run("explicit glm5-nvidia-direct rewrites upstream transport bodies onto the physical nvidia route", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let directAliasRequest = """
+                {
+                  "model": "glm5-nvidia-direct",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let upstreamRewrite = OpenAICompatTemporaryShim.rewrittenNVIDIADirectUpstreamRequestJSON(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: directAliasRequest
+                )
+                let upstreamJSON = parseJSONObject(upstreamRewrite, recorder: recorder)
+                expectEqual(upstreamJSON["model"] as? String, "glm5-nvidia", "the explicit direct alias should rewrite back onto the physical nvidia route before upstream transport", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: directAliasRequest), "glm5-nvidia-direct", "the proxy should keep the caller-visible direct alias stable before delivery rewriting", recorder: recorder)
             }
         }
 
@@ -1161,7 +1192,7 @@ struct ThinkingProxyPolicySpec {
                 """
                 let glm5DirectRequest = """
                 {
-                  "model": "glm5-nvidia",
+                  "model": "glm5-nvidia-direct",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
@@ -1201,9 +1232,9 @@ struct ThinkingProxyPolicySpec {
                     "direct NVIDIA routes without fresh live or probe evidence should cap the stale buffered-response budget",
                     recorder: recorder
                 )
-                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia")
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia-direct")
                 expectEqual(
-                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia"),
+                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia-direct"),
                     true,
                     "recording a direct NVIDIA route success should immediately mark the lane as recently trusted even without a telemetry payload",
                     recorder: recorder
@@ -1222,10 +1253,10 @@ struct ThinkingProxyPolicySpec {
                 )
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.recordRouteSuccess(
-                    forRequestModel: "glm5-nvidia",
+                    forRequestModel: "glm5-nvidia-direct",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: Date(),
-                        requestModel: "glm5-nvidia",
+                        requestModel: "glm5-nvidia-direct",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_response",
                         failureClass: nil,
@@ -1237,13 +1268,13 @@ struct ThinkingProxyPolicySpec {
                     )
                 )
                 expectEqual(
-                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia"),
+                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia-direct"),
                     true,
                     "a recent NVIDIA probe success should still count as route evidence for recovery and worker dispatch",
                     recorder: recorder
                 )
                 expectEqual(
-                    OpenAICompatTemporaryShim.hasRecentLiveInferenceSuccess(forRequestModel: "glm5-nvidia"),
+                    OpenAICompatTemporaryShim.hasRecentLiveInferenceSuccess(forRequestModel: "glm5-nvidia-direct"),
                     false,
                     "a synthetic NVIDIA canary should not count as recent live request success",
                     recorder: recorder
@@ -1281,11 +1312,11 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let glm5Request = """
                 {
-                  "model": "glm5-nvidia",
+                  "model": "glm5-nvidia-direct",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
-                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia")
+                OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia-direct")
 
                 expectEqual(
                     OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
@@ -2395,6 +2426,94 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "tool-heavy glm-5.1 requests should keep the same worker pool", recorder: recorder)
+            }
+        }
+
+        run("public glm5-nvidia demotes stale direct NVIDIA behind healthy fallbacks but keeps probing it for recovery", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia") else {
+                    recorder.recordFailure("glm5-nvidia should resolve through the public smart alias contract")
+                    return
+                }
+
+                let requestJSON = """
+                {
+                  "model": "glm5-nvidia",
+                  "stream": false,
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                let staleCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "glm5-nvidia",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(
+                    staleCandidates,
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"],
+                    "public glm5-nvidia should stop discovering a cold NVIDIA lane on real user traffic and instead try the healthy sibling pool first",
+                    recorder: recorder
+                )
+                expectEqual(
+                    Array(OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+                        forPublicAlias: "glm5-nvidia",
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: requestJSON,
+                        smartAlias: smartAlias
+                    )).sorted(),
+                    ["glm5-nvidia"],
+                    "public glm5-nvidia should still force-probe the cold NVIDIA lane so it can be re-promoted after recovery",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_response",
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "live_request",
+                        totalLatencyMilliseconds: 12
+                    )
+                )
+
+                let trustedCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "glm5-nvidia",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(
+                    trustedCandidates,
+                    ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"],
+                    "recent live NVIDIA success should re-promote the public glm5-nvidia alias back onto the direct lane first",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+                        forPublicAlias: "glm5-nvidia",
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: requestJSON,
+                        smartAlias: smartAlias
+                    ).isEmpty,
+                    true,
+                    "trusted public glm5-nvidia should stop force-probing the direct NVIDIA lane once live traffic has revalidated it",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -8495,9 +8614,9 @@ struct ThinkingProxyPolicySpec {
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
                 expectEqual(deliveredStatus, 503, "the final retryable worker candidate should still surface a 503 terminal exhaustion error", recorder: recorder)
-                expectEqual(snapshot["glm5-nvidia"]?.failureScore, 2.0, "one classified 5xx worker failure should apply the single configured 5xx penalty", recorder: recorder)
-                expectEqual(snapshot["glm5-nvidia"]?.rollingMetrics.recentOutcomes.count, 1, "the final retryable worker failure should add exactly one failure event to rolling metrics", recorder: recorder)
-                expectEqual(snapshot["glm5-nvidia"]?.status, .suspect, "one exhausted worker failure should degrade the final route once instead of opening it immediately", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia-direct"]?.failureScore, 2.0, "one classified 5xx worker failure should apply the single configured 5xx penalty", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia-direct"]?.rollingMetrics.recentOutcomes.count, 1, "the final retryable worker failure should add exactly one failure event to rolling metrics", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia-direct"]?.status, .suspect, "one exhausted worker failure should degrade the final route once instead of opening it immediately", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -10124,7 +10243,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": false,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10142,7 +10261,7 @@ struct ThinkingProxyPolicySpec {
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredStatus, 200, "direct NVIDIA buffered requests should deliver a 200 response", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "buffered direct NVIDIA requests should keep upstream on the non-stream path", recorder: recorder)
-                expectEqual(deliveredJSON["model"] as? String, "glm5-nvidia", "direct NVIDIA buffered requests should preserve the public alias in the delivered body", recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "glm5-nvidia-direct", "direct NVIDIA buffered requests should preserve the explicit direct alias in the delivered body", recorder: recorder)
                 expectEqual(
                     ((deliveredJSON["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any])?["content"] as? String,
                     "OK",
@@ -10223,7 +10342,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": true,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10332,7 +10451,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": true,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10413,7 +10532,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": true,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10502,7 +10621,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": true,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10518,7 +10637,7 @@ struct ThinkingProxyPolicySpec {
 
                 lock.lock()
                 let timeoutObserved = cancellationObserved
-                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia" })
+                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia-direct" })
                 lock.unlock()
                 expectEqual(timeoutObserved, true, "direct NVIDIA inter-chunk timeout should actively cancel the live transport", recorder: recorder)
                 expectEqual(timeoutEvent?.timeoutStage, .interChunkRead, "direct NVIDIA inter-chunk timeout should be attributed to the live transport chunk-gap watchdog", recorder: recorder)
@@ -10601,7 +10720,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": false,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10621,11 +10740,11 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 lock.lock()
-                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia" })
+                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia-direct" })
                 lock.unlock()
                 expectEqual(deliveredStatus, 504, "direct NVIDIA first-response timeout should surface as gateway timeout", recorder: recorder)
                 expectEqual(deliveredMessage, "Gateway Timeout", "direct NVIDIA first-response timeout should preserve the timeout message", recorder: recorder)
-                expectEqual(timeoutEvent?.failureClass, "transport_timeout", "direct NVIDIA first-response timeout should record transport_timeout telemetry", recorder: recorder)
+                expectEqual(timeoutEvent?.failureClass, "transport_timeout_first_byte", "direct NVIDIA first-response timeout should record transport_timeout_first_byte telemetry", recorder: recorder)
                 expectEqual(timeoutEvent?.timeoutStage, .firstResponse, "direct NVIDIA first-response timeout should be attributed to the first-response watchdog", recorder: recorder)
             }
         }
@@ -10683,7 +10802,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": false,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10700,7 +10819,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "slow-success direct NVIDIA requests should still deliver a 200 response", recorder: recorder)
                 expectEqual(
                     recordedEvents.contains(where: {
-                        $0.requestModel == "glm5-nvidia" &&
+                        $0.requestModel == "glm5-nvidia-direct" &&
                         $0.source == "live_request" &&
                         $0.transportOutcome == "send_response" &&
                         $0.timeoutStage == .none &&
@@ -10757,10 +10876,10 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
-                    forRequestModel: "glm5-nvidia",
+                    forRequestModel: "glm5-nvidia-direct",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: Date(),
-                        requestModel: "glm5-nvidia",
+                        requestModel: "glm5-nvidia-direct",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_response",
                         failureClass: nil,
@@ -10778,7 +10897,7 @@ struct ThinkingProxyPolicySpec {
                         path: "/v1/chat/completions",
                         body: """
                         {
-                          "model": "glm5-nvidia",
+                          "model": "glm5-nvidia-direct",
                           "stream": false,
                           "messages": [{"role": "user", "content": "Return exactly: OK"}]
                         }
@@ -10794,7 +10913,7 @@ struct ThinkingProxyPolicySpec {
 
                 lock.lock()
                 let timeoutEvent = recordedEvents.last(where: {
-                    $0.requestModel == "glm5-nvidia" &&
+                    $0.requestModel == "glm5-nvidia-direct" &&
                     $0.source == "live_request"
                 })
                 lock.unlock()
@@ -11427,7 +11546,7 @@ struct ThinkingProxyPolicySpec {
                     var seenRequestModel: String?
                     proxy.nvidiaCanaryTransportForTesting = { requestModel, requestJSON, completion in
                         seenRequestModel = requestModel
-                        if !requestJSON.contains("\"model\": \"glm5-nvidia\"") {
+                        if !requestJSON.contains("\"model\": \"glm5-nvidia-direct\"") {
                             recorder.recordFailure("expected canary request JSON to use the concrete route request model so the proxy can route the quarantined lane precisely")
                         }
                         let body = Data("""
@@ -11457,7 +11576,7 @@ struct ThinkingProxyPolicySpec {
                     }
                     let waitResult = semaphore.wait(timeout: .now() + 2)
                     expectEqual(waitResult, .success, "canary sweep should complete promptly under stubbed transport", recorder: recorder)
-                    expectEqual(seenRequestModel, "glm5-nvidia", "canary sweep should probe the concrete quarantined route request model exactly once", recorder: recorder)
+                    expectEqual(seenRequestModel, "glm5-nvidia-direct", "canary sweep should probe the concrete quarantined route request model exactly once", recorder: recorder)
                     expectEqual(OpenAICompatTemporaryShim.isNVIDIAHostedRouteOpen(forRequestModel: "glm5"), false, "one successful canary should immediately restore the route", recorder: recorder)
                     var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                     expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "first successful canary should close the route immediately", recorder: recorder)
@@ -12902,7 +13021,7 @@ struct ThinkingProxyPolicySpec {
                     let provenance = payload["provenance"] as? [String: Any]
                     let routeHealth = payload["route_health"] as? [String: Any]
                     let routes = routeHealth?["routes"] as? [String: Any]
-                    let glm5 = routes?["glm5-nvidia"] as? [String: Any]
+                    let glm5 = routes?["glm5-nvidia-direct"] as? [String: Any]
                     let quarantinedModels = routeHealth?["quarantined_models"] as? [String]
                     let quarantinedCanonicalModels = routeHealth?["quarantined_canonical_models"] as? [String]
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
@@ -12924,7 +13043,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual((deliveredHeaders?["X-VibeProxy-App-Version"] as? String)?.isEmpty ?? true, false, "healthz should emit app-version headers", recorder: recorder)
                     expectEqual(glm5?["status"] as? String, "open", "healthz should surface route-health state", recorder: recorder)
                     expectEqual(glm5?["canonical_model_id"] as? String, "z-ai/glm5", "healthz should preserve the canonical model id alongside the exact request-model route lane", recorder: recorder)
-                    expectEqual(quarantinedModels?.contains("glm5-nvidia"), true, "healthz should list quarantined exact request-model lanes", recorder: recorder)
+                    expectEqual(quarantinedModels?.contains("glm5-nvidia-direct"), true, "healthz should list quarantined exact request-model lanes", recorder: recorder)
                     expectEqual(quarantinedCanonicalModels?.contains("z-ai/glm5"), true, "healthz should also expose quarantined canonical model ids for summary views", recorder: recorder)
                     expectEqual(factoryWorker?["worker_model_id"] as? String, openAIFactoryWorkerContract.workerModelID, "healthz should expose the authoritative Factory worker id", recorder: recorder)
                     expectEqual(factoryWorker?["route_model"] as? String, openAIFactoryWorkerContract.routeModel, "healthz should expose the worker route model", recorder: recorder)
@@ -13044,7 +13163,7 @@ struct ThinkingProxyPolicySpec {
                 let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 let routeHealth = payload["route_health"] as? [String: Any]
                 let routes = routeHealth?["routes"] as? [String: Any]
-                let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                let glm5Route = routes?["glm5-nvidia-direct"] as? [String: Any]
                 let lastEvent = glm5Route?["last_event"] as? [String: Any]
                 let retryAfterSeconds = glm5Route?["retry_after_seconds"] as? Int
 
@@ -13096,7 +13215,7 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 let canaryModels = OpenAICompatTemporaryShim.canaryProbeRequestModels(at: now)
-                expectEqual(canaryModels.contains("glm5-nvidia"), true, "suspect NVIDIA lanes should stay probeable by the real-inference canary sweep", recorder: recorder)
+                expectEqual(canaryModels.contains("glm5-nvidia-direct"), true, "suspect NVIDIA lanes should stay probeable by the real-inference canary sweep", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5-nvidia",
@@ -13213,7 +13332,7 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let routeHealth = payload["route_health"] as? [String: Any]
                     let routes = routeHealth?["routes"] as? [String: Any]
-                    let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                    let glm5Route = routes?["glm5-nvidia-direct"] as? [String: Any]
                     let nvidiaLiveness = glm5Route?["nvidia_inference_liveness"] as? [String: Any]
                     let nvidiaProbe = nvidiaLiveness?["probe"] as? [String: Any]
                     let streamDiagnostics = glm5Route?["nvidia_stream_diagnostics"] as? [String: Any]
@@ -13935,7 +14054,7 @@ struct ThinkingProxyPolicySpec {
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
                     let routeHealth = payload["route_health"] as? [String: Any]
                     let routes = routeHealth?["routes"] as? [String: Any]
-                    let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                    let glm5Route = routes?["glm5-nvidia-direct"] as? [String: Any]
                     let nvidiaLiveness = glm5Route?["nvidia_inference_liveness"] as? [String: Any]
 
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner even after later same-route canary telemetry", recorder: recorder)

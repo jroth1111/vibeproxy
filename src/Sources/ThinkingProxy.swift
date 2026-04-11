@@ -316,7 +316,7 @@ enum OpenAICompatTemporaryShim {
 
         var timeoutRate: Double {
             guard !recentOutcomes.isEmpty else { return 0 }
-            let timeouts = recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count
+            let timeouts = recentOutcomes.filter { $0.contains(":transport_timeout") }.count
             return Double(timeouts) / Double(recentOutcomes.count)
         }
 
@@ -926,7 +926,7 @@ enum OpenAICompatTemporaryShim {
         ("glm-5", "glm-5.1"),
         ("glm-5-turbo", "glm-5.1"),
         // Rewrites must land on a concrete configured request-model alias, not a bare canonical name.
-        ("z-ai/glm5", "glm5-nvidia")
+        ("z-ai/glm5", "glm5-nvidia-direct")
     ]
     private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
         legacyRequestModelRewriteEntries,
@@ -1521,6 +1521,15 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
+    private static let publicNVIDIASmartAlias = "glm5-nvidia"
+    fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia-direct"
+    private static let publicNVIDIASmartAliasCandidateModels = [
+        "glm5-nvidia",
+        "glm-5.1-zai",
+        "glm-5.1-ollama-pro",
+        "minimax-m2.7-ollama-pro",
+        "muse-spark"
+    ]
     fileprivate static let canonicalFactoryWorkerModelID = "custom:Proxy-Worker-Smart-Router-8"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -1551,6 +1560,15 @@ enum OpenAICompatTemporaryShim {
 
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
         let requestModel = normalizedRequestModel(requestModel)
+        if requestModel == publicNVIDIASmartAlias {
+            return SmartAliasDefinition(
+                alias: publicNVIDIASmartAlias,
+                requestClass: "plain-chat",
+                failover: "silent",
+                candidates: publicNVIDIASmartAliasCandidateModels,
+                healthSensitivity: .balanced
+            )
+        }
         let smartAliases = configuredRouteConfiguration().smartAliasesByAlias
         if let exact = smartAliases[requestModel] {
             return exact
@@ -1593,13 +1611,32 @@ enum OpenAICompatTemporaryShim {
         // healthy: ZAI GLM first, then Ollama GLM, then the MiniMax fallback. When a lane degrades,
         // only health bucket ordering may move it back; latency/EMA scoring must not leapfrog a
         // lower-priority backend ahead of a healthy preferred sibling.
-        let availabilityRankedCandidates = availabilityRankedSmartAliasCandidateModels(smartAlias.candidates)
+        let trustRankedCandidates = candidateModelsAdjustedForNVIDIATrust(
+            smartAlias.candidates,
+            publicAlias: publicAlias
+        )
+        let availabilityRankedCandidates = availabilityRankedSmartAliasCandidateModels(trustRankedCandidates)
         return requestShapeAdjustedSmartAliasCandidateModels(
             availabilityRankedCandidates,
             method: method,
             path: path,
             jsonString: jsonString
         )
+    }
+
+    private static func candidateModelsAdjustedForNVIDIATrust(
+        _ candidateModels: [String],
+        publicAlias: String
+    ) -> [String] {
+        guard publicAlias == publicNVIDIASmartAlias,
+              !hasRecentLiveInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) else {
+            return candidateModels
+        }
+        guard let nvidiaCandidate = publicNVIDIASmartAliasCandidateModels.first,
+              candidateModels.contains(nvidiaCandidate) else {
+            return candidateModels
+        }
+        return candidateModels.filter { $0 != nvidiaCandidate } + [nvidiaCandidate]
     }
 
     private static func requestShapeAdjustedSmartAliasCandidateModels(
@@ -1742,6 +1779,11 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> Set<String> {
+        if publicAlias == publicNVIDIASmartAlias,
+           let nvidiaCandidate = publicNVIDIASmartAliasCandidateModels.first,
+           !hasRecentLiveInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) {
+            return [nvidiaCandidate]
+        }
         // No request class gets a hidden worker-specific probe lane. Candidate selection and
         // recovery policy are shared across plain and tool-heavy worker traffic.
         return []
@@ -2432,12 +2474,22 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         forRequestJSON jsonString: String,
         routeHealthStatus: RouteHealthStatus?
     ) -> TimeInterval? {
-        // Note: Previously this applied deadline reduction for suspect/open routes.
-        // That behavior caused premature timeouts on slow but valid NVIDIA lanes.
-        // Now we preserve the base deadline regardless of health status - the circuit
-        // breaker already handles route selection, so deadlines shouldn't shrink.
         let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString)
         guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+            // Trusted route — apply adaptive deadline from p95 first-byte latency history.
+            // Without history, fall back to the policy default (up to 720s).
+            // With history, cap at 3× p95 (minimum 60s) to catch slow/no-first-byte
+            // without waiting the full policy timeout.
+            if let requestModel = modelName(forRequestJSON: jsonString),
+               let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95FirstByteLatencyMilliseconds,
+               p95ms > 0 {
+                let p95Seconds = Double(p95ms) / 1000.0
+                let adaptiveCap = min(max(p95Seconds * 3.0, 60.0), 360.0)
+                if let baseDeadline {
+                    return min(baseDeadline, adaptiveCap)
+                }
+                return adaptiveCap
+            }
             return baseDeadline
         }
         return min(baseDeadline ?? cap.firstResponse, cap.firstResponse)
@@ -2649,7 +2701,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         if let error = attempt.error {
             let failureClass: String
             if attempt.deadlineStage != .none {
-                failureClass = "transport_timeout"
+                failureClass = attempt.deadlineStage == .firstResponse
+                    ? "transport_timeout_first_byte"
+                    : "transport_timeout"
             } else if shouldRetryNvidiaReasoningTransport(error: error) {
                 failureClass = "transport_error_retryable"
             } else {
@@ -2957,6 +3011,15 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         from candidates: [String],
         routes: [String: RouteIdentity]
     ) -> String? {
+        if candidates.contains(publicNVIDIADirectAlias) {
+            return publicNVIDIADirectAlias
+        }
+        if candidates.contains(where: { candidate in
+            guard let route = routes[candidate] else { return false }
+            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
+        }) {
+            return publicNVIDIADirectAlias
+        }
         candidates.sorted { lhs, rhs in
             let lhsIsSmartAlias = smartAliasDefinition(forRequestModel: lhs) != nil
             let rhsIsSmartAlias = smartAliasDefinition(forRequestModel: rhs) != nil
@@ -6177,7 +6240,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
-        resolvedRoutesByRequestModel()[normalizedRequestModel(model)]
+        let normalized = normalizedRequestModel(model)
+        if normalized == publicNVIDIADirectAlias {
+            return resolvedRoutesByRequestModel()[publicNVIDIASmartAlias]
+        }
+        return resolvedRoutesByRequestModel()[normalized]
     }
 
     static func providerEndpoint(forProviderID providerID: String) -> ProviderEndpoint? {
@@ -6206,6 +6273,22 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             return nil
         }
         return route
+    }
+
+    static func rewrittenNVIDIADirectUpstreamRequestJSON(
+        method: String,
+        path: String,
+        jsonString: String
+    ) -> String? {
+        guard rawModelName(forRequestJSON: jsonString) == publicNVIDIADirectAlias else {
+            return nil
+        }
+        return rewrittenRequestJSON(
+            method: method,
+            path: path,
+            replacingRequestModelIn: jsonString,
+            with: publicNVIDIASmartAlias
+        )
     }
 
     private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
@@ -13761,9 +13844,14 @@ class ThinkingProxy {
 
         let effectiveHeaders = headersInjectingRouteSpecific(headers, forCandidateModel: candidateModel)
         let internalStreaming = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+        let upstreamBody = OpenAICompatTemporaryShim.rewrittenNVIDIADirectUpstreamRequestJSON(
+            method: method,
+            path: path,
+            jsonString: body
+        ) ?? body
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.httpBody = Data(body.utf8)
+        request.httpBody = Data(upstreamBody.utf8)
         request.timeoutInterval = timeoutInterval
         let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
         for (name, value) in effectiveHeaders where !excludedHeaders.contains(name.lowercased()) {
@@ -16304,7 +16392,9 @@ class ThinkingProxy {
                     canonicalModelID: route?.canonicalModelID ?? state.model,
                     transportOutcome: "send_error",
                     attemptLane: 1,
-                    failureClass: "transport_timeout",
+                    failureClass: requestDeadline.stage == .firstResponse
+                        ? "transport_timeout_first_byte"
+                        : "transport_timeout",
                     timeoutStage: requestDeadline.stage,
                     upstreamHTTPStatus: nil,
                     retryCount: 0,
@@ -16401,7 +16491,11 @@ class ThinkingProxy {
 
         let clientRequestedStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
         let transportPolicy = effectiveNVIDIADirectTransportPolicy()
-        let upstreamBody = body
+        let upstreamBody = OpenAICompatTemporaryShim.rewrittenNVIDIADirectUpstreamRequestJSON(
+            method: method,
+            path: path,
+            jsonString: body
+        ) ?? body
 
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -16807,6 +16901,7 @@ class ThinkingProxy {
                     headers: headers,
                     body: bodyData,
                     coalescingKey: state.coalescingKey,
+                    overridingModel: state.model,
                     overridingHeaders: requestTrace.responseHeaders
                 )
             case .sendError(let statusCode, let message):
