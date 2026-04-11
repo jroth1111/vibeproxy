@@ -156,6 +156,29 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("factory worker health request uses the minimal canary payload", recorder: recorder) {
+            let request = OpenAICompatTemporaryShim.syntheticFactoryWorkerHealthRequestForTesting(
+                routeModel: "custom:Proxy-Worker-Smart-Router-8"
+            )
+            let json = parseJSONObject(request, recorder: recorder)
+            let messages = json["messages"] as? [[String: Any]]
+            let firstMessage = messages?.first
+            let tools = json["tools"] as? [[String: Any]]
+
+            expectEqual(firstMessage?["content"] as? String, "Hi", "factory worker health routing should evaluate candidates with the minimal prompt", recorder: recorder)
+            expectEqual(json["max_tokens"] as? Int, 1, "factory worker health routing should cap the synthetic request to one token", recorder: recorder)
+            expectEqual(tools?.count, 1, "factory worker health routing should still preserve the worker tool surface during candidate evaluation", recorder: recorder)
+        }
+
+        run("cost factor gives zero-priced models a non-neutral multiplier", recorder: recorder) {
+            let glm5CostFactor = OpenAICompatTemporaryShim.costFactorForTesting(forRequestModel: "glm5")
+            let museCostFactor = OpenAICompatTemporaryShim.costFactorForTesting(forRequestModel: "muse-spark")
+
+            expectEqual(glm5CostFactor > 1.0, true, "zero-priced models should no longer collapse to a neutral cost multiplier", recorder: recorder)
+            expectEqual(glm5CostFactor > 3.0, true, "the default zero-priced multiplier should preserve the intended ~3.98x cost preference", recorder: recorder)
+            expectEqual(abs(glm5CostFactor - museCostFactor) < 0.0001, true, "until explicit prices are configured, zero-priced models should share the same cost multiplier", recorder: recorder)
+        }
+
         run("canonical nvidia route identity preserves mitigation when aliases are renamed", recorder: recorder) {
             withMergedConfig(renamedAliasMergedConfigYAML()) {
                 let request = """
@@ -9200,6 +9223,61 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(routes["zai::glm-5-turbo"] == nil, true, "persisted route-health file should delete stale glm-5-turbo entries after reload", recorder: recorder)
                 expectEqual((routes["zai::glm-5.1"] as? [String: Any])?["failure_score"] as? Int, 2, "persisted route-health file should retain current glm-5.1 state", recorder: recorder)
+            }
+        }
+
+        run("persisted route-health rolling metrics write only recent-window samples", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let now = Date()
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: now,
+                        requestModel: "glm5",
+                        requestedAlias: nil,
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_error",
+                        healthTransition: nil,
+                        attemptLane: 1,
+                        winnerAttemptLane: nil,
+                        failoverDepth: nil,
+                        finalWinnerRequestModel: nil,
+                        failureClass: "transport_timeout",
+                        timeoutStage: .firstResponse,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "live_request",
+                        firstByteLatencyMilliseconds: 1234,
+                        totalLatencyMilliseconds: 4321,
+                        inflightAtRequest: nil,
+                        proxyRequestID: nil,
+                        callerRequestID: nil,
+                        callerSessionID: nil,
+                        requestShape: nil,
+                        negotiatedApplicationProtocol: nil
+                    ),
+                    at: now
+                )
+                OpenAICompatTemporaryShim.forcePersistRouteHealthForTesting()
+
+                guard let path = ProcessInfo.processInfo.environment["VIBEPROXY_ROUTE_HEALTH_PATH"],
+                      let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+                    recorder.recordFailure("expected persisted route-health file after forced flush")
+                    return
+                }
+
+                let rawJSON = parseDataJSONObject(rawData, recorder: recorder)
+                let routes = rawJSON["routes"] as? [String: Any]
+                let glm5 = routes?["nvidia::z-ai/glm5"] as? [String: Any]
+                let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
+
+                expectEqual(rawJSON["version"] as? Int, 8, "route-health persistence should bump the schema version after removing cumulative rolling counters", recorder: recorder)
+                expectEqual(rollingMetrics?["request_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative request counts", recorder: recorder)
+                expectEqual(rollingMetrics?["success_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative success counts", recorder: recorder)
+                expectEqual(rollingMetrics?["timeout_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative timeout counts", recorder: recorder)
+                expectEqual(rollingMetrics?["invalid_success_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative invalid-success counts", recorder: recorder)
+                expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.isEmpty, false, "persisted rolling metrics should retain recent outcomes for rate computations", recorder: recorder)
             }
         }
 

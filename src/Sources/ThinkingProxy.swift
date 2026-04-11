@@ -291,37 +291,21 @@ enum OpenAICompatTemporaryShim {
     }
 
     struct RouteRollingMetrics: Equatable {
-        let requestCount: Int
-        let successCount: Int
-        let timeoutCount: Int
-        let invalidSuccessCount: Int
         let recentOutcomes: [String]
         let recentFirstByteLatencyMilliseconds: [Int]
         let recentTotalLatencyMilliseconds: [Int]
 
         init(
-            requestCount: Int,
-            successCount: Int,
-            timeoutCount: Int,
-            invalidSuccessCount: Int,
             recentOutcomes: [String],
             recentFirstByteLatencyMilliseconds: [Int],
             recentTotalLatencyMilliseconds: [Int] = []
         ) {
-            self.requestCount = requestCount
-            self.successCount = successCount
-            self.timeoutCount = timeoutCount
-            self.invalidSuccessCount = invalidSuccessCount
             self.recentOutcomes = recentOutcomes
             self.recentFirstByteLatencyMilliseconds = recentFirstByteLatencyMilliseconds
             self.recentTotalLatencyMilliseconds = recentTotalLatencyMilliseconds
         }
 
         static let empty = RouteRollingMetrics(
-            requestCount: 0,
-            successCount: 0,
-            timeoutCount: 0,
-            invalidSuccessCount: 0,
             recentOutcomes: [],
             recentFirstByteLatencyMilliseconds: [],
             recentTotalLatencyMilliseconds: []
@@ -551,6 +535,9 @@ enum OpenAICompatTemporaryShim {
         case economy = 0.6
         case free = 0.4
     }
+
+    private static let smartAliasCostPreference = 0.3
+    private static let inputPricePerMillionTokensByCanonicalModelID: [String: Double] = [:]
 
     enum FailureClass: String, Hashable {
         case emptyBody = "empty_body"
@@ -828,6 +815,10 @@ enum OpenAICompatTemporaryShim {
         private var discoveredLimitUpdatedAt: [String: Date] = [:]
         private var consecutiveSuccessesAtLimit: [String: Int] = [:]
         private var concurrent429Buckets: [String: (inflightLevel: Int, count: Int)] = [:]
+        /// Tracks when inflightCounts[key] first went from 0 to >0, used to detect leaked slots.
+        private var inflightSince: [String: Date] = [:]
+        /// Maximum time a slot can be held before it's considered leaked.
+        private let slotLeakThreshold: TimeInterval = 10 * 60  // 10 minutes
 
         private let defaultConcurrencyLimit = 3
         private let maxConcurrencyLimit = 8
@@ -881,10 +872,32 @@ enum OpenAICompatTemporaryShim {
         func resetForTesting() {
             queue.sync {
                 inflightCounts.removeAll()
+                inflightSince.removeAll()
                 discoveredLimits.removeAll()
                 discoveredLimitUpdatedAt.removeAll()
                 consecutiveSuccessesAtLimit.removeAll()
                 concurrent429Buckets.removeAll()
+            }
+        }
+
+        /// Reset inflight counts for routes whose slots have been held beyond the leak threshold.
+        /// Called from the maintenance timer to recover from crashed requests that never released.
+        func sanitizeStaleSlots() {
+            queue.sync {
+                let now = Date()
+                var leakedRoutes: [String] = []
+                for (key, sinceDate) in inflightSince {
+                    let heldDuration = now.timeIntervalSince(sinceDate)
+                    if heldDuration > slotLeakThreshold {
+                        leakedRoutes.append(key)
+                    }
+                }
+                for key in leakedRoutes {
+                    let previousCount = inflightCounts[key] ?? 0
+                    inflightCounts[key] = 0
+                    inflightSince.removeValue(forKey: key)
+                    NSLog("[ThinkingProxy] Concurrency: recovered %d leaked slot(s) for route %@ (held for >%.0fs)", previousCount, key, slotLeakThreshold)
+                }
             }
         }
 
@@ -896,6 +909,9 @@ enum OpenAICompatTemporaryShim {
                     return false
                 }
                 inflightCounts[routeHealthKey] = current + 1
+                if current == 0 {
+                    inflightSince[routeHealthKey] = Date()
+                }
                 return true
             }
         }
@@ -903,7 +919,11 @@ enum OpenAICompatTemporaryShim {
         func releaseSlot(routeHealthKey: String) {
             queue.sync {
                 let current = inflightCounts[routeHealthKey] ?? 0
-                inflightCounts[routeHealthKey] = max(0, current - 1)
+                let newCount = max(0, current - 1)
+                inflightCounts[routeHealthKey] = newCount
+                if newCount == 0 {
+                    inflightSince.removeValue(forKey: routeHealthKey)
+                }
             }
         }
 
@@ -973,6 +993,22 @@ enum OpenAICompatTemporaryShim {
 
         func currentLimit(routeHealthKey: String) -> Int {
             queue.sync { effectiveLimitLocked(routeHealthKey: routeHealthKey) }
+        }
+
+        func sanitizeStaleSlots(now: Date = Date()) {
+            queue.sync {
+                let staleRoutes = inflightSince.compactMap { routeHealthKey, startedAt -> String? in
+                    guard now.timeIntervalSince(startedAt) >= slotLeakThreshold else {
+                        return nil
+                    }
+                    return routeHealthKey
+                }
+                guard !staleRoutes.isEmpty else { return }
+                for routeHealthKey in staleRoutes {
+                    inflightCounts.removeValue(forKey: routeHealthKey)
+                    inflightSince.removeValue(forKey: routeHealthKey)
+                }
+            }
         }
 
         // MARK: - Persistence
@@ -3435,6 +3471,14 @@ enum OpenAICompatTemporaryShim {
         routeHealthSnapshot()
     }
 
+    static func syntheticFactoryWorkerHealthRequestForTesting(routeModel: String) -> String {
+        ThinkingProxy.syntheticFactoryWorkerHealthRequestForTesting(routeModel: routeModel)
+    }
+
+    static func costFactorForTesting(forRequestModel model: String) -> Double {
+        costFactor(forRequestModel: model)
+    }
+
     static func reloadPersistedRouteHealthForTesting() {
         routeHealthQueue.sync {
             routeHealthPersistWorkItem?.cancel()
@@ -4579,10 +4623,6 @@ enum OpenAICompatTemporaryShim {
         }
 
         return RouteRollingMetrics(
-            requestCount: prior.requestCount + 1,
-            successCount: prior.successCount + (telemetryEvent.failureClass == nil ? 1 : 0),
-            timeoutCount: prior.timeoutCount + (telemetryEvent.failureClass == "transport_timeout" ? 1 : 0),
-            invalidSuccessCount: prior.invalidSuccessCount + (isInvalidSuccessFailureClass(telemetryEvent.failureClass) ? 1 : 0),
             recentOutcomes: recentOutcomes,
             recentFirstByteLatencyMilliseconds: recentFirstByteLatencyMilliseconds,
             recentTotalLatencyMilliseconds: recentTotalLatencyMilliseconds
@@ -4669,7 +4709,7 @@ enum OpenAICompatTemporaryShim {
         }
         let tier = modelTier(forRequestModel: requestModel)
         let momentum = state?.momentumBonus(at: now) ?? 0.0
-        let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue
+        let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue * costFactor(forRequestModel: requestModel)
         return (
             healthPriority: healthPriority,
             compositeScore: adjustedScore,
@@ -4693,7 +4733,7 @@ enum OpenAICompatTemporaryShim {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 7,
+              let version = json["version"] as? Int, version >= 1, version <= 8,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -4790,6 +4830,7 @@ enum OpenAICompatTemporaryShim {
         let healthyEmaThreshold: Double = 0.8
         let minimumHealObservations = 3
         let minimumHealSuccessRate = 0.2
+        let maxSuspectStaleness: TimeInterval = 30 * 60   // 30 minutes — auto-close suspect routes with no activity
         let now = Date()
         var healedAny = false
         for key in routeCircuitStatesByRouteHealthKey.keys {
@@ -4805,10 +4846,32 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
 
+            let age = now.timeIntervalSince(lastActivityDate)
+
+            // Auto-close suspect routes that have been stale beyond the maximum threshold,
+            // regardless of recovery evidence. Without this, routes with zero observations
+            // (e.g., direct requests that bypassed telemetry) stay suspect forever.
+            if age > maxSuspectStaleness {
+                NSLog("[ThinkingProxy] Self-heal: promoting route %@ from suspect to closed (stale for %ds, no observations needed)", key, Int(age))
+                routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
+                    status: .closed,
+                    failureScore: 0,
+                    recoverySuccesses: 0,
+                    openUntil: nil,
+                    lastScoreUpdatedAt: now,
+                    lastTelemetryEvent: state.lastTelemetryEvent,
+                    rollingMetrics: state.rollingMetrics,
+                    emaMetrics: state.emaMetrics,
+                    recoveredAt: now,
+                    nvidiaInferenceProbe: state.nvidiaInferenceProbe
+                )
+                healedAny = true
+                continue
+            }
+
             let emaSuccessRate = state.emaMetrics.successRate
             let staleThreshold = emaSuccessRate >= healthyEmaThreshold ? healthyEmaStaleThreshold : defaultStaleThreshold
 
-            let age = now.timeIntervalSince(lastActivityDate)
             let hasRecoveryEvidence =
                 state.emaMetrics.observationCount >= minimumHealObservations &&
                 emaSuccessRate >= minimumHealSuccessRate
@@ -4843,6 +4906,20 @@ enum OpenAICompatTemporaryShim {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             healStaleSuspectRoutesLocked()
+            purgeExpiredCooldownsLocked()
+        }
+        concurrencyRegistry.sanitizeStaleSlots()
+    }
+
+    /// Remove expired cooldown entries to prevent unbounded dict growth.
+    /// Must be called on routeHealthQueue.
+    private static func purgeExpiredCooldownsLocked() {
+        let now = Date()
+        let before = routeCooldownsByRouteHealthKey.count
+        routeCooldownsByRouteHealthKey = routeCooldownsByRouteHealthKey.filter { $0.value > now }
+        let removed = before - routeCooldownsByRouteHealthKey.count
+        if removed > 0 {
+            NSLog("[ThinkingProxy] Maintenance: purged %d expired cooldown entries (%d remaining)", removed, routeCooldownsByRouteHealthKey.count)
         }
     }
 
@@ -4947,7 +5024,7 @@ enum OpenAICompatTemporaryShim {
 
         let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
-            "version": 7,
+            "version": 8,
             "routes": routes,
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns
@@ -5072,10 +5149,6 @@ enum OpenAICompatTemporaryShim {
 
     private static func rollingMetricsDictionary(_ metrics: RouteRollingMetrics) -> [String: Any] {
         [
-            "request_count": metrics.requestCount,
-            "success_count": metrics.successCount,
-            "timeout_count": metrics.timeoutCount,
-            "invalid_success_count": metrics.invalidSuccessCount,
             "recent_outcomes": metrics.recentOutcomes,
             "recent_first_byte_latency_ms": metrics.recentFirstByteLatencyMilliseconds,
             "recent_total_latency_ms": metrics.recentTotalLatencyMilliseconds
@@ -5123,10 +5196,6 @@ enum OpenAICompatTemporaryShim {
             return .empty
         }
         return RouteRollingMetrics(
-            requestCount: integerValue(dict["request_count"]) ?? 0,
-            successCount: integerValue(dict["success_count"]) ?? 0,
-            timeoutCount: integerValue(dict["timeout_count"]) ?? 0,
-            invalidSuccessCount: integerValue(dict["invalid_success_count"]) ?? 0,
             recentOutcomes: dict["recent_outcomes"] as? [String] ?? [],
             recentFirstByteLatencyMilliseconds: dict["recent_first_byte_latency_ms"] as? [Int] ?? [],
             recentTotalLatencyMilliseconds: dict["recent_total_latency_ms"] as? [Int] ?? []
@@ -5700,6 +5769,23 @@ enum OpenAICompatTemporaryShim {
             return tier
         }
         return .standard
+    }
+
+    private static func canonicalModelIDForCostFactor(forRequestModel model: String) -> String {
+        if let route = resolveRouteIdentityForAnyProvider(forRequestModel: model) {
+            return route.canonicalModelID
+        }
+        return normalizedRequestModel(model)
+    }
+
+    static func costFactor(forRequestModel model: String) -> Double {
+        let canonicalModelID = canonicalModelIDForCostFactor(forRequestModel: model)
+        let pricePerMillionTokens = inputPricePerMillionTokensByCanonicalModelID[canonicalModelID] ?? 0.0
+        guard smartAliasCostPreference > 0 else { return 1.0 }
+        guard pricePerMillionTokens > 0 else {
+            return pow(100.0, smartAliasCostPreference)
+        }
+        return pow(1.0 / (pricePerMillionTokens + 0.01), smartAliasCostPreference)
     }
 
     private static func reasoningString(from message: [String: Any]) -> String {
@@ -17673,64 +17759,13 @@ class ThinkingProxy {
             return [routeModel]
         }
 
-        let syntheticWorkerRequest = """
-        {
-          "model": "\(routeModel)",
-          "messages": [
-            {
-              "role": "user",
-              "content": "Return exactly: OK"
-            }
-          ],
-          "tools": [
-            {
-              "type": "function",
-              "function": {
-                "name": "noop",
-                "parameters": {
-                  "type": "object",
-                  "properties": {}
-                }
-              }
-            }
-          ]
-        }
-        """
+        let syntheticWorkerRequest = syntheticFactoryWorkerHealthRequest(routeModel: routeModel)
 
         return OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
             forPublicAlias: routeModel,
             method: "POST",
             path: "/v1/chat/completions",
             jsonString: syntheticWorkerRequest,
-            smartAlias: smartAlias
-        )
-    }
-
-    private static func effectiveFactoryResponsesFallbackCandidateModels(
-        routeModel: String
-    ) -> [String] {
-        guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) else {
-            return [routeModel]
-        }
-
-        let syntheticPlainChatRequest = """
-        {
-          "model": "\(routeModel)",
-          "messages": [
-            {
-              "role": "user",
-              "content": "Return exactly: OK"
-            }
-          ],
-          "max_tokens": 32
-        }
-        """
-
-        return OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
-            forPublicAlias: routeModel,
-            method: "POST",
-            path: "/v1/chat/completions",
-            jsonString: syntheticPlainChatRequest,
             smartAlias: smartAlias
         )
     }
@@ -17787,9 +17822,10 @@ class ThinkingProxy {
           "messages": [
             {
               "role": "user",
-              "content": "Return exactly: OK"
+              "content": "Hi"
             }
           ],
+          "max_tokens": 1,
           "tools": [
             {
               "type": "function",
@@ -17804,6 +17840,10 @@ class ThinkingProxy {
           ]
         }
         """
+    }
+
+    static func syntheticFactoryWorkerHealthRequestForTesting(routeModel: String) -> String {
+        syntheticFactoryWorkerHealthRequest(routeModel: routeModel)
     }
 
     private static func factoryWorkerHealthCandidateIsDispatchable(
