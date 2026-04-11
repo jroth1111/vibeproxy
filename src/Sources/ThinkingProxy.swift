@@ -12704,6 +12704,7 @@ class ThinkingProxy {
             sessionKey: sessionKey,
             requestJSON: body,
             requestModel: candidateModel,
+            clientRequestedStream: clientRequestedStream,
             onChunk: lockMeaningfulOutputIfNeeded,
             completion: handleTransportResponse
         ) else {
@@ -14572,7 +14573,7 @@ class ThinkingProxy {
             var engine = NVIDIAStreamEngine()
             var bufferedSink = NVIDIABufferedAccumulatorSink()
             var streamedSink = clientRequestedStream
-                ? NVIDIAEventStreamSink(policy: Self.nvidiaDirectTransportPolicy.sinkPolicy)
+                ? NVIDIAEventStreamSink(policy: effectiveNVIDIADirectTransportPolicy().sinkPolicy)
                 : nil
 
             do {
@@ -15209,6 +15210,7 @@ class ThinkingProxy {
             sessionKey: sessionKey,
             requestJSON: body,
             requestModel: state.model,
+            clientRequestedStream: clientRequestedStream,
             onChunk: handleLiveStreamingChunk,
             completion: handleTransportResponse
         ) else {
@@ -15224,11 +15226,25 @@ class ThinkingProxy {
             )
             return
         }
+        attemptStateQueue.sync {
+            transportCancel = cancel
+        }
         coordinator.registerAttempt(attemptLane: attemptLane) {
             permit.release()
-            cancel()
+            let cancelAction: (() -> Void)? = attemptStateQueue.sync {
+                liveStreamFinished = true
+                cancelStreamingTimersLocked()
+                return transportCancel
+            }
+            cancelAction?()
         }
         requestController.registerCurrentCancel {
+            let cancelAction: (() -> Void)? = attemptStateQueue.sync {
+                liveStreamFinished = true
+                cancelStreamingTimersLocked()
+                return transportCancel
+            }
+            cancelAction?()
             _ = coordinator.tryFinish(attemptLane: 0)
         }
         if attemptLane == 1, hedgeEligible {
@@ -16268,13 +16284,16 @@ class ThinkingProxy {
                     routePayload["concurrency_limit"] = OpenAICompatTemporaryShim.currentConcurrencyLimit(routeHealthKey: route.routeHealthKey)
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
                     if route.providerID == "nvidia" {
+                        let transportPolicy = effectiveNVIDIADirectTransportPolicy()
                         let recentLiveSuccess = OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: requestModel) &&
                             state.lastTelemetryEvent?.source != "canary"
                         routePayload["nvidia_stream_diagnostics"] = [
-                            "transport_protocol": Self.nvidiaDirectTransportPolicy.protocolPreference.rawValue,
-                            "inter_chunk_read_timeout_seconds": Int(Self.nvidiaDirectTransportPolicy.interChunkReadTimeoutSeconds),
-                            "downstream_keepalives_enabled": Self.nvidiaDirectTransportPolicy.sinkPolicy.emitsDownstreamKeepalives,
-                            "downstream_keepalive_interval_seconds": Int(Self.nvidiaDirectTransportPolicy.sinkPolicy.keepaliveIntervalSeconds)
+                            "transport_protocol": transportPolicy.protocolPreference.rawValue,
+                            "inter_chunk_read_timeout_seconds": Int(transportPolicy.interChunkReadTimeoutSeconds),
+                            "downstream_keepalives_enabled": transportPolicy.sinkPolicy.emitsDownstreamKeepalives,
+                            "downstream_keepalive_interval_seconds": Int(transportPolicy.sinkPolicy.keepaliveIntervalSeconds),
+                            "chunk_gap_timeout_runtime_owner": "nvidia_direct_live_stream",
+                            "downstream_keepalive_runtime_owner": "nvidia_direct_live_stream"
                         ]
                         var livenessPayload: [String: Any] = [
                             "trusted": OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: requestModel),
