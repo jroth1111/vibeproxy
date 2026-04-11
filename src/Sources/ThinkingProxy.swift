@@ -13011,9 +13011,17 @@ class ThinkingProxy {
             )
             return
         }
+        lockingQueue.sync {
+            transportCancel = cancel
+        }
         controller?.registerCurrentCancel {
             permit.release()
-            cancel()
+            let cancelAction: (() -> Void)? = lockingQueue.sync {
+                liveStreamFinished = true
+                cancelStreamingTimersLocked()
+                return transportCancel
+            }
+            cancelAction?()
         }
     }
 
