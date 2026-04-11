@@ -1,7 +1,7 @@
 import Foundation
 
 enum NVIDIATransportProtocolPreference: String, Equatable {
-    case http1Preferred
+    case http1Only
 }
 
 struct NVIDIAStreamSinkPolicy: Equatable {
@@ -31,7 +31,7 @@ struct NVIDIATransportPolicy: Equatable {
     let sinkPolicy: NVIDIAStreamSinkPolicy
 
     static let direct = NVIDIATransportPolicy(
-        protocolPreference: .http1Preferred,
+        protocolPreference: .http1Only,
         requestTimeoutSeconds: 300,
         resourceTimeoutSeconds: 360,
         interChunkReadTimeoutSeconds: 300,
@@ -39,13 +39,12 @@ struct NVIDIATransportPolicy: Equatable {
         sinkPolicy: .streamed
     )
 
-    func sessionConfiguration(
+    func scaledTimeoutBudget(
         scaleTimeout: (TimeInterval) -> TimeInterval
-    ) -> URLSessionConfiguration {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = scaleTimeout(requestTimeoutSeconds)
-        configuration.timeoutIntervalForResource = scaleTimeout(resourceTimeoutSeconds)
-        configuration.waitsForConnectivity = waitsForConnectivity
-        return configuration
+    ) -> (request: TimeInterval, resource: TimeInterval) {
+        (
+            request: scaleTimeout(requestTimeoutSeconds),
+            resource: scaleTimeout(resourceTimeoutSeconds)
+        )
     }
 }

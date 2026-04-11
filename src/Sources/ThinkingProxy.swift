@@ -9521,53 +9521,7 @@ class ThinkingProxy {
         acquireProxiedSession(proxyURL: proxyURL)?.0
     }
 
-    private static let directPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.direct-session-pool")
-    private static var directSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
-    private static let directPoolMaxSize = 8
-    private static let directPoolIdleEviction: TimeInterval = 300
     private static let nvidiaDirectTransportPolicy = NVIDIATransportPolicy.direct
-
-    private static func acquireDirectSession(key: String) -> (URLSession, MultiplexedSessionDelegate)? {
-        directPoolQueue.sync {
-            evictIdleDirectSessionsLocked()
-
-            if let existing = directSessionPool[key] {
-                directSessionPool[key] = (existing.session, existing.delegate, lastUsed: Date())
-                return (existing.session, existing.delegate)
-            }
-
-            let configuration = nvidiaDirectTransportPolicy.sessionConfiguration(
-                scaleTimeout: OpenAICompatTemporaryShim.scaledRequestTimeout
-            )
-            let delegate = MultiplexedSessionDelegate()
-            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
-
-            if directSessionPool.count >= directPoolMaxSize {
-                if let oldestKey = directSessionPool.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
-                    directSessionPool[oldestKey]?.session.finishTasksAndInvalidate()
-                    directSessionPool.removeValue(forKey: oldestKey)
-                }
-            }
-
-            directSessionPool[key] = (session, delegate, lastUsed: Date())
-            return (session, delegate)
-        }
-    }
-
-    static func evictDirectSession(key: String, session: URLSession? = nil) {
-        directPoolQueue.sync {
-            guard let existing = directSessionPool[key] else { return }
-            if let session, existing.session !== session {
-                return
-            }
-            existing.session.finishTasksAndInvalidate()
-            directSessionPool.removeValue(forKey: key)
-        }
-    }
-
-    static func acquireDirectSessionForTesting(key: String) -> URLSession? {
-        acquireDirectSession(key: key)?.0
-    }
 
     static func nvidiaDirectTransportPolicyForTesting() -> NVIDIATransportPolicy {
         nvidiaDirectTransportPolicy
@@ -9577,21 +9531,536 @@ class ThinkingProxy {
         nvidiaDirectTransportPolicyOverrideForTesting ?? Self.nvidiaDirectTransportPolicy
     }
 
-    private static func evictIdleDirectSessionsLocked() {
-        let now = Date()
-        let stale = directSessionPool.filter { now.timeIntervalSince($0.value.lastUsed) > directPoolIdleEviction }
-        for (key, entry) in stale {
-            entry.session.finishTasksAndInvalidate()
-            directSessionPool.removeValue(forKey: key)
+    private static let nvidiaDirectTransportRuntimeOwner = "nvidia_direct_http11_transport"
+
+    enum NVIDIAHTTP1BodyMode: Equatable {
+        case contentLength(Int)
+        case chunked
+        case untilConnectionClose
+    }
+
+    struct NVIDIAHTTP1ParsedHead: Equatable {
+        let statusCode: Int
+        let httpVersion: String
+        let headerFields: [String: String]
+        let bodyMode: NVIDIAHTTP1BodyMode
+        let consumedBytes: Int
+
+        var negotiatedApplicationProtocol: String {
+            httpVersion.lowercased()
         }
     }
 
-    static func clearDirectSessionPoolForTesting() {
-        directPoolQueue.sync {
-            for (_, entry) in directSessionPool {
-                entry.session.finishTasksAndInvalidate()
+    enum NVIDIAHTTP1ParserError: Error {
+        case invalidResponseHead
+        case unsupportedHTTPVersion(String)
+        case invalidChunkFraming
+        case incompleteResponseBody
+    }
+
+    static func parseNVIDIAHTTP1ResponseHeadForTesting(_ data: Data) throws -> NVIDIAHTTP1ParsedHead {
+        try parseNVIDIAHTTP1ResponseHead(from: data)
+    }
+
+    static func consumeNVIDIAHTTP1ChunkedBodyForTesting(_ data: Data) throws -> [Data] {
+        var buffer = data
+        var currentChunkSize: Int?
+        var awaitingTrailers = false
+        let result = try consumeNVIDIAHTTP1ChunkedBody(
+            buffer: &buffer,
+            currentChunkSize: &currentChunkSize,
+            awaitingTrailers: &awaitingTrailers
+        )
+        guard result.completed, buffer.isEmpty else {
+            throw NVIDIAHTTP1ParserError.incompleteResponseBody
+        }
+        return result.chunks
+    }
+
+    private static func parseNVIDIAHTTP1ResponseHead(from data: Data) throws -> NVIDIAHTTP1ParsedHead {
+        let separator = Data("\r\n\r\n".utf8)
+        guard let headerRange = data.range(of: separator),
+              let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
+            throw NVIDIAHTTP1ParserError.invalidResponseHead
+        }
+
+        let lines = headerText.components(separatedBy: "\r\n")
+        guard let statusLine = lines.first, !statusLine.isEmpty else {
+            throw NVIDIAHTTP1ParserError.invalidResponseHead
+        }
+
+        let statusParts = statusLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard statusParts.count >= 2,
+              let statusCode = Int(statusParts[1]) else {
+            throw NVIDIAHTTP1ParserError.invalidResponseHead
+        }
+
+        let httpVersion = String(statusParts[0])
+        guard httpVersion.uppercased() == "HTTP/1.1" else {
+            throw NVIDIAHTTP1ParserError.unsupportedHTTPVersion(httpVersion)
+        }
+
+        var headerFields: [String: String] = [:]
+        for line in lines.dropFirst() where !line.isEmpty {
+            guard let separatorIndex = line.firstIndex(of: ":") else { continue }
+            let name = String(line[..<separatorIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(line[line.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            if let existing = headerFields[name], !existing.isEmpty {
+                headerFields[name] = "\(existing), \(value)"
+            } else {
+                headerFields[name] = value
             }
-            directSessionPool = [:]
+        }
+
+        let bodyMode: NVIDIAHTTP1BodyMode
+        if let transferEncoding = headerFields.first(where: { $0.key.caseInsensitiveCompare("Transfer-Encoding") == .orderedSame })?.value,
+           transferEncoding.lowercased().contains("chunked") {
+            bodyMode = .chunked
+        } else if let contentLengthString = headerFields.first(where: { $0.key.caseInsensitiveCompare("Content-Length") == .orderedSame })?.value,
+                  let contentLength = Int(contentLengthString) {
+            bodyMode = .contentLength(max(0, contentLength))
+        } else {
+            bodyMode = .untilConnectionClose
+        }
+
+        return NVIDIAHTTP1ParsedHead(
+            statusCode: statusCode,
+            httpVersion: httpVersion,
+            headerFields: headerFields,
+            bodyMode: bodyMode,
+            consumedBytes: headerRange.upperBound
+        )
+    }
+
+    private static func consumeNVIDIAHTTP1ChunkedBody(
+        buffer: inout Data,
+        currentChunkSize: inout Int?,
+        awaitingTrailers: inout Bool
+    ) throws -> (chunks: [Data], completed: Bool) {
+        let crlf = Data("\r\n".utf8)
+        let doubleCRLF = Data("\r\n\r\n".utf8)
+        var emitted: [Data] = []
+
+        while true {
+            if awaitingTrailers {
+                if buffer.starts(with: crlf) {
+                    buffer.removeSubrange(0..<crlf.count)
+                    return (emitted, true)
+                }
+                if let trailerRange = buffer.range(of: doubleCRLF) {
+                    buffer.removeSubrange(0..<trailerRange.upperBound)
+                    return (emitted, true)
+                }
+                return (emitted, false)
+            }
+
+            if currentChunkSize == nil {
+                guard let lineRange = buffer.range(of: crlf) else {
+                    return (emitted, false)
+                }
+                let lineData = buffer[..<lineRange.lowerBound]
+                guard let line = String(data: lineData, encoding: .utf8) else {
+                    throw NVIDIAHTTP1ParserError.invalidChunkFraming
+                }
+                let sizeText = line
+                    .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+                    .first
+                    .map(String.init)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard let parsedSize = Int(sizeText, radix: 16) else {
+                    throw NVIDIAHTTP1ParserError.invalidChunkFraming
+                }
+                buffer.removeSubrange(0..<lineRange.upperBound)
+                if parsedSize == 0 {
+                    awaitingTrailers = true
+                    continue
+                }
+                currentChunkSize = parsedSize
+            }
+
+            guard let chunkSize = currentChunkSize else {
+                continue
+            }
+            guard buffer.count >= chunkSize + crlf.count else {
+                return (emitted, false)
+            }
+
+            let chunk = Data(buffer.prefix(chunkSize))
+            let trailingCRLFRange = chunkSize..<(chunkSize + crlf.count)
+            guard Data(buffer[trailingCRLFRange]) == crlf else {
+                throw NVIDIAHTTP1ParserError.invalidChunkFraming
+            }
+            emitted.append(chunk)
+            buffer.removeSubrange(0..<(chunkSize + crlf.count))
+            currentChunkSize = nil
+        }
+    }
+
+    private final class NVIDIAHTTP1TransportAttempt {
+        private let request: URLRequest
+        private let host: String
+        private let port: UInt16
+        private let policy: NVIDIATransportPolicy
+        private let firstResponseSeconds: TimeInterval?
+        private let bufferedResponseSeconds: TimeInterval?
+        private let onChunk: (Data, Date) -> Void
+        private let completion: (NVIDIADirectTransportResponse) -> Void
+
+        private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-http11-transport")
+        private var connection: NWConnection?
+        private var tracker = OpenAICompatTemporaryShim.ResponseDeadlineTracker()
+        private var firstResponseDeadlineWorkItem: DispatchWorkItem?
+        private var bufferedResponseDeadlineWorkItem: DispatchWorkItem?
+        private var completed = false
+        private var startedAt = Date()
+        private var firstPayloadAt: Date?
+        private var rawBuffer = Data()
+        private var responseChunks: [Data] = []
+        private var responseHead: NVIDIAHTTP1ParsedHead?
+        private var remainingContentLength: Int?
+        private var currentChunkSize: Int?
+        private var awaitingChunkTrailers = false
+
+        init(
+            request: URLRequest,
+            host: String,
+            port: UInt16,
+            policy: NVIDIATransportPolicy,
+            firstResponseSeconds: TimeInterval?,
+            bufferedResponseSeconds: TimeInterval?,
+            onChunk: @escaping (Data, Date) -> Void,
+            completion: @escaping (NVIDIADirectTransportResponse) -> Void
+        ) {
+            self.request = request
+            self.host = host
+            self.port = port
+            self.policy = policy
+            self.firstResponseSeconds = firstResponseSeconds
+            self.bufferedResponseSeconds = bufferedResponseSeconds
+            self.onChunk = onChunk
+            self.completion = completion
+        }
+
+        func start() -> (() -> Void)? {
+            guard let endpointPort = NWEndpoint.Port(rawValue: port) else {
+                return nil
+            }
+            let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+            stateQueue.sync {
+                self.connection = connection
+                self.startedAt = Date()
+                self.scheduleFirstResponseDeadlineLocked()
+                self.scheduleBufferedResponseDeadlineLocked()
+            }
+            connection.stateUpdateHandler = { [weak self] state in
+                self?.handleConnectionState(state)
+            }
+            connection.start(queue: .global(qos: .userInitiated))
+            return { [weak self] in
+                self?.cancel()
+            }
+        }
+
+        private func handleConnectionState(_ state: NWConnection.State) {
+            switch state {
+            case .ready:
+                sendRequest()
+            case .failed(let error):
+                finish(response: nil, error: error, negotiatedApplicationProtocol: nil)
+            case .cancelled:
+                finish(response: nil, error: URLError(.cancelled), negotiatedApplicationProtocol: nil)
+            default:
+                break
+            }
+        }
+
+        private func sendRequest() {
+            guard let requestData = buildHTTPRequestData() else {
+                finish(response: nil, error: URLError(.badURL), negotiatedApplicationProtocol: nil)
+                return
+            }
+
+            connection?.send(content: requestData, completion: .contentProcessed { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    self.finish(response: nil, error: error, negotiatedApplicationProtocol: nil)
+                    return
+                }
+                self.receiveNextChunk()
+            })
+        }
+
+        private func buildHTTPRequestData() -> Data? {
+            guard let url = request.url else { return nil }
+            let path = {
+                let path = url.path.isEmpty ? "/" : url.path
+                if let query = url.query, !query.isEmpty {
+                    return "\(path)?\(query)"
+                }
+                return path
+            }()
+
+            var requestText = "\(request.httpMethod ?? "POST") \(path) HTTP/1.1\r\n"
+            let excludedHeaders: Set<String> = ["content-length", "host", "connection", "transfer-encoding"]
+            for (name, value) in request.allHTTPHeaderFields ?? [:] where !excludedHeaders.contains(name.lowercased()) {
+                requestText += "\(name): \(value)\r\n"
+            }
+            requestText += "Host: \(host):\(port)\r\n"
+            requestText += "Connection: close\r\n"
+
+            let body = request.httpBody ?? Data()
+            requestText += "Content-Length: \(body.count)\r\n"
+            requestText += "\r\n"
+
+            var requestData = Data(requestText.utf8)
+            requestData.append(body)
+            return requestData
+        }
+
+        private func receiveNextChunk() {
+            connection?.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+                if let error {
+                    self.finish(response: nil, error: error, negotiatedApplicationProtocol: nil)
+                    return
+                }
+
+                let receivedAt = Date()
+                var emittedChunks: [Data] = []
+                var finalResponse: HTTPURLResponse?
+                var finalError: Error?
+                var finalProtocol: String?
+                var shouldContinue = false
+
+                stateQueue.sync {
+                    guard !self.completed else { return }
+
+                    if let data, !data.isEmpty {
+                        self.rawBuffer.append(data)
+                    }
+
+                    do {
+                        let processResult = try self.processBufferLocked(receivedAt: receivedAt, connectionIsComplete: isComplete)
+                        emittedChunks = processResult.emittedChunks
+                        finalResponse = processResult.finalResponse
+                        finalError = processResult.finalError
+                        finalProtocol = processResult.negotiatedApplicationProtocol
+                        shouldContinue = processResult.shouldContinue
+                    } catch {
+                        finalError = error
+                        finalProtocol = self.responseHead?.negotiatedApplicationProtocol
+                    }
+                }
+
+                for chunk in emittedChunks {
+                    self.onChunk(chunk, receivedAt)
+                }
+
+                if finalResponse != nil || finalError != nil {
+                    self.finish(response: finalResponse, error: finalError, negotiatedApplicationProtocol: finalProtocol)
+                    return
+                }
+
+                if shouldContinue {
+                    self.receiveNextChunk()
+                    return
+                }
+
+                if isComplete {
+                    self.finish(response: finalResponse, error: NVIDIAHTTP1ParserError.incompleteResponseBody, negotiatedApplicationProtocol: finalProtocol)
+                }
+            }
+        }
+
+        private func processBufferLocked(
+            receivedAt: Date,
+            connectionIsComplete: Bool
+        ) throws -> (
+            emittedChunks: [Data],
+            finalResponse: HTTPURLResponse?,
+            finalError: Error?,
+            negotiatedApplicationProtocol: String?,
+            shouldContinue: Bool
+        ) {
+            if responseHead == nil {
+                do {
+                    let parsedHead = try ThinkingProxy.parseNVIDIAHTTP1ResponseHead(from: rawBuffer)
+                    responseHead = parsedHead
+                    rawBuffer.removeSubrange(0..<parsedHead.consumedBytes)
+                    if case .contentLength(let contentLength) = parsedHead.bodyMode {
+                        remainingContentLength = contentLength
+                    }
+                } catch NVIDIAHTTP1ParserError.invalidResponseHead {
+                    return (
+                        emittedChunks: [],
+                        finalResponse: nil,
+                        finalError: connectionIsComplete ? NVIDIAHTTP1ParserError.invalidResponseHead : nil,
+                        negotiatedApplicationProtocol: nil,
+                        shouldContinue: !connectionIsComplete
+                    )
+                }
+            }
+
+            guard let responseHead else {
+                return (
+                    emittedChunks: [],
+                    finalResponse: nil,
+                    finalError: nil,
+                    negotiatedApplicationProtocol: nil,
+                    shouldContinue: !connectionIsComplete
+                )
+            }
+
+            var emittedChunks: [Data] = []
+            var bodyComplete = false
+
+            switch responseHead.bodyMode {
+            case .contentLength:
+                if let remaining = remainingContentLength, remaining > 0, !rawBuffer.isEmpty {
+                    let take = min(remaining, rawBuffer.count)
+                    let chunk = Data(rawBuffer.prefix(take))
+                    rawBuffer.removeSubrange(0..<take)
+                    remainingContentLength = remaining - take
+                    if !chunk.isEmpty {
+                        recordPayloadReceivedLocked(at: receivedAt)
+                        responseChunks.append(chunk)
+                        emittedChunks.append(chunk)
+                    }
+                }
+                bodyComplete = (remainingContentLength ?? 0) == 0
+            case .chunked:
+                let chunkedResult = try ThinkingProxy.consumeNVIDIAHTTP1ChunkedBody(
+                    buffer: &rawBuffer,
+                    currentChunkSize: &currentChunkSize,
+                    awaitingTrailers: &awaitingChunkTrailers
+                )
+                if !chunkedResult.chunks.isEmpty {
+                    recordPayloadReceivedLocked(at: receivedAt)
+                    responseChunks.append(contentsOf: chunkedResult.chunks)
+                    emittedChunks.append(contentsOf: chunkedResult.chunks)
+                }
+                bodyComplete = chunkedResult.completed
+            case .untilConnectionClose:
+                if !rawBuffer.isEmpty {
+                    let chunk = rawBuffer
+                    rawBuffer.removeAll(keepingCapacity: true)
+                    recordPayloadReceivedLocked(at: receivedAt)
+                    responseChunks.append(chunk)
+                    emittedChunks.append(chunk)
+                }
+                bodyComplete = connectionIsComplete
+            }
+
+            if bodyComplete {
+                let response = HTTPURLResponse(
+                    url: request.url ?? URL(string: "http://\(host):\(port)/")!,
+                    statusCode: responseHead.statusCode,
+                    httpVersion: responseHead.httpVersion,
+                    headerFields: responseHead.headerFields
+                )
+                return (
+                    emittedChunks: emittedChunks,
+                    finalResponse: response,
+                    finalError: nil,
+                    negotiatedApplicationProtocol: responseHead.negotiatedApplicationProtocol,
+                    shouldContinue: false
+                )
+            }
+
+            return (
+                emittedChunks: emittedChunks,
+                finalResponse: nil,
+                finalError: nil,
+                negotiatedApplicationProtocol: responseHead.negotiatedApplicationProtocol,
+                shouldContinue: !connectionIsComplete
+            )
+        }
+
+        private func recordPayloadReceivedLocked(at receivedAt: Date) {
+            if firstPayloadAt == nil {
+                firstPayloadAt = receivedAt
+            }
+            tracker.payloadReceived()
+            firstResponseDeadlineWorkItem?.cancel()
+            firstResponseDeadlineWorkItem = nil
+        }
+
+        private func scheduleFirstResponseDeadlineLocked() {
+            guard let firstResponseSeconds, firstResponseSeconds > 0 else { return }
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.fireFirstResponseDeadline()
+            }
+            firstResponseDeadlineWorkItem?.cancel()
+            firstResponseDeadlineWorkItem = workItem
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + firstResponseSeconds, execute: workItem)
+        }
+
+        private func scheduleBufferedResponseDeadlineLocked() {
+            guard let bufferedResponseSeconds, bufferedResponseSeconds > 0 else { return }
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.fireBufferedResponseDeadline()
+            }
+            bufferedResponseDeadlineWorkItem?.cancel()
+            bufferedResponseDeadlineWorkItem = workItem
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + bufferedResponseSeconds, execute: workItem)
+        }
+
+        private func fireFirstResponseDeadline() {
+            let shouldFinish = stateQueue.sync { tracker.firstResponseDeadlineDidFire() && !completed }
+            guard shouldFinish else { return }
+            connection?.cancel()
+            finish(response: nil, error: URLError(.timedOut), negotiatedApplicationProtocol: responseHead?.negotiatedApplicationProtocol)
+        }
+
+        private func fireBufferedResponseDeadline() {
+            let shouldFinish = stateQueue.sync { tracker.bufferedResponseDeadlineDidFire() && !completed }
+            guard shouldFinish else { return }
+            connection?.cancel()
+            let response = stateQueue.sync {
+                responseHead.flatMap {
+                    HTTPURLResponse(
+                        url: request.url ?? URL(string: "http://\(host):\(port)/")!,
+                        statusCode: $0.statusCode,
+                        httpVersion: $0.httpVersion,
+                        headerFields: $0.headerFields
+                    )
+                }
+            }
+            finish(response: response, error: URLError(.timedOut), negotiatedApplicationProtocol: responseHead?.negotiatedApplicationProtocol)
+        }
+
+        private func cancel() {
+            connection?.cancel()
+            finish(response: nil, error: URLError(.cancelled), negotiatedApplicationProtocol: responseHead?.negotiatedApplicationProtocol)
+        }
+
+        private func finish(
+            response: HTTPURLResponse?,
+            error: Error?,
+            negotiatedApplicationProtocol: String?
+        ) {
+            let result: NVIDIADirectTransportResponse? = stateQueue.sync {
+                guard !completed else { return nil }
+                completed = true
+                firstResponseDeadlineWorkItem?.cancel()
+                firstResponseDeadlineWorkItem = nil
+                bufferedResponseDeadlineWorkItem?.cancel()
+                bufferedResponseDeadlineWorkItem = nil
+                tracker.finish()
+                return NVIDIADirectTransportResponse(
+                    chunks: responseChunks,
+                    response: response,
+                    error: error,
+                    firstByteLatencyMilliseconds: firstPayloadAt.map { Int($0.timeIntervalSince(startedAt) * 1000) },
+                    totalLatencyMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1000),
+                    deadlineStage: tracker.deadlineStage,
+                    negotiatedApplicationProtocol: negotiatedApplicationProtocol
+                )
+            }
+            if let result {
+                completion(result)
+            }
         }
     }
 
@@ -9667,7 +10136,6 @@ class ThinkingProxy {
             isRunning = false
             OpenAICompatTemporaryShim.resetConcurrencyRegistryForTesting()
             Self.clearProxiedSessionPoolForTesting()
-            Self.clearDirectSessionPoolForTesting()
             nvidiaInflightQueue.sync {
                 nvidiaRaceWaiters.removeAll()
                 inflightCoalescedRequests.removeAll()
@@ -13156,10 +13624,8 @@ class ThinkingProxy {
             }
         }
 
-        let sessionKey = "direct:127.0.0.1:\(targetPort)"
         guard let cancel = startNVIDIATransportAttempt(
             request: request,
-            sessionKey: sessionKey,
             requestJSON: body,
             requestModel: candidateModel,
             clientRequestedStream: internalStreaming,
@@ -15071,7 +15537,6 @@ class ThinkingProxy {
     @discardableResult
     private func startNVIDIATransportAttempt(
         request: URLRequest,
-        sessionKey: String,
         requestJSON: String,
         requestModel: String,
         clientRequestedStream: Bool,
@@ -15090,47 +15555,11 @@ class ThinkingProxy {
             return nvidiaDirectTransportForTesting(request, completion)
         }
 
-        guard let (session, directPoolDelegate) = ThinkingProxy.acquireDirectSession(key: sessionKey) else {
-            return nil
-        }
-
-        let responseChunksQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-chunks")
-        var responseChunks: [Data] = []
-        let responseProgress = ResponseProgressDelegate { chunk, receivedAt in
-            responseChunksQueue.sync {
-                responseChunks.append(chunk)
-            }
-            onChunk?(chunk, receivedAt)
-        }
-        let taskHolder = TaskIdHolder()
-        let (task, dataTaskException) = SafeDataTask.create(on: session, with: request) { (data: Data?, response: URLResponse?, error: Error?) in
-            defer {
-                _ = directPoolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
-                responseProgress.finish()
-            }
-            let chunks = responseChunksQueue.sync {
-                responseChunks.isEmpty ? (data.map { [$0] } ?? []) : responseChunks
-            }
-            completion(
-                NVIDIADirectTransportResponse(
-                    chunks: chunks,
-                    response: response as? HTTPURLResponse,
-                    error: error,
-                    firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
-                    totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
-                    deadlineStage: responseProgress.currentDeadlineStage(),
-                    negotiatedApplicationProtocol: responseProgress.negotiatedProtocolName()
-                )
-            )
-        }
-        guard let task else {
-            NSLog("[SafeDataTask] startNVIDIATransportAttempt: session invalidated — evicting direct pool. \(dataTaskException?.reason ?? "unknown")")
-            ThinkingProxy.evictDirectSession(key: sessionKey, session: session)
-            return nil
-        }
-        directPoolDelegate.register(task: task, delegate: responseProgress)
-        taskHolder.taskIdentifier = task.taskIdentifier
-        responseProgress.installDeadlines(
+        let transportAttempt = NVIDIAHTTP1TransportAttempt(
+            request: request,
+            host: targetHost,
+            port: targetPort,
+            policy: effectiveNVIDIADirectTransportPolicy(),
             firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
                 forRequestJSON: requestJSON,
                 routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: requestModel)
@@ -15138,12 +15567,10 @@ class ThinkingProxy {
             bufferedResponseSeconds: clientRequestedStream
                 ? nil
                 : OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: requestJSON),
-            for: task
+            onChunk: onChunk ?? { _, _ in },
+            completion: completion
         )
-        task.resume()
-        return {
-            task.cancel()
-        }
+        return transportAttempt.start()
     }
 
     private func forwardNVIDIAStreamingRequest(
@@ -15639,10 +16066,8 @@ class ThinkingProxy {
                 )
             }
         }
-        let sessionKey = "direct:127.0.0.1:\(targetPort)"
         guard let cancel = startNVIDIATransportAttempt(
             request: request,
-            sessionKey: sessionKey,
             requestJSON: body,
             requestModel: state.model,
             clientRequestedStream: clientRequestedStream,
@@ -16185,8 +16610,14 @@ class ThinkingProxy {
     
     /**
      Forwards the request to CLIProxyAPI on port 8318 (pass-through for non-thinking requests)
+     Records route health telemetry for tracked models based on upstream response status.
      */
     private func forwardRequest(method: String, path: String, version: String, headers: [(String, String)], body: String, thinkingEnabled: Bool = false, originalConnection: NWConnection, retryWithApiPrefix: Bool = false) {
+        // Extract model for route health tracking before dispatching
+        let routeHealthModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body).flatMap {
+            OpenAICompatTemporaryShim.routeIdentityForHealthTracking(forRequestModel: $0)
+        }
+        let routeHealthTelemetryStart = routeHealthModel != nil ? Date() : nil
         if let forwardRequestInterceptorForTesting,
            forwardRequestInterceptorForTesting(
             method,
@@ -16270,11 +16701,16 @@ class ThinkingProxy {
                         } else {
                             // Receive response from CLIProxyAPI (with 404 retry capability)
                             if retryWithApiPrefix {
-                                self.receiveResponseWith404Retry(from: targetConnection, originalConnection: originalConnection, 
-                                                                 method: method, path: path, version: version, 
+                                self.receiveResponseWith404Retry(from: targetConnection, originalConnection: originalConnection,
+                                                                 method: method, path: path, version: version,
                                                                  headers: headers, body: body)
                             } else {
-                                self.receiveResponse(from: targetConnection, originalConnection: originalConnection)
+                                self.receiveResponseWithRouteHealth(
+                                    from: targetConnection,
+                                    originalConnection: originalConnection,
+                                    routeHealthModel: routeHealthModel,
+                                    routeHealthStart: routeHealthTelemetryStart
+                                )
                             }
                         }
                     }))
@@ -16282,6 +16718,23 @@ class ThinkingProxy {
                 
             case .failed(let error):
                 NSLog("[ThinkingProxy] Target connection failed: \(error)")
+                if let route = routeHealthModel {
+                    let telemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: route.canonicalModelID,
+                        canonicalModelID: route.canonicalModelID,
+                        transportOutcome: "send_error",
+                        failureClass: "transport_error",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "live_request"
+                    )
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: route.canonicalModelID,
+                        telemetryEvent: telemetryEvent
+                    )
+                }
                 self.sendError(to: originalConnection, statusCode: 502, message: "Bad Gateway")
                 targetConnection.cancel()
                 
@@ -16365,6 +16818,139 @@ class ThinkingProxy {
      Receives response from CLIProxyAPI
      Starts the streaming loop for response data
      */
+    /**
+     Receives response with route health telemetry recording for the first chunk.
+     Parses the HTTP status line from the first response chunk to determine success/failure,
+     records route health, then delegates to the standard streaming loop.
+     */
+    private func receiveResponseWithRouteHealth(
+        from targetConnection: NWConnection,
+        originalConnection: NWConnection,
+        routeHealthModel: OpenAICompatTemporaryShim.RouteIdentity?,
+        routeHealthStart: Date?
+    ) {
+        guard let route = routeHealthModel, let start = routeHealthStart else {
+            // No route to track — use standard streaming
+            streamNextChunk(from: targetConnection, to: originalConnection)
+            return
+        }
+
+        var routeHealthRecorded = false
+
+        targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                NSLog("[ThinkingProxy] Receive response error: \(error)")
+                if !routeHealthRecorded {
+                    let telemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: route.canonicalModelID,
+                        canonicalModelID: route.canonicalModelID,
+                        transportOutcome: "send_error",
+                        failureClass: "transport_error",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: nil,
+                        retryCount: 0,
+                        source: "live_request",
+                        totalLatencyMilliseconds: Int(Date().timeIntervalSince(start) * 1000)
+                    )
+                    OpenAICompatTemporaryShim.recordRouteFailure(
+                        forRequestModel: route.canonicalModelID,
+                        telemetryEvent: telemetryEvent
+                    )
+                    routeHealthRecorded = true
+                }
+                targetConnection.cancel()
+                originalConnection.cancel()
+                return
+            }
+
+            if let data = data, !data.isEmpty {
+                // Parse HTTP status from first chunk for route health
+                if !routeHealthRecorded, let responseString = String(data: data, encoding: .utf8) {
+                    let statusCode = Self.parseHTTPStatus(from: responseString)
+                    let latency = Int(Date().timeIntervalSince(start) * 1000)
+                    if let statusCode {
+                        if statusCode >= 200 && statusCode < 400 {
+                            OpenAICompatTemporaryShim.recordRouteSuccess(
+                                forRequestModel: route.canonicalModelID,
+                                telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                                    timestamp: Date(),
+                                    requestModel: route.canonicalModelID,
+                                    canonicalModelID: route.canonicalModelID,
+                                    transportOutcome: "send_response",
+                                    failureClass: nil,
+                                    timeoutStage: .none,
+                                    upstreamHTTPStatus: statusCode,
+                                    retryCount: 0,
+                                    source: "live_request",
+                                    firstByteLatencyMilliseconds: latency,
+                                    totalLatencyMilliseconds: latency
+                                )
+                            )
+                        } else {
+                            let failureClass = statusCode == 429 ? "classified_429" :
+                                               statusCode >= 500 ? "classified_\(statusCode)" :
+                                               "classified_\(statusCode)"
+                            let telemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                                timestamp: Date(),
+                                requestModel: route.canonicalModelID,
+                                canonicalModelID: route.canonicalModelID,
+                                transportOutcome: "send_error",
+                                failureClass: failureClass,
+                                timeoutStage: .none,
+                                upstreamHTTPStatus: statusCode,
+                                retryCount: 0,
+                                source: "live_request",
+                                firstByteLatencyMilliseconds: latency,
+                                totalLatencyMilliseconds: latency
+                            )
+                            OpenAICompatTemporaryShim.recordRouteFailure(
+                                forRequestModel: route.canonicalModelID,
+                                telemetryEvent: telemetryEvent
+                            )
+                        }
+                        routeHealthRecorded = true
+                    }
+                }
+
+                // Forward response chunk to original client
+                originalConnection.send(content: data, completion: .contentProcessed({ sendError in
+                    if let sendError = sendError {
+                        NSLog("[ThinkingProxy] Send response error: \(sendError)")
+                    }
+
+                    if isComplete {
+                        targetConnection.cancel()
+                        originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed({ _ in
+                            originalConnection.cancel()
+                        }))
+                    } else {
+                        // Continue with standard streaming (no more health tracking needed)
+                        self.streamNextChunk(from: targetConnection, to: originalConnection)
+                    }
+                }))
+            } else if isComplete {
+                targetConnection.cancel()
+                originalConnection.send(content: nil, isComplete: true, completion: .contentProcessed({ _ in
+                    originalConnection.cancel()
+                }))
+            }
+        }
+    }
+
+    private static func parseHTTPStatus(from responseHead: String) -> Int? {
+        // HTTP/1.1 200 OK → extract 200
+        guard let firstSpace = responseHead.firstIndex(of: " "),
+              let secondSpace = responseHead[firstSpace...].dropFirst().firstIndex(of: " ") else {
+            return nil
+        }
+        let statusStart = responseHead.index(after: firstSpace)
+        let statusString = String(responseHead[statusStart..<secondSpace])
+        return Int(statusString.trimmingCharacters(in: .whitespaces))
+    }
+
     private func receiveResponse(from targetConnection: NWConnection, originalConnection: NWConnection) {
         // Start the streaming loop
         streamNextChunk(from: targetConnection, to: originalConnection)
@@ -16732,7 +17318,8 @@ class ThinkingProxy {
                             "downstream_keepalive_interval_seconds": Int(transportPolicy.sinkPolicy.keepaliveIntervalSeconds),
                             "chunk_gap_timeout_runtime_owner": "nvidia_direct_live_stream",
                             "downstream_keepalive_runtime_owner": "nvidia_direct_live_stream",
-                            "protocol_observation_runtime_owner": "urlsession_task_metrics"
+                            "protocol_observation_runtime_owner": Self.nvidiaDirectTransportRuntimeOwner,
+                            "protocol_guarantee_runtime_owner": Self.nvidiaDirectTransportRuntimeOwner
                         ]
                         if let negotiatedApplicationProtocol = state.lastTelemetryEvent?.negotiatedApplicationProtocol {
                             streamDiagnostics["last_negotiated_application_protocol"] = negotiatedApplicationProtocol

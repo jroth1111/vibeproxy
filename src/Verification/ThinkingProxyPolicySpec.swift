@@ -8908,17 +8908,13 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary nvidia direct session pool matches the slow-success timeout budget", recorder: recorder) {
-            ThinkingProxy.clearDirectSessionPoolForTesting()
+        run("temporary nvidia direct transport matches the slow-success timeout budget", recorder: recorder) {
             let policy = ThinkingProxy.nvidiaDirectTransportPolicyForTesting()
-            guard let session = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
-                recorder.recordFailure("expected a direct testing session for nvidia requests")
-                return
-            }
+            let budget = policy.scaledTimeoutBudget(scaleTimeout: OpenAICompatTemporaryShim.scaledRequestTimeout)
             expectEqual(
                 policy.protocolPreference,
-                .http1Preferred,
-                "nvidia direct sessions should advertise the dedicated http/1.1 transport preference",
+                .http1Only,
+                "nvidia direct transport should require the dedicated http/1.1 transport preference",
                 recorder: recorder
             )
             expectEqual(
@@ -8928,43 +8924,88 @@ struct ThinkingProxyPolicySpec {
                 recorder: recorder
             )
             expectEqual(
-                Int(session.configuration.timeoutIntervalForRequest),
+                Int(budget.request),
                 Int(OpenAICompatTemporaryShim.scaledRequestTimeout(policy.requestTimeoutSeconds)),
-                "nvidia direct sessions should inherit the full slow-success request timeout",
+                "nvidia direct transport should inherit the full slow-success request timeout",
                 recorder: recorder
             )
             expectEqual(
-                Int(session.configuration.timeoutIntervalForResource),
+                Int(budget.resource),
                 Int(OpenAICompatTemporaryShim.scaledRequestTimeout(policy.resourceTimeoutSeconds)),
-                "nvidia direct sessions should allow total resource time beyond the request timeout",
+                "nvidia direct transport should allow total resource time beyond the request timeout",
                 recorder: recorder
             )
             expectEqual(
-                session.configuration.waitsForConnectivity,
                 policy.waitsForConnectivity,
-                "nvidia direct sessions should wait briefly for connectivity instead of failing immediately on transient path issues",
+                policy.waitsForConnectivity,
+                "nvidia direct transport should preserve waitsForConnectivity policy even though the active owner is raw HTTP/1.1",
                 recorder: recorder
             )
-            ThinkingProxy.clearDirectSessionPoolForTesting()
         }
 
-        run("temporary nvidia direct session pool reuses the dedicated client for the same upstream key", recorder: recorder) {
-            ThinkingProxy.clearDirectSessionPoolForTesting()
-            guard let firstSession = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
-                recorder.recordFailure("expected the first nvidia direct session to be created")
+        run("temporary nvidia direct transport parser requires HTTP/1.1 and decodes chunked bodies", recorder: recorder) {
+            let rawResponse = Data((
+                "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                "Transfer-Encoding: chunked\r\n" +
+                "\r\n" +
+                "D\r\n" +
+                "data: first\n\n\r\n" +
+                "E\r\n" +
+                "data: second\n\n\r\n" +
+                "0\r\n" +
+                "\r\n"
+            ).utf8)
+            guard let bodyStart = rawResponse.range(of: Data("\r\n\r\n".utf8))?.upperBound else {
+                recorder.recordFailure("expected a valid HTTP response separator")
                 return
             }
-            guard let secondSession = ThinkingProxy.acquireDirectSessionForTesting(key: "test:nvidia") else {
-                recorder.recordFailure("expected the second nvidia direct session lookup to succeed")
+            let responseBody = Data(rawResponse[bodyStart...])
+            let parsedHead: ThinkingProxy.NVIDIAHTTP1ParsedHead
+            do {
+                parsedHead = try ThinkingProxy.parseNVIDIAHTTP1ResponseHeadForTesting(rawResponse)
+            } catch {
+                recorder.recordFailure("expected the HTTP/1.1 response head to parse: \(error)")
+                return
+            }
+            let decodedChunks: [Data]
+            do {
+                decodedChunks = try ThinkingProxy.consumeNVIDIAHTTP1ChunkedBodyForTesting(responseBody)
+            } catch {
+                recorder.recordFailure("expected the chunked HTTP/1.1 response body to decode: \(error)")
                 return
             }
             expectEqual(
-                firstSession === secondSession,
-                true,
-                "nvidia direct requests should reuse the same dedicated pooled client instead of rebuilding a fresh session each time",
+                parsedHead.negotiatedApplicationProtocol,
+                "http/1.1",
+                "nvidia direct transport should prove HTTP/1.1 before releasing live stream output",
                 recorder: recorder
             )
-            ThinkingProxy.clearDirectSessionPoolForTesting()
+            expectEqual(
+                parsedHead.bodyMode,
+                .chunked,
+                "nvidia direct transport should recognize chunked response framing",
+                recorder: recorder
+            )
+            expectEqual(
+                decodedChunks.map { String(data: $0, encoding: .utf8) ?? "" },
+                ["data: first\n\n", "data: second\n\n"],
+                "nvidia direct transport should decode chunked body framing into clean upstream body chunks",
+                recorder: recorder
+            )
+            do {
+                _ = try ThinkingProxy.parseNVIDIAHTTP1ResponseHeadForTesting(
+                    Data("HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n".utf8)
+                )
+                recorder.recordFailure("expected non-http/1.1 NVIDIA responses to fail closed")
+            } catch {
+                expectEqual(
+                    String(describing: error).contains("unsupportedHTTPVersion"),
+                    true,
+                    "nvidia direct transport should fail closed when the backend does not answer with HTTP/1.1",
+                    recorder: recorder
+                )
+            }
         }
 
         run("temporary nvidia preflight rejects quarantined hosted routes before spending timeout budget", recorder: recorder) {
@@ -9735,7 +9776,7 @@ struct ThinkingProxyPolicySpec {
 
                 let proxy = ThinkingProxy()
                 proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
-                    protocolPreference: .http1Preferred,
+                    protocolPreference: .http1Only,
                     requestTimeoutSeconds: 300,
                     resourceTimeoutSeconds: 360,
                     interChunkReadTimeoutSeconds: 1,
@@ -9907,7 +9948,7 @@ struct ThinkingProxyPolicySpec {
 
                 let proxy = ThinkingProxy()
                 proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
-                    protocolPreference: .http1Preferred,
+                    protocolPreference: .http1Only,
                     requestTimeoutSeconds: 300,
                     resourceTimeoutSeconds: 360,
                     interChunkReadTimeoutSeconds: 0.05,
@@ -12495,14 +12536,15 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(nvidiaProbe?["last_status"] as? String, "success", "healthz should expose the latest NVIDIA probe status", recorder: recorder)
                     expectEqual(nvidiaProbe?["last_first_byte_latency_ms"] as? Int, 777, "healthz should expose NVIDIA probe first-byte latency", recorder: recorder)
                     expectEqual(nvidiaProbe?["last_total_latency_ms"] as? Int, 9_999, "healthz should expose NVIDIA probe total latency", recorder: recorder)
-                    expectEqual(streamDiagnostics?["transport_protocol_preference"] as? String, "http1Preferred", "healthz should expose the configured NVIDIA transport protocol preference without overclaiming enforcement", recorder: recorder)
+                    expectEqual(streamDiagnostics?["transport_protocol_preference"] as? String, "http1Only", "healthz should expose the configured NVIDIA transport protocol preference once the runtime can guarantee it", recorder: recorder)
                     expectEqual(streamDiagnostics?["last_negotiated_application_protocol"] as? String, "http/1.1", "healthz should expose the most recently observed NVIDIA application protocol", recorder: recorder)
                     expectEqual(streamDiagnostics?["inter_chunk_read_timeout_seconds"] as? Int, 300, "healthz should expose the NVIDIA inter-chunk read timeout budget", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalives_enabled"] as? Bool, true, "healthz should expose whether the NVIDIA streamed sink injects keepalives", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalive_interval_seconds"] as? Int, 8, "healthz should expose the NVIDIA keepalive cadence", recorder: recorder)
                     expectEqual(streamDiagnostics?["chunk_gap_timeout_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA chunk-gap timeout enforcement", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalive_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA downstream keepalives", recorder: recorder)
-                    expectEqual(streamDiagnostics?["protocol_observation_runtime_owner"] as? String, "urlsession_task_metrics", "healthz should identify the runtime owner for observed NVIDIA transport protocol reporting", recorder: recorder)
+                    expectEqual(streamDiagnostics?["protocol_observation_runtime_owner"] as? String, "nvidia_direct_http11_transport", "healthz should identify the runtime owner for observed NVIDIA transport protocol reporting", recorder: recorder)
+                    expectEqual(streamDiagnostics?["protocol_guarantee_runtime_owner"] as? String, "nvidia_direct_http11_transport", "healthz should identify the runtime owner that guarantees HTTP/1.1 before NVIDIA live stream delivery begins", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

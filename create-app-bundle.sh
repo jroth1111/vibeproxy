@@ -17,7 +17,7 @@ APP_NAME="VibeProxy"
 BUNDLE_ID="com.cliproxyapi.menubar"
 BUILD_DIR="$SRC_DIR/.build/release"
 FINAL_APP_DIR="$PROJECT_DIR/$APP_NAME.app"
-APP_DIR="$PROJECT_DIR/.${APP_NAME}.app.tmp"
+APP_DIR="$PROJECT_DIR/${APP_NAME}.app.tmp"
 BACKUP_APP_DIR="$PROJECT_DIR/.${APP_NAME}.app.backup"
 VERIFY_APP_BUNDLE_SCRIPT="$PROJECT_DIR/scripts/verify-app-bundle.sh"
 

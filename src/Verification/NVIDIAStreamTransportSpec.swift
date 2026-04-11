@@ -9,8 +9,8 @@ struct NVIDIAStreamTransportSpec {
             let policy = NVIDIATransportPolicy.direct
             expectNVIDIAEqual(
                 policy.protocolPreference,
-                .http1Preferred,
-                "nvidia transport should prefer the dedicated http/1.1 path",
+                .http1Only,
+                "nvidia transport should require the dedicated http/1.1 path",
                 recorder: recorder
             )
             expectNVIDIAEqual(
@@ -26,23 +26,23 @@ struct NVIDIAStreamTransportSpec {
             )
         }
 
-        runNVIDIAStreamSpec("direct transport configuration inherits the scaled slow-success budget", recorder: recorder) {
-            let configuration = NVIDIATransportPolicy.direct.sessionConfiguration(scaleTimeout: { $0 * 3 })
+        runNVIDIAStreamSpec("direct transport timeout budgets inherit the scaled slow-success budget", recorder: recorder) {
+            let budget = NVIDIATransportPolicy.direct.scaledTimeoutBudget(scaleTimeout: { $0 * 3 })
             expectNVIDIAEqual(
-                Int(configuration.timeoutIntervalForRequest),
+                Int(budget.request),
                 900,
                 "request timeout should scale from the direct transport policy",
                 recorder: recorder
             )
             expectNVIDIAEqual(
-                Int(configuration.timeoutIntervalForResource),
+                Int(budget.resource),
                 1080,
                 "resource timeout should scale from the direct transport policy",
                 recorder: recorder
             )
             expectNVIDIATrue(
-                configuration.waitsForConnectivity,
-                "scaled transport config should preserve waitsForConnectivity",
+                NVIDIATransportPolicy.direct.waitsForConnectivity,
+                "scaled transport budgets should preserve waitsForConnectivity policy",
                 recorder: recorder
             )
         }
