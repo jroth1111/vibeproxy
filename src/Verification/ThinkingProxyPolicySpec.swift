@@ -8209,7 +8209,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("temporary worker smart alias records one route failure when the final retryable candidate exhausts", recorder: recorder) {
+        run("temporary worker smart alias records one retryable 5xx failure event when the final candidate exhausts", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let unavailableUntil = Date().addingTimeInterval(300)
@@ -8284,7 +8284,8 @@ struct ThinkingProxyPolicySpec {
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
                 expectEqual(deliveredStatus, 503, "the final retryable worker candidate should still surface a 503 terminal exhaustion error", recorder: recorder)
-                expectEqual(snapshot["glm5-nvidia"]?.failureScore, 1.0, "the final retryable worker failure should be counted exactly once in route health", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia"]?.failureScore, 2.0, "one classified 5xx worker failure should apply the single configured 5xx penalty", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia"]?.rollingMetrics.recentOutcomes.count, 1, "the final retryable worker failure should add exactly one failure event to rolling metrics", recorder: recorder)
                 expectEqual(snapshot["glm5-nvidia"]?.status, .suspect, "one exhausted worker failure should degrade the final route once instead of opening it immediately", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
