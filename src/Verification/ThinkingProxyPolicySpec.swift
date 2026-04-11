@@ -170,7 +170,7 @@ struct ThinkingProxyPolicySpec {
             expectEqual(tools?.count, 1, "factory worker health routing should still preserve the worker tool surface during candidate evaluation", recorder: recorder)
         }
 
-        run("smart worker streaming candidate selection keeps nvidia eligible without stripping live SSE intent", recorder: recorder) {
+        run("smart worker streaming candidate selection buffers NVIDIA upstream execution when synthetic SSE preserves the client contract", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
@@ -192,16 +192,96 @@ struct ThinkingProxyPolicySpec {
                 }
                 """
 
+                let candidateBody = OpenAICompatTemporaryShim.rewrittenRequestJSON(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    replacingRequestModelIn: request,
+                    with: "glm5-nvidia"
+                )
+                let transformed = candidateBody.flatMap {
+                    OpenAICompatTemporaryShim.transformRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: $0
+                    )
+                } ?? candidateBody
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
                     path: "/v1/chat/completions",
                     currentBody: request,
                     candidateModelsRemaining: ["glm5-nvidia"]
                 )
+                let preflightError = transition.map { transition in
+                    OpenAICompatTemporaryShim.configuredRoutePreflightError(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: transition.body,
+                        headers: []
+                    )
+                } ?? nil
 
-                expectEqual(transition?.model, "glm5-nvidia", "streaming worker requests should keep glm5-nvidia eligible even though NVIDIA preflight evaluates a buffered form", recorder: recorder)
-                let json = parseJSONObject(transition?.body, recorder: recorder)
-                expectEqual(json["stream"] as? Bool, true, "smart-worker execution should preserve the client streaming bit after candidate evaluation so the live SSE path still activates", recorder: recorder)
+                expectEqual(transition?.model, "glm5-nvidia", "streaming worker requests should keep glm5-nvidia eligible when the proxy can satisfy the client stream synthetically with buffered upstream execution", recorder: recorder)
+                let transformedJSON = parseJSONObject(transformed, recorder: recorder)
+                expectEqual(transformedJSON["stream"] as? Bool, true, "the original smart-worker request should still preserve the caller's streaming bit before candidate adaptation", recorder: recorder)
+                let transitionJSON = parseJSONObject(transition?.body, recorder: recorder)
+                expectEqual(transitionJSON["stream"] as? Bool, false, "candidate selection should buffer the NVIDIA upstream request when only the live upstream streaming surface is incompatible", recorder: recorder)
+                expectNil(preflightError, "buffered NVIDIA upstream execution should clear preflight for the smart-worker streaming tool surface", recorder: recorder)
+            }
+        }
+
+        run("smart worker streaming typed-content candidate selection re-transforms buffered NVIDIA upstream execution", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "custom:Proxy-Worker-Smart-Router-8",
+                  "stream": true,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo"},
+                        {"type": "reasoning", "text": "hidden chain of thought"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "noop",
+                        "parameters": {"type": "object", "properties": {}}
+                      }
+                    }
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: request,
+                    candidateModelsRemaining: ["glm5-nvidia"]
+                )
+                let transitionJSON = parseJSONObject(transition?.body, recorder: recorder)
+                let messages = transitionJSON["messages"] as? [[String: Any]]
+                let firstMessage = messages?.first
+                let preflightError = transition.map { transition in
+                    OpenAICompatTemporaryShim.configuredRoutePreflightError(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        jsonString: transition.body,
+                        headers: []
+                    )
+                } ?? nil
+
+                expectEqual(transition?.model, "glm5-nvidia", "streaming typed-content worker requests should keep glm5-nvidia eligible once buffered upstream execution is re-transformed through the NVIDIA compatibility shim", recorder: recorder)
+                expectEqual(transitionJSON["stream"] as? Bool, false, "typed-content worker candidate selection should buffer the NVIDIA upstream request", recorder: recorder)
+                expectEqual(firstMessage?["content"] as? String, "Checked repohidden chain of thought{\"step\":1}", "buffered NVIDIA worker execution should re-transform typed content into plain text before preflight", recorder: recorder)
+                expectNil(preflightError, "re-transformed buffered NVIDIA worker requests should clear typed-content preflight", recorder: recorder)
             }
         }
 
@@ -1034,6 +1114,49 @@ struct ThinkingProxyPolicySpec {
                     recorder: recorder
                 )
                 expectNil(preflightError, "metadata-only typed transcript content should not fail NVIDIA preflight", recorder: recorder)
+            }
+        }
+
+        run("temporary nvidia shim flattens visible payloads from unknown typed wrappers instead of failing preflight", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "vendor_summary", "text": "Checked "},
+                        {"type": "opaque_payload", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed ?? request, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                let preflightError = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: transformed ?? request
+                )
+
+                expectEqual(
+                    messages?.first?["content"] as? String,
+                    #"Checked {"step":1}"#,
+                    "visible non-media payloads from unknown typed wrappers should be flattened instead of excluding NVIDIA fallback lanes",
+                    recorder: recorder
+                )
+                expectNil(preflightError, "unknown typed wrappers with visible text payloads should not fail NVIDIA preflight", recorder: recorder)
             }
         }
 
@@ -2918,6 +3041,200 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("multi-tool worker requests skip muse-spark and deliver through the nvidia fallback", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-zai",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "glm-5.1-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                    requestModel: "minimax-m2.7-ollama-pro",
+                    until: Date().addingTimeInterval(300)
+                )
+
+                guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router") else {
+                    recorder.recordFailure("proxy-worker-smart-router should inherit the worker pool definition")
+                    return
+                }
+
+                let requestJSON = """
+                {
+                  "model": "proxy-worker-smart-router",
+                  "stream": false,
+                  "tools": [
+                    {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+                    {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}
+                  ],
+                  "messages": [{"role": "user", "content": "Return exactly OK."}]
+                }
+                """
+
+                let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "proxy-worker-smart-router",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: requestJSON,
+                    smartAlias: smartAlias
+                )
+                expectEqual(
+                    candidates,
+                    ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    "multi-tool worker turns should exclude muse-spark before candidate ranking and keep the nvidia fallback available",
+                    recorder: recorder
+                )
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+                var deliveredError: String?
+                var seenModels: [String] = []
+                var metaSeenModels: [String] = []
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, _ in
+                    let forwarded = parseJSONObject(body, recorder: recorder)
+                    let forwardedModel = forwarded["model"] as? String ?? "?"
+                    recorder.recordFailure("multi-tool worker turns should not use the buffered transport seam once the nvidia fallback is selected: \(forwardedModel)")
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    metaSeenModels.append(publicModel)
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-meta","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"unexpected meta attempt"},"finish_reason":"stop"}],"model":"\(publicModel)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    )
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let requestBody = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""
+                    let forwarded = parseJSONObject(requestBody, recorder: recorder)
+                    seenModels.append(forwarded["model"] as? String ?? "?")
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [
+                                Data("""
+                                {"id":"chatcmpl-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"model":"glm5-nvidia"}
+                                """.utf8)
+                            ],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil,
+                            firstByteLatencyMilliseconds: 41,
+                            totalLatencyMilliseconds: 92
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, message in
+                    deliveredError = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: requestJSON
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("multi-tool worker turns should deliver through the compatible nvidia fallback without probing muse-spark")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "multi-tool worker turns should still succeed after excluding muse-spark", recorder: recorder)
+                expectEqual(deliveredError, nil, "multi-tool worker turns should not surface the skipped muse-spark lane as a terminal error", recorder: recorder)
+                expectEqual(seenModels, ["glm5-nvidia"], "multi-tool worker turns should go straight to the nvidia fallback after skipping muse-spark", recorder: recorder)
+                expectEqual(metaSeenModels.isEmpty, true, "multi-tool worker turns should not attempt muse-spark once the preflight rejects the synthetic multi-tool bridge", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "proxy-worker-smart-router", "multi-tool worker turns should preserve the outward alias after the nvidia fallback succeeds", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("healthz separates single-tool and multi-tool worker routing surfaces", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"].forEach { requestModel in
+                        OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                            requestModel: requestModel,
+                            until: until
+                        )
+                    }
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("multi-tool-aware healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let requestShapes = factoryWorker?["request_shapes"] as? [String: Any]
+                    let toolChat = requestShapes?["tool_string_content"] as? [String: Any]
+                    let multiToolChat = requestShapes?["multi_tool_string_content"] as? [String: Any]
+                    let typedToolChat = requestShapes?["typed_tool_content"] as? [String: Any]
+                    let multiTypedToolChat = requestShapes?["multi_tool_typed_content"] as? [String: Any]
+                    let streamingTypedToolChat = requestShapes?["streaming_typed_tool_content"] as? [String: Any]
+                    let streamingMultiTypedToolChat = requestShapes?["streaming_multi_tool_typed_content"] as? [String: Any]
+                    let dispatchableRequestShapes = factoryWorker?["dispatchable_request_shapes"] as? [String]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, nil, "healthz should stop advertising a single worker lane when single-tool and multi-tool request surfaces route differently", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should label divergent worker routing when tool cardinality changes dispatchability", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should stop advertising a single worker provider when request-shape routing diverges", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should keep the worker ready when every request surface still has a dispatchable lane", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker ready when both single-tool and multi-tool request surfaces remain dispatchable", recorder: recorder)
+                    expectEqual(dispatchableRequestShapes?.contains("multi_tool_string_content"), true, "healthz should expose the multi-tool string worker shape explicitly", recorder: recorder)
+                    expectEqual(dispatchableRequestShapes?.contains("multi_tool_typed_content"), true, "healthz should expose the multi-tool typed worker shape explicitly", recorder: recorder)
+                    expectEqual(dispatchableRequestShapes?.contains("streaming_multi_tool_typed_content"), true, "healthz should expose the multi-tool streaming worker shape explicitly", recorder: recorder)
+                    expectEqual(toolChat?["effective_route_model"] as? String, "muse-spark", "single-tool string worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
+                    expectEqual(toolChat?["dispatchable_candidate_models"] as? [String], ["muse-spark", "glm5-nvidia"], "single-tool string worker health should expose both dispatchable lanes in preference order", recorder: recorder)
+                    expectEqual(multiToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool string worker health should skip Meta and fall through to NVIDIA", recorder: recorder)
+                    expectEqual(multiToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "multi-tool string worker health should exclude Meta from the dispatchable set", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model"] as? String, "muse-spark", "single-tool typed worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool typed worker health should skip Meta and fall through to NVIDIA", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "multi-tool typed worker health should exclude Meta from the dispatchable set", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "muse-spark", "single-tool streaming typed worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool streaming typed worker health should skip Meta and fall through to NVIDIA", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "multi-tool streaming typed worker health should exclude Meta from the dispatchable set", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("raceable candidate transitions exclude provider-aware preflight-incompatible lanes before launch", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -3537,7 +3854,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("streaming typed worker transcript shapes do not advertise glm5-nvidia when only the non-streaming shim is compatible", recorder: recorder) {
+        run("streaming typed worker transcript shapes keep glm5-nvidia eligible after candidate-level request shims", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let until = Date().addingTimeInterval(300)
@@ -3552,21 +3869,43 @@ struct ThinkingProxyPolicySpec {
                 var deliveredStatus: Int?
                 var deliveredError: String?
                 var seenModels: [String] = []
+                var seenContents: [String] = []
+                var seenStreams: [Bool] = []
 
                 proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
-                    let model = parseJSONObject(body, recorder: recorder)["model"] as? String ?? "?"
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? "?"
+                    let messages = json["messages"] as? [[String: Any]]
+                    let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                    let stream = json["stream"] as? Bool ?? true
                     seenModels.append(model)
-                    completion(ThinkingProxy.BufferedProxyResponse(data: nil, response: nil, error: nil))
+                    seenContents.append(assistantContent)
+                    seenStreams.append(stream)
+                    completion(ThinkingProxy.BufferedProxyResponse(
+                        data: Data("""
+                        {"id":"chatcmpl-nvidia-stream","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                        """.utf8),
+                        response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                        error: nil
+                    ))
                 }
                 proxy.nvidiaDirectTransportForTesting = { request, completion in
-                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
-                        parseJSONObject($0, recorder: recorder)["model"] as? String
-                    } ?? "?"
+                    let json = (String(data: request.httpBody ?? Data(), encoding: .utf8)).map {
+                        parseJSONObject($0, recorder: recorder)
+                    } ?? [:]
+                    let model = json["model"] as? String ?? "?"
+                    let messages = json["messages"] as? [[String: Any]]
+                    let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                    let stream = json["stream"] as? Bool ?? true
                     seenModels.append(model)
+                    seenContents.append(assistantContent)
+                    seenStreams.append(stream)
                     completion(
                         ThinkingProxy.NVIDIADirectTransportResponse(
-                            chunks: [],
-                            response: nil,
+                            chunks: [Data("""
+                            {"id":"chatcmpl-nvidia-stream","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                            """.utf8)],
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
                             error: nil
                         )
                     )
@@ -3590,23 +3929,16 @@ struct ThinkingProxyPolicySpec {
                           "model": "worker",
                           "stream": true,
                           "tools": [
-                            {
-                              "type": "function",
-                              "function": {
-                                "name": "noop",
-                                "parameters": {
-                                  "type": "object",
-                                  "properties": {}
-                                }
-                              }
-                            }
+                            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
                           ],
                           "messages": [
                             {
                               "role": "assistant",
                               "content": [
                                 {"type": "input_text", "text": "Checked "},
-                                {"type": "summary_text", "text": "repo"}
+                                {"type": "summary_text", "text": "repo"},
+                                {"type": "reasoning", "text": "hidden chain of thought"},
+                                {"type": "metadata_marker", "value": {"step": 1}}
                               ]
                             },
                             {"role": "user", "content": "Return exactly OK"}
@@ -3618,14 +3950,16 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 guard delivered.wait(timeout: .now() + 2) == .success else {
-                    recorder.recordFailure("streaming typed worker transcript shapes should return a terminal compatibility error when only NVIDIA remains")
+                    recorder.recordFailure("streaming typed worker transcript shapes should still deliver through glm5-nvidia when sibling lanes are unavailable")
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     return
                 }
 
-                expectEqual(deliveredStatus, 501, "streaming typed worker transcript shapes should fail fast instead of advertising glm5-nvidia as dispatchable", recorder: recorder)
-                expectEqual(deliveredError, "Streaming NVIDIA tool calls are not reliably supported through this proxy; use non-streaming chat completions.", "streaming typed worker transcript shapes should surface the real NVIDIA compatibility limit", recorder: recorder)
-                expectEqual(seenModels, [], "streaming typed worker transcript shapes should not attempt an upstream route after compatibility preflight fails", recorder: recorder)
+                expectEqual(deliveredStatus, 200, "streaming typed worker transcript shapes should still succeed", recorder: recorder)
+                expectEqual(deliveredError, nil, "streaming typed worker transcript shapes should not surface a terminal routing error", recorder: recorder)
+                expectEqual(seenModels, ["glm5-nvidia"], "candidate-level request shims should keep glm5-nvidia eligible for streaming typed worker transcript shapes", recorder: recorder)
+                expectEqual(seenContents, ["Checked repohidden chain of thought{\"step\":1}"], "candidate-level request shims should preserve reasoning text and metadata markers before NVIDIA dispatch", recorder: recorder)
+                expectEqual(seenStreams, [false], "streaming typed worker transcript shapes should be buffered upstream for NVIDIA while preserving synthetic SSE to the caller", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -13697,9 +14031,27 @@ struct ThinkingProxyPolicySpec {
                     let streamDiagnostics = glm5Route?["nvidia_stream_diagnostics"] as? [String: Any]
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should trust a suspect NVIDIA lane once a recent real canary probe proves inference still works", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should expose the recovered NVIDIA worker provider", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker ready when probe-backed NVIDIA recovery is the only dispatchable lane", recorder: recorder)
+                    let requestShapes = factoryWorker?["request_shapes"] as? [String: Any]
+                    let plainChat = requestShapes?["plain_chat"] as? [String: Any]
+                    let toolChat = requestShapes?["tool_string_content"] as? [String: Any]
+                    let typedToolChat = requestShapes?["typed_tool_content"] as? [String: Any]
+                    let streamingTypedToolChat = requestShapes?["streaming_typed_tool_content"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should trust the recovered NVIDIA lane once buffered upstream execution keeps the full worker surface dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "dispatchable_prediction", "healthz should label probe-backed worker recovery as a dispatchable prediction when no recent live winner exists but every worker surface remains dispatchable on NVIDIA", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should advertise NVIDIA as the recovered worker provider once the buffered streaming surface is dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should stop surfacing worker exhaustion once probe-backed NVIDIA recovery restores every worker request shape", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should mark the worker pool ready when probe-backed NVIDIA recovery restores the streaming worker shape", recorder: recorder)
+                    expectEqual(plainChat?["effective_route_model"] as? String, "glm5-nvidia", "plain chat worker health should still trust the recovered NVIDIA lane", recorder: recorder)
+                    expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the recovered NVIDIA lane", recorder: recorder)
+                    expectEqual(toolChat?["effective_route_model"] as? String, "glm5-nvidia", "tool-bearing string worker health should still trust the recovered NVIDIA lane", recorder: recorder)
+                    expectEqual(toolChat?["ready"] as? Bool, true, "tool-bearing string worker health should stay ready on the recovered NVIDIA lane", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed worker health should still trust the recovered NVIDIA lane once the shim keeps the request dispatchable", recorder: recorder)
+                    expectEqual(typedToolChat?["ready"] as? Bool, true, "typed worker health should stay ready on the recovered NVIDIA lane when the shimmed request remains dispatchable", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming typed worker health should stay on the recovered NVIDIA lane once buffered upstream execution restores dispatchability", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should expose NVIDIA as the active provider once the buffered streaming surface is dispatchable", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should stop surfacing exhaustion once NVIDIA can serve that shape through buffered upstream execution", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should become ready once buffered upstream execution restores the streaming worker shape", recorder: recorder)
                     expectEqual(nvidiaLiveness?["trusted"] as? Bool, true, "healthz should report NVIDIA inference liveness as trusted after a recent probe success", recorder: recorder)
                     expectEqual(nvidiaLiveness?["recent_probe_success"] as? Bool, true, "healthz should surface that the current NVIDIA liveness evidence comes from a recent probe", recorder: recorder)
                     expectEqual(nvidiaLiveness?["recent_live_success"] as? Bool, false, "healthz should distinguish probe-backed recovery from live request success", recorder: recorder)
@@ -14120,10 +14472,10 @@ struct ThinkingProxyPolicySpec {
                     let typedToolChat = requestShapes?["typed_tool_content"] as? [String: Any]
                     let streamingTypedToolChat = requestShapes?["streaming_typed_tool_content"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "healthz should fall back to the authoritative worker alias when only buffered request shapes can still dispatch through NVIDIA", recorder: recorder)
-                    expectNil(factoryWorker?["effective_route_provider"], "healthz should not advertise NVIDIA as the single effective provider when live streaming worker traffic remains incompatible", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "policy_exhausted", "healthz should surface a policy exhaustion summary when the streaming worker shape is no longer dispatchable", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark the worker pool unready when the live streaming worker shape cannot dispatch through the last remaining lane", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should promote NVIDIA as the effective worker lane when buffered upstream execution keeps every worker shape dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should advertise NVIDIA as the effective provider once the buffered streaming worker surface is supported", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should stop surfacing worker exhaustion when the remaining NVIDIA lane can dispatch the buffered streaming worker shape", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker pool ready when the remaining NVIDIA lane can dispatch the streaming worker shape through buffered upstream execution", recorder: recorder)
                     expectEqual(plainChat?["effective_route_model"] as? String, "glm5-nvidia", "plain chat worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
                     expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
                     expectEqual(toolChat?["effective_route_model"] as? String, "glm5-nvidia", "tool-bearing string-content worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
@@ -14131,11 +14483,11 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed-content worker health should stay on the remaining NVIDIA lane when the request is shimmed into a dispatchable form", recorder: recorder)
                     expectEqual(typedToolChat?["ready"] as? Bool, true, "typed-content worker health should stay ready when the remaining NVIDIA lane can still dispatch the shimmed request", recorder: recorder)
                     expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "typed-content worker health should expose the shim-dispatchable NVIDIA lane explicitly", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "streaming typed worker health should fall back to the authoritative worker alias when NVIDIA cannot serve the live streaming tool surface", recorder: recorder)
-                    expectNil(streamingTypedToolChat?["effective_route_provider"], "streaming typed worker health should not advertise an upstream provider when the remaining NVIDIA lane is streaming-incompatible", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["route_health_status"] as? String, "policy_exhausted", "streaming typed worker health should classify the remaining NVIDIA lane as policy-exhausted", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["ready"] as? Bool, false, "streaming typed worker health should be unready when only the non-streaming NVIDIA shim remains", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "streaming typed worker health should expose that no candidate is dispatchable when only the non-streaming NVIDIA shim remains", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming typed worker health should stay on NVIDIA once buffered upstream execution restores that request shape", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should advertise NVIDIA once the buffered streaming worker surface is supported", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should stop classifying NVIDIA as exhausted once the buffered streaming shape is dispatchable", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should be ready when the remaining NVIDIA lane can dispatch that shape through buffered upstream execution", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "streaming typed worker health should expose the buffered-dispatchable NVIDIA lane explicitly", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -14187,9 +14539,19 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should prefer the recent observed worker winner instead of a momentary synthetic dispatch pick", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "observed_recent_winner", "healthz should label a recent live worker winner as observed, not predicted", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the recent observed worker provider when that lane remains dispatchable", recorder: recorder)
+                    let requestShapes = factoryWorker?["request_shapes"] as? [String: Any]
+                    let typedToolChat = requestShapes?["typed_tool_content"] as? [String: Any]
+                    let streamingTypedToolChat = requestShapes?["streaming_typed_tool_content"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should keep the recent NVIDIA worker winner as the top-level effective lane once every worker request shape remains dispatchable there", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "observed_recent_winner", "healthz should label the top-level worker summary as the recent observed NVIDIA winner once the streaming worker shape also stays dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should keep reporting NVIDIA when the recent worker winner still serves every worker request shape", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should still expose the recent live worker winner separately from the divergent top-level summary", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should preserve the provider for the recent live worker winner", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed worker health should still prefer the recent observed NVIDIA winner while that shape remains dispatchable", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model_source"] as? String, "observed_recent_winner", "typed worker health should label the recent NVIDIA lane as an observed winner", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming worker health should keep the recent NVIDIA winner once buffered upstream execution also keeps the streaming worker shape dispatchable", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model_source"] as? String, "observed_recent_winner", "streaming worker health should label NVIDIA as the observed winner once that shape remains dispatchable there", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -14323,9 +14685,11 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should ignore synthetic probe winners when reporting the recent live worker lane", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider instead of a probe-only winner", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should keep the recent live NVIDIA worker lane as the top-level effective route when the synthetic probe does not contradict dispatchability", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "observed_recent_winner", "healthz should keep the recent live worker summary authoritative when the synthetic probe does not change worker dispatchability", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the recent live NVIDIA provider when the worker surface remains dispatchable there", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should expose the recent live worker lane when it exists", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider even after a newer synthetic probe success on a different lane", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should expose the recent live worker caller request id for correlation", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_request_shape"] as? String, "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content", "healthz should expose the recent live worker request shape for correlation", recorder: recorder)
 
@@ -14389,7 +14753,8 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should keep the recent live worker winner as the effective lane while it remains dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should keep the recent live worker winner as the top-level effective lane even when a later dispatch targeted a different request shape", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "observed_recent_winner", "healthz should keep the top-level worker summary anchored to the recent live winner when the later dispatch did not disprove NVIDIA dispatchability", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner separately from the last dispatch attempt", recorder: recorder)
                     expectEqual(factoryWorker?["recent_dispatched_route_model"] as? String, "glm-5.1-zai", "healthz should expose the most recent actual worker dispatch attempt separately from the recent live winner", recorder: recorder)
                     expectEqual(factoryWorker?["recent_dispatched_route_provider"] as? String, "zai", "healthz should expose the provider for the most recent worker dispatch attempt", recorder: recorder)

@@ -2011,22 +2011,28 @@ enum OpenAICompatTemporaryShim {
             path: path,
             jsonString: candidateBody
         ) ?? candidateBody
+        let effectiveCandidateBody = smartAliasCompatibleCandidateBody(
+            method: method,
+            path: path,
+            candidateModel: candidateModel,
+            candidateBody: transformedCandidateBody
+        )
         let preflightCandidateBody: String
         let shouldBufferStreamingPreflight =
-            requestedStream(forRequestJSON: transformedCandidateBody) &&
+            requestedStream(forRequestJSON: effectiveCandidateBody) &&
             !(candidateRoute?.providerID.hasPrefix("nvidia") ?? false)
         if shouldBufferStreamingPreflight,
-           let data = transformedCandidateBody.data(using: .utf8),
+           let data = effectiveCandidateBody.data(using: .utf8),
            var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             json["stream"] = false
             if let bufferedData = try? JSONSerialization.data(withJSONObject: json),
                let bufferedBody = String(data: bufferedData, encoding: .utf8) {
                 preflightCandidateBody = bufferedBody
             } else {
-                preflightCandidateBody = transformedCandidateBody
+                preflightCandidateBody = effectiveCandidateBody
             }
         } else {
-            preflightCandidateBody = transformedCandidateBody
+            preflightCandidateBody = effectiveCandidateBody
         }
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
@@ -2044,7 +2050,7 @@ enum OpenAICompatTemporaryShim {
                 error: preflightError
             )
         }
-        return .available(body: transformedCandidateBody)
+        return .available(body: effectiveCandidateBody)
     }
 
     fileprivate static var smartAliasExhaustionLogSinkForTesting: ((String) -> Void)?
@@ -2361,7 +2367,7 @@ enum OpenAICompatTemporaryShim {
             return ClientFacingNVIDIAFailure(
                 statusCode: failure.statusCode,
                 message: failure.message,
-                reasonCode: "meta_preflight_rejection"
+                reasonCode: failure.reasonCode ?? "meta_preflight_rejection"
             )
         }
 
@@ -5973,6 +5979,65 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         return false
     }
 
+    private static func forcingNonStreamRequestBody(from jsonString: String) -> String? {
+        guard let data = jsonString.data(using: .utf8),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        json["stream"] = false
+        guard let normalized = try? JSONSerialization.data(withJSONObject: json),
+              let normalizedString = String(data: normalized, encoding: .utf8) else {
+            return nil
+        }
+        return normalizedString
+    }
+
+    private static func smartAliasCompatibleCandidateBody(
+        method: String,
+        path: String,
+        candidateModel: String,
+        candidateBody: String
+    ) -> String {
+        guard method == "POST",
+              isChatCompletionsPath(path),
+              requestedStream(forRequestJSON: candidateBody),
+              let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
+              candidateRoute.providerID.hasPrefix("nvidia"),
+              let bufferedBody = forcingNonStreamRequestBody(from: candidateBody),
+              let livePreflight = configuredRoutePreflightError(
+                method: method,
+                path: path,
+                jsonString: candidateBody,
+                headers: []
+              ) else {
+            return candidateBody
+        }
+
+        let transformedBufferedBody = transformRequest(
+            method: method,
+            path: path,
+            jsonString: bufferedBody
+        ) ?? bufferedBody
+
+        guard configuredRoutePreflightError(
+            method: method,
+            path: path,
+            jsonString: transformedBufferedBody,
+            headers: []
+        ) == nil else {
+            return candidateBody
+        }
+
+        // Smart-alias chat streaming already returns synthetic SSE to the caller.
+        // When NVIDIA rejects the live upstream streaming surface but the same request
+        // becomes dispatchable once the proxy buffers upstream delivery, prefer the
+        // buffered upstream request so selection, health, and execution agree on the
+        // actual dispatchable path instead of exhausting the pool needlessly.
+        _ = livePreflight
+        return transformedBufferedBody
+    }
+
     private static func normalizedContentResult(from content: Any?) -> ContentNormalizationResult {
         guard let content else {
             return .unchanged
@@ -6041,44 +6106,35 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     private static func flattenedTextMessageContent(from dictionary: [String: Any]) -> String? {
-        let type = (dictionary["type"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let allowsDirectText = type == nil || type == "text" || type == "input_text" || type == "output_text" || type == "summary_text" || type == "reasoning" || type == "tool_result"
-        let allowsStructuredPayload = type == nil || type == "tool_result" || type == "output_json" || type == "input_json" || type == "json" || type == "reasoning" || type == "metadata_marker"
+        guard !containsUnsupportedMediaPayload(dictionary) else {
+            return nil
+        }
 
-        if let textValue = normalizedTextMessageScalar(dictionary["text"]),
-           allowsDirectText {
+        if let textValue = normalizedTextMessageScalar(dictionary["text"]) {
             return textValue
         }
 
-        if let outputText = normalizedTextMessageScalar(dictionary["output_text"]),
-           allowsDirectText || type == "output_json" {
+        if let outputText = normalizedTextMessageScalar(dictionary["output_text"]) {
             return outputText
         }
 
-        if let valueText = normalizedTextMessageScalar(dictionary["value"]),
-           allowsStructuredPayload {
+        if let valueText = normalizedTextMessageScalar(dictionary["value"]) {
             return valueText
         }
 
-        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]),
-           allowsStructuredPayload {
+        if let structuredJSON = normalizedStructuredPayloadString(dictionary["json"]) {
             return structuredJSON
         }
 
-        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]),
-           allowsStructuredPayload {
+        if let structuredResult = normalizedStructuredPayloadString(dictionary["result"]) {
             return structuredResult
         }
 
-        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]),
-           allowsStructuredPayload {
+        if let structuredArguments = normalizedStructuredPayloadString(dictionary["arguments"]) {
             return structuredArguments
         }
 
-        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]),
-           allowsStructuredPayload {
+        if let structuredValue = normalizedStructuredPayloadString(dictionary["value"]) {
             return structuredValue
         }
 
@@ -6970,6 +7026,7 @@ enum MetaAIWebAdapter {
     static let modelAlias = "muse-spark"
     static let conversationMode = "think_hard"
     private static let maxEventStreamDataLineBytes = 256 * 1024
+    private static let maxSyntheticToolDefinitionCount = 1
 
     enum ResponseSurface: Equatable {
         case chatCompletions
@@ -6979,6 +7036,13 @@ enum MetaAIWebAdapter {
     struct Failure: Error, Equatable {
         let statusCode: Int
         let message: String
+        let reasonCode: String?
+
+        init(statusCode: Int, message: String, reasonCode: String? = nil) {
+            self.statusCode = statusCode
+            self.message = message
+            self.reasonCode = reasonCode
+        }
     }
 
     struct ExecutionResult {
@@ -7076,7 +7140,14 @@ enum MetaAIWebAdapter {
 
     static func preflightFailure(path: String, body: String, publicModel: String) -> Failure? {
         do {
-            _ = try parseRequest(path: path, body: body, publicModel: publicModel)
+            let parsedRequest = try parseRequest(path: path, body: body, publicModel: publicModel)
+            if parsedRequest.toolDefinitions.count > maxSyntheticToolDefinitionCount {
+                return Failure(
+                    statusCode: 501,
+                    message: "Meta web adapter synthetic tool mode is only enabled for requests with at most one tool definition; multi-tool requests should use native tool providers.",
+                    reasonCode: "multi_tool_definitions_unsupported"
+                )
+            }
             return nil
         } catch let failure as Failure {
             return failure
@@ -9493,8 +9564,11 @@ class ThinkingProxy {
     private enum FactoryWorkerHealthRequestShape: String, CaseIterable {
         case plainChat = "plain_chat"
         case toolChat = "tool_string_content"
+        case multiToolChat = "multi_tool_string_content"
         case typedToolChat = "typed_tool_content"
+        case multiTypedToolChat = "multi_tool_typed_content"
         case streamingTypedToolChat = "streaming_typed_tool_content"
+        case streamingMultiTypedToolChat = "streaming_multi_tool_typed_content"
     }
 
     private struct FactoryRoleContract {
@@ -18898,27 +18972,98 @@ class ThinkingProxy {
     ) -> String {
         let contentJSON: String
         let toolsJSON: String
+        let singleToolJSON = """
+        ,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        """
+        let multiToolJSON = """
+        ,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        """
+        let streamingSingleToolJSON = """
+        ,
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        """
+        let streamingMultiToolJSON = """
+        ,
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "noop",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          ]
+        """
         switch requestShape {
         case .plainChat:
             contentJSON = "\"Hi\""
             toolsJSON = ""
         case .toolChat:
             contentJSON = "\"Hi\""
-            toolsJSON = """
-            ,
-              "tools": [
-                {
-                  "type": "function",
-                  "function": {
-                    "name": "noop",
-                    "parameters": {
-                      "type": "object",
-                      "properties": {}
-                    }
-                  }
-                }
-              ]
-            """
+            toolsJSON = singleToolJSON
+        case .multiToolChat:
+            contentJSON = "\"Hi\""
+            toolsJSON = multiToolJSON
         case .typedToolChat:
             contentJSON = """
             [
@@ -18928,21 +19073,17 @@ class ThinkingProxy {
               }
             ]
             """
-            toolsJSON = """
-            ,
-              "tools": [
-                {
-                  "type": "function",
-                  "function": {
-                    "name": "noop",
-                    "parameters": {
-                      "type": "object",
-                      "properties": {}
-                    }
-                  }
-                }
-              ]
+            toolsJSON = singleToolJSON
+        case .multiTypedToolChat:
+            contentJSON = """
+            [
+              {
+                "type": "text",
+                "text": "Hi"
+              }
+            ]
             """
+            toolsJSON = multiToolJSON
         case .streamingTypedToolChat:
             contentJSON = """
             [
@@ -18952,22 +19093,17 @@ class ThinkingProxy {
               }
             ]
             """
-            toolsJSON = """
-            ,
-              "stream": true,
-              "tools": [
-                {
-                  "type": "function",
-                  "function": {
-                    "name": "noop",
-                    "parameters": {
-                      "type": "object",
-                      "properties": {}
-                    }
-                  }
-                }
-              ]
+            toolsJSON = streamingSingleToolJSON
+        case .streamingMultiTypedToolChat:
+            contentJSON = """
+            [
+              {
+                "type": "input_text",
+                "text": "Hi"
+              }
+            ]
             """
+            toolsJSON = streamingMultiToolJSON
         }
 
         return """
@@ -19401,9 +19537,12 @@ class ThinkingProxy {
         let effectiveRouteModel = summarizedFactoryWorkerEffectiveRouteModel(
             from: requestShapeContracts
         )
-        let effectiveRouteModelSource = summarizedFactoryWorkerEffectiveRouteModelSource(
-            from: requestShapeContracts
-        )
+        let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource? =
+            effectiveRouteModel == nil
+            ? .requestShapeDivergent
+            : (summarizedFactoryWorkerEffectiveRouteModelSource(
+                from: requestShapeContracts
+            ) ?? .authoritativeFallback)
         let recentDispatchedRouteModel = summarizedFactoryWorkerRecentDispatchedRouteModel(
             from: requestShapeContracts
         )
@@ -19421,9 +19560,11 @@ class ThinkingProxy {
             workerModelID: workerModelID,
             routeModel: authoritativeRouteModel
         )
-        let effectiveRouteProvider = summarizedFactoryWorkerEffectiveRouteProvider(
-            from: requestShapeContracts
-        )
+        let effectiveRouteProvider = effectiveRouteModel.flatMap { _ in
+            summarizedFactoryWorkerEffectiveRouteProvider(
+                from: requestShapeContracts
+            )
+        }
         let recentLiveRouteProvider = recentLiveDispatch.flatMap {
             OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0.requestModel)?.providerID
         }
