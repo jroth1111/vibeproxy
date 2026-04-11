@@ -1781,44 +1781,58 @@ enum OpenAICompatTemporaryShim {
         let exhaustionSummary: SmartAliasExhaustionSummary?
     }
 
+    fileprivate enum SmartAliasExhaustionClassification: String {
+        case capacityExhausted = "capacity_exhausted"
+        case cooldownExhausted = "cooldown_exhausted"
+        case routeUnavailable = "route_unavailable"
+        case policyExhausted = "policy_exhausted"
+        case mixedExhaustion = "mixed_exhaustion"
+    }
+
     fileprivate struct SmartAliasExhaustionSummary {
-        let classification: String
+        let classification: SmartAliasExhaustionClassification
         let countsByReason: [String: Int]
         let skippedReasons: [(model: String, reason: String)]
 
         var statusCode: Int {
             switch classification {
-            case "capacity_exhausted", "cooldown_exhausted":
+            case .capacityExhausted, .cooldownExhausted:
                 return 429
-            default:
+            case .routeUnavailable, .policyExhausted, .mixedExhaustion:
                 return 503
             }
         }
 
         func clientFacingMessage(publicAlias: String) -> String {
             switch classification {
-            case "capacity_exhausted":
+            case .capacityExhausted:
                 return "All configured worker backends for \(publicAlias) are currently at concurrency capacity; retry shortly."
-            case "cooldown_exhausted":
+            case .cooldownExhausted:
                 return "All configured worker backends for \(publicAlias) are temporarily cooling down after upstream pressure; retry shortly."
-            case "policy_exhausted":
+            case .policyExhausted:
                 return "All remaining worker backends for \(publicAlias) were rejected by proxy policy for this request shape."
-            case "route_unavailable":
+            case .routeUnavailable:
                 return "All configured worker backends for \(publicAlias) are currently quarantined or unavailable."
-            case "mixed_exhaustion":
+            case .mixedExhaustion:
                 return "All configured worker backends for \(publicAlias) are currently unavailable due to mixed capacity, cooldown, and policy constraints."
-            default:
-                return "All configured worker backends are currently unavailable."
             }
         }
 
         var logSummary: [String: Any] {
             [
-                "classification": classification,
+                "classification": classification.rawValue,
                 "counts_by_reason": countsByReason,
                 "skipped": skippedReasons.map { ["model": $0.model, "reason": $0.reason] }
             ]
         }
+    }
+
+    fileprivate enum FactoryEffectiveRouteModelSource: String {
+        case observedRecentWinner = "observed_recent_winner"
+        case dispatchablePrediction = "dispatchable_prediction"
+        case authoritativeFallback = "authoritative_fallback"
+        case configuredRoute = "configured_route"
+        case requestShapeDivergent = "request_shape_divergent"
     }
 
     private enum SmartAliasCandidateEvaluation {
@@ -1836,17 +1850,17 @@ enum OpenAICompatTemporaryShim {
         }
         let reasonSet = Set(skippedReasons.map(\.reason))
 
-        let classification: String
+        let classification: SmartAliasExhaustionClassification
         if reasonSet.allSatisfy({ $0 == "concurrency_capacity" }) {
-            classification = "capacity_exhausted"
+            classification = .capacityExhausted
         } else if reasonSet.allSatisfy({ $0 == "provider_cooldown" }) {
-            classification = "cooldown_exhausted"
+            classification = .cooldownExhausted
         } else if reasonSet.allSatisfy({ $0 == "route_closed" }) {
-            classification = "route_unavailable"
+            classification = .routeUnavailable
         } else if reasonSet.allSatisfy({ $0.hasPrefix("provider_preflight_") }) {
-            classification = "policy_exhausted"
+            classification = .policyExhausted
         } else {
-            classification = "mixed_exhaustion"
+            classification = .mixedExhaustion
         }
 
         return SmartAliasExhaustionSummary(
@@ -1918,7 +1932,8 @@ enum OpenAICompatTemporaryShim {
         path: String,
         currentBody: String,
         candidateModelsRemaining: [String],
-        forceAllowClosedModels: Set<String> = []
+        forceAllowClosedModels: Set<String> = [],
+        proxyRequestID: String? = nil
     ) -> SmartAliasCandidateSelectionResult {
         var remainingCandidateModels = candidateModelsRemaining
         var skippedReasons: [(model: String, reason: String)] = []
@@ -1958,12 +1973,13 @@ enum OpenAICompatTemporaryShim {
         }
 
         let exhaustionSummary = smartAliasExhaustionSummary(for: skippedReasons)
+        let correlationPrefix = proxyRequestID.map { "proxy_request_id:\($0) " } ?? ""
         if let exhaustionSummary,
            let jsonData = try? JSONSerialization.data(withJSONObject: exhaustionSummary.logSummary, options: [.sortedKeys]),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@", jsonString)
+            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@%@", correlationPrefix, jsonString)
         } else {
-            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. Skipped: %@", skippedReasons)
+            NSLog("[ThinkingProxy] nextSmartAliasCandidateTransition: no valid candidates. %@Skipped: %@", correlationPrefix, skippedReasons)
         }
 
         return SmartAliasCandidateSelectionResult(
@@ -2201,7 +2217,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         let truncated = bodyString.prefix(maxLength)
         
         // Basic redaction of common sensitive patterns
-        var sanitized = truncated
+        let sanitized = truncated
             .replacingOccurrences(of: "\"api_key\"\\s*:\\s*\"[^\"]*\"", with: "\"api_key\":\"[REDACTED]\"", options: .regularExpression)
             .replacingOccurrences(of: "\"authorization\"\\s*:\\s*\"[^\"]*\"", with: "\"authorization\":\"[REDACTED]\"", options: .regularExpression)
             .replacingOccurrences(of: "\"password\"\\s*:\\s*\"[^\"]*\"", with: "\"password\":\"[REDACTED]\"", options: .regularExpression)
@@ -8958,6 +8974,7 @@ class ThinkingProxy {
         let requestShapeContracts: [FactoryWorkerRequestShapeContract]
         let dispatchableRouteModel: String?
         let effectiveRouteModel: String?
+        let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource?
         let effectiveRouteProvider: String?
         let recentLiveRouteModel: String?
         let recentLiveRouteProvider: String?
@@ -8989,6 +9006,7 @@ class ThinkingProxy {
         let dispatchableCandidateModels: [String]
         let dispatchableRouteModel: String?
         let effectiveRouteModel: String
+        let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource
         let effectiveRouteProvider: String?
         let routeHealthStatus: String?
 
@@ -9010,6 +9028,7 @@ class ThinkingProxy {
         let routeProvider: String
         let requestSurface: String
         let effectiveRouteModel: String
+        let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource
         let effectiveRouteProvider: String?
         let displayName: String?
         let baseURL: String?
@@ -11454,31 +11473,20 @@ class ThinkingProxy {
             return
         }
 
-        let effectiveCandidateModels = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias).map {
-            OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
-                forPublicAlias: publicAlias,
-                method: method,
-                path: path,
-                jsonString: currentBody,
-                smartAlias: $0
-            )
-        }
-
         let selection = OpenAICompatTemporaryShim.nextSmartAliasCandidateSelection(
             method: method,
             path: path,
             currentBody: currentBody,
             candidateModelsRemaining: remainingCandidateModels,
-            forceAllowClosedModels: forceProbeCandidateModels
+            forceAllowClosedModels: forceProbeCandidateModels,
+            proxyRequestID: requestTrace.proxyRequestID
         )
         guard let transition = selection.transition else {
             let exhaustionSummary = selection.exhaustionSummary
-            let poolRetryDelay = effectiveCandidateModels.flatMap {
-                OpenAICompatTemporaryShim.nextSmartAliasRetryDelay(
-                    forCandidateModels: $0,
-                    forceAllowClosedModels: forceProbeCandidateModels
-                )
-            }
+            let poolRetryDelay = OpenAICompatTemporaryShim.nextSmartAliasRetryDelay(
+                forCandidateModels: remainingCandidateModels,
+                forceAllowClosedModels: forceProbeCandidateModels
+            )
             if let exhaustedRetryableOutcome,
                case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil) = exhaustedRetryableOutcome {
                 let isImmediateRetryClass =
@@ -12334,7 +12342,7 @@ class ThinkingProxy {
                     requestTrace: requestTrace
                 )
             )
-        case .terminalError(_, let statusCode, let message, let telemetryEvent, let errorBodySnippet):
+        case .terminalError(_, let statusCode, let message, let telemetryEvent, _):
             guard requestController.isCancelled() != true else { return }
             if let telemetryEvent {
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
@@ -12477,7 +12485,7 @@ class ThinkingProxy {
                     requestTrace: requestTrace
                 )
             )
-        case .terminalError(_, let statusCode, let message, _, let errorBodySnippet):
+        case .terminalError(_, let statusCode, let message, _, _):
             deliverBufferedError(
                 defaultConnection: originalConnection,
                 statusCode: statusCode,
@@ -13898,16 +13906,14 @@ class ThinkingProxy {
                 if liveStreamingEnabled,
                    statusCode >= 200,
                    statusCode < 300 {
-completion(
-                             .terminalError(
-                                 requestModel: candidateModel,
-                                 statusCode: 502,
-                                 message: "Bad Gateway - NVIDIA stream finished without live SSE delivery",
-                                 telemetryEvent: telemetryEvent,
-                                 errorBodySnippet: attempt.data.map { sanitizeErrorBody($0) }
-                             )
-                         )
-                     )
+                    completion(
+                        .terminalError(
+                            requestModel: candidateModel,
+                            statusCode: 502,
+                            message: "Bad Gateway - NVIDIA stream finished without live SSE delivery",
+                            telemetryEvent: telemetryEvent,
+                            errorBodySnippet: OpenAICompatTemporaryShim.sanitizeErrorBodySnippet(responseBody)
+                        )
                     )
                     return
                 }
@@ -14386,7 +14392,7 @@ completion(
     ) -> [String: String] {
         var headers: [String: String] = [:]
         if let exhaustionSummary {
-            headers["X-VibeProxy-Smart-Alias-Exhaustion"] = exhaustionSummary.classification
+            headers["X-VibeProxy-Smart-Alias-Exhaustion"] = exhaustionSummary.classification.rawValue
         }
         return mergingResponseHeaders(headers, with: requestTrace)
     }
@@ -17907,6 +17913,9 @@ completion(
         if let effectiveRouteModel = contract.effectiveRouteModel {
             dict["effective_route_model"] = effectiveRouteModel
         }
+        if let effectiveRouteModelSource = contract.effectiveRouteModelSource {
+            dict["effective_route_model_source"] = effectiveRouteModelSource.rawValue
+        }
         if contract.authoritativeRouteModel != contract.routeModel {
             dict["authoritative_route_model"] = contract.authoritativeRouteModel
         }
@@ -17938,6 +17947,7 @@ completion(
                         "candidate_models": shapeContract.candidateModels,
                         "dispatchable_candidate_models": shapeContract.dispatchableCandidateModels,
                         "effective_route_model": shapeContract.effectiveRouteModel,
+                        "effective_route_model_source": shapeContract.effectiveRouteModelSource.rawValue,
                         "ready": backendReachable && shapeContract.ready
                     ]
                     if let dispatchableRouteModel = shapeContract.dispatchableRouteModel {
@@ -18026,6 +18036,7 @@ completion(
             "route_provider": contract.routeProvider,
             "request_surface": contract.requestSurface,
             "effective_route_model": contract.effectiveRouteModel,
+            "effective_route_model_source": contract.effectiveRouteModelSource.rawValue,
             "ready": backendReachable && contract.ready
         ]
         if let reasoningEffort = contract.reasoningEffort {
@@ -18316,7 +18327,7 @@ completion(
             candidateModelsRemaining: orderedCandidateModels
         )
         if let exhaustionSummary = selection.exhaustionSummary {
-            return exhaustionSummary.classification
+            return exhaustionSummary.classification.rawValue
         }
         if selection.terminalPreflightError != nil {
             return "policy_exhausted"
@@ -18341,6 +18352,7 @@ completion(
                     dispatchableCandidateModels: dispatchableRouteModel.map { [$0] } ?? [],
                     dispatchableRouteModel: dispatchableRouteModel,
                     effectiveRouteModel: dispatchableRouteModel ?? routeModel,
+                    effectiveRouteModelSource: .configuredRoute,
                     effectiveRouteProvider: dispatchableRouteModel.flatMap {
                         OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0)?.providerID
                     },
@@ -18374,6 +18386,14 @@ completion(
 
             let dispatchableRouteModel = recentWinner?.requestModel ?? dispatchableCandidateModels.first
             let effectiveRouteModel = dispatchableRouteModel ?? routeModel
+            let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource
+            if recentWinner != nil {
+                effectiveRouteModelSource = .observedRecentWinner
+            } else if dispatchableRouteModel != nil {
+                effectiveRouteModelSource = .dispatchablePrediction
+            } else {
+                effectiveRouteModelSource = .authoritativeFallback
+            }
             let effectiveRouteProvider = dispatchableRouteModel.flatMap {
                 OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0)?.providerID
             }
@@ -18384,6 +18404,7 @@ completion(
                 dispatchableCandidateModels: dispatchableCandidateModels,
                 dispatchableRouteModel: dispatchableRouteModel,
                 effectiveRouteModel: effectiveRouteModel,
+                effectiveRouteModelSource: effectiveRouteModelSource,
                 effectiveRouteProvider: effectiveRouteProvider,
                 routeHealthStatus: effectiveFactoryContractHealthStatus(
                     routeModel: routeModel,
@@ -18402,6 +18423,16 @@ completion(
             return nil
         }
         return effectiveRouteModels.first
+    }
+
+    private static func summarizedFactoryWorkerEffectiveRouteModelSource(
+        from requestShapeContracts: [FactoryWorkerRequestShapeContract]
+    ) -> OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource? {
+        let effectiveRouteModelSources = Array(Set(requestShapeContracts.map(\.effectiveRouteModelSource))).sorted { $0.rawValue < $1.rawValue }
+        guard effectiveRouteModelSources.count == 1 else {
+            return .requestShapeDivergent
+        }
+        return effectiveRouteModelSources.first
     }
 
     private static func summarizedFactoryWorkerEffectiveRouteProvider(
@@ -18508,6 +18539,7 @@ completion(
             routeProvider: routeProvider,
             requestSurface: requestSurface,
             effectiveRouteModel: directEffectiveRouteModel,
+            effectiveRouteModelSource: .configuredRoute,
             effectiveRouteProvider: directEffectiveRouteProvider,
             displayName: customModel["displayName"] as? String,
             baseURL: customModel["baseUrl"] as? String,
@@ -18575,6 +18607,9 @@ completion(
         let effectiveRouteModel = summarizedFactoryWorkerEffectiveRouteModel(
             from: requestShapeContracts
         )
+        let effectiveRouteModelSource = summarizedFactoryWorkerEffectiveRouteModelSource(
+            from: requestShapeContracts
+        )
         let recentLiveDispatch = recentSmartAliasWinnerForFactoryWorker(
             workerModelID: workerModelID,
             routeModel: authoritativeRouteModel
@@ -18628,6 +18663,7 @@ completion(
             requestShapeContracts: requestShapeContracts,
             dispatchableRouteModel: dispatchableRouteModel,
             effectiveRouteModel: effectiveRouteModel,
+            effectiveRouteModelSource: effectiveRouteModelSource,
             effectiveRouteProvider: effectiveRouteProvider,
             recentLiveRouteModel: recentLiveDispatch?.requestModel,
             recentLiveRouteProvider: recentLiveRouteProvider,
