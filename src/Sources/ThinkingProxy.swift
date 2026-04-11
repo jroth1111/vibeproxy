@@ -8866,6 +8866,11 @@ class ThinkingProxy {
             body: Data,
             telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
         )
+        case liveStreamDelivered(
+            requestModel: String,
+            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent,
+            cooldownUntil: Date?
+        )
         case retryableFailure(
             requestModel: String,
             telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent,
@@ -11046,7 +11051,7 @@ class ThinkingProxy {
                 coalescingKey: coalescingKey,
                 controller: controller,
                 onNVIDIAMeaningfulOutput: {
-                    _ = coordinator.claimMeaningfulOutput(attemptLane: attemptLane)
+                    coordinator.claimMeaningfulOutput(attemptLane: attemptLane)
                 },
                 requestTrace: requestTrace
             ) { [weak self] outcome in
@@ -11092,6 +11097,29 @@ class ThinkingProxy {
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         guard requestController.isCancelled() != true else { return }
         switch outcome {
+        case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
+            let winningTelemetryEvent = annotatedSmartAliasTelemetryEvent(
+                OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                    telemetryEvent,
+                    winnerAttemptLane: 1
+                ),
+                requestedAlias: publicAlias,
+                failoverDepth: failoverDepth,
+                finalWinnerRequestModel: requestModel
+            )
+            if smartAliasLiveStreamTelemetryWasSuccessful(winningTelemetryEvent) {
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: requestModel,
+                    telemetryEvent: winningTelemetryEvent
+                )
+            } else {
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: requestModel,
+                    telemetryEvent: winningTelemetryEvent,
+                    forcedOpenUntil: cooldownUntil,
+                    healthSensitivity: healthSensitivity
+                )
+            }
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
             guard requestController.isCancelled() != true else { return }
             let winningTelemetryEvent = annotatedSmartAliasTelemetryEvent(
@@ -11478,6 +11506,14 @@ class ThinkingProxy {
         }
     }
 
+    private func smartAliasLiveStreamTelemetryWasSuccessful(
+        _ telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
+    ) -> Bool {
+        guard telemetryEvent.transportOutcome == "send_response" else { return false }
+        guard let upstreamHTTPStatus = telemetryEvent.upstreamHTTPStatus else { return true }
+        return (200...299).contains(upstreamHTTPStatus)
+    }
+
     private func deliverSmartAliasTerminalOutcome(
         _ outcome: SmartAliasCandidateAttemptOutcome,
         publicAlias: String,
@@ -11490,6 +11526,24 @@ class ThinkingProxy {
         guard requestController?.isCancelled() != true else { return }
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
+        case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
+            let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
+                telemetryEvent,
+                winnerAttemptLane: telemetryEvent.attemptLane
+            )
+            if smartAliasLiveStreamTelemetryWasSuccessful(winningTelemetryEvent) {
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: requestModel,
+                    telemetryEvent: winningTelemetryEvent
+                )
+            } else {
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: requestModel,
+                    telemetryEvent: winningTelemetryEvent,
+                    forcedOpenUntil: cooldownUntil,
+                    healthSensitivity: healthSensitivity
+                )
+            }
         case .terminalResponse(let requestModel, let statusCode, let responseHeaders, let responseBody, _):
             deliverBufferedHTTPResponse(
                 defaultConnection: originalConnection,
@@ -12163,6 +12217,31 @@ class ThinkingProxy {
         return "data: \(jsonString)\n\n"
     }
 
+    private func rewriteNVIDIAStreamOutput(
+        _ output: NVIDIAStreamParserOutput,
+        publicAlias: String
+    ) -> NVIDIAStreamParserOutput {
+        switch output {
+        case .comment, .done:
+            return output
+        case .message(var message):
+            message.dataLines = message.dataLines.map { dataLine in
+                guard let jsonData = dataLine.data(using: .utf8),
+                      var json = (try? JSONSerialization.jsonObject(with: jsonData)) as? [String: Any],
+                      json["model"] != nil else {
+                    return dataLine
+                }
+                json["model"] = publicAlias
+                guard let rewrittenData = try? JSONSerialization.data(withJSONObject: json),
+                      let rewrittenLine = String(data: rewrittenData, encoding: .utf8) else {
+                    return dataLine
+                }
+                return rewrittenLine
+            }
+            return .message(message)
+        }
+    }
+
     private func executeSmartAliasCandidate(
         method: String,
         path: String,
@@ -12175,7 +12254,7 @@ class ThinkingProxy {
         deadlineAt: Date,
         coalescingKey: String?,
         controller: RequestCancellationController?,
-        onNVIDIAMeaningfulOutput: (() -> Void)? = nil,
+        onNVIDIAMeaningfulOutput: (() -> Bool)? = nil,
         requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
     ) {
@@ -12241,6 +12320,8 @@ class ThinkingProxy {
                 failoverDepth: failoverDepth,
                 attemptLane: attemptLane,
                 deadlineAt: deadlineAt,
+                originalConnection: originalConnection,
+                deliveryMode: deliveryMode,
                 controller: controller,
                 onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
                 state: OpenAICompatTemporaryShim.NVIDIARetryState(
@@ -12380,8 +12461,10 @@ class ThinkingProxy {
         failoverDepth: Int,
         attemptLane: Int,
         deadlineAt: Date,
+        originalConnection: NWConnection,
+        deliveryMode: SmartAliasDeliveryMode,
         controller: RequestCancellationController?,
-        onNVIDIAMeaningfulOutput: (() -> Void)?,
+        onNVIDIAMeaningfulOutput: (() -> Bool)?,
         state: OpenAICompatTemporaryShim.NVIDIARetryState,
         requestTrace: RequestTraceContext,
         completion: @escaping (SmartAliasCandidateAttemptOutcome) -> Void
@@ -12467,28 +12550,161 @@ class ThinkingProxy {
         }
         request.setValue("close", forHTTPHeaderField: "Connection")
 
+        let transportPolicy = effectiveNVIDIADirectTransportPolicy()
+        let liveStreamingEnabled = internalStreaming && deliveryMode == .syntheticSSE
         let lockingQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-smart-alias-locking")
         var lockingEngine = NVIDIAStreamEngine()
         var meaningfulOutputLocked = false
+        var liveStreamStarted = false
+        var liveStreamFinished = false
+        var liveStreamFailed = false
+        var interChunkTimeoutTriggered = false
+        var keepaliveTimer: DispatchSourceTimer?
+        var interChunkDeadlineWorkItem: DispatchWorkItem?
+        var transportCancel: (() -> Void)?
+        var liveStreamingSink = NVIDIAEventStreamSink(policy: transportPolicy.sinkPolicy)
+        let resolutionHeaders = smartAliasResolutionHeaders(
+            publicAlias: publicAlias,
+            resolvedRequestModel: candidateModel,
+            requestTrace: requestTrace
+        )
 
-        let lockMeaningfulOutputIfNeeded: (Data, Date) -> Void = { chunk, receivedAt in
+        func cancelStreamingTimersLocked() {
+            interChunkDeadlineWorkItem?.cancel()
+            interChunkDeadlineWorkItem = nil
+            keepaliveTimer?.cancel()
+            keepaliveTimer = nil
+        }
+
+        let scheduleKeepaliveTimerIfNeeded: () -> Void = { [weak self] in
+            guard let self else { return }
+            let timerToStart: DispatchSourceTimer? = lockingQueue.sync {
+                guard liveStreamingEnabled,
+                      transportPolicy.sinkPolicy.emitsDownstreamKeepalives,
+                      transportPolicy.sinkPolicy.keepaliveIntervalSeconds > 0,
+                      liveStreamStarted,
+                      !liveStreamFinished,
+                      keepaliveTimer == nil else {
+                    return nil
+                }
+                let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+                timer.schedule(
+                    deadline: .now() + transportPolicy.sinkPolicy.keepaliveIntervalSeconds,
+                    repeating: transportPolicy.sinkPolicy.keepaliveIntervalSeconds
+                )
+                timer.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    let keepaliveFrame: Data? = lockingQueue.sync {
+                        guard liveStreamStarted,
+                              !liveStreamFinished,
+                              !liveStreamFailed,
+                              controller?.isCancelled() != true,
+                              let keepalive = liveStreamingSink.emitKeepaliveIfIdle(now: Date()) else {
+                            return nil
+                        }
+                        return Data(keepalive.utf8)
+                    }
+                    if let keepaliveFrame {
+                        self.sendStreamingHTTPChunk(to: originalConnection, chunk: keepaliveFrame)
+                    }
+                }
+                keepaliveTimer = timer
+                return timer
+            }
+            timerToStart?.resume()
+        }
+
+        let resetInterChunkDeadline: () -> Void = {
+            guard liveStreamingEnabled, transportPolicy.interChunkReadTimeoutSeconds > 0 else { return }
+            let workItemToSchedule: DispatchWorkItem? = lockingQueue.sync {
+                guard !liveStreamFinished else { return nil }
+                interChunkDeadlineWorkItem?.cancel()
+                let workItem = DispatchWorkItem {
+                    let cancelAction: (() -> Void)? = lockingQueue.sync {
+                        guard !liveStreamFinished,
+                              !liveStreamFailed,
+                              controller?.isCancelled() != true else {
+                            return nil
+                        }
+                        interChunkTimeoutTriggered = true
+                        liveStreamFailed = true
+                        return transportCancel
+                    }
+                    cancelAction?()
+                }
+                interChunkDeadlineWorkItem = workItem
+                return workItem
+            }
+            if let workItemToSchedule {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + transportPolicy.interChunkReadTimeoutSeconds,
+                    execute: workItemToSchedule
+                )
+            }
+        }
+
+        let lockMeaningfulOutputIfNeeded: (Data, Date) -> Void = { [weak self] chunk, receivedAt in
             guard internalStreaming else { return }
-            lockingQueue.sync {
-                guard !meaningfulOutputLocked else { return }
+            resetInterChunkDeadline()
+            guard let self else { return }
+            let emittedFrames: [Data]? = lockingQueue.sync {
+                guard !liveStreamFailed else { return nil }
                 do {
-                    _ = try lockingEngine.ingest(
+                    let outputs = try lockingEngine.ingest(
                         chunk,
                         receivedAt: receivedAt,
                         surface: .smartAlias,
                         attemptLane: attemptLane
                     )
-                    if lockingEngine.ownsMeaningfulOutput(surface: .smartAlias, attemptLane: attemptLane) {
-                        meaningfulOutputLocked = true
-                        onNVIDIAMeaningfulOutput?()
+                    if !meaningfulOutputLocked,
+                       lockingEngine.ownsMeaningfulOutput(surface: .smartAlias, attemptLane: attemptLane) {
+                        meaningfulOutputLocked = onNVIDIAMeaningfulOutput?() ?? true
                     }
+                    guard liveStreamingEnabled, meaningfulOutputLocked, !outputs.isEmpty else {
+                        return []
+                    }
+
+                    var frames: [Data] = []
+                    for output in outputs {
+                        let outwardOutput = self.rewriteNVIDIAStreamOutput(output, publicAlias: publicAlias)
+                        switch outwardOutput {
+                        case .comment:
+                            continue
+                        case .message, .done:
+                            if !liveStreamStarted {
+                                let sseHeaders: [AnyHashable: Any] = [
+                                    "Content-Type": "text/event-stream; charset=utf-8",
+                                    "Cache-Control": "no-cache",
+                                    "X-Accel-Buffering": "no"
+                                ]
+                                self.startStreamingHTTPResponse(
+                                    to: originalConnection,
+                                    statusCode: 200,
+                                    headers: sseHeaders,
+                                    overridingHeaders: resolutionHeaders
+                                )
+                                liveStreamStarted = true
+                            }
+                            let previousFrameCount = liveStreamingSink.emittedFrames.count
+                            try liveStreamingSink.consume(outwardOutput, receivedAt: receivedAt)
+                            let newFrames = liveStreamingSink.emittedFrames.dropFirst(previousFrameCount)
+                            if let emittedFrame = newFrames.last {
+                                frames.append(Data(emittedFrame.utf8))
+                            }
+                        }
+                    }
+                    return frames
                 } catch {
-                    return
+                    liveStreamFailed = true
+                    cancelStreamingTimersLocked()
+                    return nil
                 }
+            }
+
+            guard let emittedFrames else { return }
+            scheduleKeepaliveTimerIfNeeded()
+            for frame in emittedFrames {
+                self.sendStreamingHTTPChunk(to: originalConnection, chunk: frame)
             }
         }
 
@@ -12496,8 +12712,24 @@ class ThinkingProxy {
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
 
+            let effectiveTransportResponse: NVIDIADirectTransportResponse = lockingQueue.sync {
+                liveStreamFinished = true
+                cancelStreamingTimersLocked()
+                if interChunkTimeoutTriggered && transportResponse.deadlineStage == .none {
+                    return NVIDIADirectTransportResponse(
+                        chunks: transportResponse.chunks,
+                        response: transportResponse.response,
+                        error: transportResponse.error ?? URLError(.timedOut),
+                        firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
+                        totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds,
+                        deadlineStage: .interChunkRead
+                    )
+                }
+                return transportResponse
+            }
+
             let processedAttempt = self.processNVIDIAStreamingAttemptResponse(
-                transportResponse,
+                effectiveTransportResponse,
                 state: state,
                 attemptLane: attemptLane,
                 clientRequestedStream: false,
@@ -12554,6 +12786,25 @@ class ThinkingProxy {
                     )
                 }
                 OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                let liveStreamWasDelivered = lockingQueue.sync { liveStreamStarted && meaningfulOutputLocked }
+                if liveStreamWasDelivered {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    completion(
+                        .liveStreamDelivered(
+                            requestModel: candidateModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: attempt.response.map {
+                                OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                                    failureClass: telemetryEvent.failureClass,
+                                    statusCode: $0.statusCode,
+                                    headers: $0.allHeaderFields,
+                                    bodyData: attempt.data
+                                )
+                            }
+                        )
+                    )
+                    return
+                }
                 let delay = DispatchTimeInterval.milliseconds(
                     OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(nextState.retryBackoffMilliseconds)
                 )
@@ -12569,6 +12820,8 @@ class ThinkingProxy {
                         failoverDepth: failoverDepth,
                         attemptLane: attemptLane,
                         deadlineAt: deadlineAt,
+                        originalConnection: originalConnection,
+                        deliveryMode: deliveryMode,
                         controller: controller,
                         onNVIDIAMeaningfulOutput: onNVIDIAMeaningfulOutput,
                         state: nextState,
@@ -12619,6 +12872,26 @@ class ThinkingProxy {
                             requestModel: candidateModel,
                             telemetryEvent: telemetryEvent,
                             cooldownUntil: cooldownUntil
+                        )
+                    )
+                    return
+                }
+
+                let liveStreamWasDelivered = lockingQueue.sync { liveStreamStarted && meaningfulOutputLocked }
+                if liveStreamWasDelivered {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    completion(
+                        .liveStreamDelivered(
+                            requestModel: candidateModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: classifiedFailure.shouldFailover
+                                ? OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                                    failureClass: telemetryEvent.failureClass,
+                                    statusCode: statusCode,
+                                    headers: responseHeaders,
+                                    bodyData: responseBody
+                                )
+                                : nil
                         )
                     )
                     return
@@ -12682,6 +12955,25 @@ class ThinkingProxy {
                             requestModel: candidateModel,
                             telemetryEvent: telemetryEvent,
                             cooldownUntil: cooldownUntil
+                        )
+                    )
+                    return
+                }
+
+                let liveStreamWasDelivered = lockingQueue.sync { liveStreamStarted && meaningfulOutputLocked }
+                if liveStreamWasDelivered {
+                    self.finishStreamingHTTPResponse(to: originalConnection)
+                    completion(
+                        .liveStreamDelivered(
+                            requestModel: candidateModel,
+                            telemetryEvent: telemetryEvent,
+                            cooldownUntil: attempt.response.map {
+                                OpenAICompatTemporaryShim.smartAliasForcedOpenUntil(
+                                    failureClass: telemetryEvent.failureClass,
+                                    statusCode: statusCode,
+                                    headers: $0.allHeaderFields
+                                )
+                            }
                         )
                     )
                     return
