@@ -14777,6 +14777,7 @@ class ThinkingProxy {
         }
 
         let clientRequestedStream = OpenAICompatTemporaryShim.requestedStream(forRequestJSON: body)
+        let transportPolicy = effectiveNVIDIADirectTransportPolicy()
         let upstreamBody = body
 
         var request = URLRequest(url: url)
@@ -14816,8 +14817,87 @@ class ThinkingProxy {
         var attemptReceivedPayload = false
         var liveStreamStarted = false
         var liveStreamFailed = false
+        var liveStreamFinished = false
+        var interChunkTimeoutTriggered = false
+        var keepaliveTimer: DispatchSourceTimer?
+        var interChunkDeadlineWorkItem: DispatchWorkItem?
+        var transportCancel: (() -> Void)?
         var liveStreamingEngine = NVIDIAStreamEngine()
-        var liveStreamingSink = NVIDIAEventStreamSink(policy: Self.nvidiaDirectTransportPolicy.sinkPolicy)
+        var liveStreamingSink = NVIDIAEventStreamSink(policy: transportPolicy.sinkPolicy)
+        func cancelStreamingTimersLocked() {
+            interChunkDeadlineWorkItem?.cancel()
+            interChunkDeadlineWorkItem = nil
+            keepaliveTimer?.cancel()
+            keepaliveTimer = nil
+        }
+        let scheduleKeepaliveTimerIfNeeded: () -> Void = { [weak self] in
+            guard let self else { return }
+            let timerToStart: DispatchSourceTimer? = attemptStateQueue.sync {
+                guard clientRequestedStream,
+                      transportPolicy.sinkPolicy.emitsDownstreamKeepalives,
+                      transportPolicy.sinkPolicy.keepaliveIntervalSeconds > 0,
+                      liveStreamStarted,
+                      !liveStreamFinished,
+                      keepaliveTimer == nil else {
+                    return nil
+                }
+                let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+                timer.schedule(
+                    deadline: .now() + transportPolicy.sinkPolicy.keepaliveIntervalSeconds,
+                    repeating: transportPolicy.sinkPolicy.keepaliveIntervalSeconds
+                )
+                timer.setEventHandler { [weak self] in
+                    guard let self else { return }
+                    let keepaliveFrame: Data? = attemptStateQueue.sync {
+                        guard liveStreamStarted,
+                              !liveStreamFinished,
+                              !liveStreamFailed,
+                              !requestController.isCancelled(),
+                              !coordinator.isFinished(),
+                              let keepalive = liveStreamingSink.emitKeepaliveIfIdle(now: Date()) else {
+                            return nil
+                        }
+                        return Data(keepalive.utf8)
+                    }
+                    if let keepaliveFrame {
+                        self.sendStreamingHTTPChunk(to: originalConnection, chunk: keepaliveFrame)
+                    }
+                }
+                keepaliveTimer = timer
+                return timer
+            }
+            timerToStart?.resume()
+        }
+        let resetInterChunkDeadline: () -> Void = {
+            guard clientRequestedStream, transportPolicy.interChunkReadTimeoutSeconds > 0 else { return }
+            let workItemToSchedule: DispatchWorkItem? = attemptStateQueue.sync {
+                guard !liveStreamFinished else { return nil }
+                interChunkDeadlineWorkItem?.cancel()
+                let workItem = DispatchWorkItem {
+                    let cancelAction: (() -> Void)? = attemptStateQueue.sync {
+                        guard liveStreamStarted,
+                              !liveStreamFinished,
+                              !liveStreamFailed,
+                              !requestController.isCancelled(),
+                              !coordinator.isFinished() else {
+                            return nil
+                        }
+                        interChunkTimeoutTriggered = true
+                        liveStreamFailed = true
+                        return transportCancel
+                    }
+                    cancelAction?()
+                }
+                interChunkDeadlineWorkItem = workItem
+                return workItem
+            }
+            if let workItemToSchedule {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + transportPolicy.interChunkReadTimeoutSeconds,
+                    execute: workItemToSchedule
+                )
+            }
+        }
         let markAttemptPayloadReceived: (Data, Date) -> Void = { _, _ in
             attemptStateQueue.sync {
                 attemptReceivedPayload = true
@@ -14826,6 +14906,7 @@ class ThinkingProxy {
         let handleLiveStreamingChunk: (Data, Date) -> Void = { [weak self] chunk, receivedAt in
             markAttemptPayloadReceived(chunk, receivedAt)
             guard let self, clientRequestedStream else { return }
+            resetInterChunkDeadline()
 
             let emittedFrames: [Data]? = attemptStateQueue.sync {
                 guard !liveStreamFailed else { return nil }
@@ -14871,11 +14952,13 @@ class ThinkingProxy {
                     return frames
                 } catch {
                     liveStreamFailed = true
+                    cancelStreamingTimersLocked()
                     return nil
                 }
             }
 
             guard let emittedFrames else { return }
+            scheduleKeepaliveTimerIfNeeded()
             for frame in emittedFrames {
                 self.sendStreamingHTTPChunk(to: originalConnection, chunk: frame)
             }
@@ -14889,8 +14972,24 @@ class ThinkingProxy {
             }
             guard requestController.isCancelled() != true else { return }
 
+            let effectiveTransportResponse: NVIDIADirectTransportResponse = attemptStateQueue.sync {
+                liveStreamFinished = true
+                cancelStreamingTimersLocked()
+                if interChunkTimeoutTriggered && transportResponse.deadlineStage == .none {
+                    return NVIDIADirectTransportResponse(
+                        chunks: transportResponse.chunks,
+                        response: transportResponse.response,
+                        error: transportResponse.error ?? URLError(.timedOut),
+                        firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
+                        totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds,
+                        deadlineStage: .interChunkRead
+                    )
+                }
+                return transportResponse
+            }
+
             let processedAttempt = self.processNVIDIAStreamingAttemptResponse(
-                transportResponse,
+                effectiveTransportResponse,
                 state: state,
                 attemptLane: attemptLane,
                 clientRequestedStream: clientRequestedStream
