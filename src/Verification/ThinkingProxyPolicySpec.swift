@@ -3424,7 +3424,79 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should be preserved in proxy audit headers", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "smart-router custom IDs should expose the pool primary candidate", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, genericCompatFactoryWorkerContract.workerModelID, "smart-router custom IDs should expose the authoritative Factory model id", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "smart-router custom IDs should expose the binding source", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "code_owned_worker_alias", "smart-router custom IDs should expose the code-owned worker binding source", recorder: recorder)
+                }
+            }
+        }
+
+        run("Factory canonical worker ID still routes through the worker pool when Factory settings are unavailable", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let missingSettingsPath = (FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("json")).path
+                withFactorySettingsPath(missingSettingsPath) {
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var forwardedBody: String?
+                    var deliveredHeaders: [AnyHashable: Any]?
+                    var deliveredBody: Data?
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        forwardedBody = body
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-factory-code-owned-worker",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-zai",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(
+                                    statusCode: 200,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        )
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { _, headers, body in
+                        deliveredHeaders = headers
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    let canonicalWorkerModelID = OpenAICompatTemporaryShim.canonicalFactoryWorkerModelIDForTesting()
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                        {
+                          "model": "\(canonicalWorkerModelID)",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("canonical worker request should still return a response without readable Factory settings")
+                        return
+                    }
+
+                    let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "canonical worker IDs should still route to the worker pool primary without Factory settings", recorder: recorder)
+
+                    let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    expectEqual(deliveredJSON["model"] as? String, canonicalWorkerModelID, "canonical worker IDs should remain caller-visible without Factory settings", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, canonicalWorkerModelID, "canonical worker IDs should stay in the public-model header without Factory settings", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, canonicalWorkerModelID, "canonical worker IDs should still expose the authoritative worker ID without Factory settings", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "code_owned_worker_alias", "canonical worker IDs should still report the code-owned binding source without Factory settings", recorder: recorder)
                 }
             }
         }
@@ -12521,6 +12593,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["route_model"] as? String, openAIFactoryWorkerContract.routeModel, "healthz should expose the worker route model", recorder: recorder)
                     expectEqual(factoryWorker?["route_provider"] as? String, openAIFactoryWorkerContract.routeProvider, "healthz should expose the worker route provider", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_model"] as? String, openAIFactoryWorkerContract.effectiveRouteModel, "healthz should expose the effective worker route model", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "configured_route", "healthz should say when the effective worker route is the configured direct route rather than a live observed worker winner", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, openAIFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the effective worker route provider", recorder: recorder)
                     expectEqual(factoryWorker?["request_surface"] as? String, openAIFactoryWorkerContract.requestSurface, "healthz should expose the worker API surface", recorder: recorder)
                     expectEqual(factoryWorker?["snapshot_sync_ok"] as? Bool, true, "healthz should expose snapshot sync state", recorder: recorder)
@@ -12531,6 +12604,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(orchestration?["route_provider"] as? String, "openai", "healthz should expose the orchestration route provider", recorder: recorder)
                     expectEqual(orchestration?["request_surface"] as? String, "responses", "healthz should expose the orchestration request surface", recorder: recorder)
                     expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should expose the orchestration effective route model", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model_source"] as? String, "configured_route", "healthz should say when the orchestration role is reporting its configured direct route", recorder: recorder)
                     expectEqual(orchestration?["effective_route_provider"] as? String, "openai", "healthz should expose the orchestration effective route provider", recorder: recorder)
                     expectEqual(orchestration?["ready"] as? Bool, expectedReady, "healthz should derive orchestration readiness from backend reachability and contract health", recorder: recorder)
                     expectEqual(verification?["model_id"] as? String, openAIFactoryWorkerContract.validationWorkerModelID, "healthz should expose the verification model id", recorder: recorder)
@@ -12538,6 +12612,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(verification?["route_provider"] as? String, "openai", "healthz should expose the verification route provider", recorder: recorder)
                     expectEqual(verification?["request_surface"] as? String, "responses", "healthz should expose the verification request surface", recorder: recorder)
                     expectEqual(verification?["effective_route_model"] as? String, "gpt-5.4(high)", "healthz should expose the verification effective route model", recorder: recorder)
+                    expectEqual(verification?["effective_route_model_source"] as? String, "configured_route", "healthz should say when the verification role is reporting its configured direct route", recorder: recorder)
                     expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should expose the verification effective route provider", recorder: recorder)
                     expectEqual(verification?["ready"] as? Bool, expectedReady, "healthz should derive verification readiness from backend reachability and contract health", recorder: recorder)
 
@@ -13142,6 +13217,63 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz keeps per-request-shape worker health aligned when NVIDIA is the last dispatchable lane and typed content is shimmed", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"].forEach { requestModel in
+                        OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                            requestModel: requestModel,
+                            until: until
+                        )
+                    }
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("request-shape worker healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let requestShapes = factoryWorker?["request_shapes"] as? [String: Any]
+                    let plainChat = requestShapes?["plain_chat"] as? [String: Any]
+                    let toolChat = requestShapes?["tool_string_content"] as? [String: Any]
+                    let typedToolChat = requestShapes?["typed_tool_content"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should surface the remaining NVIDIA lane at the top level when every request shape can still dispatch through the shimmed route", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should surface the remaining NVIDIA provider when every request shape agrees on the winner", recorder: recorder)
+                    expectNil(factoryWorker?["route_health_status"], "healthz should not invent top-level divergence when the remaining NVIDIA lane serves every request shape", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker pool ready when every request shape is dispatchable through NVIDIA", recorder: recorder)
+                    expectEqual(plainChat?["effective_route_model"] as? String, "glm5-nvidia", "plain chat worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
+                    expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
+                    expectEqual(toolChat?["effective_route_model"] as? String, "glm5-nvidia", "tool-bearing string-content worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
+                    expectEqual(toolChat?["ready"] as? Bool, true, "tool-bearing string-content worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed-content worker health should stay on the remaining NVIDIA lane when the request is shimmed into a dispatchable form", recorder: recorder)
+                    expectEqual(typedToolChat?["ready"] as? Bool, true, "typed-content worker health should stay ready when the remaining NVIDIA lane can still dispatch the shimmed request", recorder: recorder)
+                    expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia"], "typed-content worker health should expose the shim-dispatchable NVIDIA lane explicitly", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz prefers the recent observed worker winner when it is still dispatchable", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
@@ -13188,6 +13320,7 @@ struct ThinkingProxyPolicySpec {
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should prefer the recent observed worker winner instead of a momentary synthetic dispatch pick", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "observed_recent_winner", "healthz should label a recent live worker winner as observed, not predicted", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "nvidia", "healthz should preserve the recent observed worker provider when that lane remains dispatchable", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -13247,6 +13380,7 @@ struct ThinkingProxyPolicySpec {
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should not reuse a recent observed worker winner once that lane is open", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "dispatchable_prediction", "healthz should label fallback worker lane selection as a dispatchable prediction when no live winner is usable", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should promote the healthy worker sibling instead of the stale open winner", recorder: recorder)
                     expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should keep worker readiness healthy when a closed sibling remains available", recorder: recorder)
                     expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker pool ready when a stale recent winner is open but a healthy sibling remains", recorder: recorder)
@@ -13468,6 +13602,7 @@ struct ThinkingProxyPolicySpec {
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
                     expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should fall back to the next dispatchable worker lane when the recent live winner is at concurrency capacity", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "dispatchable_prediction", "healthz should distinguish the current dispatchable worker lane from the preserved recent live winner", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should report the provider for the current dispatchable worker lane instead of the saturated recent winner", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner separately from the next dispatchable lane", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should expose the provider for the recent live worker winner", recorder: recorder)
@@ -14776,6 +14911,38 @@ private func withFactorySettings(
             unsetenv(projectKey)
         }
         try? fileManager.removeItem(at: temporaryDirectory)
+    }
+
+    body()
+}
+
+private func withFactorySettingsPath(
+    _ path: String?,
+    projectSettingsPaths: [String] = [],
+    body: () -> Void
+) {
+    let key = "FACTORY_SETTINGS_PATH"
+    let projectKey = "FACTORY_PROJECT_SETTINGS_PATHS"
+    let previousValue = ProcessInfo.processInfo.environment[key]
+    let previousProjectValue = ProcessInfo.processInfo.environment[projectKey]
+
+    if let path {
+        setenv(key, path, 1)
+    } else {
+        unsetenv(key)
+    }
+    setenv(projectKey, projectSettingsPaths.joined(separator: ":"), 1)
+    defer {
+        if let previousValue {
+            setenv(key, previousValue, 1)
+        } else {
+            unsetenv(key)
+        }
+        if let previousProjectValue {
+            setenv(projectKey, previousProjectValue, 1)
+        } else {
+            unsetenv(projectKey)
+        }
     }
 
     body()
