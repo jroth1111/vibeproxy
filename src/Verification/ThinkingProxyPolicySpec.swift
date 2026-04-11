@@ -170,15 +170,6 @@ struct ThinkingProxyPolicySpec {
             expectEqual(tools?.count, 1, "factory worker health routing should still preserve the worker tool surface during candidate evaluation", recorder: recorder)
         }
 
-        run("cost factor gives zero-priced models a non-neutral multiplier", recorder: recorder) {
-            let glm5CostFactor = OpenAICompatTemporaryShim.costFactorForTesting(forRequestModel: "glm5")
-            let museCostFactor = OpenAICompatTemporaryShim.costFactorForTesting(forRequestModel: "muse-spark")
-
-            expectEqual(glm5CostFactor > 1.0, true, "zero-priced models should no longer collapse to a neutral cost multiplier", recorder: recorder)
-            expectEqual(glm5CostFactor > 3.0, true, "the default zero-priced multiplier should preserve the intended ~3.98x cost preference", recorder: recorder)
-            expectEqual(abs(glm5CostFactor - museCostFactor) < 0.0001, true, "until explicit prices are configured, zero-priced models should share the same cost multiplier", recorder: recorder)
-        }
-
         run("canonical nvidia route identity preserves mitigation when aliases are renamed", recorder: recorder) {
             withMergedConfig(renamedAliasMergedConfigYAML()) {
                 let request = """

@@ -420,7 +420,7 @@ enum OpenAICompatTemporaryShim {
 
     struct RouteCircuitState: Equatable {
         let status: RouteHealthStatus
-        let failureScore: Int
+        let failureScore: Double
         let recoverySuccesses: Int
         let openUntil: Date?
         let lastScoreUpdatedAt: Date?
@@ -436,7 +436,7 @@ enum OpenAICompatTemporaryShim {
 
         init(
             status: RouteHealthStatus,
-            failureScore: Int,
+            failureScore: Double,
             recoverySuccesses: Int,
             openUntil: Date?,
             lastScoreUpdatedAt: Date?,
@@ -504,14 +504,14 @@ enum OpenAICompatTemporaryShim {
     }
 
     private struct RouteCircuitBreakerPolicy {
-        let failureThreshold: Int
+        let failureThreshold: Double
         let cooldown: TimeInterval
         let recoverySuccessThreshold: Int
     }
 
     private struct PersistentRouteHealthEntry {
         let status: RouteHealthStatus
-        let failureScore: Int
+        let failureScore: Double
         let recoverySuccesses: Int
         let openUntil: Date?
         let lastScoreUpdatedAt: Date?
@@ -529,15 +529,36 @@ enum OpenAICompatTemporaryShim {
         case rejectRequiredOrFunctionChoice
     }
 
+    private static func deduplicatedStaticLookup<Value>(
+        _ entries: [(String, Value)],
+        label: String
+    ) -> [String: Value] {
+        var result: [String: Value] = [:]
+        var duplicateKeys: [String] = []
+        for (key, value) in entries {
+            guard result[key] == nil else {
+                duplicateKeys.append(key)
+                continue
+            }
+            result[key] = value
+        }
+        if !duplicateKeys.isEmpty {
+            NSLog(
+                "[ThinkingProxy] Deduplicated %d duplicate static lookup key(s) for %@: %@",
+                duplicateKeys.count,
+                label,
+                duplicateKeys.joined(separator: ",")
+            )
+        }
+        return result
+    }
+
     enum ModelTier: Double {
         case reasoning = 1.0
         case standard = 0.85
         case economy = 0.6
         case free = 0.4
     }
-
-    private static let smartAliasCostPreference = 0.3
-    private static let inputPricePerMillionTokensByCanonicalModelID: [String: Double] = [:]
 
     enum FailureClass: String, Hashable {
         case emptyBody = "empty_body"
@@ -562,8 +583,8 @@ enum OpenAICompatTemporaryShim {
         seconds * requestTimeoutScale
     }
 
-    private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = [
-        "z-ai/glm5": RequestPolicy(
+    private static let knownNVIDIARoutePolicyEntries: [(String, RequestPolicy)] = [
+        ("z-ai/glm5", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
@@ -580,8 +601,8 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .rejectBufferedMitigation,
             toolChoiceMode: .rejectRequiredOrFunctionChoice,
             forcesKimiInstantMode: false
-        ),
-        "moonshotai/kimi-k2.5": RequestPolicy(
+        )),
+        ("moonshotai/kimi-k2.5", RequestPolicy(
             minimumMaxTokens: 384,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
@@ -598,8 +619,8 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .rejectBufferedMitigation,
             toolChoiceMode: .rejectRequiredOrFunctionChoice,
             forcesKimiInstantMode: true
-        ),
-        "minimaxai/minimax-m2.5": RequestPolicy(
+        )),
+        ("minimaxai/minimax-m2.5", RequestPolicy(
             minimumMaxTokens: 128,
             maximumMaxTokens: 65536,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
@@ -616,25 +637,21 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .rejectBufferedMitigation,
             toolChoiceMode: .rejectRequiredOrFunctionChoice,
             forcesKimiInstantMode: false
-        )
+        ))
     ]
-    #if DEBUG
-    private static let _assertKnownNVIDIARoutesHaveNoDuplicates: Void = {
-        let keys = Array(knownNVIDIARoutePoliciesByCanonicalModelID.keys)
-        Swift.assert(Set(keys).count == keys.count, "Duplicate key in knownNVIDIARoutePoliciesByCanonicalModelID")
-    }()
-    #endif
-    private static let modelTierByCanonicalModelID: [String: ModelTier] = [
-        "z-ai/glm5": .standard,
-        "moonshotai/kimi-k2.5": .reasoning,
-        "minimaxai/minimax-m2.5": .standard,
+    private static let knownNVIDIARoutePoliciesByCanonicalModelID: [String: RequestPolicy] = deduplicatedStaticLookup(
+        knownNVIDIARoutePolicyEntries,
+        label: "knownNVIDIARoutePoliciesByCanonicalModelID"
+    )
+    private static let modelTierEntries: [(String, ModelTier)] = [
+        ("z-ai/glm5", .reasoning),
+        ("moonshotai/kimi-k2.5", .reasoning),
+        ("minimaxai/minimax-m2.5", .standard),
     ]
-    #if DEBUG
-    private static let _assertModelTiersHaveNoDuplicates: Void = {
-        let keys = Array(modelTierByCanonicalModelID.keys)
-        Swift.assert(Set(keys).count == keys.count, "Duplicate key in modelTierByCanonicalModelID")
-    }()
-    #endif
+    private static let modelTierByCanonicalModelID: [String: ModelTier] = deduplicatedStaticLookup(
+        modelTierEntries,
+        label: "modelTierByCanonicalModelID"
+    )
     static let canaryDisabledCanonicalModelIDs: Set<String> = [MetaAIWebAdapter.modelAlias]
     private static let workerSmartRouteRequestPolicy = RequestPolicy(
         minimumMaxTokens: 128,
@@ -655,8 +672,8 @@ enum OpenAICompatTemporaryShim {
         forcesKimiInstantMode: false
     )
 
-    private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = [
-        "glm-4.7": RequestPolicy(
+    private static let nonNVIDIAMitigationPolicyEntries: [(String, RequestPolicy)] = [
+        ("glm-4.7", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
@@ -673,8 +690,8 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
-        ),
-        "glm-5": RequestPolicy(
+        )),
+        ("glm-5", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
@@ -691,8 +708,8 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
-        ),
-        "glm-5.1": RequestPolicy(
+        )),
+        ("glm-5.1", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
@@ -709,9 +726,9 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
-        ),
-        "proxy-worker-smart-router": workerSmartRouteRequestPolicy,
-        "gpt-5.4(high)": RequestPolicy(
+        )),
+        ("proxy-worker-smart-router", workerSmartRouteRequestPolicy),
+        ("gpt-5.4(high)", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
@@ -728,14 +745,12 @@ enum OpenAICompatTemporaryShim {
             clientStreamingMode: .preserve,
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
-        )
+        ))
     ]
-    #if DEBUG
-    private static let _assertNonNVIDIAPoliciesHaveNoDuplicates: Void = {
-        let keys = Array(nonNVIDIAMitigationPoliciesByRequestModel.keys)
-        Swift.assert(Set(keys).count == keys.count, "Duplicate key in nonNVIDIAMitigationPoliciesByRequestModel")
-    }()
-    #endif
+    private static let nonNVIDIAMitigationPoliciesByRequestModel: [String: RequestPolicy] = deduplicatedStaticLookup(
+        nonNVIDIAMitigationPolicyEntries,
+        label: "nonNVIDIAMitigationPoliciesByRequestModel"
+    )
 
     private struct RequestPolicy {
         let minimumMaxTokens: Int?
@@ -770,6 +785,52 @@ enum OpenAICompatTemporaryShim {
     private static let routeHealthQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-health")
     private static var routeCircuitStatesByRouteHealthKey: [String: RouteCircuitState] = [:]
     private static var routeCooldownsByRouteHealthKey: [String: Date] = [:]
+
+    // Alias-scoped recent live winners are tracked separately from per-route
+    // telemetry so later canaries, direct requests, or failures on the same
+    // route cannot erase the last successful smart-router winner.
+    private static var recentSmartAliasWinnerByRequestedAlias: [String: RecentSmartAliasWinner] = [:]
+    struct RecentSmartAliasWinner {
+        let requestModel: String
+        let timestamp: Date
+        let requestShape: String?
+        let callerRequestID: String?
+        let callerSessionID: String?
+    }
+
+    static func recordRecentSmartAliasWinner(
+        requestedAlias: String,
+        requestModel: String,
+        requestShape: String? = nil,
+        callerRequestID: String? = nil,
+        callerSessionID: String? = nil,
+        at now: Date = Date()
+    ) {
+        routeHealthQueue.sync {
+            recentSmartAliasWinnerByRequestedAlias[requestedAlias] = RecentSmartAliasWinner(
+                requestModel: requestModel,
+                timestamp: now,
+                requestShape: requestShape,
+                callerRequestID: callerRequestID,
+                callerSessionID: callerSessionID
+            )
+        }
+    }
+
+    static func recentSmartAliasWinner(
+        forRequestedAlias alias: String,
+        maxAge: TimeInterval = 30,
+        at now: Date = Date()
+    ) -> RecentSmartAliasWinner? {
+        routeHealthQueue.sync {
+            guard let winner = recentSmartAliasWinnerByRequestedAlias[alias],
+                  now.timeIntervalSince(winner.timestamp) <= maxAge else {
+                return nil
+            }
+            return winner
+        }
+    }
+
     private static var hasLoadedPersistedRouteHealth = false
     static var routeTelemetryHookForTesting: ((RouteTelemetryEvent) -> Void)?
     static var retryBackoffJitterProviderForTesting: ((ClosedRange<Int>) -> Int)?
@@ -793,18 +854,16 @@ enum OpenAICompatTemporaryShim {
     private static let singleFlightConcurrency429Deferral: TimeInterval = 5
     private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 15
     private static let retryableMetaAdapterDeferral: TimeInterval = 60
-    private static let legacyRequestModelRewrites: [String: String] = [
-        "glm-5": "glm-5.1",
-        "glm-5-turbo": "glm-5.1",
+    private static let legacyRequestModelRewriteEntries: [(String, String)] = [
+        ("glm-5", "glm-5.1"),
+        ("glm-5-turbo", "glm-5.1"),
         // Rewrites must land on a concrete configured request-model alias, not a bare canonical name.
-        "z-ai/glm5": "glm5-nvidia"
+        ("z-ai/glm5", "glm5-nvidia")
     ]
-    #if DEBUG
-    private static let _assertLegacyRewritesHaveNoDuplicates: Void = {
-        let keys = Array(legacyRequestModelRewrites.keys)
-        Swift.assert(Set(keys).count == keys.count, "Duplicate key in legacyRequestModelRewrites")
-    }()
-    #endif
+    private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
+        legacyRequestModelRewriteEntries,
+        label: "legacyRequestModelRewrites"
+    )
 
     // MARK: - Provider Concurrency Tracker
 
@@ -1399,27 +1458,15 @@ enum OpenAICompatTemporaryShim {
         "glm-5.1",
         publicFactoryWorkerSmartRouterAlias
     ]
+    static func publicWorkerSmartRouterAlias() -> String {
+        publicFactoryWorkerSmartRouterAlias
+    }
     static func workerPrimaryCandidateModel() -> String {
         smartAliasDefinition(forRequestModel: "worker")?.candidates.first ?? "glm-5.1-zai"
     }
 
-    private static func selfRoutedFactoryWorkerPoolModelID() -> String? {
-        guard let bindings = ThinkingProxy.factoryModelBindings(),
-              let workerModelID = bindings.authoritativeWorkerModelID,
-              let binding = bindings.bindingsByIncomingModelID[workerModelID],
-              binding.requestSurface == "chat_completions",
-              binding.routeProvider == "generic-chat-completion-api",
-              binding.routeModel == workerModelID else {
-            return nil
-        }
-        return workerModelID
-    }
-
     private static func isWorkerPoolPublicAlias(_ requestModel: String) -> Bool {
-        if publicWorkerPoolAliases.contains(requestModel) {
-            return true
-        }
-        return selfRoutedFactoryWorkerPoolModelID() == requestModel
+        publicWorkerPoolAliases.contains(requestModel)
     }
 
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
@@ -1427,14 +1474,6 @@ enum OpenAICompatTemporaryShim {
         let smartAliases = configuredRouteConfiguration().smartAliasesByAlias
         if let exact = smartAliases[requestModel] {
             return exact
-        }
-
-        // Factory's current worker contract can be self-routed, meaning the custom model ID is both
-        // the caller-visible identity and the inner wire model. VibeProxy still owns worker routing,
-        // so that self-routed custom ID must inherit the proxy's worker pool even when the merged
-        // config only declares the canonical `worker` alias.
-        if selfRoutedFactoryWorkerPoolModelID() == requestModel {
-            return smartAliases["worker"]
         }
 
         // `worker` is a proxy-internal pool alias. It is useful inside VibeProxy for policy, failover,
@@ -1449,11 +1488,6 @@ enum OpenAICompatTemporaryShim {
         // legacy concrete alias for direct proxy users:
         // - `proxy-worker-smart-router` is the Droid-safe public entrypoint for Factory workers
         // - `glm-5.1` remains a legacy direct public pooled entrypoint for existing proxy callers
-        //
-        // Factory can also self-route the current worker custom model ID onto the worker pool. In
-        // both cases the user-facing worker contract stays stable while VibeProxy still chooses the
-        // best runtime lane per request class. These aliases must therefore behave like real smart
-        // routers, not single hard-coded backends with friendlier names.
         //
         // Important: callers hitting this branch still see their original public alias on the way out.
         // The internal `worker` alias remains a proxy concern, not an external runtime contract.
@@ -1810,13 +1844,13 @@ enum OpenAICompatTemporaryShim {
             return .skipped(reason: "route_closed")
         }
         if !forceAllowClosedModels.contains(candidateModel),
-           let candidateRoute = resolveConfiguredRoute(forRequestModel: candidateModel),
+           let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
            let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
            Date() < cooldownUntil {
             return .skipped(reason: "provider_cooldown")
         }
         if !forceAllowClosedModels.contains(candidateModel),
-           let candidateRoute = resolveConfiguredRoute(forRequestModel: candidateModel),
+           let candidateRoute = resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
            Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
             return .skipped(reason: "concurrency_capacity")
         }
@@ -1972,59 +2006,28 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    private static func candidateIsAvailableForStickyPrimaryPreference(_ requestModel: String) -> Bool {
-        let now = Date()
-        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
-            return true
-        }
-
-        if let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
-           now < cooldownUntil {
-            return false
-        }
-
-        guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else {
-            return true
-        }
-
-        return !state.isUnavailable(at: now)
-    }
-
     static func rankedSmartAliasFallbackCandidateModels(
         _ candidateModels: [String],
-        healthSensitivity: HealthSensitivity = .balanced,
-        stickyPrimaryCandidate: String? = nil
+        healthSensitivity: HealthSensitivity = .balanced
     ) -> [String] {
         let indexedModels = Array(candidateModels.enumerated())
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            var rankedModels = indexedModels.sorted { lhs, rhs in
+            return indexedModels.sorted { lhs, rhs in
                 let lhsScore = smartAliasFallbackRankingScore(forRequestModel: lhs.element, originalIndex: lhs.offset)
                 let rhsScore = smartAliasFallbackRankingScore(forRequestModel: rhs.element, originalIndex: rhs.offset)
                 if lhsScore.healthPriority != rhsScore.healthPriority {
                     return lhsScore.healthPriority < rhsScore.healthPriority
                 }
-                // Proven-perfect preference: a model with zero observed failures always
-                // beats a model that has seen failures, regardless of score or tier.
                 if lhsScore.isProvenPerfect != rhsScore.isProvenPerfect {
                     return lhsScore.isProvenPerfect
                 }
-                // Hysteresis: only reorder if score gap exceeds sensitivity threshold.
                 let scoreGap = lhsScore.compositeScore - rhsScore.compositeScore
                 if abs(scoreGap) >= healthSensitivity.scoreGapThreshold {
                     return scoreGap > 0
                 }
                 return lhsScore.originalIndex < rhsScore.originalIndex
             }.map(\.element)
-
-            if let stickyPrimaryCandidate,
-               rankedModels.contains(stickyPrimaryCandidate),
-               candidateIsAvailableForStickyPrimaryPreference(stickyPrimaryCandidate) {
-                rankedModels.removeAll { $0 == stickyPrimaryCandidate }
-                rankedModels.insert(stickyPrimaryCandidate, at: 0)
-            }
-
-            return rankedModels
         }
     }
 
@@ -2800,9 +2803,6 @@ enum OpenAICompatTemporaryShim {
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else { return nil }
-            // halfOpen routes are probeable — allow them through for candidate selection
-            // so the circuit breaker recovery mechanism can test the route.
-            if state.status == .halfOpen { return nil }
             return state.status == .closed ? nil : state.status
         }
     }
@@ -2944,7 +2944,11 @@ enum OpenAICompatTemporaryShim {
     // Concurrency-aware failure tracking: deduplicate failures within window per route
     private static let routeFailureDedupQueue = DispatchQueue(label: "io.automaze.vibeproxy.route-failure-dedup")
     private static var recentFailureTimestampsByRoute: [String: [Date]] = [:]
-    private static let failureDedupWindow: TimeInterval = 0.5  // 0.5 second window for burst deduplication
+    private struct RouteFailureBurstInfo {
+        let recentFailureCount: Int
+        let burstDeduplicated: Bool
+    }
+    private static let failureDedupWindow: TimeInterval = 0.2  // 200ms burst window
     private static var disableFailureDedupForTesting = false
 
     private static func adaptiveConcurrencyDeferralUntil(
@@ -3002,10 +3006,10 @@ enum OpenAICompatTemporaryShim {
         return deferredUntil
     }
 
-    private static func noteFailureAndReturnRecentCount(
+    private static func noteFailureBurst(
         routeHealthKey: String,
         at now: Date
-    ) -> Int {
+    ) -> RouteFailureBurstInfo {
         routeFailureDedupQueue.sync {
             var timestamps = recentFailureTimestampsByRoute[routeHealthKey] ?? []
             timestamps.removeAll { now.timeIntervalSince($0) > adaptiveFailureEscalationWindow }
@@ -3014,12 +3018,18 @@ enum OpenAICompatTemporaryShim {
                let last = timestamps.last,
                now.timeIntervalSince(last) <= failureDedupWindow {
                 recentFailureTimestampsByRoute[routeHealthKey] = timestamps
-                return timestamps.count
+                return RouteFailureBurstInfo(
+                    recentFailureCount: timestamps.count,
+                    burstDeduplicated: true
+                )
             }
 
             timestamps.append(now)
             recentFailureTimestampsByRoute[routeHealthKey] = timestamps
-            return timestamps.count
+            return RouteFailureBurstInfo(
+                recentFailureCount: timestamps.count,
+                burstDeduplicated: false
+            )
         }
     }
 
@@ -3028,11 +3038,11 @@ enum OpenAICompatTemporaryShim {
         recentFailureCount: Int,
         now: Date
     ) -> Date? {
-        guard recentFailureCount >= routeCircuitBreakerPolicy.failureThreshold else {
+        guard Double(recentFailureCount) >= routeCircuitBreakerPolicy.failureThreshold else {
             return currentOpenUntil
         }
 
-        let escalationExponent = max(0, recentFailureCount - routeCircuitBreakerPolicy.failureThreshold)
+        let escalationExponent = max(0, recentFailureCount - Int(routeCircuitBreakerPolicy.failureThreshold))
         let multiplier = min(
             adaptiveFailureCooldownMaxMultiplier,
             Int(pow(2.0, Double(escalationExponent)))
@@ -3059,7 +3069,7 @@ enum OpenAICompatTemporaryShim {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
-            let recentFailureCount = noteFailureAndReturnRecentCount(
+            let failureBurst = noteFailureBurst(
                 routeHealthKey: route.routeHealthKey,
                 at: now
             )
@@ -3135,7 +3145,9 @@ enum OpenAICompatTemporaryShim {
             var nextState = nextRouteCircuitState(
                 current: current,
                 afterFailureAt: now,
+                routeHealthKey: route.routeHealthKey,
                 telemetryEvent: telemetryEvent,
+                burstDeduplicated: failureBurst.burstDeduplicated,
                 policy: routeCircuitBreakerPolicy,
                 forcedOpenUntil: forcedOpenUntil,
                 healthSensitivity: healthSensitivity
@@ -3143,7 +3155,7 @@ enum OpenAICompatTemporaryShim {
             if nextState.status == .open,
                let adaptiveOpenUntil = adaptiveFailureOpenUntil(
                     currentOpenUntil: nextState.openUntil,
-                    recentFailureCount: recentFailureCount,
+                    recentFailureCount: failureBurst.recentFailureCount,
                     now: now
                ) {
                 nextState = RouteCircuitState(
@@ -3240,6 +3252,18 @@ enum OpenAICompatTemporaryShim {
             )
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
             concurrencyRegistry.recordSuccess(routeHealthKey: route.routeHealthKey)
+            if let telemetryEvent,
+               telemetryEvent.source == "smart_alias",
+               let requestedAlias = telemetryEvent.requestedAlias {
+                let winningRequestModel = telemetryEvent.finalWinnerRequestModel ?? requestModel
+                recentSmartAliasWinnerByRequestedAlias[requestedAlias] = RecentSmartAliasWinner(
+                    requestModel: winningRequestModel,
+                    timestamp: telemetryEvent.timestamp,
+                    requestShape: telemetryEvent.requestShape,
+                    callerRequestID: telemetryEvent.callerRequestID,
+                    callerSessionID: telemetryEvent.callerSessionID
+                )
+            }
             scheduleRouteHealthPersistLocked()
             if let enrichedTelemetryEvent {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
@@ -3255,6 +3279,7 @@ enum OpenAICompatTemporaryShim {
             routeHealthDirty = false
             routeCircuitStatesByRouteHealthKey = [:]
             routeCooldownsByRouteHealthKey = [:]
+            recentSmartAliasWinnerByRequestedAlias = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
         }
@@ -3457,10 +3482,6 @@ enum OpenAICompatTemporaryShim {
 
     static func syntheticFactoryWorkerHealthRequestForTesting(routeModel: String) -> String {
         ThinkingProxy.syntheticFactoryWorkerHealthRequestForTesting(routeModel: routeModel)
-    }
-
-    static func costFactorForTesting(forRequestModel model: String) -> Double {
-        costFactor(forRequestModel: model)
     }
 
     static func reloadPersistedRouteHealthForTesting() {
@@ -4148,13 +4169,19 @@ enum OpenAICompatTemporaryShim {
     private static func nextRouteCircuitState(
         current: RouteCircuitState?,
         afterFailureAt now: Date,
+        routeHealthKey: String,
         telemetryEvent: RouteTelemetryEvent?,
+        burstDeduplicated: Bool,
         policy: RouteCircuitBreakerPolicy? = nil,
         forcedOpenUntil: Date? = nil,
         healthSensitivity: HealthSensitivity? = nil
     ) -> RouteCircuitState {
         let effectivePolicy = policy ?? routeCircuitBreakerPolicy
-        let failurePenalty = failurePenalty(for: telemetryEvent)
+        let failurePenalty = failurePenalty(
+            for: telemetryEvent,
+            routeHealthKey: routeHealthKey,
+            burstDeduplicated: burstDeduplicated
+        )
         let lastTelemetryEvent = telemetryEvent ?? current?.lastTelemetryEvent
         let nextRollingMetrics = updatedRollingMetrics(
             current: current?.rollingMetrics,
@@ -4527,9 +4554,13 @@ enum OpenAICompatTemporaryShim {
         return "\(previousStatus.rawValue)->\(nextStatus.rawValue)"
     }
 
-    private static func failurePenalty(for telemetryEvent: RouteTelemetryEvent?) -> Int {
+    private static func failurePenalty(
+        for telemetryEvent: RouteTelemetryEvent?,
+        routeHealthKey: String,
+        burstDeduplicated: Bool
+    ) -> Double {
         guard let failureClass = telemetryEvent?.failureClass?.lowercased() else {
-            return 1
+            return burstDeduplicated ? 0 : 1
         }
 
         // 429 rate-limit responses indicate concurrency oversubscription, not route health issues.
@@ -4538,20 +4569,33 @@ enum OpenAICompatTemporaryShim {
             return 0
         }
 
+        let basePenalty: Double
         if failureClass == "transport_error" ||
             failureClass == "missing_response_material" ||
             failureClass.hasPrefix("classified_5") {
-            return 2
+            basePenalty = 2
+        } else {
+            basePenalty = 1
         }
 
-        return 1
+        if burstDeduplicated {
+            return 0
+        }
+
+        let currentLimit = concurrencyRegistry.currentLimit(routeHealthKey: routeHealthKey)
+        let inflightAtRequest = telemetryEvent?.inflightAtRequest ?? concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+        if inflightAtRequest >= currentLimit {
+            return basePenalty * 0.25
+        }
+
+        return basePenalty
     }
 
     private static func decayedFailureScore(
-        _ failureScore: Int,
+        _ failureScore: Double,
         lastUpdatedAt: Date?,
         now: Date
-    ) -> Int {
+    ) -> Double {
         guard failureScore > 0,
               let lastUpdatedAt else {
             return failureScore
@@ -4561,18 +4605,18 @@ enum OpenAICompatTemporaryShim {
             return failureScore
         }
         let decaySteps = Int(elapsed / routeFailureScoreDecayInterval)
-        return max(0, failureScore - decaySteps)
+        return max(0, failureScore - Double(decaySteps))
     }
 
     private static func effectiveFailureThreshold(
         policy: RouteCircuitBreakerPolicy,
         healthSensitivity: HealthSensitivity? = nil
-    ) -> Int {
+    ) -> Double {
         let baseThreshold = policy.failureThreshold
         guard let sensitivity = healthSensitivity, sensitivity != .balanced else {
             return baseThreshold
         }
-        return max(1, Int(Double(baseThreshold) * sensitivity.failureThresholdScaleFactor))
+        return max(1, baseThreshold * sensitivity.failureThresholdScaleFactor)
     }
 
     private static func updatedRollingMetrics(
@@ -4693,7 +4737,7 @@ enum OpenAICompatTemporaryShim {
         }
         let tier = modelTier(forRequestModel: requestModel)
         let momentum = state?.momentumBonus(at: now) ?? 0.0
-        let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue * costFactor(forRequestModel: requestModel)
+        let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue
         return (
             healthPriority: healthPriority,
             compositeScore: adjustedScore,
@@ -4707,12 +4751,6 @@ enum OpenAICompatTemporaryShim {
         dispatchPrecondition(condition: .onQueue(routeHealthQueue))
         guard !hasLoadedPersistedRouteHealth else { return }
         hasLoadedPersistedRouteHealth = true
-        #if DEBUG
-        _ = _assertKnownNVIDIARoutesHaveNoDuplicates
-        _ = _assertModelTiersHaveNoDuplicates
-        _ = _assertNonNVIDIAPoliciesHaveNoDuplicates
-        _ = _assertLegacyRewritesHaveNoDuplicates
-        #endif
         guard let path = routeHealthStatePath(),
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -4741,7 +4779,11 @@ enum OpenAICompatTemporaryShim {
                 .flatMap(RouteHealthStatus.init(rawValue:))
                 ?? ((parseISO8601Date(entry["open_until"]) != nil) ? .open : .closed)
             var status = persistedStatus
-            let failureScore = entry["failure_score"] as? Int ?? entry["consecutive_failures"] as? Int ?? 0
+            let failureScore = max(
+                0,
+                (entry["failure_score"] as? Double)
+                    ?? Double(entry["failure_score"] as? Int ?? entry["consecutive_failures"] as? Int ?? 0)
+            )
             let recoverySuccesses = entry["recovery_successes"] as? Int ?? 0
             var openUntil = parseISO8601Date(entry["open_until"])
             let lastScoreUpdatedAt = parseISO8601Date(entry["last_score_updated_at"])
@@ -4749,7 +4791,9 @@ enum OpenAICompatTemporaryShim {
             let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
             let lastSuccessAt = parseISO8601Date(entry["last_success_at"])
             let lastSuccessRequestID = entry["last_success_request_id"] as? String
-            let lastFailureAt = parseISO8601Date(entry["last_failure_at"])
+            let lastFailureAt =
+                parseISO8601Date(entry["last_failure_at"])
+                ?? ((lastTelemetryEvent?.failureClass != nil) ? lastTelemetryEvent?.timestamp : nil)
             let lastFailureClass = entry["last_failure_class"] as? String
 
             if status == .open {
@@ -4814,23 +4858,26 @@ enum OpenAICompatTemporaryShim {
         let healthyEmaThreshold: Double = 0.8
         let minimumHealObservations = 3
         let minimumHealSuccessRate = 0.2
-        let maxSuspectStaleness: TimeInterval = 30 * 60   // 30 minutes — auto-close suspect routes with no activity
+        let maxSuspectStaleness: TimeInterval = 10 * 60   // 10 minutes — pure staleness auto-close
         let now = Date()
         var healedAny = false
         for key in routeCircuitStatesByRouteHealthKey.keys {
             guard let state = routeCircuitStatesByRouteHealthKey[key],
                   state.status == .suspect else { continue }
 
-            let lastActivityDate: Date
-            if let lastEvent = state.lastTelemetryEvent {
-                lastActivityDate = lastEvent.timestamp
+            let stalenessAnchor: Date
+            if let lastFailureAt = state.lastFailureAt {
+                stalenessAnchor = lastFailureAt
+            } else if let lastEvent = state.lastTelemetryEvent,
+                      lastEvent.failureClass != nil {
+                stalenessAnchor = lastEvent.timestamp
             } else if let lastUpdate = state.lastScoreUpdatedAt {
-                lastActivityDate = lastUpdate
+                stalenessAnchor = lastUpdate
             } else {
                 continue
             }
 
-            let age = now.timeIntervalSince(lastActivityDate)
+            let age = now.timeIntervalSince(stalenessAnchor)
 
             // Auto-close suspect routes that have been stale beyond the maximum threshold,
             // regardless of recovery evidence. Without this, routes with zero observations
@@ -4847,6 +4894,10 @@ enum OpenAICompatTemporaryShim {
                     rollingMetrics: state.rollingMetrics,
                     emaMetrics: state.emaMetrics,
                     recoveredAt: now,
+                    lastSuccessAt: state.lastSuccessAt,
+                    lastSuccessRequestID: state.lastSuccessRequestID,
+                    lastFailureAt: state.lastFailureAt,
+                    lastFailureClass: state.lastFailureClass,
                     nvidiaInferenceProbe: state.nvidiaInferenceProbe
                 )
                 healedAny = true
@@ -4876,6 +4927,10 @@ enum OpenAICompatTemporaryShim {
                 rollingMetrics: state.rollingMetrics,
                 emaMetrics: state.emaMetrics,
                 recoveredAt: now,
+                lastSuccessAt: state.lastSuccessAt,
+                lastSuccessRequestID: state.lastSuccessRequestID,
+                lastFailureAt: state.lastFailureAt,
+                lastFailureClass: state.lastFailureClass,
                 nvidiaInferenceProbe: state.nvidiaInferenceProbe
             )
             healedAny = true
@@ -4961,6 +5016,13 @@ enum OpenAICompatTemporaryShim {
         persistRouteHealthLocked()
     }
 
+    private static func jsonNumberPreservingIntegers(_ value: Double) -> Any {
+        if value.rounded(.towardZero) == value {
+            return Int(value)
+        }
+        return value
+    }
+
     private static func persistRouteHealthLocked() {
         dispatchPrecondition(condition: .onQueue(routeHealthQueue))
         guard let path = routeHealthStatePath() else { return }
@@ -4971,7 +5033,7 @@ enum OpenAICompatTemporaryShim {
         for (routeHealthKey, state) in routeCircuitStatesByRouteHealthKey {
             var entry: [String: Any] = [
                 "status": state.status.rawValue,
-                "failure_score": state.failureScore,
+                "failure_score": jsonNumberPreservingIntegers(state.failureScore),
                 "recovery_successes": state.recoverySuccesses
             ]
             if let openUntil = state.openUntil {
@@ -5753,23 +5815,6 @@ enum OpenAICompatTemporaryShim {
             return tier
         }
         return .standard
-    }
-
-    private static func canonicalModelIDForCostFactor(forRequestModel model: String) -> String {
-        if let route = resolveRouteIdentityForAnyProvider(forRequestModel: model) {
-            return route.canonicalModelID
-        }
-        return normalizedRequestModel(model)
-    }
-
-    static func costFactor(forRequestModel model: String) -> Double {
-        let canonicalModelID = canonicalModelIDForCostFactor(forRequestModel: model)
-        let pricePerMillionTokens = inputPricePerMillionTokensByCanonicalModelID[canonicalModelID] ?? 0.0
-        guard smartAliasCostPreference > 0 else { return 1.0 }
-        guard pricePerMillionTokens > 0 else {
-            return pow(100.0, smartAliasCostPreference)
-        }
-        return pow(1.0 / (pricePerMillionTokens + 0.01), smartAliasCostPreference)
     }
 
     private static func reasoningString(from message: [String: Any]) -> String {
@@ -9459,6 +9504,10 @@ class ThinkingProxy {
     private static var proxiedSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
     private static let proxiedPoolMaxSize = 8
     private static let proxiedPoolIdleEviction: TimeInterval = 300
+    private static let bufferedBackendPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.buffered-backend-session-pool")
+    private static var bufferedBackendSessionPool: [String: (session: URLSession, delegate: MultiplexedSessionDelegate, lastUsed: Date)] = [:]
+    private static let bufferedBackendPoolMaxSize = 2
+    private static let bufferedBackendPoolIdleEviction: TimeInterval = 300
 
     private final class TaskIdHolder: @unchecked Sendable {
         var taskIdentifier: Int = 0
@@ -9512,6 +9561,59 @@ class ThinkingProxy {
             lock.unlock()
             delegate?.urlSession(session, task: task, didFinishCollecting: metrics)
         }
+    }
+
+    private static func bufferedBackendSessionPoolKey(targetHost: String, targetPort: UInt16) -> String {
+        "\(targetHost):\(targetPort)"
+    }
+
+    private static func acquireBufferedBackendSession(
+        targetHost: String,
+        targetPort: UInt16
+    ) -> (URLSession, MultiplexedSessionDelegate) {
+        bufferedBackendPoolQueue.sync {
+            evictIdleBufferedBackendSessionsLocked()
+            let poolKey = bufferedBackendSessionPoolKey(targetHost: targetHost, targetPort: targetPort)
+            if let existing = bufferedBackendSessionPool[poolKey] {
+                bufferedBackendSessionPool[poolKey] = (existing.session, existing.delegate, lastUsed: Date())
+                return (existing.session, existing.delegate)
+            }
+
+            let configuration = URLSessionConfiguration.ephemeral
+            let delegate = MultiplexedSessionDelegate()
+            let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+
+            if bufferedBackendSessionPool.count >= bufferedBackendPoolMaxSize,
+               let oldestKey = bufferedBackendSessionPool.min(by: { $0.value.lastUsed < $1.value.lastUsed })?.key {
+                bufferedBackendSessionPool[oldestKey]?.session.finishTasksAndInvalidate()
+                bufferedBackendSessionPool.removeValue(forKey: oldestKey)
+            }
+
+            bufferedBackendSessionPool[poolKey] = (session, delegate, lastUsed: Date())
+            return (session, delegate)
+        }
+    }
+
+    private static func evictIdleBufferedBackendSessionsLocked() {
+        let now = Date()
+        let stale = bufferedBackendSessionPool.filter { now.timeIntervalSince($0.value.lastUsed) > bufferedBackendPoolIdleEviction }
+        for (key, entry) in stale {
+            entry.session.finishTasksAndInvalidate()
+            bufferedBackendSessionPool.removeValue(forKey: key)
+        }
+    }
+
+    static func clearBufferedBackendSessionPoolForTesting() {
+        bufferedBackendPoolQueue.sync {
+            for (_, entry) in bufferedBackendSessionPool {
+                entry.session.finishTasksAndInvalidate()
+            }
+            bufferedBackendSessionPool = [:]
+        }
+    }
+
+    static func acquireBufferedBackendSessionForTesting(targetHost: String, targetPort: UInt16) -> URLSession {
+        acquireBufferedBackendSession(targetHost: targetHost, targetPort: targetPort).0
     }
 
     private static func acquireProxiedSession(proxyURL: String) -> (URLSession, MultiplexedSessionDelegate)? {
@@ -11512,6 +11614,7 @@ class ThinkingProxy {
 
             switch outcome {
             case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
+                NSLog("[ThinkingProxy] Warning: .liveStreamDelivered reached in smart-alias race for %@ — smart-alias delivery modes should produce .success or .terminalResponse, not live streams.", requestModel)
                 let winningTelemetryEvent = self.annotatedSmartAliasTelemetryEvent(
                     OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                         telemetryEvent,
@@ -12138,7 +12241,7 @@ class ThinkingProxy {
         _ telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent
     ) -> Bool {
         guard telemetryEvent.transportOutcome == "send_response" else { return false }
-        guard let upstreamHTTPStatus = telemetryEvent.upstreamHTTPStatus else { return true }
+        guard let upstreamHTTPStatus = telemetryEvent.upstreamHTTPStatus else { return false }
         return (200...299).contains(upstreamHTTPStatus)
     }
 
@@ -12217,16 +12320,6 @@ class ThinkingProxy {
             )
         case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
             guard requestController?.isCancelled() != true else { return }
-            OpenAICompatTemporaryShim.recordRouteFailure(
-                forRequestModel: requestModel,
-                telemetryEvent: telemetryEvent,
-                forcedOpenUntil: cooldownUntil,
-                healthSensitivity: healthSensitivity
-            )
-            // Masquerade billing/quota exhaustion as rate-limit so the Droid client
-            // retries without switching models.  402 from upstream looks like
-            // "provider billing exhausted" → Droid switches to bare built-in model.
-            // 429 tells Droid "temporary rate limit" → retry with same model.
             if telemetryEvent.failureClass == "classified_429_window" {
                 deliverBufferedError(
                     defaultConnection: originalConnection,
@@ -12256,16 +12349,21 @@ class ThinkingProxy {
                     overridingHeaders: ["Retry-After": retryAfterHeaderValue(until: cooldownUntil, fallbackSeconds: 30)]
                         .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
                 )
-            } else if let upstreamStatus = telemetryEvent.upstreamHTTPStatus,
-               upstreamStatus == 402 || upstreamStatus == 403 {
-                NSLog("[ThinkingProxy] Masquerading upstream %d as 429 for smart alias %@", upstreamStatus, publicAlias)
+            } else if telemetryEvent.upstreamHTTPStatus == 402 {
                 deliverBufferedError(
                     defaultConnection: originalConnection,
-                    statusCode: 429,
-                    message: "Rate limit exceeded. Please retry after 30 seconds.",
+                    statusCode: 402,
+                    message: "Worker backend reported billing or entitlement exhaustion.",
                     coalescingKey: coalescingKey,
-                    overridingHeaders: ["Retry-After": "30"]
-                        .merging(requestTrace?.responseHeaders ?? [:]) { current, _ in current }
+                    overridingHeaders: requestTrace?.responseHeaders ?? [:]
+                )
+            } else if telemetryEvent.upstreamHTTPStatus == 403 {
+                deliverBufferedError(
+                    defaultConnection: originalConnection,
+                    statusCode: 403,
+                    message: "Worker backend rejected the request with 403 Forbidden.",
+                    coalescingKey: coalescingKey,
+                    overridingHeaders: requestTrace?.responseHeaders ?? [:]
                 )
             } else {
                 deliverBufferedError(
@@ -14180,9 +14278,14 @@ class ThinkingProxy {
             request.setValue(value, forHTTPHeaderField: name)
         }
 
+        let (session, poolDelegate) = Self.acquireBufferedBackendSession(
+            targetHost: targetHost,
+            targetPort: targetPort
+        )
         let responseProgress = ResponseProgressDelegate()
-        let session = URLSession(configuration: .ephemeral, delegate: responseProgress, delegateQueue: nil)
+        let taskHolder = TaskIdHolder()
         let (task, exception) = SafeDataTask.create(on: session, with: request) { data, response, error in
+            _ = poolDelegate.unregister(taskIdentifier: taskHolder.taskIdentifier)
             responseProgress.finish()
             completion(
                 BufferedProxyResponse(
@@ -14194,14 +14297,14 @@ class ThinkingProxy {
                     deadlineStage: responseProgress.currentDeadlineStage()
                 )
             )
-            session.finishTasksAndInvalidate()
         }
         guard let task else {
             NSLog("[SafeDataTask] sendBufferedProxyRequest: session invalidated during dataTask creation — \(exception?.reason ?? "unknown")")
             completion(BufferedProxyResponse(data: nil, response: nil, error: URLError(.cancelled), firstByteLatencyMilliseconds: nil, totalLatencyMilliseconds: nil))
-            session.finishTasksAndInvalidate()
             return {}
         }
+        taskHolder.taskIdentifier = task.taskIdentifier
+        poolDelegate.register(task: task, delegate: responseProgress)
         responseProgress.installDeadlines(
             firstResponseSeconds: firstResponseDeadlineSeconds,
             bufferedResponseSeconds: bufferedResponseDeadlineSeconds,
@@ -17345,7 +17448,7 @@ class ThinkingProxy {
                 guard let state = routeHealthSnapshot[requestModel] else { return }
                 var routePayload: [String: Any] = [
                     "status": state.status.rawValue,
-                    "failure_score": state.failureScore,
+                    "failure_score": OpenAICompatTemporaryShim.jsonNumberPreservingIntegers(state.failureScore),
                     "recovery_successes": state.recoverySuccesses
                 ]
                 if let lastSuccessAt = state.lastSuccessAt {
@@ -17803,10 +17906,8 @@ class ThinkingProxy {
             }
         }
 
-        if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
-            forRequestedAlias: routeModel
-        ),
-        factoryWorkerHealthCandidateIsDispatchable(
+        if let recentObservedCandidate = OpenAICompatTemporaryShim.lastSmartAliasDispatch(forRequestedAlias: routeModel)?.requestModel,
+           factoryWorkerHealthCandidateIsDispatchable(
             candidateModel: recentObservedCandidate,
             routeModel: routeModel,
             requestSurface: requestSurface
@@ -17940,39 +18041,19 @@ class ThinkingProxy {
         routeProvider: String,
         requestSurface: String
     ) -> String {
+        // Authoritative: return the model actually dispatched in recent traffic.
+        if let lastDispatch = OpenAICompatTemporaryShim.lastSmartAliasDispatch(forRequestedAlias: routeModel) {
+            return lastDispatch.requestModel
+        }
+
+        // No recent dispatch observed — fall back to first available from the candidate pool.
         if requestSurface == "chat_completions",
-           let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) {
+           OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil {
             let candidateModels = effectiveFactoryWorkerCandidateModels(
                 routeModel: routeModel,
                 requestSurface: requestSurface
             )
-            if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
-                forRequestedAlias: routeModel
-            ),
-            factoryWorkerHealthCandidateIsDispatchable(
-                candidateModel: recentObservedCandidate,
-                routeModel: routeModel,
-                requestSurface: requestSurface
-            ) {
-                return recentObservedCandidate
-            }
-            if let dispatchableCandidate = dispatchableFactoryWorkerCandidateModel(
-                routeModel: routeModel,
-                requestSurface: requestSurface
-            ) {
-                return dispatchableCandidate
-            }
-            if let recentObservedCandidate = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedModel(
-                forRequestedAlias: routeModel
-            ),
-            OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: recentObservedCandidate) == nil,
-            let candidateRoute = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: recentObservedCandidate),
-            !OpenAICompatTemporaryShim.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
-                return recentObservedCandidate
-            }
-            return firstAvailableFactoryWorkerCandidateModel(from: candidateModels)
-                ?? smartAlias.candidates.first
-                ?? routeModel
+            return firstAvailableFactoryWorkerCandidateModel(from: candidateModels) ?? routeModel
         }
         let candidateModels = effectiveFactoryCandidateModels(
             routeModel: routeModel,
@@ -18063,12 +18144,10 @@ class ThinkingProxy {
             routeProvider: routeProvider,
             requestSurface: requestSurface
         )
-        let recentLiveRoute = OpenAICompatTemporaryShim.latestObservedSmartAliasResolvedWinner(
-            forRequestedAlias: routeModel
-        )
+        let recentLiveDispatch = OpenAICompatTemporaryShim.lastSmartAliasDispatch(forRequestedAlias: routeModel)
         let effectiveRouteProvider =
             OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: effectiveRouteModel)?.providerID
-        let recentLiveRouteProvider = recentLiveRoute.flatMap {
+        let recentLiveRouteProvider = recentLiveDispatch.flatMap {
             OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: $0.requestModel)?.providerID
         }
 
@@ -18095,12 +18174,12 @@ class ThinkingProxy {
             requestSurface: requestSurface,
             effectiveRouteModel: effectiveRouteModel,
             effectiveRouteProvider: effectiveRouteProvider,
-            recentLiveRouteModel: recentLiveRoute?.requestModel,
+            recentLiveRouteModel: recentLiveDispatch?.requestModel,
             recentLiveRouteProvider: recentLiveRouteProvider,
-            recentLiveRequestShape: recentLiveRoute?.requestShape,
-            recentLiveRouteAt: recentLiveRoute?.timestamp,
-            recentLiveCallerRequestID: recentLiveRoute?.callerRequestID,
-            recentLiveCallerSessionID: recentLiveRoute?.callerSessionID,
+            recentLiveRequestShape: recentLiveDispatch?.requestShape,
+            recentLiveRouteAt: recentLiveDispatch?.timestamp,
+            recentLiveCallerRequestID: recentLiveDispatch?.callerRequestID,
+            recentLiveCallerSessionID: recentLiveDispatch?.callerSessionID,
             displayName: workerModel["displayName"] as? String,
             baseURL: workerModel["baseUrl"] as? String,
             routeHealthStatus: effectiveFactoryContractHealthStatus(
