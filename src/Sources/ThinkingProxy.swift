@@ -432,6 +432,7 @@ enum OpenAICompatTemporaryShim {
         let emaMetrics: RouteEMAMetrics
         let recoveredAt: Date?
         let lastSuccessAt: Date?
+        let lastLiveSuccessAt: Date?
         let lastSuccessRequestID: String?
         let lastFailureAt: Date?
         let lastFailureClass: String?
@@ -448,6 +449,7 @@ enum OpenAICompatTemporaryShim {
             emaMetrics: RouteEMAMetrics,
             recoveredAt: Date?,
             lastSuccessAt: Date? = nil,
+            lastLiveSuccessAt: Date? = nil,
             lastSuccessRequestID: String? = nil,
             lastFailureAt: Date? = nil,
             lastFailureClass: String? = nil,
@@ -463,6 +465,7 @@ enum OpenAICompatTemporaryShim {
             self.emaMetrics = emaMetrics
             self.recoveredAt = recoveredAt
             self.lastSuccessAt = lastSuccessAt
+            self.lastLiveSuccessAt = lastLiveSuccessAt
             self.lastSuccessRequestID = lastSuccessRequestID
             self.lastFailureAt = lastFailureAt
             self.lastFailureClass = lastFailureClass
@@ -2397,13 +2400,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else {
                 return false
             }
-            if let lastSuccessAt = state.lastSuccessAt,
-               Date().timeIntervalSince(lastSuccessAt) <= nvidiaInferenceProbeFreshnessWindow {
-                return true
-            }
-            if let probe = state.nvidiaInferenceProbe,
-               probe.lastStatus == .success,
-               Date().timeIntervalSince(probe.lastProbeAt) <= nvidiaInferenceProbeFreshnessWindow {
+            if let lastLiveSuccessAt = state.lastLiveSuccessAt,
+               Date().timeIntervalSince(lastLiveSuccessAt) <= nvidiaInferenceProbeFreshnessWindow {
                 return true
             }
             return false
@@ -3396,7 +3394,13 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     lastTelemetryEvent: nextState.lastTelemetryEvent,
                     rollingMetrics: nextState.rollingMetrics,
                     emaMetrics: nextState.emaMetrics,
-                    recoveredAt: nextState.recoveredAt
+                    recoveredAt: nextState.recoveredAt,
+                    lastSuccessAt: nextState.lastSuccessAt,
+                    lastLiveSuccessAt: nextState.lastLiveSuccessAt,
+                    lastSuccessRequestID: nextState.lastSuccessRequestID,
+                    lastFailureAt: nextState.lastFailureAt,
+                    lastFailureClass: nextState.lastFailureClass,
+                    nvidiaInferenceProbe: nextState.nvidiaInferenceProbe
                 )
             }
             let enrichedTelemetryEvent = telemetryEvent.map {
@@ -3561,6 +3565,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 rollingMetrics: .empty,
                 emaMetrics: .empty,
                 recoveredAt: nil,
+                lastLiveSuccessAt: routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.lastLiveSuccessAt,
                 nvidiaInferenceProbe: routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.nvidiaInferenceProbe
             )
             persistRouteHealthLocked()
@@ -3674,6 +3679,24 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 return false
             }
             return now.timeIntervalSince(lastSuccessAt) <= maxAge
+        }
+    }
+
+    static func hasRecentLiveInferenceSuccess(
+        forRequestModel requestModel: String,
+        maxAge: TimeInterval = 300,
+        at now: Date = Date()
+    ) -> Bool {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
+            return false
+        }
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey],
+                  let lastLiveSuccessAt = state.lastLiveSuccessAt else {
+                return false
+            }
+            return now.timeIntervalSince(lastLiveSuccessAt) <= maxAge
         }
     }
 
@@ -4469,6 +4492,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             .filter { $0 > now }
             .max()
         let nextLastSuccessAt = current?.lastSuccessAt
+        let nextLastLiveSuccessAt = current?.lastLiveSuccessAt
         let nextLastSuccessRequestID = current?.lastSuccessRequestID
         let nextLastFailureAt = telemetryEvent != nil ? now : current?.lastFailureAt
         let nextLastFailureClass = telemetryEvent?.failureClass ?? current?.lastFailureClass
@@ -4485,6 +4509,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4505,6 +4530,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: current?.recoveredAt,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4526,6 +4552,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: nil,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4542,6 +4569,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4559,6 +4587,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: current?.recoveredAt,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4575,10 +4604,23 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
             )
+        }
+    }
+
+    private static func routeSuccessCountsAsLiveTraffic(_ telemetryEvent: RouteTelemetryEvent?) -> Bool {
+        guard let telemetryEvent else {
+            return true
+        }
+        switch telemetryEvent.source {
+        case "canary", "smart_alias_probe":
+            return false
+        default:
+            return true
         }
     }
 
@@ -4604,7 +4646,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             now: now
         )
         let reducedScore = max(0, decayedScore - 1)
+        let countsAsLiveTraffic = routeSuccessCountsAsLiveTraffic(telemetryEvent)
         let nextLastSuccessAt = now
+        let nextLastLiveSuccessAt = countsAsLiveTraffic ? now : current?.lastLiveSuccessAt
         let nextLastSuccessRequestID = telemetryEvent?.proxyRequestID ?? current?.lastSuccessRequestID
         let nextLastFailureAt = current?.lastFailureAt
         let nextLastFailureClass = current?.lastFailureClass
@@ -4622,6 +4666,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4639,6 +4684,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: nil,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4655,6 +4701,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4672,6 +4719,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: now,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4688,6 +4736,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4706,6 +4755,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: nextEMA,
                     recoveredAt: now,
                     lastSuccessAt: nextLastSuccessAt,
+                    lastLiveSuccessAt: nextLastLiveSuccessAt,
                     lastSuccessRequestID: nextLastSuccessRequestID,
                     lastFailureAt: nextLastFailureAt,
                     lastFailureClass: nextLastFailureClass
@@ -4722,6 +4772,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: nextEMA,
                 recoveredAt: nil,
                 lastSuccessAt: nextLastSuccessAt,
+                lastLiveSuccessAt: nextLastLiveSuccessAt,
                 lastSuccessRequestID: nextLastSuccessRequestID,
                 lastFailureAt: nextLastFailureAt,
                 lastFailureClass: nextLastFailureClass
@@ -4773,6 +4824,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             emaMetrics: state.emaMetrics,
             recoveredAt: state.recoveredAt,
             lastSuccessAt: state.lastSuccessAt,
+            lastLiveSuccessAt: state.lastLiveSuccessAt,
             lastSuccessRequestID: state.lastSuccessRequestID,
             lastFailureAt: state.lastFailureAt,
             lastFailureClass: state.lastFailureClass,
@@ -5034,7 +5086,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
               FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = json["version"] as? Int, version >= 1, version <= 8,
+              let version = json["version"] as? Int, version >= 1, version <= 9,
               let routes = json["routes"] as? [String: [String: Any]] else {
             routeCircuitStatesByRouteHealthKey = [:]
             return
@@ -5069,6 +5121,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             let lastTelemetryEvent = parseTelemetryEvent(entry["last_event"])
             let rollingMetrics = parseRollingMetrics(entry["rolling_metrics"])
             let lastSuccessAt = parseISO8601Date(entry["last_success_at"])
+            let lastLiveSuccessAt = parseISO8601Date(entry["last_live_success_at"])
             let lastSuccessRequestID = entry["last_success_request_id"] as? String
             let lastFailureAt =
                 parseISO8601Date(entry["last_failure_at"])
@@ -5094,6 +5147,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: parseEMAMetrics(entry["ema_metrics"]),
                 recoveredAt: parseISO8601Date(entry["recovered_at"] as? String),
                 lastSuccessAt: lastSuccessAt,
+                lastLiveSuccessAt: lastLiveSuccessAt,
                 lastSuccessRequestID: lastSuccessRequestID,
                 lastFailureAt: lastFailureAt,
                 lastFailureClass: lastFailureClass,
@@ -5105,7 +5159,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
         concurrencyRegistry.loadLocked(from: json, persistedVersion: version)
-        if prunedUnknownEntries || normalizedPersistedAvailability || version < 7 {
+        if prunedUnknownEntries || normalizedPersistedAvailability || version < 9 {
             persistRouteHealthLocked()
         }
 
@@ -5174,6 +5228,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     emaMetrics: state.emaMetrics,
                     recoveredAt: now,
                     lastSuccessAt: state.lastSuccessAt,
+                    lastLiveSuccessAt: state.lastLiveSuccessAt,
                     lastSuccessRequestID: state.lastSuccessRequestID,
                     lastFailureAt: state.lastFailureAt,
                     lastFailureClass: state.lastFailureClass,
@@ -5207,6 +5262,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 emaMetrics: state.emaMetrics,
                 recoveredAt: now,
                 lastSuccessAt: state.lastSuccessAt,
+                lastLiveSuccessAt: state.lastLiveSuccessAt,
                 lastSuccessRequestID: state.lastSuccessRequestID,
                 lastFailureAt: state.lastFailureAt,
                 lastFailureClass: state.lastFailureClass,
@@ -5332,6 +5388,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             if let lastSuccessAt = state.lastSuccessAt {
                 entry["last_success_at"] = iso8601String(from: lastSuccessAt)
             }
+            if let lastLiveSuccessAt = state.lastLiveSuccessAt {
+                entry["last_live_success_at"] = iso8601String(from: lastLiveSuccessAt)
+            }
             if let lastSuccessRequestID = state.lastSuccessRequestID {
                 entry["last_success_request_id"] = lastSuccessRequestID
             }
@@ -5349,7 +5408,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
         let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
-            "version": 8,
+            "version": 9,
             "routes": routes,
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns
@@ -17990,6 +18049,9 @@ class ThinkingProxy {
                 if let lastSuccessAt = state.lastSuccessAt {
                     routePayload["last_success_at"] = ISO8601DateFormatter().string(from: lastSuccessAt)
                 }
+                if let lastLiveSuccessAt = state.lastLiveSuccessAt {
+                    routePayload["last_live_success_at"] = ISO8601DateFormatter().string(from: lastLiveSuccessAt)
+                }
                 if let lastSuccessRequestID = state.lastSuccessRequestID {
                     routePayload["last_success_request_id"] = lastSuccessRequestID
                 }
@@ -18036,8 +18098,7 @@ class ThinkingProxy {
                     routePayload["inflight"] = OpenAICompatTemporaryShim.currentInflightConcurrency(routeHealthKey: route.routeHealthKey)
                     if route.providerID == "nvidia" {
                         let transportPolicy = effectiveNVIDIADirectTransportPolicy()
-                        let recentLiveSuccess = OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: requestModel) &&
-                            state.lastTelemetryEvent?.source != "canary"
+                        let recentLiveSuccess = OpenAICompatTemporaryShim.hasRecentLiveInferenceSuccess(forRequestModel: requestModel)
                         var streamDiagnostics: [String: Any] = [
                             "transport_protocol_preference": transportPolicy.protocolPreference.rawValue,
                             "inter_chunk_read_timeout_seconds": Int(transportPolicy.interChunkReadTimeoutSeconds),
@@ -18058,6 +18119,9 @@ class ThinkingProxy {
                             "recent_probe_success": OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceProbeSuccess(forRequestModel: requestModel),
                             "freshness_window_seconds": Int(OpenAICompatTemporaryShim.nvidiaInferenceProbeFreshnessWindow)
                         ]
+                        if let lastLiveSuccessAt = state.lastLiveSuccessAt {
+                            livenessPayload["last_live_success_at"] = ISO8601DateFormatter().string(from: lastLiveSuccessAt)
+                        }
                         if let probe = state.nvidiaInferenceProbe {
                             var probePayload: [String: Any] = [
                                 "last_probe_at": ISO8601DateFormatter().string(from: probe.lastProbeAt),

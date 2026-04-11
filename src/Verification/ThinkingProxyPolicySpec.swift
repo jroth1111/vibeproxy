@@ -1221,6 +1221,46 @@ struct ThinkingProxyPolicySpec {
                     recorder: recorder
                 )
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_response",
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "canary",
+                        totalLatencyMilliseconds: 7
+                    )
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia"),
+                    true,
+                    "a recent NVIDIA probe success should still count as route evidence for recovery and worker dispatch",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentLiveInferenceSuccess(forRequestModel: "glm5-nvidia"),
+                    false,
+                    "a synthetic NVIDIA canary should not count as recent live request success",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(forRequestJSON: glm5DirectRequest, routeHealthStatus: nil),
+                    15,
+                    "probe-only NVIDIA recovery should keep the capped direct first-response deadline for real client traffic",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
+                    20,
+                    "probe-only NVIDIA recovery should keep the capped direct buffered-response deadline for real client traffic",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
                 let glm5Budget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: glm5Request)
                 let kimiBudget = OpenAICompatTemporaryShim.retryBudget(forRequestJSON: kimiRequest)
@@ -9645,7 +9685,7 @@ struct ThinkingProxyPolicySpec {
                 let glm5 = routes?["nvidia::z-ai/glm5"] as? [String: Any]
                 let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
 
-                expectEqual(rawJSON["version"] as? Int, 8, "route-health persistence should bump the schema version after removing cumulative rolling counters", recorder: recorder)
+                expectEqual(rawJSON["version"] as? Int, 9, "route-health persistence should bump the schema version after adding live-success persistence for NVIDIA trust decisions", recorder: recorder)
                 expectEqual(rollingMetrics?["request_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative request counts", recorder: recorder)
                 expectEqual(rollingMetrics?["success_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative success counts", recorder: recorder)
                 expectEqual(rollingMetrics?["timeout_count"] == nil, true, "persisted rolling metrics should drop vestigial cumulative timeout counts", recorder: recorder)
@@ -10673,7 +10713,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("direct NVIDIA buffered requests fail on the untrusted outer deadline and still emit timeout telemetry", recorder: recorder) {
+        run("direct NVIDIA buffered requests still fail on the untrusted outer deadline after probe-only recovery and still emit timeout telemetry", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.setUntrustedNVIDIAProbeDeadlineOverrideForTesting(
@@ -10715,6 +10755,22 @@ struct ThinkingProxyPolicySpec {
                     deliveredMessage = message
                     delivered.signal()
                 }
+
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: "glm5-nvidia",
+                    telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: "glm5-nvidia",
+                        canonicalModelID: "z-ai/glm5",
+                        transportOutcome: "send_response",
+                        failureClass: nil,
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 200,
+                        retryCount: 0,
+                        source: "canary",
+                        totalLatencyMilliseconds: 7
+                    )
+                )
 
                 proxy.processRequestForTesting(
                     rawHTTPRequest(
@@ -13877,10 +13933,16 @@ struct ThinkingProxyPolicySpec {
 
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let routeHealth = payload["route_health"] as? [String: Any]
+                    let routes = routeHealth?["routes"] as? [String: Any]
+                    let glm5Route = routes?["glm5-nvidia"] as? [String: Any]
+                    let nvidiaLiveness = glm5Route?["nvidia_inference_liveness"] as? [String: Any]
 
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner even after later same-route canary telemetry", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should preserve the recent live worker provider even after later same-route canary telemetry", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should keep the live worker caller correlation instead of letting later same-route canaries overwrite it", recorder: recorder)
+                    expectEqual(nvidiaLiveness?["recent_live_success"] as? Bool, true, "healthz should keep reporting recent live NVIDIA success after later same-route canary telemetry", recorder: recorder)
+                    expectEqual((nvidiaLiveness?["last_live_success_at"] as? String)?.isEmpty, false, "healthz should preserve the last live NVIDIA success timestamp after later canary telemetry", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
