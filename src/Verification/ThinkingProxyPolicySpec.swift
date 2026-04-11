@@ -13466,6 +13466,74 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz exposes the most recent dispatched worker lane separately from the recent live winner", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(-5),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: alias,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42,
+                            callerRequestID: "live-worker-req"
+                        )
+                    )
+                    OpenAICompatTemporaryShim.recordRecentSmartAliasDispatch(
+                        requestedAlias: alias,
+                        requestModel: "glm-5.1-zai",
+                        requestShape: "POST:chat:custom:Proxy-Worker-Smart-Router-8:buffered:tools=0:tool_choice_auto:string_content",
+                        callerRequestID: "dispatch-worker-req",
+                        callerSessionID: "dispatch-worker-session"
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("recent-dispatch worker healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm5-nvidia", "healthz should keep the recent live worker winner as the effective lane while it remains dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner separately from the last dispatch attempt", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_dispatched_route_model"] as? String, "glm-5.1-zai", "healthz should expose the most recent actual worker dispatch attempt separately from the recent live winner", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_dispatched_route_provider"] as? String, "zai", "healthz should expose the provider for the most recent worker dispatch attempt", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_dispatched_request_shape"] as? String, "POST:chat:custom:Proxy-Worker-Smart-Router-8:buffered:tools=0:tool_choice_auto:string_content", "healthz should expose the request shape for the most recent worker dispatch attempt", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_dispatched_caller_request_id"] as? String, "dispatch-worker-req", "healthz should expose the caller request id for the most recent worker dispatch attempt", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_dispatched_caller_session_id"] as? String, "dispatch-worker-session", "healthz should expose the caller session id for the most recent worker dispatch attempt", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz preserves the recent live worker winner after later same-route canary telemetry", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {

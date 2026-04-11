@@ -810,16 +810,57 @@ enum OpenAICompatTemporaryShim {
     private static var routeCircuitStatesByRouteHealthKey: [String: RouteCircuitState] = [:]
     private static var routeCooldownsByRouteHealthKey: [String: Date] = [:]
 
-    // Alias-scoped recent live winners are tracked separately from per-route
-    // telemetry so later canaries, direct requests, or failures on the same
-    // route cannot erase the last successful smart-router winner.
+    // Alias-scoped recent dispatches and live winners are tracked separately
+    // from per-route telemetry so later canaries, direct requests, or failures
+    // on the same route cannot erase worker-pool diagnostics.
+    private static var recentSmartAliasDispatchByRequestedAlias: [String: RecentSmartAliasDispatch] = [:]
     private static var recentSmartAliasWinnerByRequestedAlias: [String: RecentSmartAliasWinner] = [:]
+    struct RecentSmartAliasDispatch {
+        let requestModel: String
+        let timestamp: Date
+        let requestShape: String?
+        let callerRequestID: String?
+        let callerSessionID: String?
+    }
     struct RecentSmartAliasWinner {
         let requestModel: String
         let timestamp: Date
         let requestShape: String?
         let callerRequestID: String?
         let callerSessionID: String?
+    }
+
+    static func recordRecentSmartAliasDispatch(
+        requestedAlias: String,
+        requestModel: String,
+        requestShape: String? = nil,
+        callerRequestID: String? = nil,
+        callerSessionID: String? = nil,
+        at now: Date = Date()
+    ) {
+        routeHealthQueue.sync {
+            recentSmartAliasDispatchByRequestedAlias[requestedAlias] = RecentSmartAliasDispatch(
+                requestModel: requestModel,
+                timestamp: now,
+                requestShape: requestShape,
+                callerRequestID: callerRequestID,
+                callerSessionID: callerSessionID
+            )
+        }
+    }
+
+    static func recentSmartAliasDispatch(
+        forRequestedAlias alias: String,
+        maxAge: TimeInterval = 30,
+        at now: Date = Date()
+    ) -> RecentSmartAliasDispatch? {
+        routeHealthQueue.sync {
+            guard let dispatch = recentSmartAliasDispatchByRequestedAlias[alias],
+                  now.timeIntervalSince(dispatch.timestamp) <= maxAge else {
+                return nil
+            }
+            return dispatch
+        }
     }
 
     static func recordRecentSmartAliasWinner(
@@ -3383,6 +3424,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             routeHealthDirty = false
             routeCircuitStatesByRouteHealthKey = [:]
             routeCooldownsByRouteHealthKey = [:]
+            recentSmartAliasDispatchByRequestedAlias = [:]
             recentSmartAliasWinnerByRequestedAlias = [:]
             hasLoadedPersistedRouteHealth = true
             persistRouteHealthLocked()
@@ -3605,6 +3647,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             hasLoadedPersistedRouteHealth = false
             routeCircuitStatesByRouteHealthKey = [:]
             routeCooldownsByRouteHealthKey = [:]
+            recentSmartAliasDispatchByRequestedAlias = [:]
             recentSmartAliasWinnerByRequestedAlias = [:]
             loadPersistedRouteHealthIfNeededLocked()
         }
@@ -8976,6 +9019,12 @@ class ThinkingProxy {
         let effectiveRouteModel: String?
         let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource?
         let effectiveRouteProvider: String?
+        let recentDispatchedRouteModel: String?
+        let recentDispatchedRouteProvider: String?
+        let recentDispatchedRequestShape: String?
+        let recentDispatchedRouteAt: Date?
+        let recentDispatchedCallerRequestID: String?
+        let recentDispatchedCallerSessionID: String?
         let recentLiveRouteModel: String?
         let recentLiveRouteProvider: String?
         let recentLiveRequestShape: String?
@@ -9009,6 +9058,9 @@ class ThinkingProxy {
         let effectiveRouteModelSource: OpenAICompatTemporaryShim.FactoryEffectiveRouteModelSource
         let effectiveRouteProvider: String?
         let routeHealthStatus: String?
+        let recentDispatchedRouteModel: String?
+        let recentDispatchedRouteProvider: String?
+        let recentDispatchedRouteAt: Date?
 
         var ready: Bool {
             dispatchableRouteModel != nil
@@ -13200,6 +13252,13 @@ class ThinkingProxy {
         let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: candidateModel)
         let requiredToolParameters = OpenAICompatTemporaryShim.requiredToolParametersIndex(forRequestJSON: body)
         let telemetrySource = smartAliasTelemetrySource(headers: headers)
+        OpenAICompatTemporaryShim.recordRecentSmartAliasDispatch(
+            requestedAlias: publicAlias,
+            requestModel: candidateModel,
+            requestShape: requestTrace.requestShape,
+            callerRequestID: requestTrace.callerRequestID,
+            callerSessionID: requestTrace.callerSessionID
+        )
         let bufferedSyntheticBody: String = {
             switch deliveryMode {
             case .syntheticSSE, .syntheticResponsesSSE:
@@ -17969,6 +18028,24 @@ class ThinkingProxy {
         if let recentLiveRouteModel = contract.recentLiveRouteModel {
             dict["recent_live_route_model"] = recentLiveRouteModel
         }
+        if let recentDispatchedRouteModel = contract.recentDispatchedRouteModel {
+            dict["recent_dispatched_route_model"] = recentDispatchedRouteModel
+        }
+        if let recentDispatchedRouteProvider = contract.recentDispatchedRouteProvider {
+            dict["recent_dispatched_route_provider"] = recentDispatchedRouteProvider
+        }
+        if let recentDispatchedRequestShape = contract.recentDispatchedRequestShape {
+            dict["recent_dispatched_request_shape"] = recentDispatchedRequestShape
+        }
+        if let recentDispatchedRouteAt = contract.recentDispatchedRouteAt {
+            dict["recent_dispatched_route_at"] = ISO8601DateFormatter().string(from: recentDispatchedRouteAt)
+        }
+        if let recentDispatchedCallerRequestID = contract.recentDispatchedCallerRequestID {
+            dict["recent_dispatched_caller_request_id"] = recentDispatchedCallerRequestID
+        }
+        if let recentDispatchedCallerSessionID = contract.recentDispatchedCallerSessionID {
+            dict["recent_dispatched_caller_session_id"] = recentDispatchedCallerSessionID
+        }
         if let recentLiveRouteProvider = contract.recentLiveRouteProvider {
             dict["recent_live_route_provider"] = recentLiveRouteProvider
         }
@@ -18099,6 +18176,17 @@ class ThinkingProxy {
         }
         guard routeModel != workerModelID else { return nil }
         return OpenAICompatTemporaryShim.recentSmartAliasWinner(forRequestedAlias: routeModel)
+    }
+
+    private static func recentSmartAliasDispatchForFactoryWorker(
+        workerModelID: String,
+        routeModel: String
+    ) -> OpenAICompatTemporaryShim.RecentSmartAliasDispatch? {
+        if let dispatch = OpenAICompatTemporaryShim.recentSmartAliasDispatch(forRequestedAlias: workerModelID) {
+            return dispatch
+        }
+        guard routeModel != workerModelID else { return nil }
+        return OpenAICompatTemporaryShim.recentSmartAliasDispatch(forRequestedAlias: routeModel)
     }
 
     private static func firstAvailableFactoryWorkerCandidateModel(from candidateModels: [String]) -> String? {
@@ -18356,7 +18444,10 @@ class ThinkingProxy {
                     effectiveRouteProvider: dispatchableRouteModel.flatMap {
                         OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0)?.providerID
                     },
-                    routeHealthStatus: routeHealthStatus
+                    routeHealthStatus: routeHealthStatus,
+                    recentDispatchedRouteModel: nil,
+                    recentDispatchedRouteProvider: nil,
+                    recentDispatchedRouteAt: nil
                 )
             ]
         }
@@ -18382,6 +18473,11 @@ class ThinkingProxy {
                 OpenAICompatTemporaryShim.recentSmartAliasWinner(forRequestedAlias: alias)
             }.first(where: { recentWinner in
                 dispatchableCandidateModels.contains(recentWinner.requestModel)
+            })
+            let recentDispatch = recentWinnerAliases.lazy.compactMap { alias in
+                OpenAICompatTemporaryShim.recentSmartAliasDispatch(forRequestedAlias: alias)
+            }.first(where: { recentDispatch in
+                candidateModels.contains(recentDispatch.requestModel)
             })
 
             let dispatchableRouteModel = recentWinner?.requestModel ?? dispatchableCandidateModels.first
@@ -18410,7 +18506,12 @@ class ThinkingProxy {
                     routeModel: routeModel,
                     requestSurface: requestSurface,
                     requestShape: requestShape
-                )
+                ),
+                recentDispatchedRouteModel: recentDispatch?.requestModel,
+                recentDispatchedRouteProvider: recentDispatch.flatMap {
+                    OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0.requestModel)?.providerID
+                },
+                recentDispatchedRouteAt: recentDispatch?.timestamp
             )
         }
     }
@@ -18444,6 +18545,39 @@ class ThinkingProxy {
             return nil
         }
         return effectiveRouteProviders.first
+    }
+
+    private static func summarizedFactoryWorkerRecentDispatchedRouteModel(
+        from requestShapeContracts: [FactoryWorkerRequestShapeContract]
+    ) -> String? {
+        let recentDispatchedRouteModels = Array(Set(requestShapeContracts.compactMap(\.recentDispatchedRouteModel))).sorted()
+        guard recentDispatchedRouteModels.count == 1,
+              requestShapeContracts.allSatisfy({ $0.recentDispatchedRouteModel == recentDispatchedRouteModels.first }) else {
+            return nil
+        }
+        return recentDispatchedRouteModels.first
+    }
+
+    private static func summarizedFactoryWorkerRecentDispatchedRouteProvider(
+        from requestShapeContracts: [FactoryWorkerRequestShapeContract]
+    ) -> String? {
+        let recentDispatchedRouteProviders = Array(Set(requestShapeContracts.compactMap(\.recentDispatchedRouteProvider))).sorted()
+        guard recentDispatchedRouteProviders.count == 1,
+              requestShapeContracts.allSatisfy({ $0.recentDispatchedRouteProvider == recentDispatchedRouteProviders.first }) else {
+            return nil
+        }
+        return recentDispatchedRouteProviders.first
+    }
+
+    private static func summarizedFactoryWorkerRecentDispatchedRouteAt(
+        from requestShapeContracts: [FactoryWorkerRequestShapeContract]
+    ) -> Date? {
+        let timestamps = Array(Set(requestShapeContracts.compactMap(\.recentDispatchedRouteAt))).sorted()
+        guard timestamps.count == 1,
+              requestShapeContracts.allSatisfy({ $0.recentDispatchedRouteAt == timestamps.first }) else {
+            return nil
+        }
+        return timestamps.first
     }
 
     private static func summarizedFactoryWorkerDispatchableRouteModel(
@@ -18610,6 +18744,19 @@ class ThinkingProxy {
         let effectiveRouteModelSource = summarizedFactoryWorkerEffectiveRouteModelSource(
             from: requestShapeContracts
         )
+        let recentDispatchedRouteModel = summarizedFactoryWorkerRecentDispatchedRouteModel(
+            from: requestShapeContracts
+        )
+        let recentDispatchedRouteProvider = summarizedFactoryWorkerRecentDispatchedRouteProvider(
+            from: requestShapeContracts
+        )
+        let recentDispatchedRouteAt = summarizedFactoryWorkerRecentDispatchedRouteAt(
+            from: requestShapeContracts
+        )
+        let recentDispatched = recentSmartAliasDispatchForFactoryWorker(
+            workerModelID: workerModelID,
+            routeModel: authoritativeRouteModel
+        )
         let recentLiveDispatch = recentSmartAliasWinnerForFactoryWorker(
             workerModelID: workerModelID,
             routeModel: authoritativeRouteModel
@@ -18665,6 +18812,14 @@ class ThinkingProxy {
             effectiveRouteModel: effectiveRouteModel,
             effectiveRouteModelSource: effectiveRouteModelSource,
             effectiveRouteProvider: effectiveRouteProvider,
+            recentDispatchedRouteModel: recentDispatchedRouteModel ?? recentDispatched?.requestModel,
+            recentDispatchedRouteProvider: recentDispatchedRouteProvider ?? recentDispatched.flatMap {
+                OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0.requestModel)?.providerID
+            },
+            recentDispatchedRequestShape: recentDispatched?.requestShape,
+            recentDispatchedRouteAt: recentDispatchedRouteAt ?? recentDispatched?.timestamp,
+            recentDispatchedCallerRequestID: recentDispatched?.callerRequestID,
+            recentDispatchedCallerSessionID: recentDispatched?.callerSessionID,
             recentLiveRouteModel: recentLiveDispatch?.requestModel,
             recentLiveRouteProvider: recentLiveRouteProvider,
             recentLiveRequestShape: recentLiveDispatch?.requestShape,
