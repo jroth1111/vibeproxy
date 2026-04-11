@@ -2808,6 +2808,16 @@ enum OpenAICompatTemporaryShim {
             return route
         }
         let normalized = normalizedRequestModel(requestModel)
+        if let factoryBinding = ThinkingProxy.factoryModelBinding(forIncomingModelID: requestModel)
+            ?? ThinkingProxy.factoryModelBinding(forIncomingModelID: normalized) {
+            if let resolvedBoundRoute = resolveConfiguredRoute(forRequestModel: factoryBinding.routeModel) {
+                return resolvedBoundRoute
+            }
+            return RouteIdentity(
+                providerID: factoryBinding.routeProvider,
+                canonicalModelID: factoryBinding.routeModel
+            )
+        }
         for (prefix, providerID) in ProviderCatalog.oauthPassthroughPrefixes {
             if normalized.hasPrefix(prefix) {
                 return RouteIdentity(providerID: providerID, canonicalModelID: normalized)
@@ -3337,7 +3347,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func forceOpenRouteForTesting(requestModel: String, until: Date) {
-        guard let route = resolveConfiguredRoute(forRequestModel: requestModel) else {
+        guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return
         }
         routeHealthQueue.sync {
@@ -3361,21 +3371,30 @@ enum OpenAICompatTemporaryShim {
     static func routeHealthSnapshotByRequestModel() -> [String: RouteCircuitState] {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
-            let routes = resolvedRoutesByRequestModel()
+            var routes = resolvedRoutesByRequestModel()
+            if let bindings = ThinkingProxy.factoryModelBindings()?.bindingsByIncomingModelID {
+                for (requestModel, _) in bindings {
+                    if let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
+                        routes[requestModel] = route
+                    }
+                }
+            }
             let requestModelsByRouteHealthKey = Dictionary(grouping: routes.keys) { requestModel in
                 routes[requestModel]?.routeHealthKey ?? requestModel
             }
-            return requestModelsByRouteHealthKey.reduce(into: [String: RouteCircuitState]()) { snapshot, entry in
+            return routeCircuitStatesByRouteHealthKey.reduce(into: [String: RouteCircuitState]()) { snapshot, entry in
                 let routeHealthKey = entry.key
-                let candidates = entry.value
-                guard let requestModel = preferredRouteHealthDisplayRequestModel(
-                    from: candidates,
-                    routes: routes
-                ),
-                let state = routeCircuitStatesByRouteHealthKey[routeHealthKey] else {
+                let state = entry.value
+                if let candidates = requestModelsByRouteHealthKey[routeHealthKey],
+                   let requestModel = preferredRouteHealthDisplayRequestModel(
+                        from: candidates,
+                        routes: routes
+                   ) {
+                    snapshot[requestModel] = state
                     return
                 }
-                snapshot[requestModel] = state
+                let fallbackRequestModel = routeHealthKey.components(separatedBy: "::").last ?? routeHealthKey
+                snapshot[fallbackRequestModel] = state
             }
         }
     }
@@ -8874,6 +8893,7 @@ class ThinkingProxy {
         let validationWorkerReasoningEffort: String?
         let configuredRouteModel: String
         let routeModel: String
+        let authoritativeRouteModel: String
         let routeProvider: String
         let requestSurface: String
         let dispatchableRouteModel: String?
@@ -10960,7 +10980,7 @@ class ThinkingProxy {
     ) {
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController)
-        let resolvedRequestModel = OpenAICompatTemporaryShim.modelName(forRequestJSON: body) ?? binding.routeModel
+        let resolvedRequestModel = binding.routeModel
         let resolutionHeaders = smartAliasResolutionHeaders(
             publicAlias: binding.incomingModelID,
             resolvedRequestModel: resolvedRequestModel,
@@ -11020,6 +11040,50 @@ class ThinkingProxy {
             permit?.release()
             guard let self else { return }
             guard requestController.isCancelled() != true else { return }
+
+            let telemetryEvaluation = self.evaluateDirectBufferedRouteTelemetry(
+                path: upstreamPath,
+                requestModel: resolvedRequestModel,
+                bufferedResponse: bufferedResponse,
+                inflightAtRequest: permit?.inflightAtRequest,
+                requestTrace: requestTrace
+            )
+            if telemetryEvaluation.shouldRecordFailure {
+                if let permit,
+                   let response = bufferedResponse.response {
+                    OpenAICompatTemporaryShim.recordConcurrency429IfNeeded(
+                        routeHealthKey: permit.routeHealthKey,
+                        inflightAtRequest: permit.inflightAtRequest,
+                        statusCode: response.statusCode,
+                        headers: response.allHeaderFields,
+                        bodyData: bufferedResponse.data
+                    )
+                }
+                if let deferredUntil = telemetryEvaluation.deferralUntil {
+                    OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
+                        forRequestModel: resolvedRequestModel,
+                        until: deferredUntil
+                    )
+                }
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: resolvedRequestModel,
+                    telemetryEvent: telemetryEvaluation.event,
+                    forcedOpenUntil: telemetryEvaluation.forcedOpenUntil
+                )
+            } else if telemetryEvaluation.shouldRecordSuccess {
+                if let permit {
+                    OpenAICompatTemporaryShim.recordConcurrencySuccess(
+                        routeHealthKey: permit.routeHealthKey,
+                        inflightAtRequest: permit.inflightAtRequest
+                    )
+                }
+                OpenAICompatTemporaryShim.recordRouteSuccess(
+                    forRequestModel: resolvedRequestModel,
+                    telemetryEvent: telemetryEvaluation.event
+                )
+            } else {
+                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvaluation.event)
+            }
 
             if let error = bufferedResponse.error {
                 let nsError = error as NSError
@@ -12135,7 +12199,7 @@ class ThinkingProxy {
                     requestTrace: requestTrace
                 )
             }
-        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
+        case .retryableFailure(let retryingRequestModel, let telemetryEvent, let cooldownUntil):
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
@@ -12160,7 +12224,7 @@ class ThinkingProxy {
                     terminalFallbackOutcome: terminalFallbackOutcome,
                     exhaustedRetryableOutcome: remainingCandidateModels.isEmpty
                         ? .retryableFailure(
-                            requestModel: requestModel,
+                            requestModel: telemetryEvent.requestModel,
                             telemetryEvent: telemetryEvent,
                             cooldownUntil: cooldownUntil
                         )
@@ -15180,7 +15244,7 @@ class ThinkingProxy {
                 headers[name] = value
             }
         }
-        if let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: resolvedRequestModel) {
+        if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: resolvedRequestModel) {
             headers["X-Resolved-Provider"] = route.providerID
             headers["X-Resolved-Canonical-Model"] = route.canonicalModelID
         }
@@ -17451,7 +17515,7 @@ class ThinkingProxy {
         // Config drift: compare Factory's effective route model against proxy's authoritative worker candidates
         if let factoryWorkerContract = ThinkingProxy.factoryWorkerContract(),
            let workerCandidates = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")?.candidates {
-            let factoryRoute = factoryWorkerContract.routeModel
+            let factoryRoute = factoryWorkerContract.authoritativeRouteModel
             let routeIsWorkerAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: factoryRoute) != nil
             let inPool = routeIsWorkerAlias || workerCandidates.contains(factoryRoute)
             let severity: String
@@ -17469,8 +17533,8 @@ class ThinkingProxy {
                 "route_in_pool": inPool,
                 "severity": severity
             ]
-            if factoryWorkerContract.configuredRouteModel != factoryWorkerContract.routeModel {
-                drift["configured_factory_route_model"] = factoryWorkerContract.configuredRouteModel
+            if factoryWorkerContract.routeModel != factoryRoute {
+                drift["configured_factory_route_model"] = factoryWorkerContract.routeModel
             }
             if let warning = warning {
                 drift["warning"] = warning
@@ -17747,8 +17811,8 @@ class ThinkingProxy {
             "ready": backendReachable && contract.ready
         ]
         dict["effective_route_model"] = contract.effectiveRouteModel
-        if contract.configuredRouteModel != contract.routeModel {
-            dict["configured_route_model"] = contract.configuredRouteModel
+        if contract.authoritativeRouteModel != contract.routeModel {
+            dict["authoritative_route_model"] = contract.authoritativeRouteModel
         }
         if let validationWorkerModelID = contract.validationWorkerModelID {
             dict["validation_worker_model_id"] = validationWorkerModelID
@@ -17798,7 +17862,7 @@ class ThinkingProxy {
         if let bindings = Self.factoryModelBindings()?.bindingsByIncomingModelID.values {
             let workerBindings = bindings.filter {
                 $0.authoritativeModelID == contract.workerModelID &&
-                $0.routeModel == contract.routeModel &&
+                $0.routeModel == contract.authoritativeRouteModel &&
                 $0.routeProvider == contract.routeProvider
             }
             let acceptedRequestModelIDs = Array(Set(workerBindings.map(\.incomingModelID))).sorted()
@@ -18157,7 +18221,7 @@ class ThinkingProxy {
             requestSurface: requestSurface
         )
         let directEffectiveRouteProvider =
-            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: directEffectiveRouteModel)?.providerID
+            OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: directEffectiveRouteModel)?.providerID
         let directRouteHealthStatus =
             OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: directEffectiveRouteModel)?.rawValue
 
@@ -18213,7 +18277,7 @@ class ThinkingProxy {
             return nil
         }
 
-        let routeModel = authoritativeFactoryWorkerRouteModel(
+        let authoritativeRouteModel = authoritativeFactoryWorkerRouteModel(
             workerModelID: workerModelID,
             configuredRouteModel: configuredRouteModel,
             routeProvider: routeProvider
@@ -18221,30 +18285,30 @@ class ThinkingProxy {
         let requestSurface = factoryWorkerRequestSurface(forProvider: routeProvider)
         let dispatchableRouteModel: String?
         if requestSurface == "chat_completions",
-           OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: routeModel) != nil {
+           OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: authoritativeRouteModel) != nil {
             dispatchableRouteModel = dispatchableFactoryWorkerCandidateModel(
-                routeModel: routeModel,
+                routeModel: authoritativeRouteModel,
                 requestSurface: requestSurface
             )
-        } else if OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: routeModel) == nil {
-            dispatchableRouteModel = routeModel
+        } else if OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: authoritativeRouteModel) == nil {
+            dispatchableRouteModel = authoritativeRouteModel
         } else {
             dispatchableRouteModel = nil
         }
         let effectiveRouteModel = ThinkingProxy.effectiveFactoryRouteModel(
-            routeModel: routeModel,
+            routeModel: authoritativeRouteModel,
             routeProvider: routeProvider,
             requestSurface: requestSurface,
             requestedAlias: workerModelID
         )
         let recentLiveDispatch = recentSmartAliasWinnerForFactoryWorker(
             workerModelID: workerModelID,
-            routeModel: routeModel
+            routeModel: authoritativeRouteModel
         )
         let effectiveRouteProvider =
-            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: effectiveRouteModel)?.providerID
+            OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: effectiveRouteModel)?.providerID
         let recentLiveRouteProvider = recentLiveDispatch.flatMap {
-            OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: $0.requestModel)?.providerID
+            OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: $0.requestModel)?.providerID
         }
 
         let snapshotDriftPaths = factoryWorkerSnapshotDriftPaths(
@@ -18266,7 +18330,8 @@ class ThinkingProxy {
             workerReasoningEffort: missionModelSettings["workerReasoningEffort"] as? String,
             validationWorkerReasoningEffort: missionModelSettings["validationWorkerReasoningEffort"] as? String,
             configuredRouteModel: configuredRouteModel,
-            routeModel: routeModel,
+            routeModel: configuredRouteModel,
+            authoritativeRouteModel: authoritativeRouteModel,
             routeProvider: routeProvider,
             requestSurface: requestSurface,
             dispatchableRouteModel: dispatchableRouteModel,
@@ -18281,7 +18346,7 @@ class ThinkingProxy {
             displayName: workerModel["displayName"] as? String,
             baseURL: workerModel["baseUrl"] as? String,
             routeHealthStatus: effectiveFactoryContractHealthStatus(
-                routeModel: routeModel,
+                routeModel: authoritativeRouteModel,
                 requestSurface: requestSurface
             ),
             authoritativeSettingsPath: settingsPath,
@@ -18298,7 +18363,7 @@ class ThinkingProxy {
         return retiredIDs.subtracting([currentWorkerModelID])
     }
 
-    fileprivate static func factoryResolvedRouteModel(forIncomingModelID incomingModelID: String) -> String? {
+    static func factoryResolvedRouteModel(forIncomingModelID incomingModelID: String) -> String? {
         factoryModelBinding(forIncomingModelID: incomingModelID)?.routeModel
     }
 
@@ -18355,7 +18420,7 @@ class ThinkingProxy {
         return "Factory worker snapshot drift detected for \(binding.incomingModelID) against authoritative worker model \(contract.workerModelID). Refusing to proxy the request until Factory settings are resynced. Drifted paths: \(driftedPaths)"
     }
 
-    private static func factoryModelBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
+    fileprivate static func factoryModelBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
         factoryModelBindings()?.bindingsByIncomingModelID[incomingModelID]
     }
 

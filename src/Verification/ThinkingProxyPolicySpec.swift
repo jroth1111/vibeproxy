@@ -3537,19 +3537,11 @@ struct ThinkingProxyPolicySpec {
                     )
                     let rewrittenJSON = parseJSONObject(rewrite?.rewrittenJSONString, recorder: recorder)
                     let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(
-                        forRequestModel: selfRoutedGenericCompatFactoryWorkerContract.routeModel
+                        forRequestModel: selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel
                     )
 
-                    expectEqual(
-                        ThinkingProxy.factoryResolvedRouteModel(
-                            forIncomingModelID: selfRoutedGenericCompatFactoryWorkerContract.workerModelID
-                        ),
-                        selfRoutedGenericCompatFactoryWorkerContract.routeModel,
-                        "self-routed smart-router worker IDs should resolve onto the authoritative public worker alias before routing",
-                        recorder: recorder
-                    )
-                    expectEqual(rewrite?.normalizedModel, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "self-routed smart-router worker IDs should normalize onto the authoritative public worker alias", recorder: recorder)
-                    expectEqual(rewrittenJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "self-routed smart-router request rewrites should target the authoritative public worker alias", recorder: recorder)
+                    expectEqual(rewrite?.normalizedModel, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "self-routed smart-router worker IDs should normalize onto the authoritative public worker alias", recorder: recorder)
+                    expectEqual(rewrittenJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "self-routed smart-router request rewrites should target the authoritative public worker alias", recorder: recorder)
                     expectEqual(smartAlias?.requestClass, "plain-chat", "the authoritative public worker alias should own the worker request class", recorder: recorder)
                     expectEqual(smartAlias?.failover, "silent", "the authoritative public worker alias should own worker failover policy", recorder: recorder)
                     expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
@@ -3575,12 +3567,12 @@ struct ThinkingProxyPolicySpec {
                         """
                     )
                     let candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
-                        forPublicAlias: selfRoutedGenericCompatFactoryWorkerContract.routeModel,
+                        forPublicAlias: selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel,
                         method: "POST",
                         path: "/v1/chat/completions",
                         jsonString: rewrite?.rewrittenJSONString ?? "",
                         smartAlias: OpenAICompatTemporaryShim.smartAliasDefinition(
-                            forRequestModel: selfRoutedGenericCompatFactoryWorkerContract.routeModel
+                            forRequestModel: selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel
                         )!
                     )
 
@@ -8214,6 +8206,60 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should return one retryable 429 when every configured candidate is in a quota window", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream rate-limit window reached for worker; retry when the provider window resets.", "worker should emit the quota-window retry guidance after exhausting the pool", recorder: recorder)
+            }
+        }
+
+        run("temporary worker smart alias records one route failure when the final retryable candidate exhausts", recorder: recorder) {
+            withMergedConfig(singleCandidateWorkerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+
+                proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let forwardedJSON = parseJSONObject(body, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "single-candidate worker exhaustion should still route through the configured last worker lane", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"backend unavailable\"}".utf8),
+                            response: httpURLResponse(
+                                statusCode: 503,
+                                headerFields: ["Content-Type": "application/json"]
+                            ),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredErrorForTesting = { statusCode, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                    {
+                      "model": "worker",
+                      "stream": false,
+                      "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                    }
+                    """),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("single-candidate worker exhaustion should return a terminal error")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
+                expectEqual(deliveredStatus, 503, "single-candidate worker exhaustion should surface the terminal upstream failure class", recorder: recorder)
+                expectEqual(snapshot["glm-5.1-zai"]?.failureScore, 1.0, "the final retryable worker failure should be counted exactly once in route health", recorder: recorder)
+                expectEqual(snapshot["glm-5.1-zai"]?.status, .suspect, "one exhausted worker failure should degrade the route once instead of opening it immediately", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -12904,13 +12950,13 @@ struct ThinkingProxyPolicySpec {
                     let configDrift = payload["config_drift"] as? [String: Any]
 
                     expectEqual(factoryWorker?["worker_model_id"] as? String, selfRoutedGenericCompatFactoryWorkerContract.workerModelID, "healthz should expose the authoritative self-routed worker id", recorder: recorder)
-                    expectEqual(factoryWorker?["route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "healthz should expose the authoritative public worker alias as the contract route model", recorder: recorder)
-                    expectEqual(factoryWorker?["configured_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.configuredRouteModel, "healthz should preserve the raw Factory-configured self-routed worker id separately from the authoritative route", recorder: recorder)
+                    expectEqual(factoryWorker?["route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "healthz should expose the raw Factory-configured self-routed worker id as the contract route model", recorder: recorder)
+                    expectEqual(factoryWorker?["authoritative_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "healthz should expose the authoritative public worker alias separately from the raw Factory-configured worker route", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.effectiveRouteModel, "healthz should still expose the actual worker pool winner for self-routed worker IDs", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, selfRoutedGenericCompatFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the real upstream provider for self-routed worker IDs", recorder: recorder)
                     expectEqual(configDrift?["route_in_pool"] as? Bool, true, "self-routed worker IDs should not trip critical config drift when proxy source of truth owns the worker pool", recorder: recorder)
                     expectEqual(configDrift?["severity"] as? String, "none", "self-routed worker IDs should be treated as in-pool by healthz", recorder: recorder)
-                    expectEqual(configDrift?["configured_factory_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.configuredRouteModel, "healthz config drift should expose the raw Factory-configured self-routed route when proxy authority normalizes it", recorder: recorder)
+                    expectEqual(configDrift?["configured_factory_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "healthz config drift should expose the raw Factory-configured self-routed route when proxy authority normalizes it", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -13055,7 +13101,7 @@ struct ThinkingProxyPolicySpec {
                     let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     let factoryWorker = payload["factory_worker"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.routeModel, "healthz should fall back to the authoritative public worker alias when no worker lane is dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "healthz should fall back to the authoritative public worker alias when no worker lane is dispatchable", recorder: recorder)
                     expectNil(factoryWorker?["effective_route_provider"], "healthz should not advertise a concrete upstream provider when the worker pool is exhausted", recorder: recorder)
                     expectEqual(factoryWorker?["route_health_status"] as? String, "cooldown_exhausted", "healthz should surface cooldown exhaustion when every worker lane is deferred", recorder: recorder)
                     expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should mark the worker pool unready when no worker lane is dispatchable", recorder: recorder)
@@ -13251,6 +13297,78 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should expose the recent live worker lane when it exists", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should expose the recent live worker caller request id for correlation", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_request_shape"] as? String, "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content", "healthz should expose the recent live worker request shape for correlation", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("healthz preserves the recent live worker winner after later same-route canary telemetry", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let alias = selfRoutedGenericCompatFactoryWorkerContract.workerModelID
+
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(-5),
+                            requestModel: "glm5-nvidia",
+                            requestedAlias: alias,
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "smart_alias",
+                            totalLatencyMilliseconds: 42,
+                            callerRequestID: "live-worker-req"
+                        )
+                    )
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: "glm5-nvidia",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "canary",
+                            totalLatencyMilliseconds: 7
+                        )
+                    )
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("same-route winner-preservation healthz should return a response")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+
+                    expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should preserve the recent live worker winner even after later same-route canary telemetry", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should preserve the recent live worker provider even after later same-route canary telemetry", recorder: recorder)
+                    expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should keep the live worker caller correlation instead of letting later same-route canaries overwrite it", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -13636,6 +13754,105 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "self-routed worker requests should exhaust the shared worker pool before surfacing saturation", recorder: recorder)
                     expectEqual(deliveredStatus, 429, "shared-pool saturation should surface as a retryable quota-window limit once every candidate is exhausted", recorder: recorder)
                     expectEqual(deliveredMessage, "Upstream rate-limit window reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry when the provider window resets.", "shared-pool saturation should preserve the caller-visible worker model identity in the retryable quota-window error", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("self-routed worker auth and billing failures stay truthful after exhausting the pool", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    for (statusCode, responseBodyJSON, expectedMessage) in [
+                        (402, "{\"error\":\"payment required\"}", "Worker backend reported billing or entitlement exhaustion."),
+                        (403, "{\"error\":\"forbidden\"}", "Worker backend rejected the request with 403 Forbidden.")
+                    ] {
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        let proxy = ThinkingProxy()
+                        proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
+                        let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                        let delivered = DispatchSemaphore(value: 0)
+                        let lock = NSLock()
+                        var seenModels: [String] = []
+                        var deliveredStatus: Int?
+                        var deliveredMessage: String?
+
+                        proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                            let json = parseJSONObject(body, recorder: recorder)
+                            let model = json["model"] as? String ?? ""
+                            lock.lock()
+                            seenModels.append(model)
+                            lock.unlock()
+                            completion(
+                                ThinkingProxy.BufferedProxyResponse(
+                                    data: Data(responseBodyJSON.utf8),
+                                    response: httpURLResponse(
+                                        statusCode: statusCode,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                        }
+                        proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                            lock.lock()
+                            seenModels.append(publicModel)
+                            lock.unlock()
+                            return ThinkingProxy.BufferedProxyResponse(
+                                data: Data(responseBodyJSON.utf8),
+                                response: httpURLResponse(
+                                    statusCode: statusCode,
+                                    headerFields: ["Content-Type": "application/json"]
+                                ),
+                                error: nil
+                            )
+                        }
+                        proxy.nvidiaDirectTransportForTesting = { request, completion in
+                            let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                                parseJSONObject($0, recorder: recorder)["model"] as? String
+                            } ?? ""
+                            lock.lock()
+                            seenModels.append(model)
+                            lock.unlock()
+                            completion(
+                                ThinkingProxy.NVIDIADirectTransportResponse(
+                                    chunks: [Data(responseBodyJSON.utf8)],
+                                    response: httpURLResponse(
+                                        statusCode: statusCode,
+                                        headerFields: ["Content-Type": "application/json"]
+                                    ),
+                                    error: nil
+                                )
+                            )
+                            return {}
+                        }
+                        proxy.deliveredErrorForTesting = { deliveredCode, message in
+                            deliveredStatus = deliveredCode
+                            deliveredMessage = message
+                            delivered.signal()
+                        }
+
+                        proxy.processRequestForTesting(
+                            rawHTTPRequest(method: "POST", path: "/v1/chat/completions", body: """
+                            {
+                              "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                              "stream": false,
+                              "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                            }
+                            """),
+                            connection: connection
+                        )
+
+                        guard delivered.wait(timeout: .now() + 2) == .success else {
+                            recorder.recordFailure("self-routed worker \(statusCode) exhaustion should return a terminal error")
+                            OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                            return
+                        }
+
+                        expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "self-routed worker \(statusCode) exhaustion should still exhaust the shared worker pool before surfacing a terminal failure", recorder: recorder)
+                        expectEqual(deliveredStatus, statusCode, "self-routed worker \(statusCode) exhaustion should preserve the truthful upstream status instead of rewriting it to 429", recorder: recorder)
+                        expectEqual(deliveredMessage, expectedMessage, "self-routed worker \(statusCode) exhaustion should preserve the truthful terminal error message", recorder: recorder)
+                    }
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -14306,25 +14523,6 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("half-open routes remain visible in route health state", recorder: recorder) {
-            withMergedConfig(workerMergedConfigYAML()) {
-                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-                let now = Date(timeIntervalSince1970: 1_700_000_050)
-
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(
-                    requestModel: "glm-5.1-zai",
-                    until: now.addingTimeInterval(300)
-                )
-                OpenAICompatTemporaryShim.recordRouteSuccess(
-                    forRequestModel: "glm-5.1-zai",
-                    at: now.addingTimeInterval(1)
-                )
-
-                expectEqual(OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: "glm-5.1-zai"), .halfOpen, "half-open routes should remain visible to health-ranked routing instead of masquerading as healthy", recorder: recorder)
-                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
-            }
-        }
-
         run("persisted negative failure scores clamp to zero on reload", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withRouteHealthPath { path in
@@ -14577,8 +14775,8 @@ private func defaultMergedConfigYAML() -> String {
 private struct FactoryWorkerSpecContract {
     let workerModelID: String
     let validationWorkerModelID: String
-    let configuredRouteModel: String
     let routeModel: String
+    let authoritativeRouteModel: String
     let routeProvider: String
     let requestSurface: String
     let effectiveRouteModel: String
@@ -14602,7 +14800,7 @@ private func factorySettingsJSON(contract: FactoryWorkerSpecContract) -> String 
         "customModels": [
         {
           "id": "\(contract.workerModelID)",
-          "model": "\(contract.configuredRouteModel)",
+          "model": "\(contract.routeModel)",
           "provider": "\(contract.routeProvider)",
           "displayName": "Factory Worker via Proxy",
           "baseUrl": "http://127.0.0.1:8317/v1"
@@ -14622,8 +14820,8 @@ private func factorySettingsJSON(contract: FactoryWorkerSpecContract) -> String 
 private let openAIFactoryWorkerContract = FactoryWorkerSpecContract(
     workerModelID: "custom:GPT-5.4-High-Proxy-2",
     validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
-    configuredRouteModel: "gpt-5.4(high)",
     routeModel: "gpt-5.4(high)",
+    authoritativeRouteModel: "gpt-5.4(high)",
     routeProvider: "openai",
     requestSurface: "responses",
     effectiveRouteModel: "gpt-5.4(high)",
@@ -14633,8 +14831,8 @@ private let openAIFactoryWorkerContract = FactoryWorkerSpecContract(
 private let genericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
     workerModelID: "custom:Proxy-Worker-Smart-Router-8",
     validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
-    configuredRouteModel: "proxy-worker-smart-router",
     routeModel: "proxy-worker-smart-router",
+    authoritativeRouteModel: "proxy-worker-smart-router",
     routeProvider: "generic-chat-completion-api",
     requestSurface: "chat_completions",
     effectiveRouteModel: "glm-5.1-zai",
@@ -14644,8 +14842,8 @@ private let genericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
 private let selfRoutedGenericCompatFactoryWorkerContract = FactoryWorkerSpecContract(
     workerModelID: "custom:Proxy-Worker-Smart-Router-8",
     validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
-    configuredRouteModel: "custom:Proxy-Worker-Smart-Router-8",
-    routeModel: "proxy-worker-smart-router",
+    routeModel: "custom:Proxy-Worker-Smart-Router-8",
+    authoritativeRouteModel: "proxy-worker-smart-router",
     routeProvider: "generic-chat-completion-api",
     requestSurface: "chat_completions",
     effectiveRouteModel: "glm-5.1-zai",
@@ -14655,8 +14853,8 @@ private let selfRoutedGenericCompatFactoryWorkerContract = FactoryWorkerSpecCont
 private let directChatFactoryWorkerContract = FactoryWorkerSpecContract(
     workerModelID: "custom:Direct-Chat-Proxy-2",
     validationWorkerModelID: "custom:GPT-5.4-High-Proxy-2",
-    configuredRouteModel: "gpt-5.4(high)",
     routeModel: "gpt-5.4(high)",
+    authoritativeRouteModel: "gpt-5.4(high)",
     routeProvider: "generic-chat-completion-api",
     requestSurface: "chat_completions",
     effectiveRouteModel: "gpt-5.4(high)",
@@ -14727,6 +14925,24 @@ private func workerMergedConfigYAML() -> String {
         "    - minimax-m2.7-ollama-pro",
         "    - muse-spark",
         "    - glm5-nvidia"
+    ].joined(separator: "\n")
+}
+
+private func singleCandidateWorkerMergedConfigYAML() -> String {
+    [
+        "claude-api-key:",
+        "- api-key: test-zai-key",
+        "  base-url: https://api.z.ai/api/anthropic",
+        "  models:",
+        "  - alias: glm-5.1-zai",
+        "    name: glm-5.1",
+        "request-retry: 3",
+        "smart-aliases:",
+        "  worker:",
+        "    request-class: plain-chat",
+        "    failover: silent",
+        "    candidates:",
+        "    - glm-5.1-zai"
     ].joined(separator: "\n")
 }
 
