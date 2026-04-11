@@ -9620,7 +9620,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("direct NVIDIA stream requests synthesize SSE from the new transport boundary", recorder: recorder) {
+        run("direct NVIDIA stream requests keep live SSE caller-visible before transport completion", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
@@ -9726,6 +9726,201 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streamed direct NVIDIA requests should deliver SSE headers", recorder: recorder)
                 expectEqual(deliveredText.contains("chat.completion.chunk"), true, "streamed direct NVIDIA requests should deliver live chat-completion chunk frames", recorder: recorder)
                 expectEqual(deliveredText.contains("data: [DONE]"), true, "streamed direct NVIDIA requests should terminate with the SSE done sentinel", recorder: recorder)
+            }
+        }
+
+        run("direct NVIDIA live streams emit downstream keepalives during real idle gaps", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
+                    protocolPreference: .http1Only,
+                    requestTimeoutSeconds: 300,
+                    resourceTimeoutSeconds: 360,
+                    interChunkReadTimeoutSeconds: 1,
+                    waitsForConnectivity: true,
+                    sinkPolicy: NVIDIAStreamSinkPolicy(
+                        emitsDownstreamKeepalives: true,
+                        keepaliveIntervalSeconds: 0.05,
+                        keepaliveComment: " keepalive"
+                    )
+                )
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let deliveredChunk = DispatchSemaphore(value: 0)
+                let deliveredFinish = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var deliveredChunks: [Data] = []
+
+                defer {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectStreamingTransportForTesting = { _, onChunk, completion in
+                    let firstChunk = Data("data: {\"id\":\"chatcmpl-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n".utf8)
+                    let doneChunk = Data("data: [DONE]\n\n".utf8)
+                    let firstEmit = DispatchWorkItem {
+                        onChunk(firstChunk, Date())
+                    }
+                    let finish = DispatchWorkItem {
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [firstChunk, doneChunk],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                                error: nil,
+                                firstByteLatencyMilliseconds: 10,
+                                totalLatencyMilliseconds: 180
+                            )
+                        )
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.01, execute: firstEmit)
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.18, execute: finish)
+                    return {
+                        firstEmit.cancel()
+                        finish.cancel()
+                    }
+                }
+                proxy.deliveredStreamingResponseChunkForTesting = { chunk in
+                    lock.lock()
+                    deliveredChunks.append(chunk)
+                    lock.unlock()
+                    deliveredChunk.signal()
+                }
+                proxy.deliveredStreamingResponseFinishForTesting = {
+                    deliveredFinish.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct NVIDIA keepalive test should not surface an error: \(statusCode) \(message)")
+                    deliveredFinish.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard deliveredChunk.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("direct NVIDIA keepalive test should receive the first live chunk")
+                    return
+                }
+
+                guard deliveredChunk.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("direct NVIDIA keepalive test should emit a downstream keepalive while upstream is idle")
+                    return
+                }
+
+                guard deliveredFinish.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA keepalive test should finish the stream")
+                    return
+                }
+
+                lock.lock()
+                let deliveredText = String(data: deliveredChunks.reduce(into: Data()) { $0.append($1) }, encoding: .utf8) ?? ""
+                lock.unlock()
+                expectEqual(deliveredText.contains(": keepalive"), true, "direct NVIDIA live streams should inject downstream keepalive comments on real idle gaps", recorder: recorder)
+                expectEqual(deliveredText.contains("data: [DONE]"), true, "direct NVIDIA keepalive test should still terminate with the SSE done sentinel", recorder: recorder)
+            }
+        }
+
+        run("direct NVIDIA live streams enforce the inter-chunk timeout in the active transport path", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
+                    protocolPreference: .http1Only,
+                    requestTimeoutSeconds: 300,
+                    resourceTimeoutSeconds: 360,
+                    interChunkReadTimeoutSeconds: 0.05,
+                    waitsForConnectivity: true,
+                    sinkPolicy: NVIDIAStreamSinkPolicy(
+                        emitsDownstreamKeepalives: false,
+                        keepaliveIntervalSeconds: 0,
+                        keepaliveComment: " keepalive"
+                    )
+                )
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let deliveredFinish = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var cancellationObserved = false
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let firstChunk = Data("data: {\"id\":\"chatcmpl-nvidia\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n".utf8)
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.nvidiaDirectStreamingTransportForTesting = { _, onChunk, completion in
+                    let firstEmit = DispatchWorkItem {
+                        onChunk(firstChunk, Date())
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.01, execute: firstEmit)
+                    return {
+                        firstEmit.cancel()
+                        lock.lock()
+                        cancellationObserved = true
+                        lock.unlock()
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [firstChunk],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "text/event-stream"]),
+                                error: URLError(.cancelled),
+                                firstByteLatencyMilliseconds: 10,
+                                totalLatencyMilliseconds: 80
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredStreamingResponseFinishForTesting = {
+                    deliveredFinish.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    recorder.recordFailure("direct NVIDIA inter-chunk timeout should finish the live stream, not surface a buffered error: \(statusCode) \(message)")
+                    deliveredFinish.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": true,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard deliveredFinish.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA inter-chunk timeout should finish after the idle gap deadline fires")
+                    return
+                }
+
+                lock.lock()
+                let timeoutObserved = cancellationObserved
+                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia" })
+                lock.unlock()
+                expectEqual(timeoutObserved, true, "direct NVIDIA inter-chunk timeout should actively cancel the live transport", recorder: recorder)
+                expectEqual(timeoutEvent?.timeoutStage, .interChunkRead, "direct NVIDIA inter-chunk timeout should be attributed to the live transport chunk-gap watchdog", recorder: recorder)
             }
         }
 
@@ -11999,6 +12194,8 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(streamDiagnostics?["inter_chunk_read_timeout_seconds"] as? Int, 300, "healthz should expose the NVIDIA inter-chunk read timeout budget", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalives_enabled"] as? Bool, true, "healthz should expose whether the NVIDIA streamed sink injects keepalives", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalive_interval_seconds"] as? Int, 8, "healthz should expose the NVIDIA keepalive cadence", recorder: recorder)
+                    expectEqual(streamDiagnostics?["chunk_gap_timeout_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA chunk-gap timeout enforcement", recorder: recorder)
+                    expectEqual(streamDiagnostics?["downstream_keepalive_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA downstream keepalives", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

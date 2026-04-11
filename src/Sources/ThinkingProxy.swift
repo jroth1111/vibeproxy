@@ -12704,7 +12704,7 @@ class ThinkingProxy {
             sessionKey: sessionKey,
             requestJSON: body,
             requestModel: candidateModel,
-            clientRequestedStream: clientRequestedStream,
+            clientRequestedStream: internalStreaming,
             onChunk: lockMeaningfulOutputIfNeeded,
             completion: handleTransportResponse
         ) else {
@@ -14876,9 +14876,9 @@ class ThinkingProxy {
                 interChunkDeadlineWorkItem?.cancel()
                 let workItem = DispatchWorkItem {
                     let cancelAction: (() -> Void)? = attemptStateQueue.sync {
-                        guard liveStreamStarted,
-                              !liveStreamFinished,
+                        guard !liveStreamFinished,
                               !liveStreamFailed,
+                              attemptReceivedPayload,
                               !requestController.isCancelled(),
                               !coordinator.isFinished() else {
                             return nil
