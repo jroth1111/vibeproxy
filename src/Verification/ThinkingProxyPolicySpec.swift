@@ -8917,7 +8917,7 @@ struct ThinkingProxyPolicySpec {
             }
             expectEqual(
                 policy.protocolPreference,
-                .http1Only,
+                .http1Preferred,
                 "nvidia direct sessions should advertise the dedicated http/1.1 transport preference",
                 recorder: recorder
             )
@@ -9735,7 +9735,7 @@ struct ThinkingProxyPolicySpec {
 
                 let proxy = ThinkingProxy()
                 proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
-                    protocolPreference: .http1Only,
+                    protocolPreference: .http1Preferred,
                     requestTimeoutSeconds: 300,
                     resourceTimeoutSeconds: 360,
                     interChunkReadTimeoutSeconds: 1,
@@ -9907,7 +9907,7 @@ struct ThinkingProxyPolicySpec {
 
                 let proxy = ThinkingProxy()
                 proxy.nvidiaDirectTransportPolicyOverrideForTesting = NVIDIATransportPolicy(
-                    protocolPreference: .http1Only,
+                    protocolPreference: .http1Preferred,
                     requestTimeoutSeconds: 300,
                     resourceTimeoutSeconds: 360,
                     interChunkReadTimeoutSeconds: 0.05,
@@ -12450,7 +12450,8 @@ struct ThinkingProxyPolicySpec {
                             retryCount: 0,
                             source: "canary",
                             firstByteLatencyMilliseconds: 777,
-                            totalLatencyMilliseconds: 9_999
+                            totalLatencyMilliseconds: 9_999,
+                            negotiatedApplicationProtocol: "http/1.1"
                         ),
                         at: nvidiaProbeAt
                     )
@@ -12494,12 +12495,14 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(nvidiaProbe?["last_status"] as? String, "success", "healthz should expose the latest NVIDIA probe status", recorder: recorder)
                     expectEqual(nvidiaProbe?["last_first_byte_latency_ms"] as? Int, 777, "healthz should expose NVIDIA probe first-byte latency", recorder: recorder)
                     expectEqual(nvidiaProbe?["last_total_latency_ms"] as? Int, 9_999, "healthz should expose NVIDIA probe total latency", recorder: recorder)
-                    expectEqual(streamDiagnostics?["transport_protocol"] as? String, "http1Only", "healthz should expose the dedicated NVIDIA transport protocol policy", recorder: recorder)
+                    expectEqual(streamDiagnostics?["transport_protocol_preference"] as? String, "http1Preferred", "healthz should expose the configured NVIDIA transport protocol preference without overclaiming enforcement", recorder: recorder)
+                    expectEqual(streamDiagnostics?["last_negotiated_application_protocol"] as? String, "http/1.1", "healthz should expose the most recently observed NVIDIA application protocol", recorder: recorder)
                     expectEqual(streamDiagnostics?["inter_chunk_read_timeout_seconds"] as? Int, 300, "healthz should expose the NVIDIA inter-chunk read timeout budget", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalives_enabled"] as? Bool, true, "healthz should expose whether the NVIDIA streamed sink injects keepalives", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalive_interval_seconds"] as? Int, 8, "healthz should expose the NVIDIA keepalive cadence", recorder: recorder)
                     expectEqual(streamDiagnostics?["chunk_gap_timeout_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA chunk-gap timeout enforcement", recorder: recorder)
                     expectEqual(streamDiagnostics?["downstream_keepalive_runtime_owner"] as? String, "nvidia_direct_live_stream", "healthz should identify the active runtime owner of NVIDIA downstream keepalives", recorder: recorder)
+                    expectEqual(streamDiagnostics?["protocol_observation_runtime_owner"] as? String, "urlsession_task_metrics", "healthz should identify the runtime owner for observed NVIDIA transport protocol reporting", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }

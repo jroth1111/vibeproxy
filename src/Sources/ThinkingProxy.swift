@@ -113,6 +113,7 @@ enum OpenAICompatTemporaryShim {
         let callerRequestID: String?
         let callerSessionID: String?
         let requestShape: String?
+        let negotiatedApplicationProtocol: String?
 
         init(
             timestamp: Date,
@@ -136,7 +137,8 @@ enum OpenAICompatTemporaryShim {
             proxyRequestID: String? = nil,
             callerRequestID: String? = nil,
             callerSessionID: String? = nil,
-            requestShape: String? = nil
+            requestShape: String? = nil,
+            negotiatedApplicationProtocol: String? = nil
         ) {
             self.timestamp = timestamp
             self.requestModel = requestModel
@@ -160,6 +162,7 @@ enum OpenAICompatTemporaryShim {
             self.callerRequestID = callerRequestID
             self.callerSessionID = callerSessionID
             self.requestShape = requestShape
+            self.negotiatedApplicationProtocol = negotiatedApplicationProtocol
         }
     }
 
@@ -207,6 +210,7 @@ enum OpenAICompatTemporaryShim {
         let deadlineStage: DeadlineStage
         let firstByteLatencyMilliseconds: Int?
         let totalLatencyMilliseconds: Int?
+        let negotiatedApplicationProtocol: String?
 
         init(
             data: Data?,
@@ -214,7 +218,8 @@ enum OpenAICompatTemporaryShim {
             error: Error?,
             deadlineStage: DeadlineStage,
             firstByteLatencyMilliseconds: Int? = nil,
-            totalLatencyMilliseconds: Int? = nil
+            totalLatencyMilliseconds: Int? = nil,
+            negotiatedApplicationProtocol: String? = nil
         ) {
             self.data = data
             self.response = response
@@ -222,6 +227,7 @@ enum OpenAICompatTemporaryShim {
             self.deadlineStage = deadlineStage
             self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
             self.totalLatencyMilliseconds = totalLatencyMilliseconds
+            self.negotiatedApplicationProtocol = negotiatedApplicationProtocol
         }
     }
 
@@ -2429,7 +2435,8 @@ enum OpenAICompatTemporaryShim {
                 proxyRequestID: proxyRequestID,
                 callerRequestID: callerRequestID,
                 callerSessionID: callerSessionID,
-                requestShape: requestShape
+                requestShape: requestShape,
+                negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol
             )
         }
 
@@ -2523,7 +2530,8 @@ enum OpenAICompatTemporaryShim {
                 proxyRequestID: proxyRequestID,
                 callerRequestID: callerRequestID,
                 callerSessionID: callerSessionID,
-                requestShape: requestShape
+                requestShape: requestShape,
+                negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol
             )
         }
 
@@ -2543,7 +2551,8 @@ enum OpenAICompatTemporaryShim {
             proxyRequestID: proxyRequestID,
             callerRequestID: callerRequestID,
             callerSessionID: callerSessionID,
-            requestShape: requestShape
+            requestShape: requestShape,
+            negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol
         )
     }
 
@@ -4480,7 +4489,8 @@ enum OpenAICompatTemporaryShim {
             proxyRequestID: event.proxyRequestID,
             callerRequestID: event.callerRequestID,
             callerSessionID: event.callerSessionID,
-            requestShape: event.requestShape
+            requestShape: event.requestShape,
+            negotiatedApplicationProtocol: event.negotiatedApplicationProtocol
         )
     }
 
@@ -5014,6 +5024,9 @@ enum OpenAICompatTemporaryShim {
         if let requestShape = event.requestShape {
             dict["request_shape"] = requestShape
         }
+        if let negotiatedApplicationProtocol = event.negotiatedApplicationProtocol {
+            dict["negotiated_application_protocol"] = negotiatedApplicationProtocol
+        }
         return dict
     }
 
@@ -5052,7 +5065,8 @@ enum OpenAICompatTemporaryShim {
             proxyRequestID: dict["proxy_request_id"] as? String,
             callerRequestID: dict["caller_request_id"] as? String,
             callerSessionID: dict["caller_session_id"] as? String,
-            requestShape: dict["request_shape"] as? String
+            requestShape: dict["request_shape"] as? String,
+            negotiatedApplicationProtocol: dict["negotiated_application_protocol"] as? String
         )
     }
 
@@ -8819,6 +8833,7 @@ class ThinkingProxy {
         let firstByteLatencyMilliseconds: Int?
         let totalLatencyMilliseconds: Int?
         let deadlineStage: OpenAICompatTemporaryShim.DeadlineStage
+        let negotiatedApplicationProtocol: String?
 
         var bodyData: Data? {
             guard !chunks.isEmpty else { return nil }
@@ -8833,7 +8848,8 @@ class ThinkingProxy {
             error: Error?,
             firstByteLatencyMilliseconds: Int? = nil,
             totalLatencyMilliseconds: Int? = nil,
-            deadlineStage: OpenAICompatTemporaryShim.DeadlineStage = .none
+            deadlineStage: OpenAICompatTemporaryShim.DeadlineStage = .none,
+            negotiatedApplicationProtocol: String? = nil
         ) {
             self.chunks = chunks
             self.response = response
@@ -8841,6 +8857,7 @@ class ThinkingProxy {
             self.firstByteLatencyMilliseconds = firstByteLatencyMilliseconds
             self.totalLatencyMilliseconds = totalLatencyMilliseconds
             self.deadlineStage = deadlineStage
+            self.negotiatedApplicationProtocol = negotiatedApplicationProtocol
         }
     }
 
@@ -9221,6 +9238,7 @@ class ThinkingProxy {
         private var interChunkReadSeconds: TimeInterval?
         private let startedAt = Date()
         private var firstPayloadAt: Date?
+        private var negotiatedApplicationProtocol: String?
 
         init(onDataReceived: ((Data, Date) -> Void)? = nil) {
             self.onDataReceived = onDataReceived
@@ -9311,6 +9329,10 @@ class ThinkingProxy {
             }
         }
 
+        func negotiatedProtocolName() -> String? {
+            stateQueue.sync { negotiatedApplicationProtocol }
+        }
+
         private func markPayloadReceived() {
             stateQueue.sync {
                 if firstPayloadAt == nil {
@@ -9359,6 +9381,19 @@ class ThinkingProxy {
             resetInterChunkDeadline(seconds: seconds, for: dataTask)
             onDataReceived?(data, Date())
         }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            didFinishCollecting metrics: URLSessionTaskMetrics
+        ) {
+            let negotiatedProtocol = metrics.transactionMetrics
+                .compactMap(\.networkProtocolName)
+                .last
+            stateQueue.sync {
+                negotiatedApplicationProtocol = negotiatedProtocol
+            }
+        }
     }
 
     private static let proxiedPoolQueue = DispatchQueue(label: "io.automaze.vibeproxy.proxied-session-pool")
@@ -9406,6 +9441,17 @@ class ThinkingProxy {
             let delegate = delegates[dataTask.taskIdentifier]
             lock.unlock()
             delegate?.urlSession(session, dataTask: dataTask, didReceive: data)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            didFinishCollecting metrics: URLSessionTaskMetrics
+        ) {
+            lock.lock()
+            let delegate = delegates[task.taskIdentifier]
+            lock.unlock()
+            delegate?.urlSession(session, task: task, didFinishCollecting: metrics)
         }
     }
 
@@ -14960,7 +15006,8 @@ class ThinkingProxy {
                     error: transportResponse.error,
                     deadlineStage: transportResponse.deadlineStage,
                     firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
-                    totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds
+                    totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds,
+                    negotiatedApplicationProtocol: transportResponse.negotiatedApplicationProtocol
                 )
             )
         }
@@ -15015,7 +15062,8 @@ class ThinkingProxy {
                 error: nil,
                 deadlineStage: transportResponse.deadlineStage,
                 firstByteLatencyMilliseconds: transportResponse.firstByteLatencyMilliseconds,
-                totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds
+                totalLatencyMilliseconds: transportResponse.totalLatencyMilliseconds,
+                negotiatedApplicationProtocol: transportResponse.negotiatedApplicationProtocol
             )
         )
     }
@@ -15070,7 +15118,8 @@ class ThinkingProxy {
                     error: error,
                     firstByteLatencyMilliseconds: responseProgress.firstByteLatencyMilliseconds(),
                     totalLatencyMilliseconds: responseProgress.totalLatencyMilliseconds(),
-                    deadlineStage: responseProgress.currentDeadlineStage()
+                    deadlineStage: responseProgress.currentDeadlineStage(),
+                    negotiatedApplicationProtocol: responseProgress.negotiatedProtocolName()
                 )
             )
         }
@@ -16661,6 +16710,9 @@ class ThinkingProxy {
                     if let requestShape = lastEvent.requestShape {
                         lastEventPayload["request_shape"] = requestShape
                     }
+                    if let negotiatedApplicationProtocol = lastEvent.negotiatedApplicationProtocol {
+                        lastEventPayload["negotiated_application_protocol"] = negotiatedApplicationProtocol
+                    }
                     routePayload["last_event"] = lastEventPayload
                 }
                 if let route = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) {
@@ -16673,14 +16725,19 @@ class ThinkingProxy {
                         let transportPolicy = effectiveNVIDIADirectTransportPolicy()
                         let recentLiveSuccess = OpenAICompatTemporaryShim.hasRecentInferenceSuccess(forRequestModel: requestModel) &&
                             state.lastTelemetryEvent?.source != "canary"
-                        routePayload["nvidia_stream_diagnostics"] = [
-                            "transport_protocol": transportPolicy.protocolPreference.rawValue,
+                        var streamDiagnostics: [String: Any] = [
+                            "transport_protocol_preference": transportPolicy.protocolPreference.rawValue,
                             "inter_chunk_read_timeout_seconds": Int(transportPolicy.interChunkReadTimeoutSeconds),
                             "downstream_keepalives_enabled": transportPolicy.sinkPolicy.emitsDownstreamKeepalives,
                             "downstream_keepalive_interval_seconds": Int(transportPolicy.sinkPolicy.keepaliveIntervalSeconds),
                             "chunk_gap_timeout_runtime_owner": "nvidia_direct_live_stream",
-                            "downstream_keepalive_runtime_owner": "nvidia_direct_live_stream"
+                            "downstream_keepalive_runtime_owner": "nvidia_direct_live_stream",
+                            "protocol_observation_runtime_owner": "urlsession_task_metrics"
                         ]
+                        if let negotiatedApplicationProtocol = state.lastTelemetryEvent?.negotiatedApplicationProtocol {
+                            streamDiagnostics["last_negotiated_application_protocol"] = negotiatedApplicationProtocol
+                        }
+                        routePayload["nvidia_stream_diagnostics"] = streamDiagnostics
                         var livenessPayload: [String: Any] = [
                             "trusted": OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: requestModel),
                             "recent_live_success": recentLiveSuccess,

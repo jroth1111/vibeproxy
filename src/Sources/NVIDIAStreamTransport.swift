@@ -1,7 +1,7 @@
 import Foundation
 
 enum NVIDIATransportProtocolPreference: String, Equatable {
-    case http1Only
+    case http1Preferred
 }
 
 struct NVIDIAStreamSinkPolicy: Equatable {
@@ -31,7 +31,7 @@ struct NVIDIATransportPolicy: Equatable {
     let sinkPolicy: NVIDIAStreamSinkPolicy
 
     static let direct = NVIDIATransportPolicy(
-        protocolPreference: .http1Only,
+        protocolPreference: .http1Preferred,
         requestTimeoutSeconds: 300,
         resourceTimeoutSeconds: 360,
         interChunkReadTimeoutSeconds: 300,

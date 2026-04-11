@@ -9,7 +9,7 @@ struct NVIDIAStreamTransportSpec {
             let policy = NVIDIATransportPolicy.direct
             expectNVIDIAEqual(
                 policy.protocolPreference,
-                .http1Only,
+                .http1Preferred,
                 "nvidia transport should prefer the dedicated http/1.1 path",
                 recorder: recorder
             )
