@@ -10485,6 +10485,111 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("direct NVIDIA first-response deadlines stay active without transport test overrides", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.nvidia-timeout-listener")
+                let backendQueue = DispatchQueue(label: "thinkingproxy-policy.nvidia-timeout-backend")
+                let listenerReady = DispatchSemaphore(value: 0)
+                let accepted = DispatchSemaphore(value: 0)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var backendConnection: NWConnection?
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+
+                guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                    recorder.recordFailure("direct NVIDIA first-response timeout test should bind a local backend listener")
+                    return
+                }
+
+                listener.newConnectionHandler = { candidate in
+                    backendConnection = candidate
+                    candidate.start(queue: backendQueue)
+                    accepted.signal()
+                }
+                listener.stateUpdateHandler = { state in
+                    if case .ready = state {
+                        listenerReady.signal()
+                    }
+                }
+                listener.start(queue: listenerQueue)
+                guard listenerReady.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA first-response timeout test listener should become ready before dispatch")
+                    listener.cancel()
+                    return
+                }
+                guard let listenerPort = listener.port else {
+                    recorder.recordFailure("direct NVIDIA first-response timeout test should expose its ephemeral listener port")
+                    listener.cancel()
+                    return
+                }
+                proxy.nvidiaDirectTargetHostOverrideForTesting = "localhost"
+                proxy.nvidiaDirectTargetPortOverrideForTesting = listenerPort.rawValue
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    backendConnection?.cancel()
+                    listener.cancel()
+                    proxy.nvidiaDirectTargetHostOverrideForTesting = nil
+                    proxy.nvidiaDirectTargetPortOverrideForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    recorder.recordFailure("direct NVIDIA first-response timeout should not deliver a successful response: \(statusCode)")
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard accepted.wait(timeout: .now() + 5) == .success else {
+                    recorder.recordFailure("direct NVIDIA request should reach the local backend listener before the first-response timeout")
+                    return
+                }
+
+                guard delivered.wait(timeout: .now() + 35) == .success else {
+                    recorder.recordFailure("direct NVIDIA first-response timeout should surface a gateway timeout instead of hanging indefinitely")
+                    return
+                }
+
+                lock.lock()
+                let timeoutEvent = recordedEvents.last(where: { $0.requestModel == "glm5-nvidia" })
+                lock.unlock()
+                expectEqual(deliveredStatus, 504, "direct NVIDIA first-response timeout should surface as gateway timeout", recorder: recorder)
+                expectEqual(deliveredMessage, "Gateway Timeout", "direct NVIDIA first-response timeout should preserve the timeout message", recorder: recorder)
+                expectEqual(timeoutEvent?.failureClass, "transport_timeout", "direct NVIDIA first-response timeout should record transport_timeout telemetry", recorder: recorder)
+                expectEqual(timeoutEvent?.timeoutStage, .firstResponse, "direct NVIDIA first-response timeout should be attributed to the first-response watchdog", recorder: recorder)
+            }
+        }
+
         run("direct NVIDIA slow-success telemetry stays successful without a timeout stage", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()

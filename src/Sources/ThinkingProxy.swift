@@ -9403,6 +9403,8 @@ class ThinkingProxy {
     var deliveredStreamingResponseChunkForTesting: ((Data) -> Void)?
     var deliveredStreamingResponseFinishForTesting: (() -> Void)?
     var deliveredErrorForTesting: ((Int, String) -> Void)?
+    var nvidiaDirectTargetHostOverrideForTesting: String?
+    var nvidiaDirectTargetPortOverrideForTesting: UInt16?
     var nvidiaDirectTransportPolicyOverrideForTesting: NVIDIATransportPolicy?
     var smartAliasTotalTimeoutOverrideForTesting: TimeInterval?
     var smartAliasLoopRetryLimitOverrideForTesting: Int?
@@ -10047,6 +10049,14 @@ class ThinkingProxy {
 
     private func effectiveNVIDIADirectTransportPolicy() -> NVIDIATransportPolicy {
         nvidiaDirectTransportPolicyOverrideForTesting ?? Self.nvidiaDirectTransportPolicy
+    }
+
+    private var effectiveNVIDIADirectTargetHost: String {
+        nvidiaDirectTargetHostOverrideForTesting ?? targetHost
+    }
+
+    private var effectiveNVIDIADirectTargetPort: UInt16 {
+        nvidiaDirectTargetPortOverrideForTesting ?? targetPort
     }
 
     private static let nvidiaDirectTransportRuntimeOwner = "nvidia_direct_http11_transport"
@@ -13676,7 +13686,7 @@ class ThinkingProxy {
             )
             return
         }
-        guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
+        guard let url = URL(string: "http://\(effectiveNVIDIADirectTargetHost):\(effectiveNVIDIADirectTargetPort)\(path)") else {
             permit.release()
             completion(
                 .terminalError(
@@ -16168,8 +16178,8 @@ class ThinkingProxy {
 
         let transportAttempt = NVIDIAHTTP1TransportAttempt(
             request: request,
-            host: targetHost,
-            port: targetPort,
+            host: effectiveNVIDIADirectTargetHost,
+            port: effectiveNVIDIADirectTargetPort,
             policy: effectiveNVIDIADirectTransportPolicy(),
             firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
                 forRequestJSON: requestJSON,
@@ -16296,7 +16306,7 @@ class ThinkingProxy {
             hedgeEligible: hedgeEligible,
             requestTrace: requestTrace,
             onMeaningfulOutput: requestDeadline?.stage == .firstResponse ? cancelRequestDeadline : nil,
-            onAttemptCompletion: cancelRequestDeadline
+            onRequestResolved: cancelRequestDeadline
         )
     }
 
@@ -16313,12 +16323,13 @@ class ThinkingProxy {
         hedgeEligible: Bool,
         requestTrace: RequestTraceContext,
         onMeaningfulOutput: (() -> Void)? = nil,
-        onAttemptCompletion: (() -> Void)? = nil
+        onRequestResolved: (() -> Void)? = nil
     ) {
         guard requestController.isCancelled() != true else { return }
         guard !coordinator.isFinished() else { return }
-        guard let url = URL(string: "http://\(targetHost):\(targetPort)\(path)") else {
+        guard let url = URL(string: "http://\(effectiveNVIDIADirectTargetHost):\(effectiveNVIDIADirectTargetPort)\(path)") else {
             if coordinator.tryFinish(attemptLane: attemptLane) {
+                onRequestResolved?()
                 sendError(
                     to: originalConnection,
                     statusCode: 500,
@@ -16357,7 +16368,7 @@ class ThinkingProxy {
                     hedgeEligible: hedgeEligible,
                     requestTrace: requestTrace,
                     onMeaningfulOutput: onMeaningfulOutput,
-                    onAttemptCompletion: onAttemptCompletion
+                    onRequestResolved: onRequestResolved
                 )
             }
             return
@@ -16529,7 +16540,6 @@ class ThinkingProxy {
         let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             guard let self else { return }
             defer {
-                onAttemptCompletion?()
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             }
@@ -16660,7 +16670,7 @@ class ThinkingProxy {
                         hedgeEligible: false,
                         requestTrace: requestTrace,
                         onMeaningfulOutput: onMeaningfulOutput,
-                        onAttemptCompletion: onAttemptCompletion
+                        onRequestResolved: onRequestResolved
                     )
                     return
                 }
@@ -16682,10 +16692,11 @@ class ThinkingProxy {
                     hedgeEligible: hedgeEligible,
                     requestTrace: requestTrace,
                     onMeaningfulOutput: onMeaningfulOutput,
-                    onAttemptCompletion: onAttemptCompletion
+                    onRequestResolved: onRequestResolved
                 )
             case .sendResponse(let statusCode, let headers, let bodyData):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                onRequestResolved?()
                 guard requestController.isCancelled() != true else { return }
                 let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                     telemetryEvent,
@@ -16741,6 +16752,7 @@ class ThinkingProxy {
                 )
             case .sendError(let statusCode, let message):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+                onRequestResolved?()
                 guard requestController.isCancelled() != true else { return }
                 let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                     telemetryEvent,
@@ -16784,6 +16796,7 @@ class ThinkingProxy {
             permit.release()
             coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
+            onRequestResolved?()
             self.deliverBufferedError(
                 defaultConnection: originalConnection,
                 statusCode: 502,
@@ -16837,7 +16850,7 @@ class ThinkingProxy {
                     hedgeEligible: false,
                     requestTrace: requestTrace,
                     onMeaningfulOutput: onMeaningfulOutput,
-                    onAttemptCompletion: onAttemptCompletion
+                    onRequestResolved: onRequestResolved
                 )
             }
         }
@@ -17118,7 +17131,7 @@ class ThinkingProxy {
         hedgeEligible: Bool,
         requestTrace: RequestTraceContext,
         onMeaningfulOutput: (() -> Void)? = nil,
-        onAttemptCompletion: (() -> Void)? = nil
+        onRequestResolved: (() -> Void)? = nil
     ) {
         let delay = DispatchTimeInterval.milliseconds(
             OpenAICompatTemporaryShim.jitteredRetryBackoffMilliseconds(state.retryBackoffMilliseconds)
@@ -17138,7 +17151,7 @@ class ThinkingProxy {
                 hedgeEligible: hedgeEligible,
                 requestTrace: requestTrace,
                 onMeaningfulOutput: onMeaningfulOutput,
-                onAttemptCompletion: onAttemptCompletion
+                onRequestResolved: onRequestResolved
             )
         }
     }
