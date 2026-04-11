@@ -995,21 +995,6 @@ enum OpenAICompatTemporaryShim {
             queue.sync { effectiveLimitLocked(routeHealthKey: routeHealthKey) }
         }
 
-        func sanitizeStaleSlots(now: Date = Date()) {
-            queue.sync {
-                let staleRoutes = inflightSince.compactMap { routeHealthKey, startedAt -> String? in
-                    guard now.timeIntervalSince(startedAt) >= slotLeakThreshold else {
-                        return nil
-                    }
-                    return routeHealthKey
-                }
-                guard !staleRoutes.isEmpty else { return }
-                for routeHealthKey in staleRoutes {
-                    inflightCounts.removeValue(forKey: routeHealthKey)
-                    inflightSince.removeValue(forKey: routeHealthKey)
-                }
-            }
-        }
 
         // MARK: - Persistence
 
@@ -1408,7 +1393,6 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
-    private static let proxyPoolToolWorkerPrimaryCandidate = "gpt-5.4(high)"
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
@@ -5800,19 +5784,8 @@ enum OpenAICompatTemporaryShim {
         return ""
     }
 
-    private static let managedResolvedRoutesByRequestModel: [String: RouteIdentity] = [
-        proxyPoolToolWorkerPrimaryCandidate: RouteIdentity(
-            providerID: "openai",
-            canonicalModelID: proxyPoolToolWorkerPrimaryCandidate
-        )
-    ]
-
     private static func resolvedRoutesByRequestModel() -> [String: RouteIdentity] {
-        var routes = configuredRouteConfiguration().routesByRequestModel
-        for (requestModel, routeIdentity) in managedResolvedRoutesByRequestModel {
-            routes[requestModel] = routeIdentity
-        }
-        return routes
+        configuredRouteConfiguration().routesByRequestModel
     }
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
@@ -10674,6 +10647,47 @@ class ThinkingProxy {
             body: modifiedBody,
             binding: factoryModelBinding
            ) {
+            // If the factory binding's route model resolves as a smart alias, the request
+            // must enter the smart-alias failover path — not the single-backend factory-bound
+            // path. Factory bindings for openai/xai/etc. previously bypassed failover entirely,
+            // pinning requests to a dead upstream with no fallback.
+            if let routeSmartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: factoryModelBinding.routeModel),
+               let routeExecutionPlan = smartAliasExecutionPlan(
+                path: rewrittenPath,
+                body: factoryBoundExecutionPlan.body,
+                clientRequestedStream: OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
+               ) {
+                let routeCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: factoryModelBinding.routeModel,
+                    method: method,
+                    path: routeExecutionPlan.path,
+                    jsonString: routeExecutionPlan.body,
+                    smartAlias: routeSmartAlias
+                )
+                let routeForceProbeModels = OpenAICompatTemporaryShim.forcedSmartAliasProbeCandidateModels(
+                    forPublicAlias: factoryModelBinding.routeModel,
+                    method: method,
+                    path: routeExecutionPlan.path,
+                    jsonString: routeExecutionPlan.body,
+                    smartAlias: routeSmartAlias
+                )
+                NSLog("[ThinkingProxy] Factory-bound smart-alias redirect: incoming=%@ routeModel=%@ candidates=%@", factoryModelBinding.incomingModelID, factoryModelBinding.routeModel, routeCandidateModels.joined(separator: ","))
+                forwardSmartAliasRequest(
+                    method: method,
+                    path: routeExecutionPlan.path,
+                    headers: headers,
+                    body: routeExecutionPlan.body,
+                    publicAlias: factoryModelBinding.incomingModelID,
+                    candidateModels: routeCandidateModels,
+                    forceProbeCandidateModels: routeForceProbeModels,
+                    originalConnection: connection,
+                    coalescingKey: nil,
+                    deliveryMode: routeExecutionPlan.deliveryMode,
+                    requestTrace: requestTrace
+                )
+                return
+            }
+
             NSLog("[ThinkingProxy] Factory-bound dispatch: model=%@ path=%@ deliveryMode=%@", factoryModelBinding.routeModel, rewrittenPath, String(describing: factoryBoundExecutionPlan.deliveryMode))
             forwardBufferedFactoryBoundRequest(
                 method: method,
@@ -10887,22 +10901,10 @@ class ThinkingProxy {
             }
 
             if !(200...299).contains(response.statusCode) {
-                // Masquerade billing/quota errors as rate-limit so the Droid client retries
-                // without switching models.  402/403 from upstream look like "provider dead"
-                // to the Droid, but 429 triggers its built-in retry logic.
-                let effectiveStatusCode: Int
-                var effectiveHeaders: [AnyHashable: Any] = response.allHeaderFields
-                if response.statusCode == 402 || response.statusCode == 403 {
-                    NSLog("[ThinkingProxy] Masquerading upstream %d as 429 for factory-bound model %@", response.statusCode, binding.incomingModelID)
-                    effectiveStatusCode = 429
-                    effectiveHeaders["Retry-After"] = "30"
-                } else {
-                    effectiveStatusCode = response.statusCode
-                }
                 self.deliverBufferedHTTPResponse(
                     defaultConnection: originalConnection,
-                    statusCode: effectiveStatusCode,
-                    headers: effectiveHeaders,
+                    statusCode: response.statusCode,
+                    headers: response.allHeaderFields,
                     body: responseData,
                     coalescingKey: nil,
                     overridingModel: binding.incomingModelID,
