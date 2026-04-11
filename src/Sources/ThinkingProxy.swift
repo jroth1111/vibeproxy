@@ -12199,7 +12199,7 @@ class ThinkingProxy {
                     requestTrace: requestTrace
                 )
             }
-        case .retryableFailure(let retryingRequestModel, let telemetryEvent, let cooldownUntil):
+        case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
             OpenAICompatTemporaryShim.recordRouteFailure(
                 forRequestModel: telemetryEvent.requestModel,
                 telemetryEvent: telemetryEvent,
@@ -12423,7 +12423,7 @@ class ThinkingProxy {
                 requestController: requestController,
                 requestTrace: requestTrace
             )
-        case .retryableFailure(let requestModel, let telemetryEvent, let cooldownUntil):
+        case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
             guard requestController?.isCancelled() != true else { return }
             if telemetryEvent.failureClass == "classified_429_window" {
                 deliverBufferedError(

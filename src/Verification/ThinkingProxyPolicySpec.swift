@@ -8210,27 +8210,55 @@ struct ThinkingProxyPolicySpec {
         }
 
         run("temporary worker smart alias records one route failure when the final retryable candidate exhausts", recorder: recorder) {
-            withMergedConfig(singleCandidateWorkerMergedConfigYAML()) {
+            withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let unavailableUntil = Date().addingTimeInterval(300)
+                [
+                    "glm-5.1-zai",
+                    "glm-5.1-ollama-pro",
+                    "minimax-m2.7-ollama-pro",
+                    "muse-spark"
+                ].forEach { requestModel in
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(
+                        requestModel: requestModel,
+                        until: unavailableUntil
+                    )
+                }
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
                 let delivered = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
 
                 proxy.smartAliasLoopRetryLimitOverrideForTesting = 0
-                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, _ in
                     let forwardedJSON = parseJSONObject(body, recorder: recorder)
-                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "single-candidate worker exhaustion should still route through the configured last worker lane", recorder: recorder)
+                    let attemptedModel = forwardedJSON["model"] as? String ?? "unknown"
+                    recorder.recordFailure("the exhausted-last-candidate regression should skip buffered worker lanes, but attempted \(attemptedModel)")
+                }
+                proxy.metaAIBufferedResponseForTesting = { _, _, publicModel in
+                    recorder.recordFailure("the exhausted-last-candidate regression should skip meta worker lanes, but attempted \(publicModel)")
+                    return ThinkingProxy.BufferedProxyResponse(
+                        data: Data("{\"error\":\"unexpected meta attempt\"}".utf8),
+                        response: httpURLResponse(statusCode: 500),
+                        error: nil
+                    )
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let requestModel = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    }
+                    expectEqual(requestModel, "glm5-nvidia", "the exhausted-last-candidate regression should terminate on the final physical worker candidate", recorder: recorder)
                     completion(
-                        ThinkingProxy.BufferedProxyResponse(
-                            data: Data("{\"error\":\"backend unavailable\"}".utf8),
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("{\"error\":\"backend unavailable\"}".utf8)],
                             response: httpURLResponse(
-                                statusCode: 503,
+                                statusCode: 502,
                                 headerFields: ["Content-Type": "application/json"]
                             ),
                             error: nil
                         )
                     )
+                    return {}
                 }
                 proxy.deliveredErrorForTesting = { statusCode, _ in
                     deliveredStatus = statusCode
@@ -8255,9 +8283,9 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
-                expectEqual(deliveredStatus, 503, "single-candidate worker exhaustion should surface the terminal upstream failure class", recorder: recorder)
-                expectEqual(snapshot["glm-5.1-zai"]?.failureScore, 1.0, "the final retryable worker failure should be counted exactly once in route health", recorder: recorder)
-                expectEqual(snapshot["glm-5.1-zai"]?.status, .suspect, "one exhausted worker failure should degrade the route once instead of opening it immediately", recorder: recorder)
+                expectEqual(deliveredStatus, 503, "the final retryable worker candidate should still surface a 503 terminal exhaustion error", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia"]?.failureScore, 1.0, "the final retryable worker failure should be counted exactly once in route health", recorder: recorder)
+                expectEqual(snapshot["glm5-nvidia"]?.status, .suspect, "one exhausted worker failure should degrade the final route once instead of opening it immediately", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -14925,24 +14953,6 @@ private func workerMergedConfigYAML() -> String {
         "    - minimax-m2.7-ollama-pro",
         "    - muse-spark",
         "    - glm5-nvidia"
-    ].joined(separator: "\n")
-}
-
-private func singleCandidateWorkerMergedConfigYAML() -> String {
-    [
-        "claude-api-key:",
-        "- api-key: test-zai-key",
-        "  base-url: https://api.z.ai/api/anthropic",
-        "  models:",
-        "  - alias: glm-5.1-zai",
-        "    name: glm-5.1",
-        "request-retry: 3",
-        "smart-aliases:",
-        "  worker:",
-        "    request-class: plain-chat",
-        "    failover: silent",
-        "    candidates:",
-        "    - glm-5.1-zai"
     ].joined(separator: "\n")
 }
 
