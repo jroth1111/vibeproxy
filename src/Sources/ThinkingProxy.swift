@@ -2513,21 +2513,23 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         routeHealthStatus: RouteHealthStatus?
     ) -> TimeInterval? {
         let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString)
-        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
-            // Trusted route — apply adaptive deadline from p95 first-byte latency history.
-            // Without history, fall back to the policy default (up to 720s).
-            // With history, cap at 3× p95 (minimum 60s) to catch slow/no-first-byte
-            // without waiting the full policy timeout.
-            if let requestModel = modelName(forRequestJSON: jsonString),
-               let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95FirstByteLatencyMilliseconds,
-               p95ms > 0 {
-                let p95Seconds = Double(p95ms) / 1000.0
-                let adaptiveCap = min(max(p95Seconds * 3.0, 60.0), 360.0)
-                if let baseDeadline {
-                    return min(baseDeadline, adaptiveCap)
-                }
-                return adaptiveCap
+
+        // If p95 first-byte latency history exists, use it for an adaptive deadline
+        // regardless of trust status. This lets slow-but-functional routes get proportional
+        // timeouts instead of being stuck at the 15s untrusted cap.
+        if let requestModel = modelName(forRequestJSON: jsonString),
+           let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95FirstByteLatencyMilliseconds,
+           p95ms > 0 {
+            let p95Seconds = Double(p95ms) / 1000.0
+            let adaptiveCap = min(max(p95Seconds * 3.0, 60.0), 360.0)
+            if let baseDeadline {
+                return min(baseDeadline, adaptiveCap)
             }
+            return adaptiveCap
+        }
+
+        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+            // Trusted route with no latency history — use the full policy deadline.
             return baseDeadline
         }
         return min(baseDeadline ?? cap.firstResponse, cap.firstResponse)

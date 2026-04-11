@@ -1406,6 +1406,88 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary adaptive first-response deadline caps at 3x p95 for routes with latency history", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let glm5DirectRequest = """
+                {
+                  "model": "glm5-nvidia-direct",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                // Seed 3 successful outcomes with fast first-byte latency history
+                for (offset, latency) in [2_200, 2_600, 2_900].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia-direct",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia-direct",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 500
+                        )
+                    )
+                }
+
+                let deadline = OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                    forRequestJSON: glm5DirectRequest,
+                    routeHealthStatus: nil
+                )
+                // p95 of [2200, 2600, 2900] ≈ 2900ms. 3× 2.9s = 8.7s, floored at 60s.
+                expectEqual(
+                    deadline,
+                    60,
+                    "route with sub-3s p95 first-byte history should cap at the 60s floor instead of 720s",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                // Seed with slower first-byte latencies to test the adaptive cap above the floor
+                for (offset, latency) in [25_000, 30_000, 35_000].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia-direct",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia-direct",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 5_000
+                        )
+                    )
+                }
+
+                let slowDeadline = OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                    forRequestJSON: glm5DirectRequest,
+                    routeHealthStatus: nil
+                )
+                // p95 of [25000, 30000, 35000] ≈ 35000ms. 3× 35s = 105s.
+                // The route may not earn stable trust (p95 > 8s), but the adaptive
+                // deadline uses p95 regardless of trust status.
+                expectEqual(
+                    slowDeadline,
+                    105,
+                    "route with ~30s p95 first-byte history should cap at 3× p95 = 105s regardless of trust status",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary retry backoff jitter only widens delays within a capped positive range", recorder: recorder) {
             OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting()
             defer { OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting() }
@@ -10815,6 +10897,84 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredMessage, "Gateway Timeout", "direct NVIDIA first-response timeout should preserve the timeout message", recorder: recorder)
                 expectEqual(timeoutEvent?.failureClass, "transport_timeout_first_byte", "direct NVIDIA first-response timeout should record transport_timeout_first_byte telemetry", recorder: recorder)
                 expectEqual(timeoutEvent?.timeoutStage, .firstResponse, "direct NVIDIA first-response timeout should be attributed to the first-response watchdog", recorder: recorder)
+            }
+        }
+
+        run("direct NVIDIA first-byte timeout retries degrade route health before exhausting the transport retry budget", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                // First-byte timeout on every attempt — the transport should retry then fail
+                proxy.nvidiaDirectTransportForTesting = { _, completion in
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [],
+                            response: nil,
+                            error: URLError(.timedOut),
+                            firstByteLatencyMilliseconds: nil,
+                            totalLatencyMilliseconds: 15000,
+                            deadlineStage: .firstResponse
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "glm5-nvidia-direct",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 30) == .success else {
+                    recorder.recordFailure("first-byte timeout retry test should complete within the test deadline")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 504, "first-byte timeouts exhausting transport retries should surface as gateway timeout", recorder: recorder)
+                // The route should have recorded failures — not just logged telemetry.
+                // Snapshot key is the canonical model ID, not the request alias.
+                let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                let nvidiaState = snapshot["z-ai/glm5"]
+                expectTrue(
+                    (nvidiaState?.rollingMetrics.recentOutcomes.filter { $0.contains("transport_timeout") }.count ?? 0) >= 1,
+                    "first-byte timeout retries should record route failures immediately, not just at terminal failure",
+                    recorder: recorder
+                )
+                expectTrue(
+                    (nvidiaState?.failureScore ?? 0) > 0,
+                    "first-byte timeout retries should increase the route failure score",
+                    recorder: recorder
+                )
             }
         }
 
