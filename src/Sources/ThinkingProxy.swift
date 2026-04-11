@@ -913,7 +913,7 @@ enum OpenAICompatTemporaryShim {
     private static let routeRollingWindow = 8
     private static let fastCanaryInterval: TimeInterval = 30
     private static let defaultCanaryInterval: TimeInterval = 60
-    private static let defaultSuspectHedgeDelay: TimeInterval = 45
+    private static let defaultSuspectHedgeDelay: TimeInterval = 5
     fileprivate static let nvidiaInferenceProbeFreshnessWindow: TimeInterval = 300
     private static let routeFailureScoreDecayInterval: TimeInterval = 180
     private static let concurrency429RepeatWindow: TimeInterval = 10 * 60
@@ -925,8 +925,9 @@ enum OpenAICompatTemporaryShim {
     private static let legacyRequestModelRewriteEntries: [(String, String)] = [
         ("glm-5", "glm-5.1"),
         ("glm-5-turbo", "glm-5.1"),
-        // Rewrites must land on a concrete configured request-model alias, not a bare canonical name.
-        ("z-ai/glm5", "glm5-nvidia-direct")
+        // Canonical GLM requests should land on the resilient pooled alias, not the debug-only
+        // direct lane.
+        ("z-ai/glm5", "glm5-nvidia")
     ]
     private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
         legacyRequestModelRewriteEntries,
@@ -1523,6 +1524,7 @@ enum OpenAICompatTemporaryShim {
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     private static let publicNVIDIASmartAlias = "glm5-nvidia"
     fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia-direct"
+    private static let directNVIDIAAccessHeader = "X-VibeProxy-Allow-Direct-NVIDIA"
     private static let publicNVIDIASmartAliasCandidateModels = [
         "glm5-nvidia",
         "glm-5.1-zai",
@@ -1629,7 +1631,7 @@ enum OpenAICompatTemporaryShim {
         publicAlias: String
     ) -> [String] {
         guard publicAlias == publicNVIDIASmartAlias,
-              !hasRecentLiveInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) else {
+              !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) else {
             return candidateModels
         }
         guard let nvidiaCandidate = publicNVIDIASmartAliasCandidateModels.first,
@@ -2026,7 +2028,8 @@ enum OpenAICompatTemporaryShim {
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
-            jsonString: preflightCandidateBody
+            jsonString: preflightCandidateBody,
+            headers: []
            ) {
             let reason = [
                 "provider_preflight_\(preflightError.statusCode)",
@@ -2196,13 +2199,54 @@ enum OpenAICompatTemporaryShim {
         }
     }
 
-    static func preflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
+    private static func requestHeaderValue(
+        _ name: String,
+        in headers: [(String, String)]
+    ) -> String? {
+        for (headerName, headerValue) in headers.reversed() {
+            if headerName.caseInsensitiveCompare(name) == .orderedSame {
+                return headerValue
+            }
+        }
+        return nil
+    }
+
+    private static func allowsExplicitNVIDIADirectAccess(headers: [(String, String)]) -> Bool {
+        if let probeHeader = requestHeaderValue("X-VibeProxy-Probe", in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !probeHeader.isEmpty {
+            return true
+        }
+
+        guard let allowHeader = requestHeaderValue(directNVIDIAAccessHeader, in: headers)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() else {
+            return false
+        }
+        return allowHeader == "1" || allowHeader == "true" || allowHeader == "yes"
+    }
+
+    static func preflightError(
+        method: String,
+        path: String,
+        jsonString: String,
+        headers: [(String, String)] = []
+    ) -> ClientFacingNVIDIAFailure? {
         guard method == "POST",
               let jsonData = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
               let model = json["model"] as? String,
               let route = resolveNVIDIAHostedRoute(forRequestModel: model) else {
             return nil
+        }
+
+        if normalizedRequestModel(model) == publicNVIDIADirectAlias,
+           !allowsExplicitNVIDIADirectAccess(headers: headers) {
+            return ClientFacingNVIDIAFailure(
+                statusCode: 403,
+                message: "\(publicNVIDIADirectAlias) is reserved for probe/debug traffic; use \(publicNVIDIASmartAlias) for resilient routed NVIDIA access.",
+                reasonCode: "direct_alias_debug_only"
+            )
         }
 
         if isResponsesPath(path) {
@@ -2268,7 +2312,12 @@ enum OpenAICompatTemporaryShim {
         return nil
     }
 
-    static func configuredRoutePreflightError(method: String, path: String, jsonString: String) -> ClientFacingNVIDIAFailure? {
+    static func configuredRoutePreflightError(
+        method: String,
+        path: String,
+        jsonString: String,
+        headers: [(String, String)] = []
+    ) -> ClientFacingNVIDIAFailure? {
         guard method == "POST",
               let jsonData = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
@@ -2296,7 +2345,7 @@ enum OpenAICompatTemporaryShim {
             )
         }
 
-        return preflightError(method: method, path: path, jsonString: jsonString)
+        return preflightError(method: method, path: path, jsonString: jsonString, headers: headers)
     }
 
     static func isNvidiaReasoningChatRequest(method: String, path: String, jsonString: String) -> Bool {
@@ -2437,18 +2486,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
               route.providerID == "nvidia" else {
             return nil
         }
-        let hasRecentEvidence = routeHealthQueue.sync {
-            loadPersistedRouteHealthIfNeededLocked()
-            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else {
-                return false
-            }
-            if let lastLiveSuccessAt = state.lastLiveSuccessAt,
-               Date().timeIntervalSince(lastLiveSuccessAt) <= nvidiaInferenceProbeFreshnessWindow {
-                return true
-            }
-            return false
-        }
-        guard !hasRecentEvidence else {
+        guard !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: requestModel) else {
             return nil
         }
         let deadlineOverride = untrustedNVIDIAProbeDeadlineOverrideForTesting
@@ -3763,6 +3801,43 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
     }
 
+    static func hasRecentStableNVIDIAInferenceSuccess(
+        forRequestModel requestModel: String,
+        maxAge: TimeInterval = 300,
+        at now: Date = Date()
+    ) -> Bool {
+        guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
+              route.providerID == "nvidia" else {
+            return hasRecentLiveInferenceSuccess(forRequestModel: requestModel, maxAge: maxAge, at: now)
+        }
+
+        return routeHealthQueue.sync {
+            loadPersistedRouteHealthIfNeededLocked()
+            guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey],
+                  let lastLiveSuccessAt = state.lastLiveSuccessAt,
+                  now.timeIntervalSince(lastLiveSuccessAt) <= maxAge,
+                  state.status == .closed else {
+                return false
+            }
+
+            let metrics = state.rollingMetrics
+            let successCount = metrics.recentOutcomes.filter { $0 == "send_response" }.count
+            guard successCount >= 3,
+                  metrics.recentFirstByteLatencyMilliseconds.count >= 3 else {
+                return false
+            }
+            guard metrics.timeoutRate < 0.25,
+                  metrics.invalidSuccessRate == 0 else {
+                return false
+            }
+            if let p95FirstByte = metrics.p95FirstByteLatencyMilliseconds,
+               p95FirstByte > 8_000 {
+                return false
+            }
+            return true
+        }
+    }
+
     static func nvidiaInferenceProbeState(
         forRequestModel requestModel: String
     ) -> NVIDIAInferenceProbeState? {
@@ -4962,7 +5037,10 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
 
         let basePenalty: Double
-        if failureClass == "transport_error" ||
+        if failureClass.hasPrefix("transport_timeout"),
+           telemetryEvent?.timeoutStage == .firstResponse {
+            basePenalty = 4
+        } else if failureClass == "transport_error" ||
             failureClass == "missing_response_material" ||
             failureClass.hasPrefix("classified_5") {
             basePenalty = 2
@@ -5069,21 +5147,21 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard let metrics else { return defaultSuspectHedgeDelay }
         if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
            averageFirstByteLatencyMilliseconds >= 120_000 {
-            return 90
+            return 10
         }
         if metrics.invalidSuccessRate >= 0.5 {
-            return 15
+            return 3
         }
         if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
            averageFirstByteLatencyMilliseconds >= 60_000 {
-            return 60
+            return 8
         }
         if metrics.timeoutRate >= 0.5 {
-            return 45
+            return 5
         }
         if let averageFirstByteLatencyMilliseconds = metrics.averageFirstByteLatencyMilliseconds,
            averageFirstByteLatencyMilliseconds >= 20_000 {
-            return 45
+            return 5
         }
         return defaultSuspectHedgeDelay
     }
@@ -11185,7 +11263,8 @@ class ThinkingProxy {
             if let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
                 method: method,
                 path: rewrittenPath,
-                jsonString: modifiedBody
+                jsonString: modifiedBody,
+                headers: headers
             ) {
                 if let reasonCode = preflightError.reasonCode {
                     NSLog(
@@ -13696,8 +13775,11 @@ class ThinkingProxy {
                 candidateModel: candidateModel,
                 timeoutInterval: timeoutInterval,
                 endpoint: endpoint,
-                firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
-                bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
+                firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                    forRequestJSON: body,
+                    routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel)
+                ),
+                bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: body)
             ) { [weak self] bufferedResponse in
                 permit.release()
                 guard let self, controller?.isCancelled() != true else { return }
@@ -13728,8 +13810,11 @@ class ThinkingProxy {
             headers: effectiveHeaders,
             body: bufferedSyntheticBody,
             timeoutInterval: timeoutInterval,
-            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
-            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
+            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                forRequestJSON: body,
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel)
+            ),
+            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self, controller?.isCancelled() != true else { return }
@@ -15056,8 +15141,11 @@ class ThinkingProxy {
             candidateModel: candidateModel,
             timeoutInterval: timeoutInterval,
             endpoint: endpoint,
-            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.firstResponseDeadline(forRequestJSON: body),
-            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.bufferedResponseDeadline(forRequestJSON: body)
+            firstResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                forRequestJSON: body,
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: candidateModel)
+            ),
+            bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             permit.release()
             guard let self else { return }
@@ -16806,10 +16894,15 @@ class ThinkingProxy {
                     )
                 }
                 guard !coordinator.isFinished() else { return }
+                let isFirstByteTimeout = attempt.deadlineStage == .firstResponse
                 if attemptLane == 1,
                    hedgeEligible,
                    coordinator.shouldStartHedge() {
-                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    if isFirstByteTimeout {
+                        OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                    } else {
+                        OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                    }
                     self.executeNVIDIADirectAttempt(
                         method: method,
                         path: path,
@@ -16827,7 +16920,11 @@ class ThinkingProxy {
                     )
                     return
                 }
-                OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                if isFirstByteTimeout {
+                    OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
+                } else {
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                }
                 if attemptStateQueue.sync(execute: { liveStreamStarted }) {
                     self.finishStreamingHTTPResponse(to: originalConnection)
                     return
@@ -17253,6 +17350,7 @@ class ThinkingProxy {
         request.timeoutInterval = OpenAICompatTemporaryShim.attemptTimeout(forRequestJSON: requestJSON) ?? Config.nvidiaCanaryTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("close", forHTTPHeaderField: "Connection")
+        request.setValue("canary", forHTTPHeaderField: "X-VibeProxy-Probe")
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             completion(data, response as? HTTPURLResponse, error)

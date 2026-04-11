@@ -251,7 +251,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("canonical z-ai/glm5 rewrites onto the explicit direct alias while public glm5-nvidia stays smart-routed", recorder: recorder) {
+        run("canonical z-ai/glm5 rewrites onto the pooled alias while the explicit direct lane stays opt-in", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let exactAliasRequest = """
                 {
@@ -291,9 +291,9 @@ struct ThinkingProxyPolicySpec {
                     path: "/v1/chat/completions",
                     jsonString: canonicalRequest
                 )
-                expectEqual(canonicalRewrite?.normalizedModel, "glm5-nvidia-direct", "canonical z-ai/glm5 requests should normalize onto the explicit direct nvidia alias", recorder: recorder)
+                expectEqual(canonicalRewrite?.normalizedModel, "glm5-nvidia", "canonical z-ai/glm5 requests should normalize onto the resilient pooled alias instead of the direct lane", recorder: recorder)
                 let canonicalJSON = parseJSONObject(canonicalRewrite?.rewrittenJSONString, recorder: recorder)
-                expectEqual(canonicalJSON["model"] as? String, "glm5-nvidia-direct", "canonical z-ai/glm5 requests should be rewritten to the explicit direct alias instead of the public smart alias", recorder: recorder)
+                expectEqual(canonicalJSON["model"] as? String, "glm5-nvidia", "canonical z-ai/glm5 requests should be rewritten to the public smart alias", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.providerID, "nvidia", "canonical z-ai/glm5 should still resolve onto the nvidia route", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "z-ai/glm5")?.canonicalModelID, "z-ai/glm5", "canonical z-ai/glm5 should preserve the canonical model identity after alias normalization", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia-direct")?.providerID, "nvidia", "the explicit direct alias should still resolve onto the nvidia route", recorder: recorder)
@@ -320,6 +320,35 @@ struct ThinkingProxyPolicySpec {
                 let upstreamJSON = parseJSONObject(upstreamRewrite, recorder: recorder)
                 expectEqual(upstreamJSON["model"] as? String, "glm5-nvidia", "the explicit direct alias should rewrite back onto the physical nvidia route before upstream transport", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: directAliasRequest), "glm5-nvidia-direct", "the proxy should keep the caller-visible direct alias stable before delivery rewriting", recorder: recorder)
+            }
+        }
+
+        run("explicit glm5-nvidia-direct is rejected without an explicit debug or probe header", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let directAliasRequest = """
+                {
+                  "model": "glm5-nvidia-direct",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let rejected = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: directAliasRequest
+                )
+                let allowed = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: directAliasRequest,
+                    headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
+                )
+
+                expectEqual(rejected?.statusCode ?? 0, 403, "public direct NVIDIA access should fail closed without an explicit override", recorder: recorder)
+                expectEqual(rejected?.reasonCode, "direct_alias_debug_only", "direct NVIDIA rejection should explain that the lane is debug-only", recorder: recorder)
+                expectNil(allowed, "an explicit debug override header should preserve probe/debug access to the direct lane", recorder: recorder)
             }
         }
 
@@ -1240,15 +1269,52 @@ struct ThinkingProxyPolicySpec {
                     recorder: recorder
                 )
                 expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentStableNVIDIAInferenceSuccess(forRequestModel: "glm5-nvidia-direct"),
+                    false,
+                    "one unmeasured direct NVIDIA success should not re-promote the lane to stable trust",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
+                    20,
+                    "one unmeasured direct NVIDIA success should keep the capped buffered-response budget in place",
+                    recorder: recorder
+                )
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                for (offset, latency) in [2_200, 2_600, 2_900].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia-direct",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia-direct",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 500
+                        )
+                    )
+                }
+                expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentStableNVIDIAInferenceSuccess(forRequestModel: "glm5-nvidia-direct"),
+                    true,
+                    "multiple recent low-latency live NVIDIA successes should be required before direct trust is restored",
+                    recorder: recorder
+                )
+                expectEqual(
                     OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(forRequestJSON: glm5DirectRequest, routeHealthStatus: nil),
-                    720,
-                    "recently proven NVIDIA routes should regain the full first-response budget",
+                    60,
+                    "restored NVIDIA trust should still honor adaptive first-byte caps instead of reopening the full static budget",
                     recorder: recorder
                 )
                 expectEqual(
                     OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
                     855,
-                    "recently proven NVIDIA routes should regain the full buffered-response budget",
+                    "stable live NVIDIA recovery should restore the buffered-response budget",
                     recorder: recorder
                 )
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -2159,7 +2225,7 @@ struct ThinkingProxyPolicySpec {
                     telemetryEvent: timeoutEvent,
                     at: now
                 )
-                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 45, "high recent timeout rates should keep a cautious hedge delay instead of racing immediately", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 5, "high recent timeout rates should trigger a fast hedge instead of waiting tens of seconds", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
@@ -15999,11 +16065,21 @@ private func rawHTTPRequest(
     body: String
 ) -> String {
     let bodyData = Data(body.utf8)
+    let hasDirectNVIDIAHeader = headers.contains { name, _ in
+        name.caseInsensitiveCompare("X-VibeProxy-Allow-Direct-NVIDIA") == .orderedSame ||
+        name.caseInsensitiveCompare("X-VibeProxy-Probe") == .orderedSame
+    }
+    let effectiveHeaders: [(String, String)]
+    if body.contains("\"model\": \"glm5-nvidia-direct\""), !hasDirectNVIDIAHeader {
+        effectiveHeaders = headers + [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
+    } else {
+        effectiveHeaders = headers
+    }
     let requestLines = [
         "\(method) \(path) HTTP/1.1",
         "Host: 127.0.0.1:8317",
         "Content-Type: application/json"
-    ] + headers.map { "\($0.0): \($0.1)" } + [
+    ] + effectiveHeaders.map { "\($0.0): \($0.1)" } + [
         "Content-Length: \(bodyData.count)",
         "",
         body
