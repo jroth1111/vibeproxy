@@ -58,7 +58,7 @@ struct ConfigComposerSpec {
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "meta-web", in: patched) ?? [:]), ["muse-spark"], "managed patches should also expose the Meta web muse-spark alias", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5, then NVIDIA Kimi K2.5", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -141,8 +141,8 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"],
-                "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama/NVIDIA/Meta worker chain",
+                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"],
+                "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama/NVIDIA/Meta worker chain plus the Kimi rescue lane",
                 recorder: recorder
             )
         }

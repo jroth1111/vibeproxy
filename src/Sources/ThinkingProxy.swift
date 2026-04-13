@@ -925,8 +925,8 @@ enum OpenAICompatTemporaryShim {
     private static let legacyRequestModelRewriteEntries: [(String, String)] = [
         ("glm-5", "glm-5.1"),
         ("glm-5-turbo", "glm-5.1"),
-        // Canonical GLM requests should land on the resilient pooled alias, not the debug-only
-        // direct lane.
+        // Canonical GLM requests should stabilize onto the public direct alias, not the
+        // probe/debug-only alias.
         ("z-ai/glm5", "glm5-nvidia")
     ]
     private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
@@ -1522,8 +1522,11 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
-    private static let publicNVIDIASmartAlias = "glm5-nvidia"
-    fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia-direct"
+    // Keep provider-backed direct aliases distinct from any resilient smart alias.
+    // `glm5-nvidia` is the public direct NVIDIA route; the smart alias must not shadow it.
+    fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia"
+    private static let publicNVIDIASmartAlias = "glm5-nvidia-smart"
+    fileprivate static let debugNVIDIADirectAlias = "glm5-nvidia-direct"
     private static let directNVIDIAAccessHeader = "X-VibeProxy-Allow-Direct-NVIDIA"
     private static let publicNVIDIASmartAliasCandidateModels = [
         "glm5-nvidia",
@@ -1533,6 +1536,7 @@ enum OpenAICompatTemporaryShim {
         "muse-spark"
     ]
     fileprivate static let canonicalFactoryWorkerModelID = "custom:Proxy-Worker-Smart-Router-8"
+    static let canonicalWorkerPoolCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"]
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
         "glm-5.1",
@@ -1770,7 +1774,12 @@ enum OpenAICompatTemporaryShim {
         case .halfOpen:
             return 2
         case .open:
-            return 3
+            if let routeKey = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel)?.routeHealthKey,
+               let state = routeCircuitStatesByRouteHealthKey[routeKey],
+               state.isUnavailable(at: now) {
+                return 3
+            }
+            return 2  // expired open — same tier as halfOpen
         }
     }
 
@@ -1800,7 +1809,7 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        let canonicalCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"]
+        let canonicalCandidates = canonicalWorkerPoolCandidates
         guard smartAlias.candidates == canonicalCandidates,
               let primaryRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[0]),
               primaryRoute.providerID == "zai",
@@ -1816,10 +1825,13 @@ enum OpenAICompatTemporaryShim {
               metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias,
               let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[4]),
               terminalFallbackRoute.providerID == "nvidia",
-              terminalFallbackRoute.canonicalModelID == "z-ai/glm5" else {
+              terminalFallbackRoute.canonicalModelID == "z-ai/glm5",
+              let rescueFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[5]),
+              rescueFallbackRoute.providerID == "nvidia",
+              rescueFallbackRoute.canonicalModelID == "moonshotai/kimi-k2.5" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia, then kimi-k2.5-nvidia."
             )
         }
 
@@ -2267,11 +2279,11 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        if normalizedRequestModel(model) == publicNVIDIADirectAlias,
+        if normalizedRequestModel(model) == debugNVIDIADirectAlias,
            !allowsExplicitNVIDIADirectAccess(headers: headers) {
             return ClientFacingNVIDIAFailure(
                 statusCode: 403,
-                message: "\(publicNVIDIADirectAlias) is reserved for probe/debug traffic; use \(publicNVIDIASmartAlias) for resilient routed NVIDIA access.",
+                message: "\(debugNVIDIADirectAlias) is reserved for probe/debug traffic; use \(publicNVIDIADirectAlias) for public direct NVIDIA access.",
                 reasonCode: "direct_alias_debug_only"
             )
         }
@@ -3137,11 +3149,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             guard let route = routes[candidate] else { return false }
             return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
         }) {
-            return publicNVIDIASmartAlias
+            return publicNVIDIADirectAlias
         }
 
-        let nonDirectCandidates = candidates.filter { $0 != publicNVIDIADirectAlias }
-        let hasNVIDIADirectAlias = candidates.contains(publicNVIDIADirectAlias)
+        let nonDirectCandidates = candidates.filter { $0 != publicNVIDIADirectAlias && $0 != debugNVIDIADirectAlias }
+        let hasNVIDIADirectAlias = candidates.contains(publicNVIDIADirectAlias) || candidates.contains(debugNVIDIADirectAlias)
         let hasNonDirectNVIDIA = nonDirectCandidates.contains { candidate in
             guard let route = routes[candidate] else { return false }
             return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
@@ -3976,8 +3988,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         routeHealthSnapshot()
     }
 
-    static func syntheticFactoryWorkerHealthRequestForTesting(routeModel: String) -> String {
-        ThinkingProxy.syntheticFactoryWorkerHealthRequestForTesting(routeModel: routeModel)
+    static func syntheticFactoryWorkerHealthRequestForTesting(
+        routeModel: String,
+        requestShape: String? = nil
+    ) -> String {
+        ThinkingProxy.syntheticFactoryWorkerHealthRequestForTesting(
+            routeModel: routeModel,
+            requestShape: requestShape
+        )
     }
 
     static func reloadPersistedRouteHealthForTesting() {
@@ -5428,13 +5446,13 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                   state.status == .suspect else { continue }
 
             let stalenessAnchor: Date
-            if let lastFailureAt = state.lastFailureAt {
+            if let lastScoreUpdate = state.lastScoreUpdatedAt {
+                stalenessAnchor = lastScoreUpdate
+            } else if let lastFailureAt = state.lastFailureAt {
                 stalenessAnchor = lastFailureAt
             } else if let lastEvent = state.lastTelemetryEvent,
                       lastEvent.failureClass != nil {
                 stalenessAnchor = lastEvent.timestamp
-            } else if let lastUpdate = state.lastScoreUpdatedAt {
-                stalenessAnchor = lastUpdate
             } else {
                 continue
             }
@@ -5504,11 +5522,48 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
     }
 
+    /// Transition expired-open routes (openUntil in the past) to halfOpen so they can
+    /// receive recovery traffic. Must be called on routeHealthQueue.
+    private static func healExpiredOpenRoutesLocked() {
+        let now = Date()
+        var healedAny = false
+        for key in routeCircuitStatesByRouteHealthKey.keys {
+            guard let state = routeCircuitStatesByRouteHealthKey[key],
+                  state.status == .open,
+                  let openUntil = state.openUntil,
+                  now >= openUntil else { continue }
+
+            NSLog("[ThinkingProxy] Self-heal: transitioning expired-open route %@ to halfOpen", key)
+            routeCircuitStatesByRouteHealthKey[key] = RouteCircuitState(
+                status: .halfOpen,
+                failureScore: state.failureScore,
+                recoverySuccesses: 0,
+                openUntil: nil,
+                lastScoreUpdatedAt: now,
+                lastTelemetryEvent: state.lastTelemetryEvent,
+                rollingMetrics: state.rollingMetrics,
+                emaMetrics: state.emaMetrics,
+                recoveredAt: nil,
+                lastSuccessAt: state.lastSuccessAt,
+                lastLiveSuccessAt: state.lastLiveSuccessAt,
+                lastSuccessRequestID: state.lastSuccessRequestID,
+                lastFailureAt: state.lastFailureAt,
+                lastFailureClass: state.lastFailureClass,
+                nvidiaInferenceProbe: state.nvidiaInferenceProbe
+            )
+            healedAny = true
+        }
+        if healedAny {
+            persistRouteHealthLocked()
+        }
+    }
+
     /// Public entry point for maintenance timer to heal stale suspect routes.
     static func maintenanceRouteHealthPass() {
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             healStaleSuspectRoutesLocked()
+            healExpiredOpenRoutesLocked()
             purgeExpiredCooldownsLocked()
         }
         concurrencyRegistry.sanitizeStaleSlots()
@@ -6056,10 +6111,16 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             if isIgnorableNonMediaTypedContent(dictionary) {
                 return .flattened("")
             }
+            if isEmptyVisibleNonMediaTypedContent(dictionary) {
+                return .flattened("")
+            }
             return .unsupported
         }
         guard let segments = content as? [Any] else {
             return .unsupported
+        }
+        if segments.isEmpty {
+            return .flattened("")
         }
 
         var collectedSegments: [String] = []
@@ -6078,11 +6139,15 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             guard let dictionary = segment as? [String: Any] else {
                 return .unsupported
             }
-            if containsUnsupportedMediaPayload(dictionary) {
+            if containsUnsupportedMediaContent(dictionary) {
                 return .unsupported
             }
             guard let textValue = flattenedTextMessageContent(from: dictionary) else {
                 if isIgnorableNonMediaTypedContent(dictionary) {
+                    sawIgnorableNonMediaSegment = true
+                    continue
+                }
+                if isEmptyVisibleNonMediaTypedContent(dictionary) {
                     sawIgnorableNonMediaSegment = true
                     continue
                 }
@@ -6106,7 +6171,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     private static func flattenedTextMessageContent(from dictionary: [String: Any]) -> String? {
-        guard !containsUnsupportedMediaPayload(dictionary) else {
+        guard !containsUnsupportedMediaContent(dictionary) else {
             return nil
         }
 
@@ -6150,6 +6215,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             }
         }
 
+        if let typeValue = (dictionary["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !typeValue.isEmpty {
+            let knownTextTypes: Set<String> = ["text", "input_text", "output_text", "summary_text", "reasoning", "tool_result", "output_json", "input_json", "json", "metadata_marker"]
+            if !knownTextTypes.contains(typeValue) {
+                NSLog("[ThinkingProxy] Flattening unknown typed content type=%@ for NVIDIA compatibility", typeValue)
+            }
+        }
+
         return nil
     }
 
@@ -6167,7 +6240,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     private static func isIgnorableNonMediaTypedContent(_ dictionary: [String: Any]) -> Bool {
-        guard !containsUnsupportedMediaPayload(dictionary) else {
+        guard !containsUnsupportedMediaContent(dictionary) else {
             return false
         }
 
@@ -6199,6 +6272,33 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
 
         return !nonIgnorableTypes.contains(type)
+    }
+
+    private static func isEmptyVisibleNonMediaTypedContent(_ dictionary: [String: Any]) -> Bool {
+        guard !containsUnsupportedMediaContent(dictionary),
+              hasVisibleStructuredPayloadField(dictionary) else {
+            return false
+        }
+
+        for key in ["text", "output_text"] {
+            if let value = dictionary[key] as? String,
+               value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return true
+            }
+        }
+
+        if let content = dictionary["content"] {
+            if let value = content as? String,
+               value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return true
+            }
+            if let segments = content as? [Any],
+               segments.isEmpty {
+                return true
+            }
+        }
+
+        return false
     }
 
     private static func normalizedTextMessageScalar(_ value: Any?) -> String? {
@@ -6240,7 +6340,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         return nil
     }
 
-    private static func containsUnsupportedMediaPayload(_ value: Any) -> Bool {
+    private static func containsUnsupportedMediaContent(_ dictionary: [String: Any]) -> Bool {
         let unsupportedTypes: Set<String> = [
             "input_image",
             "image",
@@ -6265,14 +6365,19 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             "video_url"
         ]
 
+        if let type = (dictionary["type"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+           unsupportedTypes.contains(type) {
+            return true
+        }
+
+        return dictionary.keys.contains(where: { unsupportedKeys.contains($0) })
+    }
+
+    private static func containsUnsupportedMediaPayload(_ value: Any) -> Bool {
         if let dictionary = value as? [String: Any] {
-            if let type = (dictionary["type"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-               unsupportedTypes.contains(type) {
-                return true
-            }
-            if dictionary.keys.contains(where: { unsupportedKeys.contains($0) }) {
+            if containsUnsupportedMediaContent(dictionary) {
                 return true
             }
             for nestedValue in dictionary.values where containsUnsupportedMediaPayload(nestedValue) {
@@ -6471,8 +6576,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
         let normalized = normalizedRequestModel(model)
-        if normalized == publicNVIDIADirectAlias {
-            return resolvedRoutesByRequestModel()[publicNVIDIASmartAlias]
+        if normalized == debugNVIDIADirectAlias {
+            return resolvedRoutesByRequestModel()[publicNVIDIADirectAlias]
         }
         return resolvedRoutesByRequestModel()[normalized]
     }
@@ -6510,14 +6615,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         path: String,
         jsonString: String
     ) -> String? {
-        guard rawModelName(forRequestJSON: jsonString) == publicNVIDIADirectAlias else {
+        guard rawModelName(forRequestJSON: jsonString) == debugNVIDIADirectAlias else {
             return nil
         }
         return rewrittenRequestJSON(
             method: method,
             path: path,
             replacingRequestModelIn: jsonString,
-            with: publicNVIDIASmartAlias
+            with: publicNVIDIADirectAlias
         )
     }
 
@@ -7843,6 +7948,9 @@ enum MetaAIWebAdapter {
         guard let segments = value as? [Any] else {
             throw Failure(statusCode: 400, message: "Meta web adapter only supports text message content.")
         }
+        if segments.isEmpty {
+            return ""
+        }
 
         var parts: [String] = []
         var sawIgnorableNonMediaSegment = false
@@ -7864,6 +7972,10 @@ enum MetaAIWebAdapter {
             }
             guard let text = try flattenedText(fromContentDictionary: dictionary) else {
                 if isIgnorableNonMediaContent(dictionary) {
+                    sawIgnorableNonMediaSegment = true
+                    continue
+                }
+                if isEmptyVisibleNonMediaContent(dictionary) {
                     sawIgnorableNonMediaSegment = true
                     continue
                 }
@@ -7938,6 +8050,9 @@ enum MetaAIWebAdapter {
         if isIgnorableNonMediaContent(dictionary) {
             return ""
         }
+        if isEmptyVisibleNonMediaContent(dictionary) {
+            return ""
+        }
 
         return nil
     }
@@ -7964,6 +8079,33 @@ enum MetaAIWebAdapter {
             return true
         }
         return !nonIgnorableTypes.contains(type)
+    }
+
+    private static func isEmptyVisibleNonMediaContent(_ dictionary: [String: Any]) -> Bool {
+        guard !containsUnsupportedMediaContent(dictionary),
+              hasVisibleStructuredPayloadField(dictionary) else {
+            return false
+        }
+
+        for key in ["text", "output_text"] {
+            if let value = dictionary[key] as? String,
+               value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return true
+            }
+        }
+
+        if let content = dictionary["content"] {
+            if let value = content as? String,
+               value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return true
+            }
+            if let segments = content as? [Any],
+               segments.isEmpty {
+                return true
+            }
+        }
+
+        return false
     }
 
     private static func hasVisibleStructuredPayloadField(_ dictionary: [String: Any]) -> Bool {
@@ -9569,6 +9711,38 @@ class ThinkingProxy {
         case multiTypedToolChat = "multi_tool_typed_content"
         case streamingTypedToolChat = "streaming_typed_tool_content"
         case streamingMultiTypedToolChat = "streaming_multi_tool_typed_content"
+    }
+
+    private static func factoryWorkerHealthRequestShape(
+        forObservedRequestShape requestShape: String?
+    ) -> FactoryWorkerHealthRequestShape? {
+        guard let requestShape,
+              requestShape.hasPrefix("POST:chat:"),
+              requestShape.hasSuffix(":string_content") || requestShape.hasSuffix(":typed_content"),
+              let toolsMarker = requestShape.range(of: ":tools="),
+              let toolsCountTerminator = requestShape[toolsMarker.upperBound...].firstIndex(of: ":"),
+              let toolsCount = Int(requestShape[toolsMarker.upperBound..<toolsCountTerminator]) else {
+            return nil
+        }
+
+        let isStreaming = requestShape.contains(":stream:")
+        let isTypedContent = requestShape.hasSuffix(":typed_content")
+
+        if toolsCount <= 0 {
+            return .plainChat
+        }
+
+        if toolsCount == 1 {
+            if isTypedContent {
+                return isStreaming ? .streamingTypedToolChat : .typedToolChat
+            }
+            return .toolChat
+        }
+
+        if isTypedContent {
+            return isStreaming ? .streamingMultiTypedToolChat : .multiTypedToolChat
+        }
+        return .multiToolChat
     }
 
     private struct FactoryRoleContract {
@@ -12341,6 +12515,7 @@ class ThinkingProxy {
         let completionQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-race-completion")
         var remainingAttempts = raceTransitions.count
         var terminalOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
+        var retryableOutcomesByLane: [Int: SmartAliasCandidateAttemptOutcome] = [:]
         let completionGate = DispatchSemaphore(value: 0)
         requestController.registerCurrentCancel {
             _ = coordinator.tryFinish(attemptLane: 0)
@@ -12349,6 +12524,12 @@ class ThinkingProxy {
         func finalizeExhaustedRaceIfNeeded() {
             guard remainingAttempts == 0, !coordinator.isFinished() else { return }
             _ = coordinator.tryFinish(attemptLane: 0)
+            let prioritizedTerminalOutcome =
+                terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ??
+                terminalFallbackOutcome
+            let prioritizedRetryableOutcome =
+                retryableOutcomesByLane.keys.sorted().compactMap({ retryableOutcomesByLane[$0] }).first ??
+                exhaustedRetryableOutcome
 
             if !deferredCandidateModels.isEmpty {
                 self.attemptSmartAliasCandidate(
@@ -12364,8 +12545,8 @@ class ThinkingProxy {
                     deadlineAt: deadlineAt,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
-                    terminalFallbackOutcome: terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome,
-                    exhaustedRetryableOutcome: nil,
+                    terminalFallbackOutcome: prioritizedTerminalOutcome,
+                    exhaustedRetryableOutcome: prioritizedRetryableOutcome,
                     deliveryMode: deliveryMode,
                     loopRetriesRemaining: loopRetriesRemaining,
                     requestController: requestController,
@@ -12374,14 +12555,28 @@ class ThinkingProxy {
                 return
             }
 
-            if let terminalOutcome = terminalOutcomesByLane.keys.sorted().compactMap({ terminalOutcomesByLane[$0] }).first ?? terminalFallbackOutcome {
+            if let terminalOutcome = prioritizedTerminalOutcome {
                 self.deliverSmartAliasTerminalOutcome(
                     terminalOutcome,
                     publicAlias: publicAlias,
                     originalConnection: originalConnection,
                     coalescingKey: coalescingKey,
                     deliveryMode: deliveryMode,
-                    requestController: requestController
+                    requestController: requestController,
+                    requestTrace: requestTrace
+                )
+                return
+            }
+
+            if let retryableOutcome = prioritizedRetryableOutcome {
+                self.deliverSmartAliasTerminalOutcome(
+                    retryableOutcome,
+                    publicAlias: publicAlias,
+                    originalConnection: originalConnection,
+                    coalescingKey: coalescingKey,
+                    deliveryMode: deliveryMode,
+                    requestController: requestController,
+                    requestTrace: requestTrace
                 )
                 return
             }
@@ -12485,6 +12680,7 @@ class ThinkingProxy {
                     forcedOpenUntil: cooldownUntil,
                     healthSensitivity: healthSensitivity
                 )
+                retryableOutcomesByLane[attemptLane] = outcome
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
                 remainingAttempts -= 1
             case .terminalResponse(_, _, _, _, let telemetryEvent):
@@ -15321,6 +15517,10 @@ class ThinkingProxy {
             permit.release()
             guard let self else { return }
             guard requestController.isCancelled() != true else { return }
+            let resolutionHeaders = self.directResolutionHeaders(
+                requestModel: candidateModel,
+                requestTrace: requestTrace
+            )
             let telemetryEvaluation = self.evaluateDirectBufferedRouteTelemetry(
                 path: path,
                 requestModel: candidateModel,
@@ -15368,7 +15568,7 @@ class ThinkingProxy {
                     to: originalConnection,
                     statusCode: statusCode,
                     message: statusCode == 504 ? "Gateway Timeout" : "Bad Gateway",
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
                 return
             }
@@ -15378,7 +15578,7 @@ class ThinkingProxy {
                     to: originalConnection,
                     statusCode: 502,
                     message: "Bad Gateway",
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
                 return
             }
@@ -15394,7 +15594,7 @@ class ThinkingProxy {
                 body: data,
                 coalescingKey: nil,
                 overridingModel: overridingModel,
-                overridingHeaders: requestTrace.responseHeaders
+                overridingHeaders: resolutionHeaders
             )
         }
         requestController.registerCurrentCancel {
@@ -15985,6 +16185,17 @@ class ThinkingProxy {
             headers["X-Factory-Request-Surface"] = factoryBinding.requestSurface
         }
         return headers
+    }
+
+    private func directResolutionHeaders(
+        requestModel: String,
+        requestTrace: RequestTraceContext
+    ) -> [String: String] {
+        smartAliasResolutionHeaders(
+            publicAlias: requestModel,
+            resolvedRequestModel: requestModel,
+            requestTrace: requestTrace
+        )
     }
 
     private func acquireRouteConcurrencyPermit(forRequestModel requestModel: String) -> RouteConcurrencyPermit? {
@@ -16619,6 +16830,10 @@ class ThinkingProxy {
         let coordinator = NVIDIAAttemptCoordinator()
         let requestController = RequestCancellationController()
         installClientDisconnectCancellation(on: originalConnection, controller: requestController, requestTrace: requestTrace)
+        let resolutionHeaders = directResolutionHeaders(
+            requestModel: state.model,
+            requestTrace: requestTrace
+        )
         let requestDeadline = OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(forRequestJSON: body)
         let requestDeadlineQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-request-deadline")
         var requestDeadlineCompleted = false
@@ -16683,7 +16898,7 @@ class ThinkingProxy {
                     statusCode: 504,
                     message: "Gateway Timeout",
                     coalescingKey: state.coalescingKey,
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
             }
             requestDeadlineQueue.sync {
@@ -16735,6 +16950,10 @@ class ThinkingProxy {
     ) {
         guard requestController.isCancelled() != true else { return }
         guard !coordinator.isFinished() else { return }
+        let resolutionHeaders = directResolutionHeaders(
+            requestModel: state.model,
+            requestTrace: requestTrace
+        )
         guard let url = URL(string: "http://\(effectiveNVIDIADirectTargetHost):\(effectiveNVIDIADirectTargetPort)\(path)") else {
             if coordinator.tryFinish(attemptLane: attemptLane) {
                 onRequestResolved?()
@@ -16742,7 +16961,7 @@ class ThinkingProxy {
                     to: originalConnection,
                     statusCode: 500,
                     message: "Internal Server Error",
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
             }
             return
@@ -16921,7 +17140,7 @@ class ThinkingProxy {
                                     to: originalConnection,
                                     statusCode: 200,
                                     headers: sseHeaders,
-                                    overridingHeaders: requestTrace.responseHeaders
+                                    overridingHeaders: resolutionHeaders
                                 )
                                 liveStreamStarted = true
                             }
@@ -17158,7 +17377,7 @@ class ThinkingProxy {
                         statusCode: 502,
                         message: "Bad Gateway - NVIDIA stream finished without live SSE delivery",
                         coalescingKey: state.coalescingKey,
-                        overridingHeaders: requestTrace.responseHeaders
+                        overridingHeaders: resolutionHeaders
                     )
                     return
                 }
@@ -17170,7 +17389,7 @@ class ThinkingProxy {
                     body: bodyData,
                     coalescingKey: state.coalescingKey,
                     overridingModel: state.model,
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
             case .sendError(let statusCode, let message):
                 guard coordinator.tryFinish(attemptLane: attemptLane) else { return }
@@ -17203,7 +17422,7 @@ class ThinkingProxy {
                     statusCode: statusCode,
                     message: message,
                     coalescingKey: state.coalescingKey,
-                    overridingHeaders: requestTrace.responseHeaders
+                    overridingHeaders: resolutionHeaders
                 )
             }
         }
@@ -17224,7 +17443,7 @@ class ThinkingProxy {
                 statusCode: 502,
                 message: "upstream session unavailable",
                 coalescingKey: state.coalescingKey,
-                overridingHeaders: requestTrace.responseHeaders
+                overridingHeaders: resolutionHeaders
             )
             return
         }
@@ -18970,8 +19189,47 @@ class ThinkingProxy {
         routeModel: String,
         requestShape: FactoryWorkerHealthRequestShape = .toolChat
     ) -> String {
-        let contentJSON: String
+        let messagesJSON: String
         let toolsJSON: String
+        let simpleUserMessageJSON = """
+        [
+          {
+            "role": "user",
+            "content": "Hi"
+          }
+        ]
+        """
+        let mixedTypedWorkerMessagesJSON = """
+        [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Checked "
+              },
+              {
+                "type": "summary_text",
+                "text": "repo"
+              },
+              {
+                "type": "reasoning",
+                "text": "hidden chain of thought"
+              },
+              {
+                "type": "metadata_marker",
+                "value": {
+                  "step": 1
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "Return exactly OK"
+          }
+        ]
+        """
         let singleToolJSON = """
         ,
           "tools": [
@@ -19056,65 +19314,32 @@ class ThinkingProxy {
         """
         switch requestShape {
         case .plainChat:
-            contentJSON = "\"Hi\""
+            messagesJSON = simpleUserMessageJSON
             toolsJSON = ""
         case .toolChat:
-            contentJSON = "\"Hi\""
+            messagesJSON = simpleUserMessageJSON
             toolsJSON = singleToolJSON
         case .multiToolChat:
-            contentJSON = "\"Hi\""
+            messagesJSON = simpleUserMessageJSON
             toolsJSON = multiToolJSON
         case .typedToolChat:
-            contentJSON = """
-            [
-              {
-                "type": "text",
-                "text": "Hi"
-              }
-            ]
-            """
+            messagesJSON = mixedTypedWorkerMessagesJSON
             toolsJSON = singleToolJSON
         case .multiTypedToolChat:
-            contentJSON = """
-            [
-              {
-                "type": "text",
-                "text": "Hi"
-              }
-            ]
-            """
+            messagesJSON = mixedTypedWorkerMessagesJSON
             toolsJSON = multiToolJSON
         case .streamingTypedToolChat:
-            contentJSON = """
-            [
-              {
-                "type": "input_text",
-                "text": "Hi"
-              }
-            ]
-            """
+            messagesJSON = mixedTypedWorkerMessagesJSON
             toolsJSON = streamingSingleToolJSON
         case .streamingMultiTypedToolChat:
-            contentJSON = """
-            [
-              {
-                "type": "input_text",
-                "text": "Hi"
-              }
-            ]
-            """
+            messagesJSON = mixedTypedWorkerMessagesJSON
             toolsJSON = streamingMultiToolJSON
         }
 
         return """
         {
           "model": "\(routeModel)",
-          "messages": [
-            {
-              "role": "user",
-              "content": \(contentJSON)
-            }
-          ],
+          "messages": \(messagesJSON),
           "max_tokens": 1\(toolsJSON)
         }
         """
@@ -19268,12 +19493,14 @@ class ThinkingProxy {
             let recentWinner = recentWinnerAliases.lazy.compactMap { alias in
                 OpenAICompatTemporaryShim.recentSmartAliasWinner(forRequestedAlias: alias)
             }.first(where: { recentWinner in
-                dispatchableCandidateModels.contains(recentWinner.requestModel)
+                dispatchableCandidateModels.contains(recentWinner.requestModel) &&
+                factoryWorkerHealthRequestShape(forObservedRequestShape: recentWinner.requestShape) == requestShape
             })
             let recentDispatch = recentWinnerAliases.lazy.compactMap { alias in
                 OpenAICompatTemporaryShim.recentSmartAliasDispatch(forRequestedAlias: alias)
             }.first(where: { recentDispatch in
-                candidateModels.contains(recentDispatch.requestModel)
+                candidateModels.contains(recentDispatch.requestModel) &&
+                factoryWorkerHealthRequestShape(forObservedRequestShape: recentDispatch.requestShape) == requestShape
             })
 
             let dispatchableRouteModel = recentWinner?.requestModel ?? dispatchableCandidateModels.first
