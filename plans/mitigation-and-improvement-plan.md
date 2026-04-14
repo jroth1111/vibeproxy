@@ -1,210 +1,477 @@
-# VibeProxy Mitigation & Improvement Plan
+# VibeProxy Failure Mitigation & Improvement Plan
 
-**Date:** 2026-03-31
-**Status:** Ready for execution
-**Scope:** Fix active issues, harden concurrency, align config sources, restore test suite
-
----
-
-## Phase 1: Active Issue Mitigation (Immediate)
-
-### 1.1 Fix Config Drift — Worker Model Not in Candidate Pool
-
-**Problem:** Factory effective route model `gpt-5.4(high)` is NOT in the proxy's worker candidate pool. The healthz endpoint confirms: `config_drift.route_in_pool: false`. Worker requests to `gpt-5.4(high)` bypass smart alias failover entirely.
-
-**Root cause:** `settings.json` defines `workerModel: "custom:Proxy-Worker-Smart-Router-8"` which resolves to route model `proxy-worker-smart-router`. The healthz check compares the *validation* route model (`gpt-5.4(high)`) against the worker candidate pool (which contains `glm-5.1-zai`, `mimo-v2-pro-opencode`, etc.). The validation model is a different concern than the worker routing — but the drift warning still indicates misconfiguration.
-
-**Fix:**
-- Verify that `custom:GPT-5.4-High-Proxy-2` (which maps to `gpt-5.4(high)`) is intentionally a *validation* model, not a *worker* model. If so, the drift warning is a false positive for the validation role but a real problem if Factory sends worker requests to it.
-- Run `sync-factory-worker-contract.sh --check` to see exact drift
-- Ensure all mission `runtime-custom-models.json` files have the canonical `customModels` array
-- Update the 4 project `settings.json` files (songbird4, voc, merchant-warrior2, pi_agent_rust) to match global config
-
-**Files:**
-- `~/.factory/settings.json`
-- `~/.factory/missions/*/runtime-custom-models.json` (6 files)
-- `~/CascadeProjects/{songbird4,voc,merchant-warrior2,pi_agent_rust}/.factory/settings.json` (4 files)
-
-**Command:** `./scripts/sync-factory-worker-contract.sh`
-
-### 1.2 Fix Worker Ready State
-
-**Problem:** `factory_worker.ready: false` — even though the worker model ID resolves correctly, the proxy considers it not ready.
-
-**Investigation:** The `ready` flag is likely computed from route health + validation. With `glm-5.1` stuck in `suspect` status and the primary candidate degraded, the worker pool may not declare ready.
-
-**Fix:**
-- Run `factory-worker-preflight.sh` to get detailed failure reason
-- If the issue is route health, the self-heal in `healStaleSuspectRoutesLocked()` should clear suspect routes older than 5 minutes. Verify the self-heal is running on the current build.
-- If stale entries persist despite self-heal, manually clear `route-health.json` (`~/.cli-proxy-api/route-health.json`) and restart proxy
-
-### 1.3 Fix Suspect Route Self-Heal
-
-**Problem:** `glm-5.1` and other routes remain in `suspect` status despite `failure_score: 0`. The self-heal mechanism (`healStaleSuspectRoutesLocked()`) uses a 300s (5 min) stale threshold from `lastRouteHealthActivityDate`. If activity is recent, routes won't heal.
-
-**Investigation path:**
-- Check if `lastRouteHealthActivityDate` is being updated on every request (even successful ones) or only on failures
-- If success also updates the timestamp, a healthy route receiving traffic will never become "stale" and won't self-heal from suspect→closed
-
-**Fix (if needed):** Update `recordRouteSuccess` to NOT update `lastRouteHealthActivityDate` (only failures should refresh the stale clock), OR change the self-heal to compare against `lastFailureDate` instead of `lastRouteHealthActivityDate`.
-
-**File:** `src/Sources/ThinkingProxy.swift` lines ~2130-2161 (success recording), ~3262-3301 (self-heal)
-
-### 1.4 Fix CLIProxyAPIPlus Health Endpoint
-
-**Problem:** Port 8318 returns 404 on `/healthz`. The monitor script considers this "unexpected" but still marks it healthy.
-
-**Investigation:** The Go binary `cli-proxy-api-plus` may not expose `/healthz`. Check if this is expected behavior (the backend may use a different health path, or health is proxied through VibeProxy on 8317).
-
-**Fix:** Update `monitor-proxy-health.sh` to use the correct health path, or accept 404 as healthy for CLIProxyAPIPlus since VibeProxy's healthz already reports backend reachability (`backend.reachable: true`).
+**Date:** 2026-04-14  
+**Status:** Ready for execution  
+**Scope:** Smart-router worker reliability, upstream pressure handling, telemetry clarity, Droid correlation, and operator verification
 
 ---
 
-## Phase 2: Test Suite Restoration
+## Objective
 
-### 2.1 Fix 16 Stale Test Assertions
+Make worker routing degrade gracefully under provider pressure, keep live routing observable from `healthz`, and let operators distinguish:
 
-**Problem:** 16 test failures in `ThinkingProxyPolicySpec.swift` due to model ordering changes from recent commits.
+- proxy logic bugs
+- upstream provider instability
+- Droid/runtime failures outside the proxy
 
-**Approach:**
-1. Run `make test` to get the exact list of 16 failing tests
-2. For each failure, compare the test's expected values against current `ThinkingProxy.swift` behavior
-3. Update assertions to match current model ordering, candidate lists, and circuit breaker behavior
+The source of truth for worker routing remains:
 
-**Key areas likely affected:**
-- Worker candidate ordering (EMA-based ranking replaced lexicographic sort)
-- Health-sensitivity thresholds (eager=0.5x, balanced=1x, conservative=2x)
-- Circuit breaker halfOpen now returns `isUnavailable: false`
-- Provider cooldown skip logic
-- Model tier weights for ranking
-
-**File:** `src/Verification/ThinkingProxyPolicySpec.swift`
-
-**Command:** `make test` (or `./scripts/run-verification-specs.sh`)
+- `src/Sources/ThinkingProxy.swift`
 
 ---
 
-## Phase 3: Concurrency Hardening
+## Current State Summary
 
-### 3.1 Pool Ephemeral URLSession Instances
+### What was just fixed
 
-**Problem:** `sendBufferedProxyRequest` (line 7576) and `forwardNvidiaReasoningRequestWithRetry` (line 8296) create new `URLSession(configuration: .ephemeral)` per request. Under concurrent load (4 agents), dozens of TCP connections open/close per minute.
+- Smart-router terminal delivery could be suppressed after request cancellation, causing recoverable worker requests to look exhausted.
+- NVIDIA fallback-race handling could recurse into bad exhaustion behavior and retry exhausted pools too broadly.
+- Route telemetry summaries misclassified `gpt-*` traffic as `unknown` instead of `openai`.
+- Verification had drifted toward a stray local `ProxyCore` split instead of compiling against the real proxy source path.
 
-**Fix:** Extend the existing session pool (`proxiedSessionPool` at line 4712) to also cover buffered proxy and NVIDIA reasoning paths. Create a generic `acquireSession(key:configuration:)` method that both paths can use.
+### What is healthy now
 
-**File:** `src/Sources/ThinkingProxy.swift` lines ~4711-4819, 7576, 8296
+- Live proxy health endpoint returns `200`.
+- Worker route is currently `glm-5.1-ollama-pro` for active worker request shapes.
+- Current live PID shows clean post-restart traffic with no fresh proxy-side failures.
+- Droid is again executing worker requests successfully.
+- The previously failing mission shows old `worker_failed` events, then successful recovery after restart.
 
-### 3.2 Add Concurrency-Aware Failure Attribution
+### What is still not a local proxy bug
 
-**Problem:** Circuit breaker sees success/failure but has no concept of "this failure happened because we sent too many requests at once." A route can go suspect from oversubscription rather than actual unhealthiness.
-
-**Fix:**
-- Track concurrent inflight requests per route (partially done via `RouteConcurrencyPermit`)
-- On failure, if `inflight >= concurrency_limit`, reduce failure penalty (e.g., penalty = 0 for concurrent-overflow failures)
-- Only apply full failure penalty when inflight is within normal limits
-
-**File:** `src/Sources/ThinkingProxy.swift` lines ~2081-2127 (`recordRouteFailure`), ~3018-3036 (`failurePenalty`)
-
-### 3.3 Fix Circuit Breaker Overshoot
-
-**Problem:** Concurrent failures on the same route independently increment the failure score. If 4 requests hit the same failing route simultaneously, the score jumps by 4 instead of 1.
-
-**Fix:** The existing `routeHealthQueue.sync` serialization should prevent this. Verify that `recordRouteFailure` is called within `routeHealthQueue.sync {}` for all call sites. If there are callers outside the sync block, fix them.
-
-**File:** `src/Sources/ThinkingProxy.swift` line ~2092 (already inside `routeHealthQueue.sync`)
-
-### 3.4 Credential Distribution Under Concurrency
-
-**Problem:** Multiple goroutines in the Go binary independently pick the next credential and retry on failure. If key #3 fails, multiple concurrent requests all retry with key #4 simultaneously.
-
-**Fix:** This is in the Go binary (`cli-proxy-api-plus`), not the Swift proxy. Investigate whether the Go binary has a credential rotation mutex. If not, add atomic round-robin or per-request credential assignment.
-
-**Scope:** Out of scope for Swift proxy changes — requires Go binary modification.
+- ZAI `429_concurrency`, `429_window`, retryable `400 network_error`, and occasional `500`.
+- Ollama `429_window`, `503`, `empty_content`, and `reasoning_only_content_missing`.
+- Direct `glm5-nvidia` first-byte timeout / slow completion behavior.
+- Older Droid `worker_failed` events caused by runtime exits rather than route-selection bugs.
 
 ---
 
-## Phase 4: Resilience Improvements
+## Plan Structure
 
-### 4.1 Kimi K2.5 Timeout Validation
+This plan is organized into four execution tracks:
 
-**Problem (originally):** 45-second `firstResponseDeadline` killed NVIDIA-hosted Kimi K2.5 requests.
-
-**Current state:** Timeout has been increased to 120s (`firstResponseDeadline: 120`) in the current code. Verify this is sufficient by running a test request.
-
-**Action:** Run `run-nvidia-live-matrix.sh` to validate current timeouts against live NVIDIA endpoints.
-
-### 4.2 Route Health Startup Hardening
-
-**Problem (originally):** Stale route health entries persisted across restarts, degrading new sessions.
-
-**Current state:** Self-heal mechanism (`healStaleSuspectRoutesLocked`) is implemented with 300s stale threshold. Provider cooldowns are capped at 3600s on restore.
-
-**Improvement:** Add a startup log line that reports all loaded route health entries and their staleness, making debugging easier.
-
-**File:** `src/Sources/ThinkingProxy.swift` line ~3187 (`loadPersistedRouteHealthIfNeededLocked`)
-
-### 4.3 Config Drift Monitoring
-
-**Problem:** Three config sources (factory settings, mission runtime, proxy code) can diverge silently.
-
-**Improvement:** Add a periodic healthz field that reports config drift severity with a human-readable diff, not just a count.
-
-**File:** `src/Sources/ThinkingProxy.swift` healthz endpoint (~line 9281)
-
-### 4.4 Worker Failure Rate Dashboard
-
-**Problem:** No visibility into per-mission worker failure rates without parsing raw logs.
-
-**Improvement:** Add worker failure/completion counters to the healthz endpoint, broken down by mission ID.
+1. Protect the fixed worker routing path
+2. Make upstream pressure degrade predictably
+3. Improve health, telemetry, and cross-system correlation
+4. Operationalize verification and incident response
 
 ---
 
-## Phase 5: Cleanup
+## Track 1: Protect the Fixed Worker Routing Path
 
-### 5.1 Remove Dead Code
+### 1.1 Lock in smart-router terminal delivery behavior
 
-The problem doc mentions:
-- Dead cost preference code (commit df6b713)
-- Unused metrics parameter (commit 317c561)
-- Dead phantom route removal (commit 6666542)
+**Goal:** Prevent any future regression where a winning fallback or terminal retryable outcome is dropped after cancellation state changes.
 
-Verify these are already committed and no dead code remains.
+**Actions**
 
-### 5.2 Fix daemon.log Pull Failures
+- Add regression tests for terminal smart-alias outcomes after intermediate candidate cancellation.
+- Add coverage for:
+  - terminal success after failover
+  - terminal `429_window`
+  - terminal generic unavailable
+  - terminal `send_error`
+  - typed high-tool worker failover chains
+- Keep the current request-controller ownership behavior as the required end-state:
+  - clear current cancel before terminal delivery
+  - cancel only after the terminal result is committed
 
-The beads daemon log shows repeated `git pull failed: fatal: couldn't find remote ref temporary-vibeproxy-nvidia-fix`. This branch reference is stale. Fix by updating the beads config or removing the stale remote tracking branch.
+**Primary code**
 
-**Command:** `git branch -dr origin/temporary-vibeproxy-nvidia-fix` or update `.beads/config.yaml`
+- `src/Sources/ThinkingProxy.swift`
+
+**Verification**
+
+- `./scripts/run-verification-specs.sh`
+- targeted `ThinkingProxyPolicySpec` coverage for cancellation and terminal delivery paths
+
+### 1.2 Lock in race and exhaustion semantics
+
+**Goal:** Ensure NVIDIA races never collapse into false exhaustion or misclassified loop retries.
+
+**Actions**
+
+- Add regression coverage proving exhausted-pool loop retries happen only when exhaustion is true capacity exhaustion.
+- Add regression coverage proving deferred candidates are preserved after a raced NVIDIA pair does not cleanly resolve the request.
+- Keep race recursion disabled once a race collapses back into serial candidate handling.
+
+**Primary code**
+
+- `src/Sources/ThinkingProxy.swift`
+
+**Verification**
+
+- policy spec for:
+  - raced NVIDIA pair
+  - deferred non-NVIDIA serial fallback
+  - empty candidate set after real exhaustion only
+
+### 1.3 Add exact replay-spec coverage for the incident request shape
+
+**Goal:** Preserve the exact worker request shape that triggered the failure as a permanent regression check.
+
+**Replay shape**
+
+- assistant content array including:
+  - `input_text`
+  - `summary_text`
+  - `reasoning`
+  - `metadata_marker`
+- followed by a user turn asking for `Return exactly OK`
+
+**Actions**
+
+- Add a spec or replay harness covering:
+  - direct `muse-spark`
+  - direct `glm5-nvidia`
+  - worker alias `custom:Proxy-Worker-Smart-Router-8`
+- Assert:
+  - direct `muse-spark` returns `OK`
+  - direct `glm5-nvidia` classifies slow-first-byte correctly
+  - worker alias returns a delivered result instead of exhaustion
 
 ---
 
-## Execution Order
+## Track 2: Make Upstream Pressure Degrade Predictably
 
-| Priority | Phase | Effort | Risk |
-|----------|-------|--------|------|
-| P0 | 1.1 Config drift sync | Low | Low |
-| P0 | 1.2 Worker ready state | Low | Low |
-| P0 | 1.3 Suspect route self-heal | Medium | Low |
-| P0 | 2.1 Fix test failures | High | Low |
-| P1 | 1.4 CLIProxyAPIPlus health | Low | Low |
-| P1 | 3.1 Pool ephemeral sessions | Medium | Medium |
-| P1 | 3.2 Concurrency-aware failure | Medium | Medium |
-| P2 | 3.3 Circuit breaker overshoot | Low | Low |
-| P2 | 3.4 Credential distribution | High | High |
-| P2 | 4.1 Kimi timeout validation | Low | Low |
-| P2 | 4.2 Startup logging | Low | Low |
-| P2 | 4.3 Config drift monitoring | Medium | Low |
-| P2 | 4.4 Worker failure dashboard | Medium | Low |
-| P3 | 5.1 Dead code cleanup | Low | Low |
-| P3 | 5.2 Beads daemon fix | Low | Low |
+### 2.1 Normalize provider-specific failure policy
+
+**Goal:** Treat common upstream pressure as controlled failover input, not as ambiguous failure noise.
+
+**Actions**
+
+- Split worker failover policy by failure class:
+  - `classified_429_window`: cooldown and fall through
+  - `classified_429_concurrency`: short bounded retry or fall through without over-penalizing route health
+  - `classified_5xx`: immediate failover
+  - malformed `200` body (`empty_content`, `reasoning_only_content_missing`): mark suspect and fail over
+  - retryable `400 network_error`: retryable provider signal, not a preflight or model mismatch
+- Keep direct NVIDIA first-byte timeout classified explicitly as timeout-policy behavior.
+
+**Desired outcome**
+
+- Upstream pressure stays visible in telemetry.
+- Worker requests recover onto healthy siblings whenever the pool still has a valid route.
+- Operators can tell “provider overloaded” from “proxy broken.”
+
+### 2.2 Bias worker routing toward currently healthy lanes by request shape
+
+**Goal:** Make the worker pool choose the healthiest viable candidate for the exact incoming request shape, especially for typed multi-tool traffic.
+
+**Actions**
+
+- Keep request-shape-specific dispatchability authoritative in `healthz`.
+- Strengthen observed-winner and dispatchable-lane preference for:
+  - `multi_tool_typed_content`
+  - `streaming_multi_tool_typed_content`
+- Avoid promoting half-open or probe-only winners over healthy dispatchable siblings.
+
+**Desired outcome**
+
+- Typed multi-tool worker traffic keeps landing on `glm-5.1-ollama-pro` while ZAI remains degraded.
+- Healthy live winners outweigh synthetic probe noise.
+
+### 2.3 Add `minimax-m2.7-nvidia` as a worker-pool candidate
+
+**Goal:** Add a second NVIDIA-backed Minimax lane so the worker pool has a stronger fallback option when Ollama or ZAI paths are degraded.
+
+**Design stance**
+
+- NVIDIA inference must be treated as a hostile or unreliable transport surface.
+- `minimax-m2.7-nvidia` should not be added as a thin provider alias.
+- The route is only acceptable if it ships with explicit proxy-side mitigations that make behavior deterministic, observable, and fail-soft under bad upstream behavior.
+- The objective is not to assume NVIDIA becomes good; the objective is to make the proxy resilient enough that NVIDIA unreliability does not break worker correctness.
+
+**Current discovery from manual validation on 2026-04-14**
+
+- `minimax-m2.7-nvidia` is not implemented in the current routing source of truth.
+- `src/Sources/ThinkingProxy.swift` currently exposes `minimax-m2.7-ollama-pro` but no `minimax-m2.7-nvidia`.
+- `healthz` currently reports `minimax-m2.7-ollama-pro` as a live route and reports `minimax-m2.7-nvidia` as absent.
+- A live direct replay to `minimax-m2.7-nvidia` returned `502` with `unknown provider for model minimax-m2.7-nvidia`.
+- A control replay to `custom:Proxy-Worker-Smart-Router-8` still succeeded and resolved onto `glm-5.1-ollama-pro`, so the missing NVIDIA Minimax route is not currently harming worker availability.
+- The existing Minimax lane that is validated today is `minimax-m2.7-ollama-pro`, which is already winning fresh typed worker traffic in live logs.
+
+**Actions**
+
+- Add `minimax-m2.7-nvidia` to the configured provider/model catalog.
+- Add `minimaxai/minimax-m2.7` as the canonical NVIDIA route identity for that model.
+- Decide the exact worker-pool placement by request shape:
+  - include it for string-content and tool-bearing worker traffic where NVIDIA routes are already eligible
+  - include it for typed-content worker traffic only after full manual live validation proves request normalization and provider behavior are compatible
+- Extend smart-router ranking and fallback policy so `minimax-m2.7-nvidia` is treated as a first-class sibling to `glm5-nvidia` and `kimi-k2.5-nvidia`, not as an ad hoc terminal fallback.
+- Add direct replay coverage and worker-alias coverage for `minimax-m2.7-nvidia`.
+- Require a manual live validation pass before changing default routing authority for any worker request-shape bucket.
+- Add route-health, timeout, and telemetry coverage so the new route appears correctly in:
+  - `healthz`
+  - route telemetry summaries
+  - last-2-hour provider/model distribution reports
+
+**Required NVIDIA mitigation package**
+
+- Eligibility and normalization:
+  - hard-gate unsupported request shapes
+  - keep request-shape-specific enablement for plain, tool-bearing, typed, and streaming traffic
+  - normalize mixed-content and tool-bearing payloads into the narrow NVIDIA-safe shape before dispatch
+- Output correctness enforcement:
+  - validate every `200` response against the request contract
+  - treat malformed success bodies, missing visible content, broken tool calls, and invalid arguments as route failures, not successes
+  - apply repair prompts or schema-aware retries only when the proxy can do so deterministically
+- Transport and timeout hardening:
+  - use the proven NVIDIA transport path with explicit first-byte, buffered-response, and inter-chunk budgets
+  - distinguish slow-first-byte, chunk-gap, and buffered-response failures explicitly
+  - keep downstream keepalives and partial-stream stall detection enabled
+- Health and isolation:
+  - isolate `minimax-m2.7-nvidia` on its own route-health key and metrics lane
+  - keep its timeouts, malformed outputs, and `429` pressure from poisoning sibling NVIDIA or Ollama routes
+  - use conservative concurrency, bounded retries, rapid quarantine, and sibling failover when the route degrades
+- Rollout and observability:
+  - expose the route distinctly in `healthz` and route telemetry
+  - require probe and low-volume live evidence before promotion
+  - ship it in a non-default position first and only promote it if it reduces, rather than increases, worker terminal failures
+- Common hardening allowed:
+  - sticky cooldowns
+  - jittered retry delays
+  - hedged probes
+  - stricter preflight rejection
+  - response-shape feature flags
+  - canary-only rollout gates
+  - automatic demotion on repeated bad-output or timeout sequences
+
+**Promotion rules**
+
+- `minimax-m2.7-nvidia` may be implemented before it is trusted.
+- `minimax-m2.7-nvidia` may be trusted for plain-chat or tool-string traffic before it is trusted for typed-content traffic.
+- `minimax-m2.7-nvidia` must not become a preferred typed worker lane until it proves:
+  - stable direct buffered behavior
+  - stable direct streaming behavior
+  - valid tool-call behavior
+  - valid mixed-content behavior
+  - acceptable timeout profile under live load
+  - clean failover behavior when NVIDIA misbehaves
+
+**Verification**
+
+- manual direct replay against `minimax-m2.7-nvidia`
+- manual worker alias replay proving the route can be selected and delivered
+- manual mixed-content replay using the incident transcript shape
+- manual timeout/failover replay proving slow or malformed upstream behavior is classified correctly
+- `healthz` check showing the route in the appropriate candidate pools
+- telemetry summary showing `nvidia / minimax-m2.7-nvidia` as a distinct provider/model lane
+
+**Manual validation gate**
+
+- Manual validation is blocked until the route exists in source and appears in `healthz`.
+- Do not claim `minimax-m2.7-nvidia` ready for worker typed-content routing until it has passed:
+  - direct buffered replay
+  - direct streaming replay
+  - worker alias replay
+  - mixed-content typed replay
+  - tool-bearing replay
+  - timeout / slow-first-byte replay
+  - fresh-log correlation in proxy, Droid, and mission surfaces
+  - malformed-success-body replay proving the route is rejected and failed over correctly
+  - concurrency-pressure replay proving route-health isolation and bounded retry behavior
+
+### 2.4 Add a formal provider-pressure mode
+
+**Goal:** Keep the worker marked ready when the pool is still usable, while making degraded provider conditions obvious.
+
+**Actions**
+
+- Add an explicit worker-pressure summary derived from route health by request shape.
+- Surface whether degradation is:
+  - quota-window pressure
+  - concurrency pressure
+  - upstream malformed-output pressure
+  - direct-timeout pressure
+
+**Desired outcome**
+
+- `ready:true` does not hide that the pool is operating on a reduced set of healthy routes.
 
 ---
 
-## Verification
+## Track 3: Improve Health, Telemetry, and Cross-System Correlation
 
-After each phase:
-1. Run `./scripts/monitor-proxy-health.sh` — all proxies healthy
-2. Run `./scripts/factory-worker-preflight.sh` — all validations pass
-3. Run `make test` — all tests pass
-4. Run `./scripts/sync-factory-worker-contract.sh --check` — zero drift
-5. Run `curl -s http://127.0.0.1:8317/healthz | jq` — check route_health, config_drift, factory_worker.ready
+### 3.1 Expand terminal outcome telemetry
+
+**Goal:** Make every terminal worker result reconstructable without manual log archaeology.
+
+**Actions**
+
+- Include these fields in terminal route telemetry:
+  - first selected candidate
+  - failover chain
+  - final winning candidate
+  - terminal failure class
+  - whether result was delivered, retried, or exhausted
+- Add a terminal outcome marker for:
+  - `success`
+  - `retryable_quota`
+  - `retryable_concurrency`
+  - `provider_5xx`
+  - `proxy_unavailable`
+  - `runtime_exit`
+
+### 3.2 Improve `healthz` operator signal
+
+**Goal:** Let one `curl` explain worker readiness, route health, and current effective route by request shape.
+
+**Actions**
+
+- Keep and strengthen:
+  - `factory_worker.ready`
+  - `effective_route_model`
+  - `effective_route_model_source`
+  - per-shape `dispatchable_candidate_models`
+- Add:
+  - worker-pressure summary
+  - last terminal worker outcome summary
+  - last live worker winner and last dispatched winner side by side for every important request-shape bucket
+
+### 3.3 Correlate proxy, Droid, and mission failures
+
+**Goal:** Make `worker_failed` triage mechanical instead of forensic.
+
+**Actions**
+
+- Introduce a shared correlation field across:
+  - proxy route telemetry
+  - Droid worker request logs
+  - mission progress logs
+- When a mission emits `worker_failed`, attempt automatic classification:
+  - proxy terminal failure present
+  - proxy healthy / Droid runtime exit
+  - upstream provider pressure with later recovery
+
+**Desired outcome**
+
+- A fresh `worker_failed` can be attributed in one pass as either proxy, upstream, or runtime.
+
+### 3.4 Keep telemetry reporting source-truth aligned
+
+**Goal:** Prevent analysis tools from drifting away from what the proxy actually does.
+
+**Actions**
+
+- Keep route summary logic consistent with `ThinkingProxy.swift` provider identities.
+- Add checks that summary output classifies at least:
+  - `gpt-*` as `openai`
+  - `*-ollama-pro` as `ollama-pro`
+  - `*-nvidia` as `nvidia`
+  - `muse-spark` as `meta-web`
+  - `*-zai` and `glm-5.1` canonical ZAI routes as `zai`
+
+---
+
+## Track 4: Operationalize Verification and Incident Response
+
+### 4.1 Codify the restart verification runbook
+
+**Goal:** Make rebuild-and-restart verification consistent and cheap.
+
+**Runbook**
+
+1. `CARGO_TARGET_DIR=.verify-target TMPDIR=$PWD/.verify-tmp ./scripts/run-verification-specs.sh`
+2. `./create-app-bundle.sh`
+3. `launchctl kickstart -k gui/$(id -u)/com.vibeproxy.repo`
+4. `./scripts/factory-worker-preflight.sh`
+5. `curl -sS -D - http://127.0.0.1:8317/healthz`
+6. inspect fresh proxy, Droid, and mission logs
+7. summarize current live PID traffic only
+
+**Desired outcome**
+
+- No restart is considered valid until worker preflight, `healthz`, and current-PID telemetry all agree.
+
+### 4.2 Add an incident summary command
+
+**Goal:** Replace ad hoc shell archaeology with one repeatable report.
+
+**Actions**
+
+- Add a script that outputs:
+  - current live PID
+  - last 2 hours winner distribution
+  - attempted-lane distribution
+  - non-200 distribution
+  - current worker effective route
+  - mission `worker_failed` count in the same window
+
+**Desired outcome**
+
+- The operator can answer “what is actually happening right now?” from one command.
+
+### 4.3 Keep verification harnesses tied to real source paths
+
+**Goal:** Prevent test harnesses from silently validating stale local abstractions.
+
+**Actions**
+
+- Keep `scripts/run-verification-specs.sh` compiling from the real `ThinkingProxy.swift` source path.
+- Allow only minimal source sanitization needed for test compilation.
+- Reject future verifier drift toward local-only source splits or scaffolding.
+
+---
+
+## Proposed Milestones
+
+### Milestone A: Routing Reliability Guardrails
+
+- terminal-delivery regression coverage added
+- race/exhaustion regression coverage added
+- mixed typed-content replay-spec added
+
+### Milestone B: Upstream Pressure Behavior
+
+- failure-class-specific worker policy reviewed and hardened
+- request-shape route preference improved
+- provider-pressure summary exposed in `healthz`
+
+### Milestone C: Cross-System Observability
+
+- terminal outcome telemetry expanded
+- proxy/Droid/mission correlation field added
+- 2-hour incident summary script added
+
+### Milestone D: Runbook and Operator Tooling
+
+- restart verification runbook documented and scriptable
+- live-PID-only summary path standardized
+- failure attribution playbook documented
+
+---
+
+## Acceptance Criteria
+
+This plan is complete when all of the following are true:
+
+- No current-PID worker traffic can regress into dropped terminal delivery after valid failover.
+- `healthz` shows accurate worker readiness and effective route by request shape.
+- Direct slow `glm5-nvidia` requests are classified as timeout-policy or upstream slowness, not proxy hang.
+- `worker_failed` incidents can be attributed to proxy logic, upstream behavior, or Droid/runtime exits with explicit evidence.
+- The last-2-hour routing summary can be generated exactly from one repeatable command.
+- Verification scripts compile against the real proxy source-of-truth path.
+
+---
+
+## Verification Checklist
+
+- `CARGO_TARGET_DIR=.verify-target TMPDIR=$PWD/.verify-tmp ./scripts/run-verification-specs.sh`
+- `./create-app-bundle.sh`
+- `launchctl kickstart -k gui/$(id -u)/com.vibeproxy.repo`
+- `./scripts/factory-worker-preflight.sh`
+- `curl -sS -D - http://127.0.0.1:8317/healthz`
+- proxy log check against current live PID only
+- Droid log check for fresh worker execution
+- mission log check for fresh `worker_failed` vs `worker_completed`
+- 2-hour telemetry summary by provider/model/failure class
+
+---
+
+## Notes
+
+- Routing source of truth remains `src/Sources/ThinkingProxy.swift`.
+- Factory `settings.json` and mission runtime model files are runtime inputs, not routing authority.
+- Old proxy PIDs must never be reported as current state once a new PID is live.
+- Upstream provider pressure must remain visible as upstream pressure, not collapsed into generic proxy blame.

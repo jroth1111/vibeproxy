@@ -2154,14 +2154,16 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
-                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                // B.1: transport_timeout failures no longer change route health state.
+                // Use classified_500 to exercise the same rolling-metrics / suspect logic.
+                let failureEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
                     requestModel: "glm5",
                     canonicalModelID: "z-ai/glm5",
                     transportOutcome: "send_error",
-                    failureClass: "transport_timeout",
-                    timeoutStage: .firstResponse,
-                    upstreamHTTPStatus: nil,
+                    failureClass: "classified_500",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 500,
                     retryCount: 0,
                     source: "live_request",
                     firstByteLatencyMilliseconds: 6_000,
@@ -2183,7 +2185,7 @@ struct ThinkingProxyPolicySpec {
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now
                 )
                 OpenAICompatTemporaryShim.recordRouteSuccess(
@@ -2192,8 +2194,8 @@ struct ThinkingProxyPolicySpec {
                 )
 
                 var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky first-byte timeout history", recorder: recorder)
-                expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.recentOutcomes.contains(where: { $0.hasSuffix(":transport_timeout") }), true, "rolling metrics should retain timeout history while the route is suspect", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .suspect, "a single lucky success should not instantly clear a flaky failure history", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.rollingMetrics.recentOutcomes.contains(where: { $0.hasSuffix(":classified_500") }), true, "rolling metrics should retain failure history while the route is suspect", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
@@ -2840,40 +2842,42 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
-                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                // B.1: transport_timeout no longer updates rolling metrics or route state.
+                // Use classified_500 with high first-byte latency to drive the same hedge/canary paths.
+                let failureEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
                     requestModel: "glm5",
                     canonicalModelID: "z-ai/glm5",
                     transportOutcome: "send_error",
-                    failureClass: "transport_timeout",
-                    timeoutStage: .firstResponse,
-                    upstreamHTTPStatus: nil,
+                    failureClass: "classified_500",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 500,
                     retryCount: 0,
                     source: "live_request",
-                    firstByteLatencyMilliseconds: 5_500,
+                    firstByteLatencyMilliseconds: 25_000,
                     totalLatencyMilliseconds: 25_000
                 )
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now
                 )
-                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 5, "high recent timeout rates should trigger a fast hedge instead of waiting tens of seconds", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.recommendedNVIDIAHedgeDelay(forRequestModel: "glm5"), 5, "high recent first-byte latency should trigger a fast hedge instead of waiting tens of seconds", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now.addingTimeInterval(1)
                 )
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now.addingTimeInterval(2)
                 )
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now.addingTimeInterval(3)
                 )
                 expectEqual(OpenAICompatTemporaryShim.recommendedCanaryInterval(), 30, "quarantined slow routes should still be canaried aggressively once they truly open", recorder: recorder)
@@ -2920,14 +2924,16 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
-                let timeoutEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                // B.1: transport_timeout no longer changes route state. Use classified_500
+                // to exercise the same repeated-failure quarantine threshold logic.
+                let failureEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                     timestamp: now,
                     requestModel: "glm5",
                     canonicalModelID: "z-ai/glm5",
                     transportOutcome: "send_error",
-                    failureClass: "transport_timeout",
-                    timeoutStage: .firstResponse,
-                    upstreamHTTPStatus: nil,
+                    failureClass: "classified_500",
+                    timeoutStage: .none,
+                    upstreamHTTPStatus: 500,
                     retryCount: 0,
                     source: "live_request"
                 )
@@ -2945,7 +2951,7 @@ struct ThinkingProxyPolicySpec {
 
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now
                 )
                 OpenAICompatTemporaryShim.recordRouteSuccess(
@@ -2955,12 +2961,12 @@ struct ThinkingProxyPolicySpec {
                 )
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
-                    telemetryEvent: timeoutEvent,
+                    telemetryEvent: failureEvent,
                     at: now.addingTimeInterval(2)
                 )
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
-                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "repeated first-byte timeout pressure should now quarantine the slow NVIDIA route instead of leaving it merely suspect", recorder: recorder)
+                expectEqual(snapshot["z-ai/glm5"]?.status, .open, "repeated classified failure pressure should now quarantine the unhealthy NVIDIA route instead of leaving it merely suspect", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -10035,6 +10041,8 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: now.addingTimeInterval(300))
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: now.addingTimeInterval(300))
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: now.addingTimeInterval(300))
+                // B.1: transport_timeout no longer changes route state. Use classified_500
+                // to quarantine glm-5.1-ollama-pro so it gets skipped in candidate selection.
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm-5.1-ollama-pro",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -10042,9 +10050,9 @@ struct ThinkingProxyPolicySpec {
                         requestModel: "glm-5.1-ollama-pro",
                         canonicalModelID: "glm-5.1",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "smart_alias"
                     ),
@@ -10717,14 +10725,16 @@ struct ThinkingProxyPolicySpec {
                 withRouteHealthPath { path in
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let now = Date()
+                    // B.1: transport_timeout no longer changes route state. Use classified_500
+                    // to drive real state transitions that persist across reload.
                     let event = OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: now,
                         requestModel: "glm5",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .bufferedResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 1,
                         source: "live_request"
                     )
@@ -10765,7 +10775,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(persisted?.isUnavailable(at: now), false, "startup reload should not keep the route unavailable purely from persisted state", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "startup reload should retain the transport outcome", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "startup reload should retain the original health transition evidence", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "startup reload should retain rolling timeout counts in recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":classified_500") }.count, 4, "startup reload should retain rolling failure counts in recent outcomes", recorder: recorder)
                     expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "startup reload should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
@@ -10780,7 +10790,7 @@ struct ThinkingProxyPolicySpec {
                     let lastEvent = glm5?["last_event"] as? [String: Any]
                     expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "startup normalization should preserve the original health transition evidence on disk", recorder: recorder)
                     let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
-                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":transport_timeout") }.count, 4, "startup normalization should preserve rolling timeout counts in recent outcomes", recorder: recorder)
+                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":classified_500") }.count, 4, "startup normalization should preserve rolling failure counts in recent outcomes", recorder: recorder)
                     expectEqual(glm5?["open_until"] == nil, true, "startup normalization should drop persisted open-until timestamps so restart does not inherit unavailability", recorder: recorder)
                 }
             }
@@ -10850,6 +10860,8 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
+                // B.1: transport_timeout no longer updates rolling metrics. Use classified_500
+                // so the route gets real state changes and rolling-metric entries.
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -10863,9 +10875,9 @@ struct ThinkingProxyPolicySpec {
                         winnerAttemptLane: nil,
                         failoverDepth: nil,
                         finalWinnerRequestModel: nil,
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "live_request",
                         firstByteLatencyMilliseconds: 1234,
@@ -11913,18 +11925,21 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(deliveredStatus, 504, "first-byte timeouts exhausting transport retries should surface as gateway timeout", recorder: recorder)
-                // The route should have recorded failures — not just logged telemetry.
-                // Snapshot key is the canonical model ID, not the request alias.
+                // B.1: transport_timeout failures no longer change route health state.
+                // They preserve telemetry (lastTelemetryEvent) but do not accumulate
+                // failure scores or rolling-metric outcomes. Verify telemetry is recorded.
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 let nvidiaState = snapshot["z-ai/glm5"]
-                expectTrue(
-                    (nvidiaState?.rollingMetrics.recentOutcomes.filter { $0.contains("transport_timeout") }.count ?? 0) >= 1,
-                    "first-byte timeout retries should record route failures immediately, not just at terminal failure",
+                expectEqual(
+                    nvidiaState?.lastTelemetryEvent?.failureClass?.hasPrefix("transport_timeout"),
+                    true,
+                    "first-byte timeout retries should record telemetry even though route health is not degraded",
                     recorder: recorder
                 )
-                expectTrue(
-                    (nvidiaState?.failureScore ?? 0) > 0,
-                    "first-byte timeout retries should increase the route failure score",
+                expectEqual(
+                    nvidiaState?.failureScore ?? 0,
+                    0,
+                    "first-byte timeout retries should not increase the route failure score under B.1 transport-timeout normalization",
                     recorder: recorder
                 )
             }
@@ -14310,9 +14325,9 @@ struct ThinkingProxyPolicySpec {
                         requestModel: "glm5-nvidia",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "live_request",
                         firstByteLatencyMilliseconds: 240_000,
@@ -14359,7 +14374,7 @@ struct ThinkingProxyPolicySpec {
                 let retryAfterSeconds = glm5Route?["retry_after_seconds"] as? Int
 
                 expectEqual(glm5Route?["last_success_request_id"] as? String, "proxy-success-1", "healthz should surface the last successful proxy request id for each route", recorder: recorder)
-                expectEqual(glm5Route?["last_failure_class"] as? String, "transport_timeout", "healthz should surface the last failure class for each route", recorder: recorder)
+                expectEqual(glm5Route?["last_failure_class"] as? String, "classified_500", "healthz should surface the last failure class for each route", recorder: recorder)
                 expectEqual((glm5Route?["cooldown_until"] as? String)?.isEmpty ?? true, false, "healthz should surface an active cooldown deadline when present", recorder: recorder)
                 if let retryAfterSeconds {
                     if retryAfterSeconds < 295 || retryAfterSeconds > 300 {
@@ -14428,6 +14443,8 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
 
+                // B.1: transport_timeout no longer changes route state. Use classified_500
+                // to make the route suspect so it becomes canary-probeable.
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5-nvidia",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -14435,9 +14452,9 @@ struct ThinkingProxyPolicySpec {
                         requestModel: "glm5-nvidia",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "live_request",
                         firstByteLatencyMilliseconds: 240_000,
@@ -14484,6 +14501,8 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
 
+                // B.1: transport_timeout no longer changes route state. Use classified_500
+                // to make the route suspect so it becomes canary-probeable.
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "kimi-k2.5-nvidia",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -14491,9 +14510,9 @@ struct ThinkingProxyPolicySpec {
                         requestModel: "kimi-k2.5-nvidia",
                         canonicalModelID: "moonshotai/kimi-k2.5",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "live_request",
                         firstByteLatencyMilliseconds: 240_000,
@@ -14543,9 +14562,9 @@ struct ThinkingProxyPolicySpec {
                             requestedAlias: selfRoutedGenericCompatFactoryWorkerContract.workerModelID,
                             canonicalModelID: "z-ai/glm5",
                             transportOutcome: "send_error",
-                            failureClass: "transport_timeout",
-                            timeoutStage: .firstResponse,
-                            upstreamHTTPStatus: nil,
+                            failureClass: "classified_500",
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 500,
                             retryCount: 0,
                             source: "live_request",
                             firstByteLatencyMilliseconds: 240_000,
@@ -16561,6 +16580,8 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
 
+                // B.1: transport_timeout no longer updates lastFailureClass. Use classified_500
+                // so the failure class is actually recorded in route health state.
                 OpenAICompatTemporaryShim.recordRouteFailure(
                     forRequestModel: "glm5-nvidia",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
@@ -16568,9 +16589,9 @@ struct ThinkingProxyPolicySpec {
                         requestModel: "glm5-nvidia",
                         canonicalModelID: "z-ai/glm5",
                         transportOutcome: "send_error",
-                        failureClass: "transport_timeout",
-                        timeoutStage: .firstResponse,
-                        upstreamHTTPStatus: nil,
+                        failureClass: "classified_500",
+                        timeoutStage: .none,
+                        upstreamHTTPStatus: 500,
                         retryCount: 0,
                         source: "live_request",
                         firstByteLatencyMilliseconds: 240_000,
@@ -16578,7 +16599,7 @@ struct ThinkingProxyPolicySpec {
                     ),
                     at: now
                 )
-                expectEqual(OpenAICompatTemporaryShim.routeHealthState(forRequestModel: "glm5-nvidia")?.lastFailureClass, "transport_timeout", "route health should retain the failure class while the route is degraded", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.routeHealthState(forRequestModel: "glm5-nvidia")?.lastFailureClass, "classified_500", "route health should retain the failure class while the route is degraded", recorder: recorder)
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5-nvidia",

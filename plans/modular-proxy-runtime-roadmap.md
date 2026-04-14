@@ -179,7 +179,7 @@ Suggested core files:
 
 ## Roadmap
 
-### 1. Freeze Current Behavior With a Regression Harness
+### 1. Freeze Current Behavior With a Regression Harness [C][V]
 
 #### Goal
 
@@ -231,7 +231,7 @@ Lock down current runtime behavior before moving authority out of `ThinkingProxy
 
 This item is complete only when the current system's routing and diagnostic behavior is preserved well enough that later extractions can be compared against it.
 
-### 2. Introduce a Typed Domain Layer
+### 2. Introduce a Typed Domain Layer [C][V]
 
 #### Goal
 
@@ -278,7 +278,7 @@ Move runtime concepts out of inline dictionaries, local structs, and ad hoc stat
 
 All future service extraction work must depend on these shared types rather than inventing new local equivalents.
 
-### 3. Replace Inline Config Authority With Typed Managed Config
+### 3. Replace Inline Config Authority With Typed Managed Config [C][V]
 
 #### Goal
 
@@ -338,7 +338,7 @@ Move config, managed providers, and managed aliases into typed Swift structures 
 
 Managed routing rules are declared in one typed Swift location and loaded exactly once through typed config services.
 
-### 4. Build `RouteCatalog` as the Sole Route Authority
+### 4. Build `RouteCatalog` as the Sole Route Authority [C][V]
 
 #### Goal
 
@@ -385,7 +385,7 @@ Centralize route and alias resolution in one service and remove runtime dependen
 
 No runtime route resolution path materially bypasses `RouteCatalog`.
 
-### 5. Introduce Typed Policy Registries
+### 5. Introduce Typed Policy Registries [C][V]
 
 #### Goal
 
@@ -433,7 +433,7 @@ Make model-specific and provider-specific runtime behavior explicit, typed, and 
 
 Timeouts, retries, streaming rules, responses support, and provider-specific constraints are no longer scattered across the monolith.
 
-### 6. Unify Credential Ownership Behind `CredentialPool`
+### 6. Unify Credential Ownership Behind `CredentialPool` [C][V]
 
 #### Goal
 
@@ -475,7 +475,7 @@ Move provider credential readiness, selection, and diagnostics into one runtime 
 
 Provider execution no longer depends on multiple unrelated credential-readiness mechanisms.
 
-### 7. Extract Health and Concurrency Into a Dedicated Subsystem
+### 7. Extract Health and Concurrency Into a Dedicated Subsystem [C][V]
 
 #### Goal
 
@@ -533,7 +533,7 @@ Keep the current stronger health behavior while removing it from monolithic stat
 
 The extracted health subsystem preserves current stronger semantics, including learned concurrency and NVIDIA-sensitive behavior.
 
-### 8. Make Request Shape and Compatibility Evaluation Explicit
+### 8. Make Request Shape and Compatibility Evaluation Explicit [C][V]
 
 #### Goal
 
@@ -587,7 +587,7 @@ Turn scattered request-shape checks into a first-class planning input.
 
 Request compatibility is decided before execution starts and is independently testable.
 
-### 9. Add Explicit `ExecutionPlan` and `ExecutionStage` Routing
+### 9. Add Explicit `ExecutionPlan` and `ExecutionStage` Routing [C][V]
 
 #### Goal
 
@@ -638,7 +638,7 @@ Plan execution before execution starts and make serial/race/hedge behavior expli
 
 Alias routing starts with a plan object and no longer relies on on-the-fly execution branching as the primary source of truth.
 
-### 10. Extract Telemetry and Bound Its Retention
+### 10. Extract Telemetry and Bound Its Retention [C][V]
 
 #### Goal
 
@@ -688,7 +688,7 @@ Keep the current telemetry richness while making ownership explicit and memory u
 
 Telemetry richness remains, but retention is explicitly bounded and service-owned.
 
-### 11. Build a Typed `TransportFacade` and Extract Provider Adapters
+### 11. Build a Typed `TransportFacade` and Extract Provider Adapters [C][V]
 
 #### Goal
 
@@ -736,7 +736,7 @@ Hide transport complexity behind a stable interface and isolate provider-specifi
 
 Generic runtime code depends on a typed transport facade and provider adapters, not on transport pool internals.
 
-### 12. Introduce `ProxyRuntime` as the Runtime Nucleus
+### 12. Introduce `ProxyRuntime` as the Runtime Nucleus [C][V]
 
 #### Goal
 
@@ -786,7 +786,7 @@ Replace split ownership across `ThinkingProxy`, `ServerManager`, and `AppDelegat
 
 All proxy runtime authority lives in `ProxyRuntime`, not in the macOS shell or listener.
 
-### 13. Extract Factory Contract Logic Into Its Own Subsystem
+### 13. Extract Factory Contract Logic Into Its Own Subsystem [C][V]
 
 #### Goal
 
@@ -834,7 +834,7 @@ Preserve the current strong Factory contract behavior while removing it from gen
 
 Factory-specific runtime behavior is isolated but not weakened.
 
-### 14. Rebuild Endpoint Handling on the New Runtime
+### 14. Rebuild Endpoint Handling on the New Runtime [C][V]
 
 #### Goal
 
@@ -874,7 +874,7 @@ Switch live endpoint behavior to the new runtime and supersede old implementatio
 
 The new runtime materially owns all public endpoint behavior.
 
-### 15. Delete Legacy Runtime Authority
+### 15. Delete Legacy Runtime Authority [C][V]
 
 #### Goal
 
@@ -920,7 +920,7 @@ Finish the replacement by removing the monolithic runtime path once the new serv
 
 The old monolithic authority is not merely bypassed; it is gone.
 
-### 16. Final Cleanup, Documentation, and Operational Alignment
+### 16. Final Cleanup, Documentation, and Operational Alignment [C][V]
 
 #### Goal
 
