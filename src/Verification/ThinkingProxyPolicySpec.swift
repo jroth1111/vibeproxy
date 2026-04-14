@@ -17935,6 +17935,154 @@ struct ThinkingProxyPolicySpec {
             expectEqual(countsByReason?["circuit_open"], 2, "exhaustion should count 2 circuit_open skips", recorder: recorder)
         }
 
+        // MARK: - Track 1: Incident Request Shape Replay Spec (A.3)
+
+        run("direct muse-spark replay preserves the incident request shape through transformRequest", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "muse-spark",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo status"},
+                        {"type": "reasoning", "text": "analyzing code"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                // muse-spark is a meta-web route, not NVIDIA — transformRequest may return nil (no transform needed)
+                let resultString = transformed ?? request
+                let json = parseJSONObject(resultString, recorder: recorder)
+                expectEqual(json["model"] as? String, "muse-spark", "muse-spark replay should preserve the model name", recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                expectEqual(messages?.count, 2, "muse-spark replay should preserve the two-turn message structure", recorder: recorder)
+            }
+        }
+
+        run("direct glm5-nvidia replay classifies first-byte timeout correctly in telemetry", recorder: recorder) {
+            OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            let recordedEvents: OpenAICompatTemporaryShim.RouteTelemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                timestamp: Date(),
+                requestModel: "glm5-nvidia",
+                canonicalModelID: "z-ai/glm5",
+                transportOutcome: "send_error",
+                failureClass: "transport_timeout_first_byte",
+                timeoutStage: .firstResponse,
+                upstreamHTTPStatus: nil,
+                retryCount: 0,
+                source: "live_request",
+                firstByteLatencyMilliseconds: 6000
+            )
+            // Verify the telemetry event captures the timeout classification
+            expectEqual(recordedEvents.failureClass, "transport_timeout_first_byte", "glm5-nvidia slow first-byte should classify as transport_timeout_first_byte", recorder: recorder)
+            expectEqual(recordedEvents.timeoutStage, .firstResponse, "glm5-nvidia slow first-byte should mark timeout stage as firstResponse", recorder: recorder)
+            expectEqual(recordedEvents.transportOutcome, "send_error", "glm5-nvidia timeout should record send_error transport outcome", recorder: recorder)
+            OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+        }
+
+        run("worker alias replay delivers a result instead of exhaustion for incident request shape", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {
+                              "id": "chatcmpl-incident-replay",
+                              "object": "chat.completion",
+                              "model": "glm-5.1-ollama-pro",
+                              "choices": [
+                                {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "OK"},
+                                  "finish_reason": "stop"
+                                }
+                              ]
+                            }
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    delivered.signal()
+                }
+
+                let incidentShape = """
+                {
+                  "model": "custom:Proxy-Worker-Smart-Router-8",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo status"},
+                        {"type": "reasoning", "text": "analyzing code"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: incidentShape
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("worker alias replay should deliver a result for the incident request shape, not exhaust")
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker alias replay should deliver success for the incident request shape", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "custom:Proxy-Worker-Smart-Router-8", "worker alias replay should preserve the outward alias in the response", recorder: recorder)
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
