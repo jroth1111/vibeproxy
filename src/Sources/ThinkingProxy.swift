@@ -2634,13 +2634,50 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     static func untrustedNVIDIADirectRequestDeadline(
         forRequestJSON jsonString: String
     ) -> (seconds: TimeInterval, stage: DeadlineStage)? {
-        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
+        guard nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) != nil else {
             return nil
         }
         if requestedStream(forRequestJSON: jsonString) {
-            return (seconds: cap.firstResponse, stage: .firstResponse)
+            return (
+                seconds: effectiveFirstResponseDeadline(
+                    forRequestJSON: jsonString,
+                    routeHealthStatus: modelName(forRequestJSON: jsonString).flatMap { requestModel in
+                        routeHealthStatus(forRequestModel: requestModel)
+                    }
+                ) ?? untrustedNVIDIAProbeFirstResponseDeadline,
+                stage: .firstResponse
+            )
         }
-        return (seconds: cap.bufferedResponse, stage: .bufferedResponse)
+        return (
+            seconds: effectiveBufferedResponseDeadline(forRequestJSON: jsonString)
+                ?? untrustedNVIDIAProbeBufferedResponseDeadline,
+            stage: .bufferedResponse
+        )
+    }
+
+    private static func adaptiveFirstResponseDeadlineCap(forP95Milliseconds p95Milliseconds: Int) -> TimeInterval {
+        let p95Seconds = Double(p95Milliseconds) / 1000.0
+        return min(max(p95Seconds * 3.0, 60.0), 360.0)
+    }
+
+    private static func adaptiveFirstResponseDeadlineCap(forRequestJSON jsonString: String) -> TimeInterval? {
+        guard let requestModel = modelName(forRequestJSON: jsonString),
+              let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95FirstByteLatencyMilliseconds,
+              p95ms > 0 else {
+            return nil
+        }
+        return adaptiveFirstResponseDeadlineCap(forP95Milliseconds: p95ms)
+    }
+
+    private static func adaptiveBufferedResponseDeadlineCap(forRequestJSON jsonString: String) -> TimeInterval? {
+        guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString),
+              let requestModel = modelName(forRequestJSON: jsonString),
+              let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95TotalLatencyMilliseconds,
+              p95ms > 0 else {
+            return nil
+        }
+        let p95Seconds = Double(p95ms) / 1000.0
+        return min(max(p95Seconds * 3.0, cap.bufferedResponse), 360.0)
     }
 
     static func effectiveFirstResponseDeadline(
@@ -2652,11 +2689,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         // If p95 first-byte latency history exists, use it for an adaptive deadline
         // regardless of trust status. This lets slow-but-functional routes get proportional
         // timeouts instead of being stuck at the 15s untrusted cap.
-        if let requestModel = modelName(forRequestJSON: jsonString),
-           let p95ms = rollingMetrics(forRequestModel: requestModel)?.p95FirstByteLatencyMilliseconds,
-           p95ms > 0 {
-            let p95Seconds = Double(p95ms) / 1000.0
-            let adaptiveCap = min(max(p95Seconds * 3.0, 60.0), 360.0)
+        if let adaptiveCap = adaptiveFirstResponseDeadlineCap(forRequestJSON: jsonString) {
             if let baseDeadline {
                 return min(baseDeadline, adaptiveCap)
             }
@@ -2672,6 +2705,12 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func effectiveBufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
         let baseDeadline = bufferedResponseDeadline(forRequestJSON: jsonString)
+        if let adaptiveCap = adaptiveBufferedResponseDeadlineCap(forRequestJSON: jsonString) {
+            if let baseDeadline {
+                return min(baseDeadline, adaptiveCap)
+            }
+            return adaptiveCap
+        }
         guard let cap = nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) else {
             return baseDeadline
         }

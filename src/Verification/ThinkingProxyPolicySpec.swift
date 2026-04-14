@@ -1815,6 +1815,65 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("temporary adaptive buffered-response deadline caps at 3x p95 total for untrusted NVIDIA direct routes", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let glm5DirectRequest = """
+                {
+                  "model": "glm5-nvidia-direct",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+
+                for (offset, latency) in [25_000, 30_000, 35_000].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia-direct",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia-direct",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: nil,
+                            totalLatencyMilliseconds: latency
+                        )
+                    )
+                }
+
+                expectEqual(
+                    OpenAICompatTemporaryShim.hasRecentStableNVIDIAInferenceSuccess(forRequestModel: "glm5-nvidia-direct"),
+                    false,
+                    "high-latency direct NVIDIA totals without recent first-byte evidence should stay untrusted while still informing buffered deadlines",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: glm5DirectRequest),
+                    105,
+                    "untrusted direct NVIDIA buffered requests should scale to 3x p95 total latency instead of staying pinned to the stale 20-second cap",
+                    recorder: recorder
+                )
+                let requestDeadline = OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(forRequestJSON: glm5DirectRequest)
+                expectEqual(
+                    requestDeadline?.stage,
+                    .bufferedResponse,
+                    "the outer untrusted NVIDIA watchdog should keep attributing non-streaming requests to the buffered-response deadline",
+                    recorder: recorder
+                )
+                expectEqual(
+                    requestDeadline?.seconds,
+                    105,
+                    "the outer untrusted NVIDIA watchdog should inherit the adaptive buffered-response deadline",
+                    recorder: recorder
+                )
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("temporary retry backoff jitter only widens delays within a capped positive range", recorder: recorder) {
             OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting()
             defer { OpenAICompatTemporaryShim.resetRetryBackoffJitterForTesting() }
