@@ -30,11 +30,17 @@ struct NVIDIAStreamSemanticFlags: Equatable {
     var meaningfulOutput = false
     var toolCallStarted = false
     var upstreamErrorSeen = false
+    var specialTokenLeak = false
+    var successShapedFailure = false
+    var repetitionDetected = false
 
     mutating func formUnion(_ other: NVIDIAStreamSemanticFlags) {
         meaningfulOutput = meaningfulOutput || other.meaningfulOutput
         toolCallStarted = toolCallStarted || other.toolCallStarted
         upstreamErrorSeen = upstreamErrorSeen || other.upstreamErrorSeen
+        specialTokenLeak = specialTokenLeak || other.specialTokenLeak
+        successShapedFailure = successShapedFailure || other.successShapedFailure
+        repetitionDetected = repetitionDetected || other.repetitionDetected
     }
 }
 
@@ -264,5 +270,88 @@ struct NVIDIAStreamEngine {
         default:
             return false
         }
+    }
+}
+
+// MARK: - Stream Content Quality Validation
+
+/// Accumulates streamed text content and runs periodic content quality checks
+/// against a rolling window, similar to the LiteLLM guardrail's streaming validation.
+struct NVIDIAStreamContentValidator {
+    private var buffer = ""
+    private let repetitionWindow = 500
+    private var chunkCount = 0
+
+    struct ContentQualityTokens {
+        static let specialTokens: Set<String> = [
+            "<|im_start|>", "<|im_end|>", "",
+            "<|start_header_id|>", "<|end_header_id|>",
+            "<|eot_id|>", "<|return|>",
+            "[INST]", "[/INST]",
+            "<s>", "</s>"
+        ]
+
+        static let errorSignatures: [String] = [
+            "model is currently unavailable",
+            "rate limit exceeded",
+            "internal server error",
+            "service temporarily unavailable",
+            "gateway timeout",
+            "upstream connect error",
+            "too many requests",
+            "model not found",
+            "invalid model",
+            "connection reset",
+            "function not found",
+            "not found for account",
+            "function id version"
+        ]
+    }
+
+    mutating func append(_ text: String) -> NVIDIAStreamSemanticFlags {
+        var flags = NVIDIAStreamSemanticFlags()
+        buffer += text
+        chunkCount += 1
+
+        // Per-chunk checks (cheap)
+        flags.specialTokenLeak = ContentQualityTokens.specialTokens.contains(where: { text.contains($0) })
+
+        let loweredBuffer = buffer.lowercased()
+        if loweredBuffer.count < 500 {
+            flags.successShapedFailure = ContentQualityTokens.errorSignatures.contains(where: { loweredBuffer.contains($0) })
+        }
+
+        // Periodic repetition check (every 20 chunks, with rolling window)
+        if chunkCount % 20 == 0 && buffer.count >= repetitionWindow {
+            let window = String(buffer.suffix(repetitionWindow))
+            if detectRepetitionLoop(window) != nil {
+                flags.repetitionDetected = true
+            }
+        }
+
+        // Trim buffer to prevent unbounded growth
+        if buffer.count > repetitionWindow * 2 {
+            buffer = String(buffer.suffix(repetitionWindow))
+        }
+
+        return flags
+    }
+
+    private func detectRepetitionLoop(_ text: String, maxRatio: Double = 0.4) -> String? {
+        let words = text.split(separator: " ").map(String.init)
+        guard words.count >= 20 else { return nil }
+        let ngramSize = 6
+        var counts: [String: Int] = [:]
+        for i in 0..<(words.count - ngramSize + 1) {
+            let ngram = words[i..<(i + ngramSize)].joined(separator: " ").lowercased()
+            counts[ngram, default: 0] += 1
+        }
+        for (ngram, count) in counts where count >= 3 {
+            let ratio = Double(count * ngramSize) / Double(words.count)
+            if ratio > maxRatio {
+                return String(ngram.prefix(60))
+            }
+        }
+        return nil
     }
 }

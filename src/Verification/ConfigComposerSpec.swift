@@ -55,10 +55,10 @@ struct ConfigComposerSpec {
 
             expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "glm5-nvidia", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose both glm5 aliases plus kimi-k2.5-nvidia", recorder: recorder)
-            expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.5-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.5-nvidia", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.7-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.7-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "meta-web", in: patched) ?? [:]), ["muse-spark"], "managed patches should also expose the Meta web muse-spark alias", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5, then NVIDIA Kimi K2.5", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5, then NVIDIA Kimi K2.5, then NVIDIA MiniMax", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -111,7 +111,7 @@ struct ConfigComposerSpec {
                             ["api-key": "inline-b"]
                         ],
                         "models": [
-                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5"]
+                            ["name": "minimaxai/minimax-m2.7", "alias": "minimax-m2.5"]
                         ]
                     ]
                 ],
@@ -135,14 +135,14 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]),
-                ["minimax-m2.5-nvidia"],
+                ["minimax-m2.7-nvidia"],
                 "managed NVIDIA MiniMax aliases should replace stale user-defined aliases",
                 recorder: recorder
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"],
-                "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama/NVIDIA/Meta worker chain plus the Kimi rescue lane",
+                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"],
+                "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama/NVIDIA/Meta worker chain plus the Kimi and MiniMax rescue lanes",
                 recorder: recorder
             )
         }
@@ -308,7 +308,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.7-nvidia", "kimi-k2.5-nvidia"]
                     ]
                 ]
             ]
@@ -321,7 +321,7 @@ struct ConfigComposerSpec {
             let smartAliases = dictionary(merged["smart-aliases"])
             let worker = dictionary(smartAliases["worker"])
             expectEqual(worker["request-class"] as? String, "plain-chat", "smart alias request class should survive additive config composition", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "smart alias candidate order should be preserved", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.7-nvidia", "kimi-k2.5-nvidia"], "smart alias candidate order should be preserved", recorder: recorder)
         }
 
         run("parseCustomProviders ignores reserved providers and keeps UI metadata", recorder: recorder) {
@@ -603,7 +603,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.7-nvidia"]
                     ]
                 ]
             ]
@@ -621,7 +621,7 @@ struct ConfigComposerSpec {
             let smartAliases = dictionary(runtime["smart-aliases"])
             let worker = dictionary(smartAliases["worker"])
             expectEqual(worker["failover"] as? String, "silent", "runtime config should preserve smart alias failover mode", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.5-nvidia"], "runtime config should preserve smart alias candidate order", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "minimax-m2.7-nvidia"], "runtime config should preserve smart alias candidate order", recorder: recorder)
         }
 
         run("wildcard oauth exclusions are detectable", recorder: recorder) {
@@ -743,7 +743,7 @@ struct ConfigComposerSpec {
                         "name": "nvidia",
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
-                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
+                            ["name": "minimaxai/minimax-m2.7", "alias": "minimax-m2.7-nvidia"]
                         ]
                     ]
                 ],
@@ -751,7 +751,7 @@ struct ConfigComposerSpec {
                     " worker ": [
                         "request-class": "streaming",
                         "failover": "visible",
-                        "candidates": ["glm-5.1-zai", " unknown ", "minimax-m2.5-nvidia", "minimax-m2.5-nvidia"]
+                        "candidates": ["glm-5.1-zai", " unknown ", "minimax-m2.7-nvidia", "minimax-m2.7-nvidia"]
                     ],
                     "fanout": [
                         "request-class": "plain-chat",
@@ -782,7 +782,7 @@ struct ConfigComposerSpec {
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
                             ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5-nvidia"],
-                            ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
+                            ["name": "minimaxai/minimax-m2.7", "alias": "minimax-m2.7-nvidia"]
                         ]
                     ]
                 ],
@@ -790,7 +790,7 @@ struct ConfigComposerSpec {
                     "worker": [
                         "request-class": "plain-chat",
                         "failover": "silent",
-                        "candidates": ["glm-5.1-zai", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]
+                        "candidates": ["glm-5.1-zai", "minimax-m2.7-nvidia", "kimi-k2.5-nvidia"]
                     ]
                 ]
             ]

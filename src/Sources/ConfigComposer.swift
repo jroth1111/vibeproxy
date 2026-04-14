@@ -744,11 +744,11 @@ enum ConfigComposer {
             [
                 "name": "nvidia-minimax",
                 "display-name": "NVIDIA MiniMax",
-                "help-text": "NVIDIA pool for minimax-m2.5 with automatic request shaping and response cleanup.",
+                "help-text": "NVIDIA pool for minimax-m2.7 with automatic request shaping and response cleanup.",
                 "icon-system": "bolt.fill",
                 "base-url": "https://integrate.api.nvidia.com/v1",
                 "models": [
-                    ["name": "minimaxai/minimax-m2.5", "alias": "minimax-m2.5-nvidia"]
+                    ["name": "minimaxai/minimax-m2.7", "alias": "minimax-m2.7-nvidia"]
                 ]
             ],
             [
@@ -770,7 +770,7 @@ enum ConfigComposer {
             "worker": [
                 "request-class": "plain-chat",
                 "failover": "silent",
-                "candidates": ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"]
+                "candidates": ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
             ]
         ]
     }

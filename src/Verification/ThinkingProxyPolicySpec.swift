@@ -10,7 +10,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "minimax-m2.5-nvidia",
+                  "model": "minimax-m2.7-nvidia",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ],
@@ -90,7 +90,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let request = """
                 {
-                  "model": "minimax-m2.5-nvidia",
+                  "model": "minimax-m2.7-nvidia",
                   "messages": [
                     {"role": "user", "content": "Return exactly: OK"}
                   ],
@@ -1536,7 +1536,7 @@ struct ThinkingProxyPolicySpec {
                 """
                 let minimaxRequest = """
                 {
-                  "model": "minimax-m2.5-nvidia",
+                  "model": "minimax-m2.7-nvidia",
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
@@ -3053,7 +3053,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "worker")
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "worker should load its candidate order from merged config", recorder: recorder)
 
                 let transition = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
                     method: "POST",
@@ -3072,7 +3072,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm-5.1")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "glm-5.1 should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "glm-5.1 should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "glm-5.1 should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -3088,7 +3088,7 @@ struct ThinkingProxyPolicySpec {
                 let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "proxy-worker-smart-router")
                 expectEqual(smartAlias?.requestClass, "plain-chat", "proxy-worker-smart-router should inherit the pooled request class instead of bypassing the worker pool", recorder: recorder)
                 expectEqual(smartAlias?.failover, "silent", "proxy-worker-smart-router should inherit silent failover from the internal worker pool", recorder: recorder)
-                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
+                expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "proxy-worker-smart-router should reuse the full worker candidate order", recorder: recorder)
             }
         }
 
@@ -3125,7 +3125,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy glm-5.1 requests should keep the same worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "tool-heavy glm-5.1 requests should keep the same worker pool", recorder: recorder)
             }
         }
 
@@ -3266,7 +3266,7 @@ struct ThinkingProxyPolicySpec {
                     smartAlias: smartAlias
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy proxy-worker-smart-router requests should keep the same worker pool", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "tool-heavy proxy-worker-smart-router requests should keep the same worker pool", recorder: recorder)
             }
         }
 
@@ -3333,7 +3333,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stickyCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
+                expectEqual(stickyCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "tool-heavy worker requests should keep the same candidate ordering as plain chat", recorder: recorder)
 
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(
                     requestModel: "glm-5.1-ollama-pro",
@@ -3347,7 +3347,7 @@ struct ThinkingProxyPolicySpec {
                     jsonString: requestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-ollama-pro"], "tool-heavy worker requests should demote degraded siblings behind still-healthy fallbacks while preserving the healthy primary", recorder: recorder)
+                expectEqual(stillPinnedCandidates, ["glm-5.1-zai", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia", "glm-5.1-ollama-pro"], "tool-heavy worker requests should demote degraded siblings behind still-healthy fallbacks while preserving the healthy primary", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -3395,7 +3395,7 @@ struct ThinkingProxyPolicySpec {
                 )
                 expectEqual(
                     candidates,
-                    ["glm5-nvidia", "muse-spark", "kimi-k2.5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    ["glm5-nvidia", "muse-spark", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
                     "strict tool-choice worker turns should still availability-rank healthy candidates first while keeping muse-spark behind nvidia within the compatible closed bucket",
                     recorder: recorder
                 )
@@ -3498,7 +3498,7 @@ struct ThinkingProxyPolicySpec {
                 )
                 expectEqual(
                     candidates,
-                    ["glm5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
                     "multi-tool worker turns should exclude muse-spark before candidate ranking while keeping both NVIDIA rescue lanes available",
                     recorder: recorder
                 )
@@ -3573,7 +3573,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "multi-tool worker turns should still succeed after excluding muse-spark", recorder: recorder)
                 expectEqual(deliveredError, nil, "multi-tool worker turns should not surface the skipped muse-spark lane as a terminal error", recorder: recorder)
-                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "multi-tool worker turns should race both NVIDIA rescue lanes after skipping muse-spark", recorder: recorder)
+                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "multi-tool worker turns should race both NVIDIA rescue lanes after skipping muse-spark", recorder: recorder)
                 expectEqual(metaSeenModels.isEmpty, true, "multi-tool worker turns should not attempt muse-spark once the preflight rejects the synthetic multi-tool bridge", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "proxy-worker-smart-router", "multi-tool worker turns should preserve the outward alias after the nvidia fallback succeeds", recorder: recorder)
@@ -3635,9 +3635,9 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(dispatchableRequestShapes?.contains("multi_tool_typed_content"), false, "healthz should stop advertising multi-tool typed worker dispatch when only NVIDIA typed fallbacks remain", recorder: recorder)
                     expectEqual(dispatchableRequestShapes?.contains("streaming_multi_tool_typed_content"), false, "healthz should stop advertising streaming multi-tool typed worker dispatch when only NVIDIA typed fallbacks remain", recorder: recorder)
                     expectEqual(toolChat?["effective_route_model"] as? String, "muse-spark", "single-tool string worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
-                    expectEqual(toolChat?["dispatchable_candidate_models"] as? [String], ["muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "single-tool string worker health should expose every dispatchable native lane in preference order", recorder: recorder)
+                    expectEqual(toolChat?["dispatchable_candidate_models"] as? [String], ["muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "single-tool string worker health should expose every dispatchable native lane in preference order", recorder: recorder)
                     expectEqual(multiToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool string worker health should skip Meta and fall through to NVIDIA", recorder: recorder)
-                    expectEqual(multiToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia"], "multi-tool string worker health should exclude Meta while preserving both dispatchable NVIDIA fallbacks", recorder: recorder)
+                    expectEqual(multiToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "multi-tool string worker health should exclude Meta while preserving both dispatchable NVIDIA fallbacks", recorder: recorder)
                     expectEqual(typedToolChat?["effective_route_model"] as? String, "muse-spark", "single-tool typed worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
                     expectEqual(multiTypedToolChat?["ready"] as? Bool, false, "multi-tool typed worker health should report no dispatchable lane when only NVIDIA typed fallbacks remain", recorder: recorder)
                     expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool typed worker health should no longer advertise NVIDIA typed fallbacks as dispatchable", recorder: recorder)
@@ -4161,7 +4161,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "opaque untyped worker transcript shapes should still succeed", recorder: recorder)
                 expectEqual(deliveredError, nil, "opaque untyped worker transcript shapes should not surface a terminal routing error", recorder: recorder)
-                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "opaque untyped worker transcript shapes should keep both NVIDIA rescue lanes eligible instead of preflight-skipping them", recorder: recorder)
+                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "opaque untyped worker transcript shapes should keep both NVIDIA rescue lanes eligible instead of preflight-skipping them", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -4262,7 +4262,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "mixed typed worker transcript shapes should still succeed", recorder: recorder)
                 expectEqual(deliveredError, nil, "mixed typed worker transcript shapes should not surface a terminal routing error", recorder: recorder)
-                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "candidate-level request shims should keep both NVIDIA rescue lanes eligible for mixed typed worker transcript shapes", recorder: recorder)
+                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "candidate-level request shims should keep both NVIDIA rescue lanes eligible for mixed typed worker transcript shapes", recorder: recorder)
                 expectEqual(Set(seenContents), Set(["Checked repohidden chain of thought{\"step\":1}"]), "candidate-level request shims should preserve reasoning text and metadata markers before NVIDIA dispatch", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -4372,7 +4372,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(deliveredStatus, 200, "streaming typed worker transcript shapes should still succeed", recorder: recorder)
                 expectEqual(deliveredError, nil, "streaming typed worker transcript shapes should not surface a terminal routing error", recorder: recorder)
-                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "candidate-level request shims should keep both NVIDIA rescue lanes eligible for streaming typed worker transcript shapes", recorder: recorder)
+                expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "candidate-level request shims should keep both NVIDIA rescue lanes eligible for streaming typed worker transcript shapes", recorder: recorder)
                 expectEqual(Set(seenContents), Set(["Checked repohidden chain of thought{\"step\":1}"]), "candidate-level request shims should preserve reasoning text and metadata markers before NVIDIA dispatch", recorder: recorder)
                 expectEqual(Set(seenStreams), Set([false]), "streaming typed worker transcript shapes should be buffered upstream for NVIDIA while preserving synthetic SSE to the caller", recorder: recorder)
 
@@ -4474,7 +4474,7 @@ struct ThinkingProxyPolicySpec {
 
                     expectEqual(deliveredStatus, 200, "self-routed worker transcript metadata wrappers should still succeed", recorder: recorder)
                     expectEqual(deliveredError, nil, "self-routed worker transcript metadata wrappers should not surface a terminal routing error", recorder: recorder)
-                    expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "self-routed worker transcript metadata wrappers should keep both NVIDIA rescue lanes eligible", recorder: recorder)
+                    expectEqual(Set(seenModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "self-routed worker transcript metadata wrappers should keep both NVIDIA rescue lanes eligible", recorder: recorder)
                     expectEqual(Set(seenContents), Set(["Checked repo"]), "self-routed worker transcript metadata wrappers should preserve visible assistant text before NVIDIA dispatch", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -4527,7 +4527,7 @@ struct ThinkingProxyPolicySpec {
                 )
                 expectEqual(
                     candidates,
-                    ["glm5-nvidia", "kimi-k2.5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
+                    ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"],
                     "true multimodal worker transcript shapes should exclude muse-spark before candidate selection while preserving both NVIDIA rescue lanes",
                     recorder: recorder
                 )
@@ -4902,7 +4902,7 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(rewrittenJSON["model"] as? String, selfRoutedGenericCompatFactoryWorkerContract.authoritativeRouteModel, "self-routed smart-router request rewrites should target the authoritative public worker alias", recorder: recorder)
                     expectEqual(smartAlias?.requestClass, "plain-chat", "the authoritative public worker alias should own the worker request class", recorder: recorder)
                     expectEqual(smartAlias?.failover, "silent", "the authoritative public worker alias should own worker failover policy", recorder: recorder)
-                    expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
+                    expectEqual(smartAlias?.candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "self-routed smart-router worker IDs should reuse the full worker candidate order without a duplicate merged-config alias", recorder: recorder)
                 }
             }
         }
@@ -4934,7 +4934,7 @@ struct ThinkingProxyPolicySpec {
                         )!
                     )
 
-                    expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "tool-heavy self-routed smart-router requests should keep the same worker pool", recorder: recorder)
+                    expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "tool-heavy self-routed smart-router requests should keep the same worker pool", recorder: recorder)
                 }
             }
         }
@@ -6907,7 +6907,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 500, "worker should fail closed when its primary route contract is violated", recorder: recorder)
                 expectEqual(
                     deliveredMessage,
-                    "The worker pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia, then kimi-k2.5-nvidia.",
+                    "The worker pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia, then kimi-k2.5-nvidia, then minimax-m2.7-nvidia.",
                     "worker should emit a stable misconfiguration error",
                     recorder: recorder
                 )
@@ -7107,7 +7107,7 @@ struct ThinkingProxyPolicySpec {
                         parseJSONObject($0, recorder: recorder)["model"] as? String
                     } ?? ""
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.NVIDIADirectTransportResponse(
                                 chunks: [Data("{\"error\":\"bad request\"}".utf8)],
@@ -7133,14 +7133,14 @@ struct ThinkingProxyPolicySpec {
                         parseJSONObject($0, recorder: recorder)["model"] as? String
                     } ?? ""
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.NVIDIADirectTransportResponse(
                                 chunks: [Data("""
                                 {
                                   "id": "chatcmpl-fallback-valid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5-nvidia",
+                                  "model": "minimax-m2.7-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -7187,14 +7187,14 @@ struct ThinkingProxyPolicySpec {
                         parseJSONObject($0, recorder: recorder)["model"] as? String
                     } ?? ""
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.NVIDIADirectTransportResponse(
                                 chunks: [Data("""
                                 {
                                   "id": "chatcmpl-invalid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5-nvidia",
+                                  "model": "minimax-m2.7-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -7532,14 +7532,14 @@ struct ThinkingProxyPolicySpec {
                     seenModels.append(model)
                     lock.unlock()
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.NVIDIADirectTransportResponse(
                                 chunks: [Data("""
                                 {
                                   "id": "chatcmpl-minimax",
                                   "object": "chat.completion",
-                                  "model": "minimaxai/minimax-m2.5",
+                                  "model": "minimaxai/minimax-m2.7",
                                   "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]
                                 }
                                 """.utf8)],
@@ -7588,7 +7588,7 @@ struct ThinkingProxyPolicySpec {
                 // glm-5.1, kilo, MiMo opencode, and MiniMax free opencode are tried serially; then NVIDIA races
                 let seenBeforeNvidia = seenModels.prefix(4)
                 expectEqual(Array(seenBeforeNvidia), ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode"], "worker should try both MiMo legs and the opencode MiniMax free leg before falling through to NVIDIA", recorder: recorder)
-                expectEqual(seenModels.contains("minimax-m2.5-nvidia") || seenModels.contains("kimi-k2.5-nvidia"), true, "worker should reach the nvidia race after all mimo providers fail", recorder: recorder)
+                expectEqual(seenModels.contains("minimax-m2.7-nvidia") || seenModels.contains("kimi-k2.5-nvidia"), true, "worker should reach the nvidia race after all mimo providers fail", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "nvidia fallback should deliver a successful response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, "worker", "response model should be rewritten to the public alias", recorder: recorder)
@@ -7917,12 +7917,12 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 OpenAICompatTemporaryShim.recordRouteFailure(
-                    forRequestModel: "minimax-m2.5-nvidia",
+                    forRequestModel: "minimax-m2.7-nvidia",
                     telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
                         timestamp: Date(),
-                        requestModel: "minimax-m2.5-nvidia",
+                        requestModel: "minimax-m2.7-nvidia",
                         requestedAlias: "worker",
-                        canonicalModelID: "minimaxai/minimax-m2.5",
+                        canonicalModelID: "minimaxai/minimax-m2.7",
                         transportOutcome: "send_error",
                         failoverDepth: 1,
                         failureClass: "transport_timeout",
@@ -8017,7 +8017,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels.prefix(6).map { $0 }, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "kimi-k2.5-nvidia", "minimax-m2.5-nvidia"], "worker should exhaust the free serial legs first, then launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
+                expectEqual(seenModels.prefix(6).map { $0 }, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "worker should exhaust the free serial legs first, then launch healthier NVIDIA fallbacks first once live metrics mark minimax as degraded", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should keep succeeding while reordering its fallback race by route health", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -8055,7 +8055,7 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                         return {}
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         let workItem = DispatchWorkItem {
                             completion(
                                 ThinkingProxy.BufferedProxyResponse(
@@ -8063,7 +8063,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-win",
                                       "object": "chat.completion",
-                                      "model": "minimax-m2.5-nvidia",
+                                      "model": "minimax-m2.7-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -8119,7 +8119,7 @@ struct ThinkingProxyPolicySpec {
                         parseJSONObject($0, recorder: recorder)["model"] as? String
                     } ?? ""
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         let workItem = DispatchWorkItem {
                             completion(
                                 ThinkingProxy.NVIDIADirectTransportResponse(
@@ -8127,7 +8127,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-win",
                                       "object": "chat.completion",
-                                      "model": "minimax-m2.5-nvidia",
+                                      "model": "minimax-m2.7-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -8256,7 +8256,7 @@ struct ThinkingProxyPolicySpec {
                             )
                         )
                         return {}
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         if invocationCount > 1 {
                             recorder.recordFailure("coalesced raced winner should reuse the in-flight minimax NVIDIA attempt")
                         }
@@ -8268,7 +8268,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-coalesced-win",
                                       "object": "chat.completion",
-                                      "model": "minimax-m2.5-nvidia",
+                                      "model": "minimax-m2.7-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -8333,7 +8333,7 @@ struct ThinkingProxyPolicySpec {
                     let invocationCount = modelInvocationCounts[model] ?? 0
                     lock.unlock()
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         if invocationCount > 1 {
                             recorder.recordFailure("coalesced raced winner should reuse the in-flight minimax NVIDIA attempt")
                         }
@@ -8345,7 +8345,7 @@ struct ThinkingProxyPolicySpec {
                                     {
                                       "id": "chatcmpl-race-coalesced-win",
                                       "object": "chat.completion",
-                                      "model": "minimax-m2.5-nvidia",
+                                      "model": "minimax-m2.7-nvidia",
                                       "choices": [
                                         {
                                           "index": 0,
@@ -8461,7 +8461,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(deliveredResponseCount, 2, "coalesced raced winners should be delivered to both callers", recorder: recorder)
-                expectEqual(modelInvocationCounts["minimax-m2.5-nvidia"] ?? 0, 1, "winning raced NVIDIA lane should only open one upstream transport across both requests", recorder: recorder)
+                expectEqual(modelInvocationCounts["minimax-m2.7-nvidia"] ?? 0, 1, "winning raced NVIDIA lane should only open one upstream transport across both requests", recorder: recorder)
                 expectEqual(modelInvocationCounts["kimi-k2.5-nvidia"] ?? 0, 1, "losing raced NVIDIA lane should only open one upstream transport across both requests", recorder: recorder)
                 expectEqual(kimiCanceled, true, "winning a coalesced raced lane should still cancel the losing NVIDIA transport", recorder: recorder)
             }
@@ -8496,14 +8496,14 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-invalid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5-nvidia",
+                                  "model": "minimax-m2.7-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -8646,14 +8646,14 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
                                   "id": "chatcmpl-fallback-valid",
                                   "object": "chat.completion",
-                                  "model": "minimax-m2.5-nvidia",
+                                  "model": "minimax-m2.7-nvidia",
                                   "choices": [
                                     {
                                       "index": 0,
@@ -8733,7 +8733,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia"], "worker should treat malformed primary 200 bodies as retryable candidate failures, exhaust the free serial fallbacks, then race the NVIDIA fallbacks", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.7-nvidia", "kimi-k2.5-nvidia"], "worker should treat malformed primary 200 bodies as retryable candidate failures, exhaust the free serial fallbacks, then race the NVIDIA fallbacks", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still return a successful fallback response after a malformed primary 200", recorder: recorder)
                 expectNil(deliveredMessage, "worker should not surface an error when a later fallback returns a valid response", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -8913,7 +8913,7 @@ struct ThinkingProxyPolicySpec {
                                 error: nil
                             )
                         )
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         completion(
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("{\"error\":\"bad request\"}".utf8),
@@ -8993,7 +8993,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.5-nvidia", "kimi-k2.5-nvidia", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the free serial legs fail and the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "mimo-v2-pro-opencode", "mimo-v2-pro-kilocode", "minimax-m2.5-opencode", "minimax-m2.7-nvidia", "kimi-k2.5-nvidia", "gpt-5.4-medium"], "worker should continue to the deferred last-resort backend after the free serial legs fail and the raced NVIDIA fallbacks only return terminal outcomes", recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should still succeed once the deferred last-resort backend returns a valid response", recorder: recorder)
                 expectNil(deliveredMessage, "worker should not surface an error when the deferred last-resort backend succeeds", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -9561,7 +9561,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "worker should exhaust every configured candidate before surfacing failure", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should return one retryable 429 when every configured candidate is in a quota window", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream rate-limit window reached for worker; retry when the provider window resets.", "worker should emit the quota-window retry guidance after exhausting the pool", recorder: recorder)
             }
@@ -9643,7 +9643,7 @@ struct ThinkingProxyPolicySpec {
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotByRequestModel()
                 expectEqual(deliveredStatus, 503, "the final retryable worker candidate should still surface a 503 terminal exhaustion error", recorder: recorder)
-                expectEqual(Set(seenNVIDIAModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "the exhausted-last-candidate regression should terminate on the raced NVIDIA rescue lanes", recorder: recorder)
+                expectEqual(Set(seenNVIDIAModels), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "the exhausted-last-candidate regression should terminate on the raced NVIDIA rescue lanes", recorder: recorder)
                 expectEqual(snapshot["glm5-nvidia"]?.failureScore, 2.0, "one classified 5xx worker failure should apply the configured 5xx penalty to the GLM rescue lane", recorder: recorder)
                 expectEqual(snapshot["glm5-nvidia"]?.rollingMetrics.recentOutcomes.count, 1, "the GLM rescue lane should add exactly one failure event to rolling metrics", recorder: recorder)
                 expectEqual(snapshot["glm5-nvidia"]?.status, .suspect, "one exhausted worker failure should degrade the GLM rescue lane once instead of opening it immediately", recorder: recorder)
@@ -9843,7 +9843,7 @@ struct ThinkingProxyPolicySpec {
                     return
                 }
 
-                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "worker should give the preferred primary one bounded retry, then advance through the rest of the pool instead of spinning indefinitely", recorder: recorder)
+                expectEqual(seenModels, ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "worker should give the preferred primary one bounded retry, then advance through the rest of the pool instead of spinning indefinitely", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "worker should surface a retryable concurrency error when every pool lane is saturated", recorder: recorder)
                 expectEqual(deliveredMessage, "Upstream concurrency limit reached for worker; retry shortly.", "worker should return the public worker concurrency guidance after exhausting the pool", recorder: recorder)
             }
@@ -10143,7 +10143,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(seenModels.first, "muse-spark", "worker should attempt muse-spark first before failing over after a retryable meta adapter 400", recorder: recorder)
                 let racedRescueLanes = Set(seenModels.dropFirst())
                 expectEqual(
-                    racedRescueLanes.isSubset(of: Set(["minimax-m2.5-nvidia", "kimi-k2.5-nvidia"])),
+                    racedRescueLanes.isSubset(of: Set(["minimax-m2.7-nvidia", "kimi-k2.5-nvidia"])),
                     true,
                     "worker should only fan out across the NVIDIA rescue race after a retryable meta adapter 400",
                     recorder: recorder
@@ -10277,7 +10277,7 @@ struct ThinkingProxyPolicySpec {
 
                 expectEqual(
                     seenModels,
-                    ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"],
+                    ["glm-5.1-zai", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"],
                     "the observed worker failure mix should perform the bounded ZAI concurrency retry, then traverse the fallback chain before landing on nvidia",
                     recorder: recorder
                 )
@@ -10388,7 +10388,7 @@ struct ThinkingProxyPolicySpec {
                 )
                 expectEqual(
                     Set(seenModels.dropFirst(2)),
-                    Set(["glm5-nvidia", "kimi-k2.5-nvidia"]),
+                    Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]),
                     "the observed 502 chain should open both NVIDIA rescue lanes once the serial free providers are exhausted",
                     recorder: recorder
                 )
@@ -10408,7 +10408,7 @@ struct ThinkingProxyPolicySpec {
                   "object": "list",
                   "data": [
                     {"id": "glm-5.1", "object": "model", "owned_by": "zai"},
-                    {"id": "minimax-m2.5-nvidia", "object": "model", "owned_by": "nvidia"},
+                    {"id": "minimax-m2.7-nvidia", "object": "model", "owned_by": "nvidia"},
                     {"id": "kimi-k2.5-nvidia", "object": "model", "owned_by": "nvidia"}
                   ]
                 }
@@ -10419,7 +10419,7 @@ struct ThinkingProxyPolicySpec {
 
                 let until = Date().addingTimeInterval(60)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1", until: until)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-nvidia", until: until)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
 
                 guard let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8)) else {
@@ -10470,18 +10470,18 @@ struct ThinkingProxyPolicySpec {
                   "object": "list",
                   "data": [
                     {"id": "glm-5.1", "object": "model", "owned_by": "zai"},
-                    {"id": "minimax-m2.5-nvidia", "object": "model", "owned_by": "nvidia"},
+                    {"id": "minimax-m2.7-nvidia", "object": "model", "owned_by": "nvidia"},
                     {"id": "kimi-k2.5-nvidia", "object": "model", "owned_by": "nvidia"}
                   ]
                 }
                 """
                 let expired = Date().addingTimeInterval(-60)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1", until: expired)
-                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.5-nvidia", until: expired)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-nvidia", until: expired)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: expired)
 
                 expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "glm-5.1"), false, "expired cooldown windows should make worker primaries eligible for live traffic again", recorder: recorder)
-                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "minimax-m2.5-nvidia"), false, "expired cooldown windows should make raced fallbacks eligible again", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.isConfiguredRouteOpen(forRequestModel: "minimax-m2.7-nvidia"), false, "expired cooldown windows should make raced fallbacks eligible again", recorder: recorder)
 
                 let filtered = OpenAICompatTemporaryShim.filteredModelListBodyRemovingOpenNVIDIARoutes(Data(body.utf8))
                 expectNil(filtered, "healthy cooldown-expired worker candidates should leave /v1/models unchanged instead of re-injecting the smart alias", recorder: recorder)
@@ -12141,7 +12141,7 @@ struct ThinkingProxyPolicySpec {
                             error: nil
                         )
                     )
-                    if model == "glm5-nvidia" || model == "minimax-m2.5-nvidia" || model == "kimi-k2.5-nvidia" {
+                    if model == "glm5-nvidia" || model == "minimax-m2.7-nvidia" || model == "kimi-k2.5-nvidia" {
                         recorder.recordFailure("NVIDIA worker candidates should no longer use the buffered proxy seam")
                     }
                 }
@@ -12196,7 +12196,7 @@ struct ThinkingProxyPolicySpec {
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 expectEqual(deliveredStatus, 200, "worker should deliver the buffered NVIDIA fallback response successfully", recorder: recorder)
                 expectEqual(
-                    Set(["glm5-nvidia", "kimi-k2.5-nvidia"]).contains(seenNvidiaModel ?? ""),
+                    Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]).contains(seenNvidiaModel ?? ""),
                     true,
                     "worker should hand one of the configured direct NVIDIA fallback candidates to the transport boundary",
                     recorder: recorder
@@ -12324,7 +12324,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredStatus, 200, "worker live NVIDIA fallback should deliver a 200 response", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "worker live NVIDIA fallback should preserve SSE headers", recorder: recorder)
                 expectEqual(
-                    Set(["glm5-nvidia", "kimi-k2.5-nvidia"]).contains(seenNvidiaModel ?? ""),
+                    Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]).contains(seenNvidiaModel ?? ""),
                     true,
                     "worker live NVIDIA fallback should still hand the direct transport one of the concrete NVIDIA candidates",
                     recorder: recorder
@@ -12483,7 +12483,7 @@ struct ThinkingProxyPolicySpec {
                     lock.unlock()
 
                     switch model {
-                    case "minimax-m2.5-nvidia":
+                    case "minimax-m2.7-nvidia":
                         let firstChunk = Data("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n".utf8)
                         let doneChunk = Data("data: [DONE]\n\n".utf8)
                         let meaningfulOutput = DispatchWorkItem {
@@ -12584,7 +12584,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(deliveredText.contains("\"content\":\"OK\""), true, "nvidia-race should deliver the winner's content, not the canceled loser's payload", recorder: recorder)
                 expectEqual(deliveredText.contains("\"content\":\"SLOW\""), false, "nvidia-race should suppress the canceled loser's streamed content", recorder: recorder)
                 expectEqual(kimiCanceled, true, "nvidia-race should cancel the faster losing NVIDIA race lane after the first meaningful output locks the winner", recorder: recorder)
-                expectEqual(Set(seenNvidiaModels), Set(["minimax-m2.5-nvidia", "kimi-k2.5-nvidia"]), "nvidia-race should still open the raced NVIDIA candidates before the winner lock cancels the loser", recorder: recorder)
+                expectEqual(Set(seenNvidiaModels), Set(["minimax-m2.7-nvidia", "kimi-k2.5-nvidia"]), "nvidia-race should still open the raced NVIDIA candidates before the winner lock cancels the loser", recorder: recorder)
             }
         }
 
@@ -13107,7 +13107,7 @@ struct ThinkingProxyPolicySpec {
                     headerFields: ["Content-Type": "application/json"]
                 )
                 let initialState = OpenAICompatTemporaryShim.NVIDIARetryState(
-                    model: "minimax-m2.5-nvidia",
+                    model: "minimax-m2.7-nvidia",
                     initialTransportRetries: 0,
                     initialSemanticRetries: 1,
                     transportRetriesRemaining: 0,
@@ -13574,7 +13574,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5-nvidia",
+                    model: "minimax-m2.7-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -13600,7 +13600,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5-nvidia",
+                    model: "minimax-m2.7-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -14143,7 +14143,7 @@ struct ThinkingProxyPolicySpec {
                 """
 
                 let evaluation = OpenAICompatTemporaryShim.evaluateNvidiaReasoningResponse(
-                    model: "minimax-m2.5-nvidia",
+                    model: "minimax-m2.7-nvidia",
                     statusCode: 200,
                     bodyData: Data(response.utf8)
                 )
@@ -14611,7 +14611,7 @@ struct ThinkingProxyPolicySpec {
                     let multiTypedToolChat = requestShapes?["multi_tool_typed_content"] as? [String: Any]
                     let streamingMultiTypedToolChat = requestShapes?["streaming_multi_tool_typed_content"] as? [String: Any]
 
-                    let recoveredNVIDIAModels: Set<String> = ["glm5-nvidia", "kimi-k2.5-nvidia"]
+                    let recoveredNVIDIAModels: Set<String> = ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
                     let effectiveWorkerModel = factoryWorker?["effective_route_model"] as? String
                     let plainChatModel = plainChat?["effective_route_model"] as? String
                     let toolChatModel = toolChat?["effective_route_model"] as? String
@@ -14910,7 +14910,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let deferredUntil = Date().addingTimeInterval(30)
-                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"].forEach { requestModel in
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"].forEach { requestModel in
                         OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
                             forRequestModel: requestModel,
                             until: deferredUntil
@@ -14974,7 +14974,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                     let deferredUntil = Date().addingTimeInterval(30)
-                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"].forEach { requestModel in
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"].forEach { requestModel in
                         OpenAICompatTemporaryShim.recordRouteAvailabilityDeferral(
                             forRequestModel: requestModel,
                             until: deferredUntil
@@ -15070,12 +15070,12 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(toolChat?["ready"] as? Bool, true, "tool-bearing string-content worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
                     expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed-content worker health should stay on the remaining NVIDIA lane when the request is shimmed into a dispatchable form", recorder: recorder)
                     expectEqual(typedToolChat?["ready"] as? Bool, true, "typed-content worker health should stay ready when the remaining NVIDIA lane can still dispatch the shimmed request", recorder: recorder)
-                    expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia"], "typed-content worker health should expose every shim-dispatchable NVIDIA lane explicitly", recorder: recorder)
+                    expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "typed-content worker health should expose every shim-dispatchable NVIDIA lane explicitly", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming typed worker health should stay on NVIDIA once buffered upstream execution restores that request shape", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should advertise NVIDIA once the buffered streaming worker surface is supported", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should stop classifying NVIDIA as exhausted once the buffered streaming shape is dispatchable", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should be ready when the remaining NVIDIA lane can dispatch that shape through buffered upstream execution", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia"], "streaming typed worker health should expose every buffered-dispatchable NVIDIA lane explicitly", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "streaming typed worker health should expose every buffered-dispatchable NVIDIA lane explicitly", recorder: recorder)
                     expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool typed worker health should stop advertising NVIDIA when the remaining route is only a typed NVIDIA fallback", recorder: recorder)
                     expectEqual(multiTypedToolChat?["ready"] as? Bool, false, "multi-tool typed worker health should stay unready when only typed NVIDIA fallbacks remain", recorder: recorder)
                     expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "streaming multi-tool typed worker health should stop advertising NVIDIA when the remaining route is only a typed NVIDIA fallback", recorder: recorder)
@@ -15887,7 +15887,7 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     expectEqual(Array(seenModels.prefix(4)), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"], "self-routed worker requests should still exhaust the serial worker pool before entering the NVIDIA rescue race", recorder: recorder)
-                    expectEqual(Set(seenModels.dropFirst(4)), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "self-routed worker saturation should open both raced NVIDIA rescue lanes before surfacing the retryable quota-window limit", recorder: recorder)
+                    expectEqual(Set(seenModels.dropFirst(4)), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "self-routed worker saturation should open both raced NVIDIA rescue lanes before surfacing the retryable quota-window limit", recorder: recorder)
                     expectEqual(deliveredStatus, 429, "shared-pool saturation should surface as a retryable quota-window limit once every candidate is exhausted", recorder: recorder)
                     expectEqual(deliveredMessage, "Upstream rate-limit window reached for \(selfRoutedGenericCompatFactoryWorkerContract.workerModelID); retry when the provider window resets.", "shared-pool saturation should preserve the caller-visible worker model identity in the retryable quota-window error", recorder: recorder)
 
@@ -15986,7 +15986,7 @@ struct ThinkingProxyPolicySpec {
                         }
 
                         expectEqual(Array(seenModels.prefix(4)), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"], "self-routed worker \(statusCode) exhaustion should still exhaust the serial worker pool before entering the NVIDIA rescue race", recorder: recorder)
-                        expectEqual(Set(seenModels.dropFirst(4)), Set(["glm5-nvidia", "kimi-k2.5-nvidia"]), "self-routed worker \(statusCode) exhaustion should still open both raced NVIDIA rescue lanes before surfacing a terminal failure", recorder: recorder)
+                        expectEqual(Set(seenModels.dropFirst(4)), Set(["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]), "self-routed worker \(statusCode) exhaustion should still open both raced NVIDIA rescue lanes before surfacing a terminal failure", recorder: recorder)
                         expectEqual(deliveredStatus, statusCode, "self-routed worker \(statusCode) exhaustion should preserve the truthful upstream status instead of rewriting it to 429", recorder: recorder)
                         expectEqual(deliveredMessage, expectedMessage, "self-routed worker \(statusCode) exhaustion should preserve the truthful terminal error message", recorder: recorder)
                     }
@@ -16495,10 +16495,10 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
                 let candidates = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
-                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"]
+                    ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
                 )
 
-                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
+                expectEqual(candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "worker candidate ordering should remain deterministic and primary-first", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -16508,7 +16508,7 @@ struct ThinkingProxyPolicySpec {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 let now = Date()
-                let allCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"]
+                let allCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
 
                 for candidate in allCandidates.dropLast() {
                     OpenAICompatTemporaryShim.forceOpenRouteForTesting(
@@ -16529,7 +16529,7 @@ struct ThinkingProxyPolicySpec {
                     candidateModelsRemaining: allCandidates
                 )
 
-                expectEqual(transition?.model, "kimi-k2.5-nvidia", "when the primary candidates are quarantined, the deterministic last remaining worker fallback should now be the Kimi rescue lane", recorder: recorder)
+                expectEqual(transition?.model, "minimax-m2.7-nvidia", "when the primary candidates are quarantined, the deterministic last remaining worker fallback should now be the minimax NVIDIA rescue lane", recorder: recorder)
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
@@ -16843,11 +16843,11 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
 
                 let ranked = OpenAICompatTemporaryShim.rankedSmartAliasFallbackCandidateModels(
-                    ["minimax-m2.5-nvidia", "glm5"]
+                    ["minimax-m2.7-nvidia", "glm5"]
                 )
                 expectEqual(
                     ranked,
-                    ["minimax-m2.5-nvidia", "glm5"],
+                    ["minimax-m2.7-nvidia", "glm5"],
                     "when candidate health scores are tied and there is no route telemetry yet, ranking should stay stable and preserve the configured input order",
                     recorder: recorder
                 )
@@ -17337,6 +17337,7 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: until)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-nvidia", until: until)
 
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -17413,6 +17414,7 @@ struct ThinkingProxyPolicySpec {
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: until)
                 OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-nvidia", until: until)
 
                 let proxy = ThinkingProxy()
                 let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
@@ -18308,8 +18310,8 @@ private func defaultMergedConfigYAML() -> String {
         "- name: nvidia-minimax",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: minimax-m2.5-nvidia",
-        "    name: minimaxai/minimax-m2.5"
+        "  - alias: minimax-m2.7-nvidia",
+        "    name: minimaxai/minimax-m2.7"
     ].joined(separator: "\n")
 }
 
@@ -18416,7 +18418,7 @@ private func renamedAliasMergedConfigYAML() -> String {
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
         "  - alias: minimax-custom",
-        "    name: minimaxai/minimax-m2.5"
+        "    name: minimaxai/minimax-m2.7"
     ].joined(separator: "\n")
 }
 
@@ -18451,6 +18453,13 @@ private func workerMergedConfigYAML() -> String {
         "    name: z-ai/glm5",
         "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.7-nvidia",
+        "    name: minimaxai/minimax-m2.7",
         "- name: meta-web",
         "  api-key: test-meta-web-key",
         "  base-url: https://www.meta.ai",
@@ -18468,7 +18477,8 @@ private func workerMergedConfigYAML() -> String {
         "    - minimax-m2.7-ollama-pro",
         "    - muse-spark",
         "    - glm5-nvidia",
-        "    - kimi-k2.5-nvidia"
+        "    - kimi-k2.5-nvidia",
+        "    - minimax-m2.7-nvidia"
     ].joined(separator: "\n")
 }
 
@@ -18503,6 +18513,13 @@ private func workerWithProxyMergedConfigYAML() -> String {
         "    name: z-ai/glm5",
         "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.7-nvidia",
+        "    name: minimaxai/minimax-m2.7",
         "- name: meta-web",
         "  api-key: test-meta-web-key",
         "  base-url: https://www.meta.ai",
@@ -18534,7 +18551,8 @@ private func workerWithProxyMergedConfigYAML() -> String {
         "    - minimax-m2.7-ollama-pro",
         "    - muse-spark",
         "    - glm5-nvidia",
-        "    - kimi-k2.5-nvidia"
+        "    - kimi-k2.5-nvidia",
+        "    - minimax-m2.7-nvidia"
     ].joined(separator: "\n")
 }
 
@@ -18563,10 +18581,17 @@ private func workerNvidiaRaceMergedConfigYAML() -> String {
         "  - api-key: test-nvidia-key",
         "  base-url: https://integrate.api.nvidia.com/v1",
         "  models:",
-        "  - alias: minimax-m2.5-nvidia",
-        "    name: minimaxai/minimax-m2.5",
+        "  - alias: minimax-m2.7-nvidia",
+        "    name: minimaxai/minimax-m2.7",
         "  - alias: kimi-k2.5-nvidia",
         "    name: moonshotai/kimi-k2.5",
+        "- name: nvidia-minimax",
+        "  api-key-entries:",
+        "  - api-key: test-nvidia-key",
+        "  base-url: https://integrate.api.nvidia.com/v1",
+        "  models:",
+        "  - alias: minimax-m2.7-nvidia",
+        "    name: minimaxai/minimax-m2.7",
         "- name: meta-web",
         "  api-key: test-meta-web-key",
         "  base-url: https://www.meta.ai",
@@ -18583,7 +18608,7 @@ private func workerNvidiaRaceMergedConfigYAML() -> String {
         "    - glm-5.1-ollama-pro",
         "    - minimax-m2.7-ollama-pro",
         "    - muse-spark",
-        "    - minimax-m2.5-nvidia",
+        "    - minimax-m2.7-nvidia",
         "    - kimi-k2.5-nvidia"
     ].joined(separator: "\n")
 }
