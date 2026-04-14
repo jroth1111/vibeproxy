@@ -17221,6 +17221,501 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        // MARK: - Track 1: Terminal Delivery Regression Tests (A.1)
+
+        run("worker smart alias delivers terminal success after first candidate fails over with 429", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_error\"}}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "glm-5.1-ollama-pro":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-terminal-failover-regression",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-ollama-pro",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should deliver a terminal response after first candidate fails over")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should deliver success from the second candidate after the first fails with 429", recorder: recorder)
+                lock.lock()
+                let models = seenModels
+                lock.unlock()
+                expectTrue(models.contains("glm-5.1-zai"), "worker should attempt the first candidate before failing over", recorder: recorder)
+                expectTrue(models.contains("glm-5.1-ollama-pro"), "worker should attempt the second candidate as failover", recorder: recorder)
+                let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                expectEqual(deliveredJSON["model"] as? String, "worker", "worker should preserve the outward alias in the terminal failover response", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("worker smart alias delivers terminal retryable failure when remaining candidates return 429 window exhaustion", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let until = Date().addingTimeInterval(300)
+                // Force most routes open so only 2 candidates remain
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":{\"message\":\"Too many requests. Please try again in 300s.\",\"type\":\"rate_limit_error\",\"code\":\"1305\"}}".utf8),
+                            response: httpURLResponse(statusCode: 429),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 4) == .success else {
+                    recorder.recordFailure("worker should deliver a terminal response when remaining candidates return 429")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectTrue(deliveredStatus != nil, "worker should deliver a terminal status when remaining candidates return 429 window exhaustion", recorder: recorder)
+
+                lock.lock()
+                let models = seenModels
+                lock.unlock()
+                expectTrue(models.contains("glm-5.1-ollama-pro"), "worker should attempt the remaining dispatchable candidate before terminal delivery", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("worker smart alias delivers terminal generic unavailable when all dispatchable routes are open", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let until = Date().addingTimeInterval(300)
+                // Force all routes open so no candidates remain
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm5-nvidia", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("worker should deliver a terminal error when all routes are circuit-broken")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectTrue(deliveredStatus != nil, "worker should deliver a terminal error status when all routes are circuit-broken", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("worker smart alias does not double-deliver after cancellation suppresses a late result", recorder: recorder) {
+            #if DEBUG
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let accepted = DispatchSemaphore(value: 0)
+                let clientReady = DispatchSemaphore(value: 0)
+                let transportStarted = DispatchSemaphore(value: 0)
+                let upstreamCancelled = DispatchSemaphore(value: 0)
+                let unexpectedSecondDelivery = DispatchSemaphore(value: 0)
+                let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.terminal-no-double-deliver.listener")
+                let connectionQueue = DispatchQueue(label: "thinkingproxy-policy.terminal-no-double-deliver.connection")
+                let lock = NSLock()
+                var serverConnection: NWConnection?
+                var deliveryCount = 0
+
+                guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                    recorder.recordFailure("should create a local listener for no-double-deliver testing")
+                    return
+                }
+
+                listener.newConnectionHandler = { connection in
+                    serverConnection = connection
+                    connection.start(queue: connectionQueue)
+                    accepted.signal()
+                }
+                listener.start(queue: listenerQueue)
+
+                guard let port = listener.port else {
+                    recorder.recordFailure("listener should expose an ephemeral port")
+                    listener.cancel()
+                    return
+                }
+
+                let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+                client.stateUpdateHandler = { state in
+                    if case .ready = state { clientReady.signal() }
+                }
+                client.start(queue: connectionQueue)
+
+                guard clientReady.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client should connect before testing")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                guard accepted.wait(timeout: .now() + 2) == .success,
+                      let serverConnection else {
+                    recorder.recordFailure("listener should accept the client")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, _, _, completion in
+                    transportStarted.signal()
+                    // Return a delayed first attempt error (429) then a late success after cancel
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":{\"message\":\"rate limited\"}}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                    }
+                    return {
+                        upstreamCancelled.signal()
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    lock.lock()
+                    deliveryCount += 1
+                    if deliveryCount > 1 {
+                        unexpectedSecondDelivery.signal()
+                    }
+                    lock.unlock()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    lock.lock()
+                    deliveryCount += 1
+                    if deliveryCount > 1 {
+                        unexpectedSecondDelivery.signal()
+                    }
+                    lock.unlock()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: serverConnection
+                )
+
+                guard transportStarted.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("transport should start before disconnect")
+                    client.cancel()
+                    serverConnection.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                // Disconnect the client before the response can be delivered
+                client.cancel()
+
+                guard upstreamCancelled.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("upstream cancel should fire after client disconnect")
+                    serverConnection.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                if unexpectedSecondDelivery.wait(timeout: .now() + 0.5) == .success {
+                    recorder.recordFailure("worker should not deliver more than one response after cancellation during failover")
+                }
+
+                serverConnection.cancel()
+                listener.cancel()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+            #endif
+        }
+
+        run("worker smart alias delivers typed high-tool content through full failover chain", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var seenContents: [String] = []
+                var deliveredStatus: Int?
+                var deliveredBody: Data?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    let messages = json["messages"] as? [[String: Any]]
+                    let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                    lock.lock()
+                    seenModels.append(model)
+                    seenContents.append(assistantContent)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm-5.1-zai":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":{\"message\":\"rate limited\"}}".utf8),
+                                response: httpURLResponse(statusCode: 429),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "glm-5.1-ollama-pro":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-typed-failover",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-ollama-pro",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, body in
+                    deliveredStatus = statusCode
+                    deliveredBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    delivered.signal()
+                }
+
+                let incidentRequestShape = """
+                {
+                  "model": "worker",
+                  "stream": false,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo status"},
+                        {"type": "reasoning", "text": "analyzing code"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}},
+                    {"type": "function", "function": {"name": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: incidentRequestShape
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 3) == .success else {
+                    recorder.recordFailure("typed high-tool worker request should deliver through the failover chain")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "typed high-tool worker request should succeed after failover", recorder: recorder)
+                lock.lock()
+                let models = seenModels
+                let contents = seenContents
+                lock.unlock()
+                expectTrue(models.contains("glm-5.1-zai"), "typed high-tool worker should attempt the first candidate", recorder: recorder)
+                expectTrue(models.contains("glm-5.1-ollama-pro"), "typed high-tool worker should fail over to the second candidate", recorder: recorder)
+                // Verify typed content was flattened before upstream dispatch
+                let firstFlattened = contents.first ?? ""
+                expectTrue(firstFlattened.contains("Checked "), "typed content arrays should be flattened for upstream dispatch (input_text)", recorder: recorder)
+                expectTrue(firstFlattened.contains("repo status"), "typed content arrays should be flattened for upstream dispatch (summary_text)", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
