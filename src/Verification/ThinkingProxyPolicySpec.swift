@@ -17138,6 +17138,89 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("NVIDIA preflight passes on transformRequest-normalized factory worker body", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "custom:Proxy-Worker-Smart-Router-8",
+                  "stream": true,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo"},
+                        {"type": "reasoning", "text": "hidden chain of thought"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "noop",
+                        "parameters": {"type": "object", "properties": {}}
+                      }
+                    }
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                // Simulate the buffering that smartAliasCompatibleCandidateBody applies for NVIDIA
+                var bodyJSON = parseJSONObject(transformed, recorder: recorder)
+                bodyJSON["stream"] = false
+                guard let bufferedData = try? JSONSerialization.data(withJSONObject: bodyJSON, options: [.sortedKeys]) else {
+                    recorder.recordFailure("failed to re-serialize buffered body for preflight check")
+                    return
+                }
+                let bufferedString = String(data: bufferedData, encoding: .utf8)!
+
+                let preflightError = OpenAICompatTemporaryShim.configuredRoutePreflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: bufferedString,
+                    headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
+                )
+
+                expectNil(preflightError, "NVIDIA preflight should pass after transformRequest normalizes typed content and stream is buffered", recorder: recorder)
+            }
+        }
+
+        run("transformRequest preserves plain string content for non-alias models unchanged", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "glm5",
+                  "messages": [
+                    {"role": "user", "content": "Hello world"}
+                  ]
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                // transformRequest returns nil when no transformation is needed — that's the correct outcome
+                let resultString = transformed ?? request
+                let json = parseJSONObject(resultString, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                let content = messages?.first?["content"] as? String
+                expectEqual(content, "Hello world", "transformRequest should preserve plain string content for non-alias models", recorder: recorder)
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
