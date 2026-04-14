@@ -19792,6 +19792,37 @@ class ThinkingProxy {
         return "route_unavailable"
     }
 
+    private static func recentWinnerIsViableForShape(
+        _ recentWinner: OpenAICompatTemporaryShim.RecentSmartAliasWinner,
+        requestShape: FactoryWorkerHealthRequestShape
+    ) -> Bool {
+        // For typed-content and multi-tool shapes, the recent winner must be in
+        // closed route health state and observed within the last 30 minutes.
+        // Half-open or suspect routes may have stale evidence that doesn't reflect
+        // current provider behavior for complex request shapes.
+        let isTypedShape = requestShape == .streamingMultiTypedToolChat ||
+                           requestShape == .multiTypedToolChat ||
+                           requestShape == .streamingTypedToolChat ||
+                           requestShape == .typedToolChat
+        guard isTypedShape else {
+            return true
+        }
+
+        // Freshness gate: recent winner must have been observed within 30 minutes
+        let stalenessThreshold: TimeInterval = 30 * 60
+        guard Date().timeIntervalSince(recentWinner.timestamp) < stalenessThreshold else {
+            return false
+        }
+
+        // Health gate: recent winner must be in closed state
+        if let routeState = OpenAICompatTemporaryShim.routeHealthState(forRequestModel: recentWinner.requestModel),
+           routeState.status != .closed {
+            return false
+        }
+
+        return true
+    }
+
     private static func factoryWorkerRequestShapeContracts(
         routeModel: String,
         routeProvider: String,
@@ -19842,7 +19873,8 @@ class ThinkingProxy {
                 OpenAICompatTemporaryShim.recentSmartAliasWinner(forRequestedAlias: alias)
             }.first(where: { recentWinner in
                 dispatchableCandidateModels.contains(recentWinner.requestModel) &&
-                factoryWorkerHealthRequestShape(forObservedRequestShape: recentWinner.requestShape) == requestShape
+                factoryWorkerHealthRequestShape(forObservedRequestShape: recentWinner.requestShape) == requestShape &&
+                recentWinnerIsViableForShape(recentWinner, requestShape: requestShape)
             })
             let recentDispatch = recentWinnerAliases.lazy.compactMap { alias in
                 OpenAICompatTemporaryShim.recentSmartAliasDispatch(forRequestedAlias: alias)
