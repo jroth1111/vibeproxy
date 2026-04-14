@@ -927,7 +927,8 @@ enum OpenAICompatTemporaryShim {
         ("glm-5-turbo", "glm-5.1"),
         // Canonical GLM requests should stabilize onto the public direct alias, not the
         // probe/debug-only alias.
-        ("z-ai/glm5", "glm5-nvidia")
+        ("z-ai/glm5", "glm5-nvidia"),
+        ("moonshotai/kimi-k2.5", "kimi-k2.5-nvidia")
     ]
     private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
         legacyRequestModelRewriteEntries,
@@ -1523,17 +1524,32 @@ enum OpenAICompatTemporaryShim {
 
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     // Keep provider-backed direct aliases distinct from any resilient smart alias.
-    // `glm5-nvidia` is the public direct NVIDIA route; the smart alias must not shadow it.
+    // Public direct NVIDIA routes are caller-visible only when the lane is freshly trusted.
     fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia"
+    fileprivate static let publicKimiNVIDIADirectAlias = "kimi-k2.5-nvidia"
     private static let publicNVIDIASmartAlias = "glm5-nvidia-smart"
+    private static let publicKimiNVIDIASmartAlias = "kimi-k2.5-nvidia-smart"
     fileprivate static let debugNVIDIADirectAlias = "glm5-nvidia-direct"
     private static let directNVIDIAAccessHeader = "X-VibeProxy-Allow-Direct-NVIDIA"
-    private static let publicNVIDIASmartAliasCandidateModels = [
+    private static let publicNVIDIASmartAliasCandidateModelsByAlias: [String: [String]] = [
+        publicNVIDIASmartAlias: [
         "glm5-nvidia",
         "glm-5.1-zai",
         "glm-5.1-ollama-pro",
         "minimax-m2.7-ollama-pro",
         "muse-spark"
+    ],
+        publicKimiNVIDIASmartAlias: [
+        "kimi-k2.5-nvidia",
+        "glm-5.1-zai",
+        "glm-5.1-ollama-pro",
+        "minimax-m2.7-ollama-pro",
+        "muse-spark"
+    ]
+    ]
+    private static let publicNVIDIASmartAliasByDirectAlias: [String: String] = [
+        publicNVIDIADirectAlias: publicNVIDIASmartAlias,
+        publicKimiNVIDIADirectAlias: publicKimiNVIDIASmartAlias
     ]
     fileprivate static let canonicalFactoryWorkerModelID = "custom:Proxy-Worker-Smart-Router-8"
     static let canonicalWorkerPoolCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia"]
@@ -1564,14 +1580,26 @@ enum OpenAICompatTemporaryShim {
         requestModel == canonicalFactoryWorkerModelID || codeOwnedFactoryWorkerRescueModelIDs.contains(requestModel)
     }
 
+    private static func primaryNVIDIACandidate(forSmartAlias alias: String) -> String? {
+        publicNVIDIASmartAliasCandidateModelsByAlias[alias]?.first
+    }
+
+    private static func publicNVIDIASmartAlias(forDirectRequestModel requestModel: String) -> String? {
+        publicNVIDIASmartAliasByDirectAlias[normalizedRequestModel(requestModel)]
+    }
+
+    fileprivate static func isPublicNVIDIADirectAlias(_ requestModel: String) -> Bool {
+        publicNVIDIASmartAlias(forDirectRequestModel: requestModel) != nil
+    }
+
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
         let requestModel = normalizedRequestModel(requestModel)
-        if requestModel == publicNVIDIASmartAlias {
+        if let candidates = publicNVIDIASmartAliasCandidateModelsByAlias[requestModel] {
             return SmartAliasDefinition(
-                alias: publicNVIDIASmartAlias,
+                alias: requestModel,
                 requestClass: "plain-chat",
                 failover: "silent",
-                candidates: publicNVIDIASmartAliasCandidateModels,
+                candidates: candidates,
                 healthSensitivity: .balanced
             )
         }
@@ -1634,12 +1662,11 @@ enum OpenAICompatTemporaryShim {
         _ candidateModels: [String],
         publicAlias: String
     ) -> [String] {
-        guard publicAlias == publicNVIDIASmartAlias,
-              !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) else {
+        guard let nvidiaCandidate = primaryNVIDIACandidate(forSmartAlias: publicAlias),
+              !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: nvidiaCandidate) else {
             return candidateModels
         }
-        guard let nvidiaCandidate = publicNVIDIASmartAliasCandidateModels.first,
-              candidateModels.contains(nvidiaCandidate) else {
+        guard candidateModels.contains(nvidiaCandidate) else {
             return candidateModels
         }
         return candidateModels.filter { $0 != nvidiaCandidate } + [nvidiaCandidate]
@@ -1790,9 +1817,8 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> Set<String> {
-        if publicAlias == publicNVIDIASmartAlias,
-           let nvidiaCandidate = publicNVIDIASmartAliasCandidateModels.first,
-           !hasRecentLiveInferenceSuccess(forRequestModel: publicNVIDIASmartAlias) {
+        if let nvidiaCandidate = primaryNVIDIACandidate(forSmartAlias: publicAlias),
+           !hasRecentLiveInferenceSuccess(forRequestModel: nvidiaCandidate) {
             return [nvidiaCandidate]
         }
         // No request class gets a hidden worker-specific probe lane. Candidate selection and
@@ -2046,12 +2072,18 @@ enum OpenAICompatTemporaryShim {
         } else {
             preflightCandidateBody = effectiveCandidateBody
         }
+        let internalPreflightHeaders: [(String, String)]
+        if candidateRoute?.providerID == "nvidia" {
+            internalPreflightHeaders = [(directNVIDIAAccessHeader, "1")]
+        } else {
+            internalPreflightHeaders = []
+        }
         if applyProviderAwarePreflight,
            let preflightError = configuredRoutePreflightError(
             method: method,
             path: path,
             jsonString: preflightCandidateBody,
-            headers: []
+            headers: internalPreflightHeaders
            ) {
             let reason = [
                 "provider_preflight_\(preflightError.statusCode)",
@@ -2265,6 +2297,25 @@ enum OpenAICompatTemporaryShim {
         return allowHeader == "1" || allowHeader == "true" || allowHeader == "yes"
     }
 
+    private static func directNVIDIATrustPreflightFailure(
+        forRequestModel requestModel: String,
+        headers: [(String, String)]
+    ) -> ClientFacingNVIDIAFailure? {
+        let normalizedModel = normalizedRequestModel(requestModel)
+        guard isPublicNVIDIADirectAlias(normalizedModel),
+              !allowsExplicitNVIDIADirectAccess(headers: headers),
+              !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: normalizedModel) else {
+            return nil
+        }
+
+        let smartAlias = publicNVIDIASmartAlias(forDirectRequestModel: normalizedModel) ?? publicNVIDIASmartAlias
+        return ClientFacingNVIDIAFailure(
+            statusCode: 503,
+            message: "\(normalizedModel) direct access is temporarily disabled until NVIDIA proves fresh stable live traffic on this lane. Use \(smartAlias) for proxy-managed failover, or send \(directNVIDIAAccessHeader): 1 to force a diagnostic direct attempt.",
+            reasonCode: "direct_route_untrusted"
+        )
+    }
+
     static func preflightError(
         method: String,
         path: String,
@@ -2354,6 +2405,13 @@ enum OpenAICompatTemporaryShim {
                 message: "This NVIDIA route does not reliably preserve required/function tool-choice semantics through the proxy; use tool_choice=auto or another provider.",
                 reasonCode: "strict_tool_choice"
             )
+        }
+
+        if let directTrustFailure = directNVIDIATrustPreflightFailure(
+            forRequestModel: model,
+            headers: headers
+        ) {
+            return directTrustFailure
         }
 
         _ = route
@@ -6054,6 +6112,12 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         candidateModel: String,
         candidateBody: String
     ) -> String {
+        let candidateHeaders: [(String, String)]
+        if isPublicNVIDIADirectAlias(candidateModel) {
+            candidateHeaders = [(directNVIDIAAccessHeader, "1")]
+        } else {
+            candidateHeaders = []
+        }
         guard method == "POST",
               isChatCompletionsPath(path),
               requestedStream(forRequestJSON: candidateBody),
@@ -6064,7 +6128,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 method: method,
                 path: path,
                 jsonString: candidateBody,
-                headers: []
+                headers: candidateHeaders
               ) else {
             return candidateBody
         }
@@ -6079,7 +6143,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             method: method,
             path: path,
             jsonString: transformedBufferedBody,
-            headers: []
+            headers: candidateHeaders
         ) == nil else {
             return candidateBody
         }

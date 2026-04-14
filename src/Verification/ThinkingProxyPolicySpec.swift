@@ -242,7 +242,7 @@ struct ThinkingProxyPolicySpec {
                         method: "POST",
                         path: "/v1/chat/completions",
                         jsonString: transition.body,
-                        headers: []
+                        headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
                     )
                 } ?? nil
 
@@ -300,7 +300,7 @@ struct ThinkingProxyPolicySpec {
                         method: "POST",
                         path: "/v1/chat/completions",
                         jsonString: transition.body,
-                        headers: []
+                        headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
                     )
                 } ?? nil
 
@@ -357,7 +357,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("public glm5-nvidia stays direct while the explicit smart and debug aliases remain opt-in", recorder: recorder) {
+        run("public glm5-nvidia and kimi-k2.5-nvidia stay direct while explicit smart aliases remain opt-in", recorder: recorder) {
             withMergedConfig(defaultMergedConfigYAML()) {
                 let exactAliasRequest = """
                 {
@@ -377,10 +377,17 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.modelName(forRequestJSON: exactAliasRequest), "glm5-nvidia", "glm5-nvidia requests should preserve the concrete routable alias", recorder: recorder)
                 expectNil(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia-direct"), "glm5-nvidia-direct should stay a hard-pinned direct lane instead of recursively entering the smart alias path", recorder: recorder)
                 expectNil(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia"), "public glm5-nvidia should resolve as the direct provider route instead of entering the smart alias path", recorder: recorder)
+                expectNil(OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "kimi-k2.5-nvidia"), "public kimi-k2.5-nvidia should also resolve as the direct provider route instead of entering the smart alias path", recorder: recorder)
                 expectEqual(
                     OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia-smart")?.candidates,
                     ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"],
                     "the explicit smart alias should keep the resilient NVIDIA failover contract",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "kimi-k2.5-nvidia-smart")?.candidates,
+                    ["kimi-k2.5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"],
+                    "the explicit Kimi smart alias should prefer Kimi direct first, then fall back through the shared worker pool",
                     recorder: recorder
                 )
 
@@ -407,6 +414,27 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia")?.canonicalModelID, "z-ai/glm5", "public glm5-nvidia should preserve the canonical model identity", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia-direct")?.providerID, "nvidia", "the explicit direct alias should still resolve onto the nvidia route", recorder: recorder)
                 expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "glm5-nvidia-direct")?.canonicalModelID, "z-ai/glm5", "the explicit direct alias should preserve the canonical model identity", recorder: recorder)
+
+                let canonicalKimiRequest = """
+                {
+                  "model": "moonshotai/kimi-k2.5",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+                let canonicalKimiRewrite = OpenAICompatTemporaryShim.normalizedRequestModelRewrite(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: canonicalKimiRequest
+                )
+                expectEqual(canonicalKimiRewrite?.normalizedModel, "kimi-k2.5-nvidia", "canonical Kimi requests should normalize onto the public direct NVIDIA alias", recorder: recorder)
+                let canonicalKimiJSON = parseJSONObject(canonicalKimiRewrite?.rewrittenJSONString, recorder: recorder)
+                expectEqual(canonicalKimiJSON["model"] as? String, "kimi-k2.5-nvidia", "canonical Kimi requests should be rewritten to the public direct alias", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "moonshotai/kimi-k2.5")?.providerID, "nvidia", "canonical Kimi should still resolve onto the nvidia route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "moonshotai/kimi-k2.5")?.canonicalModelID, "moonshotai/kimi-k2.5", "canonical Kimi should preserve the canonical model identity after alias normalization", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "kimi-k2.5-nvidia")?.providerID, "nvidia", "public kimi-k2.5-nvidia should resolve directly onto the nvidia route", recorder: recorder)
+                expectEqual(OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: "kimi-k2.5-nvidia")?.canonicalModelID, "moonshotai/kimi-k2.5", "public kimi-k2.5-nvidia should preserve the canonical model identity", recorder: recorder)
             }
         }
 
@@ -458,6 +486,78 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(rejected?.statusCode ?? 0, 403, "public direct NVIDIA access should fail closed without an explicit override", recorder: recorder)
                 expectEqual(rejected?.reasonCode, "direct_alias_debug_only", "direct NVIDIA rejection should explain that the lane is debug-only", recorder: recorder)
                 expectNil(allowed, "an explicit debug override header should preserve probe/debug access to the direct lane", recorder: recorder)
+            }
+        }
+
+        run("public direct nvidia aliases fail closed until fresh stable live trust exists", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let glm5Request = """
+                {
+                  "model": "glm5-nvidia",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+                let kimiRequest = """
+                {
+                  "model": "kimi-k2.5-nvidia",
+                  "messages": [
+                    {"role": "user", "content": "Return exactly: OK"}
+                  ]
+                }
+                """
+
+                let staleGLM5 = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: glm5Request
+                )
+                let staleKimi = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: kimiRequest
+                )
+                let forcedGLM5 = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: glm5Request,
+                    headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
+                )
+
+                expectEqual(staleGLM5?.statusCode ?? 0, 503, "public glm5 direct access should fail fast when the lane is not freshly trusted", recorder: recorder)
+                expectEqual(staleGLM5?.reasonCode, "direct_route_untrusted", "public glm5 direct access should explain the trust gate explicitly", recorder: recorder)
+                expectEqual(staleKimi?.statusCode ?? 0, 503, "public Kimi direct access should fail fast when the lane is not freshly trusted", recorder: recorder)
+                expectEqual(staleKimi?.reasonCode, "direct_route_untrusted", "public Kimi direct access should explain the trust gate explicitly", recorder: recorder)
+                expectNil(forcedGLM5, "an explicit direct-override header should still permit a diagnostic direct NVIDIA attempt", recorder: recorder)
+
+                for (offset, latency) in [2_000, 2_400, 2_700].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "glm5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "glm5-nvidia",
+                            canonicalModelID: "z-ai/glm5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 300
+                        )
+                    )
+                }
+
+                let trustedGLM5 = OpenAICompatTemporaryShim.preflightError(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: glm5Request
+                )
+                expectNil(trustedGLM5, "public direct NVIDIA access should reopen automatically after fresh stable live NVIDIA success", recorder: recorder)
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
         }
 
@@ -1840,7 +1940,7 @@ struct ThinkingProxyPolicySpec {
                             method: "POST",
                             path: "/v1/chat/completions",
                             jsonString: transition.body,
-                            headers: []
+                            headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
                         )
                     } ?? nil
                     let transitionJSON = parseJSONObject(transition?.body, recorder: recorder)
@@ -1928,7 +2028,7 @@ struct ThinkingProxyPolicySpec {
                             method: "POST",
                             path: "/v1/chat/completions",
                             jsonString: transition.body,
-                            headers: []
+                            headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
                         )
                     } ?? nil
                     let transitionJSON = parseJSONObject(transition?.body, recorder: recorder)
@@ -2929,30 +3029,49 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("explicit glm5-nvidia-smart preserves the NVIDIA promotion path without shadowing the public direct alias", recorder: recorder) {
+        run("explicit NVIDIA smart aliases demote stale direct lanes and restore them once trust returns", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 guard let smartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "glm5-nvidia-smart") else {
                     recorder.recordFailure("glm5-nvidia-smart should resolve through the explicit smart alias contract")
                     return
                 }
+                guard let kimiSmartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: "kimi-k2.5-nvidia-smart") else {
+                    recorder.recordFailure("kimi-k2.5-nvidia-smart should resolve through the explicit smart alias contract")
+                    return
+                }
 
-                let requestJSON = """
+                let glm5RequestJSON = """
                 {
                   "model": "glm5-nvidia-smart",
                   "stream": false,
                   "messages": [{"role": "user", "content": "Return exactly: OK"}]
                 }
                 """
+                let kimiRequestJSON = """
+                {
+                  "model": "kimi-k2.5-nvidia-smart",
+                  "stream": false,
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
 
-                let staleCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                let staleGLM5Candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
                     forPublicAlias: "glm5-nvidia-smart",
                     method: "POST",
                     path: "/v1/chat/completions",
-                    jsonString: requestJSON,
+                    jsonString: glm5RequestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(staleCandidates.contains("glm5-nvidia"), true, "glm5-nvidia-smart should still keep the direct NVIDIA lane in the fallback pool", recorder: recorder)
+                let staleKimiCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "kimi-k2.5-nvidia-smart",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: kimiRequestJSON,
+                    smartAlias: kimiSmartAlias
+                )
+                expectEqual(staleGLM5Candidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia"], "glm5-nvidia-smart should demote stale direct NVIDIA to the rescue tail instead of preferring it by default", recorder: recorder)
+                expectEqual(staleKimiCandidates, ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "kimi-k2.5-nvidia"], "kimi-k2.5-nvidia-smart should demote stale direct Kimi to the rescue tail instead of preferring it by default", recorder: recorder)
 
                 for (offset, latency) in [2_000, 2_400, 2_700].enumerated() {
                     OpenAICompatTemporaryShim.recordRouteSuccess(
@@ -2972,15 +3091,50 @@ struct ThinkingProxyPolicySpec {
                         )
                     )
                 }
+                for (offset, latency) in [2_100, 2_500, 2_900].enumerated() {
+                    OpenAICompatTemporaryShim.recordRouteSuccess(
+                        forRequestModel: "kimi-k2.5-nvidia",
+                        telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date().addingTimeInterval(Double(offset)),
+                            requestModel: "kimi-k2.5-nvidia",
+                            canonicalModelID: "moonshotai/kimi-k2.5",
+                            transportOutcome: "send_response",
+                            failureClass: nil,
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 200,
+                            retryCount: 0,
+                            source: "live_request",
+                            firstByteLatencyMilliseconds: latency,
+                            totalLatencyMilliseconds: latency + 200
+                        )
+                    )
+                }
 
-                let trustedCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                let trustedGLM5Candidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
                     forPublicAlias: "glm5-nvidia-smart",
                     method: "POST",
                     path: "/v1/chat/completions",
-                    jsonString: requestJSON,
+                    jsonString: glm5RequestJSON,
                     smartAlias: smartAlias
                 )
-                expectEqual(trustedCandidates.contains("glm5-nvidia"), true, "glm5-nvidia-smart should preserve the direct NVIDIA candidate after live NVIDIA success", recorder: recorder)
+                let trustedKimiCandidates = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+                    forPublicAlias: "kimi-k2.5-nvidia-smart",
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: kimiRequestJSON,
+                    smartAlias: kimiSmartAlias
+                )
+                expectEqual(trustedGLM5Candidates, ["glm5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"], "glm5-nvidia-smart should restore the direct NVIDIA lane to the front once live trust returns", recorder: recorder)
+                expectEqual(trustedKimiCandidates, ["kimi-k2.5-nvidia", "glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark"], "kimi-k2.5-nvidia-smart should restore the direct Kimi lane to the front once live trust returns", recorder: recorder)
+
+                let directOnlyRescue = OpenAICompatTemporaryShim.nextSmartAliasCandidateTransition(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    currentBody: glm5RequestJSON,
+                    candidateModelsRemaining: ["glm5-nvidia"],
+                    logExhaustion: false
+                )
+                expectEqual(directOnlyRescue?.model, "glm5-nvidia", "smart alias internal failover should still be able to open the NVIDIA rescue lane even when public direct access is trust-gated", recorder: recorder)
 
                 OpenAICompatTemporaryShim.clearRouteHealthForTesting()
             }
@@ -11085,6 +11239,7 @@ struct ThinkingProxyPolicySpec {
                     rawHTTPRequest(
                         method: "POST",
                         path: "/v1/chat/completions",
+                        headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")],
                         body: """
                         {
                           "model": "glm5-nvidia",
@@ -11186,6 +11341,7 @@ struct ThinkingProxyPolicySpec {
                     rawHTTPRequest(
                         method: "POST",
                         path: "/v1/chat/completions",
+                        headers: [("X-VibeProxy-Allow-Direct-NVIDIA", "1")],
                         body: """
                         {
                           "model": "glm5-nvidia",
