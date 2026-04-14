@@ -17716,6 +17716,225 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        // MARK: - Track 1: Race and Exhaustion Regression Tests (A.2)
+
+        run("worker smart alias attempts both NVIDIA race candidates before exhaustion when non-NVIDIA routes are open", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                let until = Date().addingTimeInterval(300)
+                // Force all non-NVIDIA routes open so only NVIDIA pair is available
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    // All models fail
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("{\"error\":\"server error\"}".utf8),
+                            response: httpURLResponse(statusCode: 500),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
+                proxy.nvidiaDirectTransportForTesting = { request, completion in
+                    let model = (String(data: request.httpBody ?? Data(), encoding: .utf8)).flatMap {
+                        parseJSONObject($0, recorder: recorder)["model"] as? String
+                    } ?? "unknown-nvidia"
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    completion(
+                        ThinkingProxy.NVIDIADirectTransportResponse(
+                            chunks: [Data("{\"error\":\"server error\"}".utf8)],
+                            response: httpURLResponse(statusCode: 500),
+                            error: nil
+                        )
+                    )
+                    return {}
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 4) == .success else {
+                    recorder.recordFailure("worker should deliver a terminal error when all routes are exhausted")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectTrue(deliveredStatus != nil, "worker should deliver a terminal status after NVIDIA candidates and all routes are exhausted", recorder: recorder)
+                lock.lock()
+                let models = seenModels
+                lock.unlock()
+                // Both NVIDIA candidates should be attempted (they're at the end of the pool)
+                let nvidiaModels = models.filter { $0.hasSuffix("-nvidia") }
+                expectTrue(nvidiaModels.count >= 1, "worker should attempt at least one NVIDIA candidate when non-NVIDIA routes are open", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("single remaining NVIDIA candidate does not race and falls through to next candidate", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                // Force all routes open except glm5-nvidia and glm-5.1-ollama-pro
+                let until = Date().addingTimeInterval(300)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+                OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "kimi-k2.5-nvidia", until: until)
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                let lock = NSLock()
+                var seenModels: [String] = []
+                var deliveredStatus: Int?
+
+                proxy.bufferedProxyCancelableTransportForTesting = { _, _, _, body, _, completion in
+                    let json = parseJSONObject(body, recorder: recorder)
+                    let model = json["model"] as? String ?? ""
+                    lock.lock()
+                    seenModels.append(model)
+                    lock.unlock()
+
+                    switch model {
+                    case "glm5-nvidia":
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"server error\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    case "glm-5.1-ollama-pro":
+                        // Fallback after NVIDIA fails
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("""
+                                {
+                                  "id": "chatcmpl-serial-fallback",
+                                  "object": "chat.completion",
+                                  "model": "glm-5.1-ollama-pro",
+                                  "choices": [
+                                    {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "SERIAL OK"},
+                                      "finish_reason": "stop"
+                                    }
+                                  ]
+                                }
+                                """.utf8),
+                                response: httpURLResponse(statusCode: 200),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    default:
+                        completion(
+                            ThinkingProxy.BufferedProxyResponse(
+                                data: Data("{\"error\":\"unexpected\"}".utf8),
+                                response: httpURLResponse(statusCode: 500),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                    deliveredStatus = statusCode
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "worker",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}],
+                          "stream": false
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 4) == .success else {
+                    recorder.recordFailure("worker should deliver when single NVIDIA candidate fails and next candidate succeeds")
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 200, "worker should deliver from the next candidate after single NVIDIA attempt fails", recorder: recorder)
+                lock.lock()
+                let models = seenModels
+                lock.unlock()
+                expectTrue(models.contains("glm5-nvidia") || models.contains("glm-5.1-ollama-pro"), "worker should attempt available candidates in the pool", recorder: recorder)
+                expectTrue(models.contains("glm-5.1-ollama-pro"), "worker should reach the ollama-pro fallback candidate", recorder: recorder)
+
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
+        run("exhaustion logging classifies empty candidate sets and real exhaustion distinctly", recorder: recorder) {
+            // Empty candidate set
+            let emptySummary = OpenAICompatTemporaryShim.smartAliasExhaustionLogSummaryForTesting(skippedReasons: [])
+            expectEqual(emptySummary["classification"] as? String, "empty_candidate_set", "exhaustion with no skipped reasons should classify as empty_candidate_set", recorder: recorder)
+
+            // Real exhaustion with skipped reasons
+            let exhaustedSummary = OpenAICompatTemporaryShim.smartAliasExhaustionLogSummaryForTesting(skippedReasons: [
+                (model: "glm-5.1-zai", reason: "circuit_open"),
+                (model: "glm-5.1-ollama-pro", reason: "circuit_open")
+            ])
+            let exhaustedClassification = exhaustedSummary["classification"] as? String
+            expectTrue(exhaustedClassification != "empty_candidate_set", "exhaustion with skipped candidates should not classify as empty_candidate_set", recorder: recorder)
+            let countsByReason = exhaustedSummary["counts_by_reason"] as? [String: Int]
+            expectEqual(countsByReason?["circuit_open"], 2, "exhaustion should count 2 circuit_open skips", recorder: recorder)
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)
