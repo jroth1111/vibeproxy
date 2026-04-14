@@ -98,6 +98,8 @@ def provider_details_for_event(
         return "nvidia", request_model
     if request_model == "muse-spark":
         return "meta-web", request_model
+    if request_model.startswith("gpt-"):
+        return "openai", request_model
     if request_model.endswith("-zai") or canonical_model_id.startswith("glm-5.1"):
         return "zai", request_model
     return "unknown", request_model

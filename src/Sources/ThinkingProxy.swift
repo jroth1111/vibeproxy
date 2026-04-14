@@ -4249,7 +4249,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         return retryableTransportErrorCodes.contains(nsError.code)
     }
 
-    fileprivate static func isChatCompletionsPath(_ path: String) -> Bool {
+    static func isChatCompletionsPath(_ path: String) -> Bool {
         path == "/v1/chat/completions" || path == "/api/v1/chat/completions"
     }
 
@@ -6142,7 +6142,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         return false
     }
 
-    fileprivate static func containsUnsupportedMediaMessageContent(in json: [String: Any]) -> Bool {
+    static func containsUnsupportedMediaMessageContent(in json: [String: Any]) -> Bool {
         guard let messages = json["messages"] as? [[String: Any]] else {
             return false
         }
@@ -7226,7 +7226,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         )
     }
 
-    fileprivate static func hasStrictToolChoice(in json: [String: Any]) -> Bool {
+    static func hasStrictToolChoice(in json: [String: Any]) -> Bool {
         guard let toolChoice = json["tool_choice"] else {
             return false
         }
@@ -12320,6 +12320,7 @@ class ThinkingProxy {
         terminalFallbackOutcome: SmartAliasCandidateAttemptOutcome?,
         exhaustedRetryableOutcome: SmartAliasCandidateAttemptOutcome?,
         deliveryMode: SmartAliasDeliveryMode,
+        allowNVIDIARace: Bool = true,
         loopRetriesRemaining: Int = 0,
         requestController: RequestCancellationController,
         requestTrace: RequestTraceContext
@@ -12360,7 +12361,7 @@ class ThinkingProxy {
             )
         }
 
-        if raceableFallbackModels.count >= 2 {
+        if allowNVIDIARace && raceableFallbackModels.count >= 2 {
             let deferredCandidateModels = Array(remainingCandidateModels.dropFirst(raceableFallbackModels.count))
             attemptSmartAliasFallbackRace(
                 method: method,
@@ -12407,8 +12408,11 @@ class ThinkingProxy {
                     telemetryEvent.failureClass == "classified_429_overload" ||
                     telemetryEvent.failureClass == "classified_429_concurrency" ||
                     telemetryEvent.failureClass == "classified_429"
+                let shouldLoopRetryExhaustedPool =
+                    exhaustionSummary?.classification == .capacityExhausted
                 let nextRetryDelay = poolRetryDelay ?? cooldownUntil.map({ max(0.05, $0.timeIntervalSinceNow) })
                 if isImmediateRetryClass,
+                   shouldLoopRetryExhaustedPool,
                    loopRetriesRemaining > 0,
                    let retryDelay = nextRetryDelay,
                    retryDelay <= Config.smartAliasMaxLoopRetryDelay,
@@ -12616,7 +12620,7 @@ class ThinkingProxy {
                 headers: headers,
                 currentBody: currentBody,
                 publicAlias: publicAlias,
-                remainingCandidateModels: raceTransitions.map(\.model) + deferredCandidateModels,
+                remainingCandidateModels: rankedRaceCandidateModels + deferredCandidateModels,
                 forceProbeCandidateModels: forceProbeCandidateModels,
                 primaryProbeRetriesRemaining: primaryProbeRetriesRemaining,
                 failoverDepth: failoverDepth,
@@ -12626,6 +12630,7 @@ class ThinkingProxy {
                 terminalFallbackOutcome: terminalFallbackOutcome,
                 exhaustedRetryableOutcome: exhaustedRetryableOutcome,
                 deliveryMode: deliveryMode,
+                allowNVIDIARace: false,
                 loopRetriesRemaining: loopRetriesRemaining,
                 requestController: requestController,
                 requestTrace: requestTrace
@@ -13388,6 +13393,8 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext? = nil
     ) {
         guard requestController?.isCancelled() != true else { return }
+        requestController?.clearCurrentCancel()
+        defer { requestController?.cancel() }
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
@@ -13430,7 +13437,6 @@ class ThinkingProxy {
                 overridingHeaders: requestTrace?.responseHeaders ?? [:]
             )
         case .success(let requestModel, let statusCode, let responseHeaders, let responseBody, let telemetryEvent):
-            guard requestController?.isCancelled() != true else { return }
             let winningTelemetryEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                 telemetryEvent,
                 winnerAttemptLane: telemetryEvent.attemptLane
@@ -13452,7 +13458,6 @@ class ThinkingProxy {
                 requestTrace: requestTrace
             )
         case .retryableFailure(_, let telemetryEvent, let cooldownUntil):
-            guard requestController?.isCancelled() != true else { return }
             if telemetryEvent.failureClass == "classified_429_window" {
                 deliverBufferedError(
                     defaultConnection: originalConnection,
@@ -13523,6 +13528,8 @@ class ThinkingProxy {
         requestTrace: RequestTraceContext? = nil
     ) {
         guard requestController?.isCancelled() != true else { return }
+        requestController?.clearCurrentCancel()
+        defer { requestController?.cancel() }
         let overridingHeaders = smartAliasResolutionHeaders(
             publicAlias: publicAlias,
             resolvedRequestModel: resolvedRequestModel,
@@ -14278,6 +14285,7 @@ class ThinkingProxy {
                 bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: body)
             ) { [weak self] bufferedResponse in
                 permit.release()
+                controller?.clearCurrentCancel()
                 guard let self, controller?.isCancelled() != true else { return }
                 self.handleSmartAliasBufferedCandidateResult(
                     bufferedResponse,
@@ -14313,6 +14321,7 @@ class ThinkingProxy {
             bufferedResponseDeadlineSeconds: OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: body)
         ) { [weak self] bufferedResponse in
             permit.release()
+            controller?.clearCurrentCancel()
             guard let self, controller?.isCancelled() != true else { return }
             self.handleSmartAliasBufferedCandidateResult(
                 bufferedResponse,
@@ -14602,6 +14611,7 @@ class ThinkingProxy {
 
         let handleTransportResponse: (NVIDIADirectTransportResponse) -> Void = { [weak self] transportResponse in
             permit.release()
+            controller?.clearCurrentCancel()
             guard let self, controller?.isCancelled() != true else { return }
 
             let effectiveTransportResponse: NVIDIADirectTransportResponse = lockingQueue.sync {

@@ -14,7 +14,6 @@ cleanup() {
 trap cleanup EXIT
 
 PREPARED_SWIFT_SOURCES=()
-
 prepare_stable_sources() {
     local dest_dir="$1"
     shift
@@ -26,7 +25,16 @@ prepare_stable_sources() {
     local relative_path
     for relative_path in "$@"; do
         local copied_path="$dest_dir/${index}_$(basename "$relative_path")"
-        cp "$SRC_DIR/$relative_path" "$copied_path"
+        if [ "$relative_path" = "Sources/ThinkingProxy.swift" ]; then
+            awk '
+                $0 == "import ProxyCore" { next }
+                /MARK: - ProxyCore Domain Typealiases/ { skipping = 1; next }
+                skipping && /MARK: - Original inline types/ { skipping = 0; next }
+                !skipping { print }
+            ' "$SRC_DIR/$relative_path" > "$copied_path"
+        else
+            cp "$SRC_DIR/$relative_path" "$copied_path"
+        fi
         PREPARED_SWIFT_SOURCES+=("$copied_path")
         index=$((index + 1))
     done
