@@ -1,0 +1,15 @@
+public enum FailureClass: String, Hashable {
+    case emptyBody = "empty_body"
+    case emptyContent = "empty_content"
+    case reasoningOnlyContentMissing = "reasoning_only_content_missing"
+    case reasoningLeakLength = "reasoning_leak_length"
+    case reasoningLeakContent = "reasoning_leak_content"
+    case malformedToolArguments = "malformed_tool_arguments"
+    case invalidJson = "invalid_json"
+    case missingChoices = "missing_choices"
+    case successShapedFailure = "success_shaped_failure"
+    case repetitionLoop = "repetition_loop"
+    case inputEcho = "input_echo"
+    case whitespaceCollapse = "whitespace_collapse"
+    case specialTokenLeak = "special_token_leak"
+}

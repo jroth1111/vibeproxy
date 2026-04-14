@@ -19,11 +19,16 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CLIProxyMenuBar",
-            dependencies: ["Sparkle", "Yams", "CLIProxyObjCBridge"],
+            dependencies: ["Sparkle", "Yams", "CLIProxyObjCBridge", "ProxyCore"],
             path: "Sources",
+            exclude: ["ProxyCore"],
             resources: [
                 .copy("Resources")
             ]
+        ),
+        .target(
+            name: "ProxyCore",
+            path: "Sources/ProxyCore"
         ),
         .target(
             name: "CLIProxyObjCBridge",
