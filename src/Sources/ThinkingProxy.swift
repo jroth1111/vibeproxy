@@ -24,6 +24,9 @@ enum OpenAICompatTemporaryShim {
     typealias ModelTier = ProxyCore.ModelTier
     typealias FailureClass = ProxyCore.FailureClass
     typealias Provider429Disposition = ProxyCore.Provider429Disposition
+    typealias RequestPolicy = ProxyCore.RequestPolicy
+    typealias ClientStreamingMode = ProxyCore.ClientStreamingMode
+    typealias ToolChoiceMode = ProxyCore.ToolChoiceMode
 #else
     // MARK: - Original inline types
     struct ClientFacingNVIDIAFailure {
@@ -411,6 +414,35 @@ enum OpenAICompatTemporaryShim {
         case concurrency(retryAfterSeconds: TimeInterval?)
         case quotaWindow(cooldownUntil: Date)
     }
+
+    enum ClientStreamingMode {
+        case preserve
+        case rejectBufferedMitigation
+    }
+
+    enum ToolChoiceMode {
+        case preserve
+        case rejectRequiredOrFunctionChoice
+    }
+
+    struct RequestPolicy {
+        let minimumMaxTokens: Int?
+        let maximumMaxTokens: Int?
+        let strippedFields: Set<String>
+        let attemptTimeout: TimeInterval?
+        let firstResponseDeadline: TimeInterval?
+        let bufferedResponseDeadline: TimeInterval?
+        let transportRetries: Int
+        let semanticRetries: Int
+        let retryableFailureClasses: Set<FailureClass>
+        let retryBackoffMilliseconds: Int
+        let stripsReasoningFieldFromSuccess: Bool
+        let allowsThinkLeakRepair: Bool
+        let salvagesBestEffortRepair: Bool
+        let clientStreamingMode: ClientStreamingMode
+        let toolChoiceMode: ToolChoiceMode
+        let forcesKimiInstantMode: Bool
+    }
 #endif
 
     struct NvidiaReasoningEvaluation {
@@ -592,16 +624,6 @@ enum OpenAICompatTemporaryShim {
         let lastScoreUpdatedAt: Date?
         let lastTelemetryEvent: RouteTelemetryEvent?
         let rollingMetrics: RouteRollingMetrics
-    }
-
-    private enum ClientStreamingMode {
-        case preserve
-        case rejectBufferedMitigation
-    }
-
-    private enum ToolChoiceMode {
-        case preserve
-        case rejectRequiredOrFunctionChoice
     }
 
     private static func deduplicatedStaticLookup<Value>(
@@ -824,24 +846,6 @@ enum OpenAICompatTemporaryShim {
         label: "nonNVIDIAMitigationPoliciesByRequestModel"
     )
 
-    private struct RequestPolicy {
-        let minimumMaxTokens: Int?
-        let maximumMaxTokens: Int?
-        let strippedFields: Set<String>
-        let attemptTimeout: TimeInterval?
-        let firstResponseDeadline: TimeInterval?
-        let bufferedResponseDeadline: TimeInterval?
-        let transportRetries: Int
-        let semanticRetries: Int
-        let retryableFailureClasses: Set<FailureClass>
-        let retryBackoffMilliseconds: Int
-        let stripsReasoningFieldFromSuccess: Bool
-        let allowsThinkLeakRepair: Bool
-        let salvagesBestEffortRepair: Bool
-        let clientStreamingMode: ClientStreamingMode
-        let toolChoiceMode: ToolChoiceMode
-        let forcesKimiInstantMode: Bool
-    }
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
     private static let retryableTransportErrorCodes: Set<Int> = [
         URLError.Code.timedOut.rawValue,
@@ -2148,7 +2152,7 @@ enum OpenAICompatTemporaryShim {
             preflightCandidateBody = effectiveCandidateBody
         }
         let internalPreflightHeaders: [(String, String)]
-        if candidateRoute?.providerID == "nvidia" {
+        if candidateRoute?.providerID == "nvidia" || candidateRoute?.providerID == "nvidia-minimax" {
             internalPreflightHeaders = [(directNVIDIAAccessHeader, "1")]
         } else {
             internalPreflightHeaders = []
@@ -4268,7 +4272,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         at now: Date = Date()
     ) -> Bool {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
-              route.providerID == "nvidia" else {
+              route.providerID == "nvidia" || route.providerID == "nvidia-minimax" else {
             return hasRecentLiveInferenceSuccess(forRequestModel: requestModel, maxAge: maxAge, at: now)
         }
 
@@ -4303,7 +4307,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         forRequestModel requestModel: String
     ) -> NVIDIAInferenceProbeState? {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
-              route.providerID == "nvidia" else {
+              route.providerID == "nvidia" || route.providerID == "nvidia-minimax" else {
             return nil
         }
         return routeHealthQueue.sync {
@@ -5553,7 +5557,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         route: RouteIdentity,
         telemetryEvent: RouteTelemetryEvent?
     ) -> NVIDIAInferenceProbeState? {
-        guard route.providerID == "nvidia" else { return nil }
+        guard route.providerID == "nvidia" || route.providerID == "nvidia-minimax" else { return nil }
         guard let telemetryEvent, telemetryEvent.source == "canary" else {
             return current
         }
@@ -19937,7 +19941,7 @@ class ThinkingProxy {
         if let routeState = OpenAICompatTemporaryShim.routeHealthState(forRequestModel: candidateModel),
            routeState.status == .open || routeState.status == .suspect || routeState.status == .halfOpen {
             if let candidateRoute = OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel),
-               candidateRoute.providerID == "nvidia" {
+               candidateRoute.providerID == "nvidia" || candidateRoute.providerID == "nvidia-minimax" {
                 guard OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: candidateModel) else {
                     return false
                 }
