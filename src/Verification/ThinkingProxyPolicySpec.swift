@@ -16973,6 +16973,171 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        // Regression tests for else-if gate fix (handler-level transformRequest)
+        // The fix changed `else if` to `if` at the handler level so that
+        // transformRequest always runs after normalizedRequestModelRewrite,
+        // ensuring typed content arrays are flattened before smart alias routing.
+
+        run("transformRequest flattens typed content arrays for factory worker alias after model rewrite", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let request = """
+                {
+                  "model": "custom:Proxy-Worker-Smart-Router-8",
+                  "stream": true,
+                  "messages": [
+                    {
+                      "role": "assistant",
+                      "content": [
+                        {"type": "input_text", "text": "Checked "},
+                        {"type": "summary_text", "text": "repo"},
+                        {"type": "reasoning", "text": "hidden chain of thought"},
+                        {"type": "metadata_marker", "value": {"step": 1}}
+                      ]
+                    },
+                    {"role": "user", "content": "Return exactly OK"}
+                  ],
+                  "tools": [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "noop",
+                        "parameters": {"type": "object", "properties": {}}
+                      }
+                    }
+                  ],
+                  "tool_choice": "auto"
+                }
+                """
+
+                let transformed = OpenAICompatTemporaryShim.transformRequest(
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    jsonString: request
+                )
+
+                let json = parseJSONObject(transformed, recorder: recorder)
+                let messages = json["messages"] as? [[String: Any]]
+                let assistantMessage = messages?.first(where: { ($0["role"] as? String) == "assistant" })
+                let content = assistantMessage?["content"] as? String
+
+                expectEqual(content, "Checked repohidden chain of thought{\"step\":1}", "transformRequest should flatten typed content arrays (input_text, summary_text, reasoning, metadata_marker) for factory worker alias requests", recorder: recorder)
+            }
+        }
+
+        run("factory worker alias with streaming tools and full typed content reaches NVIDIA when sibling routes are closed", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let until = Date().addingTimeInterval(300)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-zai", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "glm-5.1-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "minimax-m2.7-ollama-pro", until: until)
+                    OpenAICompatTemporaryShim.forceOpenRouteForTesting(requestModel: "muse-spark", until: until)
+
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredStatus: Int?
+                    var deliveredError: String?
+                    var seenModels: [String] = []
+                    var seenContents: [String] = []
+                    var seenStreams: [Bool] = []
+
+                    proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                        let json = parseJSONObject(body, recorder: recorder)
+                        let model = json["model"] as? String ?? "?"
+                        let messages = json["messages"] as? [[String: Any]]
+                        let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                        let stream = json["stream"] as? Bool ?? true
+                        seenModels.append(model)
+                        seenContents.append(assistantContent)
+                        seenStreams.append(stream)
+                        completion(ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-regression-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        ))
+                    }
+                    proxy.nvidiaDirectTransportForTesting = { request, completion in
+                        let json = (String(data: request.httpBody ?? Data(), encoding: .utf8)).map {
+                            parseJSONObject($0, recorder: recorder)
+                        } ?? [:]
+                        let model = json["model"] as? String ?? "?"
+                        let messages = json["messages"] as? [[String: Any]]
+                        let assistantContent = messages?.first(where: { ($0["role"] as? String) == "assistant" })?["content"] as? String ?? "?"
+                        let stream = json["stream"] as? Bool ?? true
+                        seenModels.append(model)
+                        seenContents.append(assistantContent)
+                        seenStreams.append(stream)
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("""
+                                {"id":"chatcmpl-regression-nvidia","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"}}],"model":"\(model)"}
+                                """.utf8)],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                                error: nil
+                            )
+                        )
+                        return {}
+                    }
+                    proxy.deliveredHTTPResponseForTesting = { statusCode, _, _ in
+                        deliveredStatus = statusCode
+                        delivered.signal()
+                    }
+                    proxy.deliveredErrorForTesting = { _, message in
+                        deliveredError = message
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(
+                            method: "POST",
+                            path: "/v1/chat/completions",
+                            body: """
+                            {
+                              "model": "\(selfRoutedGenericCompatFactoryWorkerContract.workerModelID)",
+                              "stream": true,
+                              "tools": [
+                                {"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}}
+                              ],
+                              "tool_choice": "auto",
+                              "messages": [
+                                {
+                                  "role": "assistant",
+                                  "content": [
+                                    {"type": "input_text", "text": "Checked "},
+                                    {"type": "summary_text", "text": "repo"},
+                                    {"type": "reasoning", "text": "hidden chain of thought"},
+                                    {"type": "metadata_marker", "value": {"step": 1}}
+                                  ]
+                                },
+                                {"role": "user", "content": "Return exactly OK"}
+                              ]
+                            }
+                            """
+                        ),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 2) == .success else {
+                        recorder.recordFailure("factory worker alias with streaming tools and full typed content should deliver through NVIDIA when sibling routes are unavailable")
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        return
+                    }
+
+                    expectEqual(deliveredStatus, 200, "factory worker alias with streaming tools and full typed content should succeed when sibling routes are closed", recorder: recorder)
+                    expectEqual(deliveredError, nil, "factory worker alias with streaming tools and full typed content should not surface a terminal routing error", recorder: recorder)
+                    let nvidiaSeen = seenModels.filter { $0.hasSuffix("-nvidia") }
+                    expectEqual(nvidiaSeen.count > 0, true, "factory worker alias with streaming tools and full typed content should reach at least one NVIDIA route when sibling routes are closed", recorder: recorder)
+                    expectEqual(Set(seenStreams), Set([false]), "NVIDIA upstream should receive buffered requests even though caller requested streaming", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         if recorder.failures == 0 {
             print("ThinkingProxyPolicySpec: all checks passed")
             Foundation.exit(EXIT_SUCCESS)

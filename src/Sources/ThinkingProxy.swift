@@ -11586,7 +11586,8 @@ class ThinkingProxy {
                         binding.source
                     )
                 }
-            } else if let shimmed = OpenAICompatTemporaryShim.transformRequest(
+            }
+            if let shimmed = OpenAICompatTemporaryShim.transformRequest(
                 method: method,
                 path: rewrittenPath,
                 jsonString: modifiedBody
