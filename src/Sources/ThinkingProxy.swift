@@ -3677,6 +3677,204 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 return
             }
 
+            // Transport timeouts are timeout-policy behavior, not route health evidence.
+            // Accumulating circuit-breaker penalties for slow upstream responses would
+            // penalize routes for provider-side latency rather than route-level failures.
+            if let fc = normalizedFailureClass, fc.hasPrefix("transport_timeout") {
+                let currentStatus = current?.status ?? .closed
+                let enrichedTelemetryEvent = telemetryEvent.map {
+                    enrichTelemetryEvent($0, from: currentStatus, to: currentStatus)
+                }
+                let probeState = updatedNVIDIAInferenceProbeState(
+                    current: current?.nvidiaInferenceProbe,
+                    route: route,
+                    telemetryEvent: enrichedTelemetryEvent
+                )
+                let preservedState = routeCircuitState(
+                    current ?? RouteCircuitState(
+                        status: .closed,
+                        failureScore: 0,
+                        recoverySuccesses: 0,
+                        openUntil: nil,
+                        lastScoreUpdatedAt: now,
+                        lastTelemetryEvent: nil,
+                        rollingMetrics: .empty,
+                        emaMetrics: .empty,
+                        recoveredAt: nil
+                    ),
+                    replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                    replacingNVIDIAInferenceProbe: probeState
+                )
+                routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = preservedState
+                scheduleRouteHealthPersistLocked()
+                if let enrichedTelemetryEvent {
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
+            // 5xx failures trigger immediate failover with an elevated failure penalty
+            // but a shorter open window — the upstream may recover quickly.
+            if let fc = normalizedFailureClass, fc.hasPrefix("classified_5") {
+                let currentStatus = current?.status ?? .closed
+                var nextState = nextRouteCircuitState(
+                    current: current,
+                    afterFailureAt: now,
+                    routeHealthKey: route.routeHealthKey,
+                    telemetryEvent: telemetryEvent,
+                    burstDeduplicated: failureBurst.burstDeduplicated,
+                    policy: routeCircuitBreakerPolicy,
+                    forcedOpenUntil: forcedOpenUntil,
+                    healthSensitivity: healthSensitivity
+                )
+                // Cap the open window for 5xx — upstream should recover faster than
+                // a persistent protocol-level failure.
+                let short5xxOpenDuration: TimeInterval = 60
+                if nextState.status == .open {
+                    let shortOpenUntil = now.addingTimeInterval(short5xxOpenDuration)
+                    if let existingOpen = nextState.openUntil, existingOpen > shortOpenUntil {
+                        nextState = RouteCircuitState(
+                            status: nextState.status,
+                            failureScore: nextState.failureScore,
+                            recoverySuccesses: nextState.recoverySuccesses,
+                            openUntil: shortOpenUntil,
+                            lastScoreUpdatedAt: nextState.lastScoreUpdatedAt,
+                            lastTelemetryEvent: nextState.lastTelemetryEvent,
+                            rollingMetrics: nextState.rollingMetrics,
+                            emaMetrics: nextState.emaMetrics,
+                            recoveredAt: nextState.recoveredAt,
+                            lastSuccessAt: nextState.lastSuccessAt,
+                            lastLiveSuccessAt: nextState.lastLiveSuccessAt,
+                            lastSuccessRequestID: nextState.lastSuccessRequestID,
+                            lastFailureAt: nextState.lastFailureAt,
+                            lastFailureClass: nextState.lastFailureClass,
+                            nvidiaInferenceProbe: nextState.nvidiaInferenceProbe
+                        )
+                    }
+                }
+                let enrichedTelemetryEvent = telemetryEvent.map {
+                    enrichTelemetryEvent($0, from: currentStatus, to: nextState.status)
+                }
+                let probeState = updatedNVIDIAInferenceProbeState(
+                    current: current?.nvidiaInferenceProbe,
+                    route: route,
+                    telemetryEvent: enrichedTelemetryEvent
+                )
+                nextState = routeCircuitState(
+                    nextState,
+                    replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                    replacingNVIDIAInferenceProbe: probeState
+                )
+                if current?.status != nextState.status {
+                    NSLog(
+                        "[ThinkingProxy] Route health transition %@: %@ -> %@ (5xx failover)",
+                        route.routeHealthKey,
+                        currentStatus.rawValue,
+                        nextState.status.rawValue
+                    )
+                }
+                routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = nextState
+                scheduleRouteHealthPersistLocked()
+                if let enrichedTelemetryEvent {
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
+            // Malformed success bodies (empty content, reasoning-only missing content)
+            // mark the route suspect without fully opening it. The upstream returned a
+            // valid HTTP response but the body doesn't match the request contract.
+            if let fc = normalizedFailureClass,
+               fc == "empty_content" || fc == "reasoning_only_content_missing" {
+                let currentStatus = current?.status ?? .closed
+                // Only degrade to suspect, never open the circuit for malformed output
+                let targetStatus: RouteHealthStatus = currentStatus == .closed ? .suspect : currentStatus
+                let enrichedTelemetryEvent = telemetryEvent.map {
+                    enrichTelemetryEvent($0, from: currentStatus, to: targetStatus)
+                }
+                let probeState = updatedNVIDIAInferenceProbeState(
+                    current: current?.nvidiaInferenceProbe,
+                    route: route,
+                    telemetryEvent: enrichedTelemetryEvent
+                )
+                let preservedState = RouteCircuitState(
+                    status: targetStatus,
+                    failureScore: current?.failureScore ?? 0,
+                    recoverySuccesses: current?.recoverySuccesses ?? 0,
+                    openUntil: current?.openUntil,
+                    lastScoreUpdatedAt: now,
+                    lastTelemetryEvent: enrichedTelemetryEvent,
+                    rollingMetrics: current?.rollingMetrics ?? .empty,
+                    emaMetrics: current?.emaMetrics ?? .empty,
+                    recoveredAt: current?.recoveredAt,
+                    lastSuccessAt: current?.lastSuccessAt,
+                    lastLiveSuccessAt: current?.lastLiveSuccessAt,
+                    lastSuccessRequestID: current?.lastSuccessRequestID,
+                    lastFailureAt: now,
+                    lastFailureClass: telemetryEvent?.failureClass,
+                    nvidiaInferenceProbe: probeState
+                )
+                if current?.status != targetStatus {
+                    NSLog(
+                        "[ThinkingProxy] Route health transition %@: %@ -> %@ (malformed output)",
+                        route.routeHealthKey,
+                        currentStatus.rawValue,
+                        targetStatus.rawValue
+                    )
+                }
+                routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = preservedState
+                scheduleRouteHealthPersistLocked()
+                if let enrichedTelemetryEvent {
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
+            // Network errors (retryable 400 classified as network_error) get a deferral
+            // like concurrency pressure — not evidence of route unhealthiness.
+            if let fc = normalizedFailureClass, fc == "network_error" {
+                let currentStatus = current?.status ?? .closed
+                let enrichedTelemetryEvent = telemetryEvent.map {
+                    enrichTelemetryEvent($0, from: currentStatus, to: currentStatus)
+                }
+                let probeState = updatedNVIDIAInferenceProbeState(
+                    current: current?.nvidiaInferenceProbe,
+                    route: route,
+                    telemetryEvent: enrichedTelemetryEvent
+                )
+                let preservedState = routeCircuitState(
+                    current ?? RouteCircuitState(
+                        status: .closed,
+                        failureScore: 0,
+                        recoverySuccesses: 0,
+                        openUntil: nil,
+                        lastScoreUpdatedAt: now,
+                        lastTelemetryEvent: nil,
+                        rollingMetrics: .empty,
+                        emaMetrics: .empty,
+                        recoveredAt: nil
+                    ),
+                    replacingLastTelemetryEvent: enrichedTelemetryEvent,
+                    replacingNVIDIAInferenceProbe: probeState
+                )
+                routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = preservedState
+                if let cooldownUntil = adaptiveConcurrencyDeferralUntil(
+                    routeHealthKey: route.routeHealthKey,
+                    currentState: current,
+                    existingCooldownUntil: routeCooldownsByRouteHealthKey[route.routeHealthKey],
+                    telemetryEvent: enrichedTelemetryEvent,
+                    forcedOpenUntil: forcedOpenUntil,
+                    now: now
+                ), now < cooldownUntil {
+                    routeCooldownsByRouteHealthKey[route.routeHealthKey] = cooldownUntil
+                }
+                scheduleRouteHealthPersistLocked()
+                if let enrichedTelemetryEvent {
+                    logNVIDIARouteTelemetry(enrichedTelemetryEvent)
+                }
+                return
+            }
+
             // Always count failures — the circuit breaker threshold dampens rapid failures naturally
 
             var nextState = nextRouteCircuitState(
