@@ -1525,30 +1525,45 @@ enum OpenAICompatTemporaryShim {
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
     // Keep provider-backed direct aliases distinct from any resilient smart alias.
     // Public direct NVIDIA routes are caller-visible only when the lane is freshly trusted.
-    fileprivate static let publicNVIDIADirectAlias = "glm5-nvidia"
+    fileprivate static let publicGLM5NVIDIADirectAlias = "glm5-nvidia"
     fileprivate static let publicKimiNVIDIADirectAlias = "kimi-k2.5-nvidia"
-    private static let publicNVIDIASmartAlias = "glm5-nvidia-smart"
+    private static let publicGLM5NVIDIASmartAlias = "glm5-nvidia-smart"
     private static let publicKimiNVIDIASmartAlias = "kimi-k2.5-nvidia-smart"
-    fileprivate static let debugNVIDIADirectAlias = "glm5-nvidia-direct"
+    fileprivate static let debugGLM5NVIDIADirectAlias = "glm5-nvidia-direct"
+    fileprivate static let debugKimiNVIDIADirectAlias = "kimi-k2.5-nvidia-direct"
     private static let directNVIDIAAccessHeader = "X-VibeProxy-Allow-Direct-NVIDIA"
-    private static let publicNVIDIASmartAliasCandidateModelsByAlias: [String: [String]] = [
-        publicNVIDIASmartAlias: [
-        "glm5-nvidia",
+    private static let publicDirectNVIDIAAliasByCanonicalModelID: [String: String] = [
+        "z-ai/glm5": publicGLM5NVIDIADirectAlias,
+        "moonshotai/kimi-k2.5": publicKimiNVIDIADirectAlias
+    ]
+    private static let publicDirectNVIDIAAliases: Set<String> = Set(publicDirectNVIDIAAliasByCanonicalModelID.values)
+    private static let debugDirectNVIDIAAliasByPublicAlias: [String: String] = [
+        publicGLM5NVIDIADirectAlias: debugGLM5NVIDIADirectAlias,
+        publicKimiNVIDIADirectAlias: debugKimiNVIDIADirectAlias
+    ]
+    private static let publicDirectNVIDIAAliasByDebugAlias: [String: String] = [
+        debugGLM5NVIDIADirectAlias: publicGLM5NVIDIADirectAlias,
+        debugKimiNVIDIADirectAlias: publicKimiNVIDIADirectAlias
+    ]
+    private static let debugDirectNVIDIAAliases: Set<String> = Set(publicDirectNVIDIAAliasByDebugAlias.keys)
+    private static let publicSmartNVIDIACandidateModelsByAlias: [String: [String]] = [
+        publicGLM5NVIDIASmartAlias: [
+        publicGLM5NVIDIADirectAlias,
         "glm-5.1-zai",
         "glm-5.1-ollama-pro",
         "minimax-m2.7-ollama-pro",
         "muse-spark"
     ],
         publicKimiNVIDIASmartAlias: [
-        "kimi-k2.5-nvidia",
+        publicKimiNVIDIADirectAlias,
         "glm-5.1-zai",
         "glm-5.1-ollama-pro",
         "minimax-m2.7-ollama-pro",
         "muse-spark"
     ]
     ]
-    private static let publicNVIDIASmartAliasByDirectAlias: [String: String] = [
-        publicNVIDIADirectAlias: publicNVIDIASmartAlias,
+    private static let publicSmartNVIDIAAliasByDirectAlias: [String: String] = [
+        publicGLM5NVIDIADirectAlias: publicGLM5NVIDIASmartAlias,
         publicKimiNVIDIADirectAlias: publicKimiNVIDIASmartAlias
     ]
     fileprivate static let canonicalFactoryWorkerModelID = "custom:Proxy-Worker-Smart-Router-8"
@@ -1580,21 +1595,33 @@ enum OpenAICompatTemporaryShim {
         requestModel == canonicalFactoryWorkerModelID || codeOwnedFactoryWorkerRescueModelIDs.contains(requestModel)
     }
 
-    private static func primaryNVIDIACandidate(forSmartAlias alias: String) -> String? {
-        publicNVIDIASmartAliasCandidateModelsByAlias[alias]?.first
+    private static func primaryDirectNVIDIACandidate(forPublicSmartAlias alias: String) -> String? {
+        publicSmartNVIDIACandidateModelsByAlias[alias]?.first
     }
 
-    private static func publicNVIDIASmartAlias(forDirectRequestModel requestModel: String) -> String? {
-        publicNVIDIASmartAliasByDirectAlias[normalizedRequestModel(requestModel)]
+    private static func publicSmartNVIDIAAlias(forDirectRequestModel requestModel: String) -> String? {
+        publicSmartNVIDIAAliasByDirectAlias[normalizedRequestModel(requestModel)]
+    }
+
+    private static func publicDirectNVIDIAAlias(forDebugRequestModel requestModel: String) -> String? {
+        publicDirectNVIDIAAliasByDebugAlias[normalizedRequestModel(requestModel)]
+    }
+
+    private static func publicDirectNVIDIAAlias(forCanonicalModelID canonicalModelID: String) -> String? {
+        publicDirectNVIDIAAliasByCanonicalModelID[canonicalModelID]
     }
 
     fileprivate static func isPublicNVIDIADirectAlias(_ requestModel: String) -> Bool {
-        publicNVIDIASmartAlias(forDirectRequestModel: requestModel) != nil
+        publicSmartNVIDIAAlias(forDirectRequestModel: requestModel) != nil
+    }
+
+    fileprivate static func isDebugNVIDIADirectAlias(_ requestModel: String) -> Bool {
+        publicDirectNVIDIAAlias(forDebugRequestModel: requestModel) != nil
     }
 
     static func smartAliasDefinition(forRequestModel requestModel: String) -> SmartAliasDefinition? {
         let requestModel = normalizedRequestModel(requestModel)
-        if let candidates = publicNVIDIASmartAliasCandidateModelsByAlias[requestModel] {
+        if let candidates = publicSmartNVIDIACandidateModelsByAlias[requestModel] {
             return SmartAliasDefinition(
                 alias: requestModel,
                 requestClass: "plain-chat",
@@ -1662,7 +1689,7 @@ enum OpenAICompatTemporaryShim {
         _ candidateModels: [String],
         publicAlias: String
     ) -> [String] {
-        guard let nvidiaCandidate = primaryNVIDIACandidate(forSmartAlias: publicAlias),
+        guard let nvidiaCandidate = primaryDirectNVIDIACandidate(forPublicSmartAlias: publicAlias),
               !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: nvidiaCandidate) else {
             return candidateModels
         }
@@ -1817,7 +1844,7 @@ enum OpenAICompatTemporaryShim {
         jsonString: String,
         smartAlias: SmartAliasDefinition
     ) -> Set<String> {
-        if let nvidiaCandidate = primaryNVIDIACandidate(forSmartAlias: publicAlias),
+        if let nvidiaCandidate = primaryDirectNVIDIACandidate(forPublicSmartAlias: publicAlias),
            !hasRecentLiveInferenceSuccess(forRequestModel: nvidiaCandidate) {
             return [nvidiaCandidate]
         }
@@ -1827,9 +1854,9 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func smartAliasContractError(forRequestModel requestModel: String) -> ClientFacingNVIDIAFailure? {
-        // Validate the internal alias and the one explicit public pooled entrypoint against the same
-        // underlying pool contract. `worker` stays proxy-internal; `glm-5.1` is the only remaining
-        // external pooled alias.
+        // Validate the internal alias and both public pooled entrypoints against the same
+        // underlying pool contract. `worker` stays proxy-internal; `glm-5.1` and
+        // `proxy-worker-smart-router` remain the external pooled aliases.
         guard isWorkerPoolPublicAlias(requestModel),
               let smartAlias = smartAliasDefinition(forRequestModel: requestModel) else {
             return nil
@@ -2308,7 +2335,7 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        let smartAlias = publicNVIDIASmartAlias(forDirectRequestModel: normalizedModel) ?? publicNVIDIASmartAlias
+        let smartAlias = publicSmartNVIDIAAlias(forDirectRequestModel: normalizedModel) ?? normalizedModel
         return ClientFacingNVIDIAFailure(
             statusCode: 503,
             message: "\(normalizedModel) direct access is temporarily disabled until NVIDIA proves fresh stable live traffic on this lane. Use \(smartAlias) for proxy-managed failover, or send \(directNVIDIAAccessHeader): 1 to force a diagnostic direct attempt.",
@@ -2330,11 +2357,13 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        if normalizedRequestModel(model) == debugNVIDIADirectAlias,
+        let normalizedModel = normalizedRequestModel(model)
+        if isDebugNVIDIADirectAlias(normalizedModel),
            !allowsExplicitNVIDIADirectAccess(headers: headers) {
+            let publicAlias = publicDirectNVIDIAAlias(forDebugRequestModel: normalizedModel) ?? publicGLM5NVIDIADirectAlias
             return ClientFacingNVIDIAFailure(
                 statusCode: 403,
-                message: "\(debugNVIDIADirectAlias) is reserved for probe/debug traffic; use \(publicNVIDIADirectAlias) for public direct NVIDIA access.",
+                message: "\(normalizedModel) is reserved for probe/debug traffic; use \(publicAlias) for public direct NVIDIA access.",
                 reasonCode: "direct_alias_debug_only"
             )
         }
@@ -3157,14 +3186,16 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         from candidates: [String],
         routes: [String: RouteIdentity]
     ) -> String? {
-        if candidates.contains(publicNVIDIADirectAlias) {
-            return publicNVIDIADirectAlias
+        if let publicAlias = candidates.first(where: { publicDirectNVIDIAAliases.contains($0) }) {
+            return publicAlias
         }
-        if candidates.contains(where: { candidate in
-            guard let route = routes[candidate] else { return false }
-            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
-        }) {
-            return publicNVIDIADirectAlias
+        for candidate in candidates {
+            guard let route = routes[candidate],
+                  route.providerID.hasPrefix("nvidia"),
+                  let publicAlias = publicDirectNVIDIAAlias(forCanonicalModelID: route.canonicalModelID) else {
+                continue
+            }
+            return publicAlias
         }
         return preferredConcreteRequestModel(from: candidates, routes: routes)
     }
@@ -3203,25 +3234,19 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         from candidates: [String],
         routes: [String: RouteIdentity]
     ) -> String? {
-        if candidates.contains(where: { candidate in
-            guard let route = routes[candidate] else { return false }
-            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
-        }) {
-            return publicNVIDIADirectAlias
+        if let publicAlias = preferredRouteHealthDisplayRequestModel(
+            from: candidates,
+            routes: routes
+        ), publicDirectNVIDIAAliases.contains(publicAlias) {
+            return publicAlias
         }
 
-        let nonDirectCandidates = candidates.filter { $0 != publicNVIDIADirectAlias && $0 != debugNVIDIADirectAlias }
-        let hasNVIDIADirectAlias = candidates.contains(publicNVIDIADirectAlias) || candidates.contains(debugNVIDIADirectAlias)
-        let hasNonDirectNVIDIA = nonDirectCandidates.contains { candidate in
-            guard let route = routes[candidate] else { return false }
-            return route.providerID.hasPrefix("nvidia") && route.canonicalModelID == "z-ai/glm5"
-        }
-        if hasNVIDIADirectAlias, hasNonDirectNVIDIA,
-           let preferredNonDirect = preferredConcreteRequestModel(
-            from: nonDirectCandidates,
+        let nonDebugCandidates = candidates.filter { !debugDirectNVIDIAAliases.contains($0) }
+        if let preferredNonDebug = preferredConcreteRequestModel(
+            from: nonDebugCandidates,
             routes: routes
         ) {
-            return preferredNonDirect
+            return preferredNonDebug
         }
         return preferredRouteHealthDisplayRequestModel(
             from: candidates,
@@ -6640,8 +6665,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
         let normalized = normalizedRequestModel(model)
-        if normalized == debugNVIDIADirectAlias {
-            return resolvedRoutesByRequestModel()[publicNVIDIADirectAlias]
+        if let publicAlias = publicDirectNVIDIAAlias(forDebugRequestModel: normalized) {
+            return resolvedRoutesByRequestModel()[publicAlias]
         }
         return resolvedRoutesByRequestModel()[normalized]
     }
@@ -6679,14 +6704,15 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         path: String,
         jsonString: String
     ) -> String? {
-        guard rawModelName(forRequestJSON: jsonString) == debugNVIDIADirectAlias else {
+        guard let rawModel = rawModelName(forRequestJSON: jsonString),
+              let publicAlias = publicDirectNVIDIAAlias(forDebugRequestModel: rawModel) else {
             return nil
         }
         return rewrittenRequestJSON(
             method: method,
             path: path,
             replacingRequestModelIn: jsonString,
-            with: publicNVIDIADirectAlias
+            with: publicAlias
         )
     }
 
