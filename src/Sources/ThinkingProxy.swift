@@ -19139,13 +19139,23 @@ class ThinkingProxy {
             requestShape: requestShape
         )
 
-        return OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
+        let candidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
             forPublicAlias: routeModel,
             method: "POST",
             path: "/v1/chat/completions",
             jsonString: syntheticWorkerRequest,
             smartAlias: smartAlias
         )
+        // Live worker multi-tool typed transcripts still contain content-array forms that the
+        // NVIDIA routes reject at request preflight. Keep runtime routing on the real request,
+        // but make healthz conservative so it does not advertise those lanes as dispatchable for
+        // multi-tool typed buckets when the healthy non-NVIDIA siblings are gone.
+        if requestShape == .multiTypedToolChat || requestShape == .streamingMultiTypedToolChat {
+            return candidateModels.filter { candidateModel in
+                OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: candidateModel)?.providerID != "nvidia"
+            }
+        }
+        return candidateModels
     }
 
     private static func dispatchableFactoryWorkerCandidateModel(
