@@ -28,6 +28,7 @@ public struct RouteTelemetryEvent: Equatable {
     public let terminalOutcomeMarker: String?
     public let failoverChain: String?
     public let firstSelectedCandidate: String?
+    public let correlationID: String?
 
     public init(
         timestamp: Date,
@@ -56,7 +57,8 @@ public struct RouteTelemetryEvent: Equatable {
         errorBodySnippet: String? = nil,
         terminalOutcomeMarker: String? = nil,
         failoverChain: String? = nil,
-        firstSelectedCandidate: String? = nil
+        firstSelectedCandidate: String? = nil,
+        correlationID: String? = nil
     ) {
         self.timestamp = timestamp
         self.requestModel = requestModel
@@ -85,5 +87,6 @@ public struct RouteTelemetryEvent: Equatable {
         self.terminalOutcomeMarker = terminalOutcomeMarker
         self.failoverChain = failoverChain
         self.firstSelectedCandidate = firstSelectedCandidate
+        self.correlationID = correlationID
     }
 }

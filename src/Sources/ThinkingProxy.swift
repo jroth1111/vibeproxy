@@ -76,6 +76,7 @@ enum OpenAICompatTemporaryShim {
         let terminalOutcomeMarker: String?
         let failoverChain: String?
         let firstSelectedCandidate: String?
+        let correlationID: String?
 
         init(
             timestamp: Date,
@@ -104,7 +105,8 @@ enum OpenAICompatTemporaryShim {
             errorBodySnippet: String? = nil,
             terminalOutcomeMarker: String? = nil,
             failoverChain: String? = nil,
-            firstSelectedCandidate: String? = nil
+            firstSelectedCandidate: String? = nil,
+            correlationID: String? = nil
         ) {
             self.timestamp = timestamp
             self.requestModel = requestModel
@@ -133,6 +135,7 @@ enum OpenAICompatTemporaryShim {
             self.terminalOutcomeMarker = terminalOutcomeMarker
             self.failoverChain = failoverChain
             self.firstSelectedCandidate = firstSelectedCandidate
+            self.correlationID = correlationID
         }
     }
 
@@ -3107,7 +3110,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         callerRequestID: String? = nil,
         callerSessionID: String? = nil,
         requestShape: String? = nil,
-        errorBodyData: Data? = nil
+        errorBodyData: Data? = nil,
+        correlationID: String? = nil
     ) -> RouteTelemetryEvent {
         let canonicalModelID = resolveConfiguredRoute(forRequestModel: state.model)?.canonicalModelID ?? state.model
         let retryCount = max(0, state.initialTransportRetries - state.transportRetriesRemaining) +
@@ -3144,7 +3148,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 callerSessionID: callerSessionID,
                 requestShape: requestShape,
                 negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol,
-                errorBodySnippet: snippet
+                errorBodySnippet: snippet,
+                correlationID: correlationID
             )
         }
 
@@ -3181,7 +3186,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 proxyRequestID: proxyRequestID,
                 callerRequestID: callerRequestID,
                 callerSessionID: callerSessionID,
-                requestShape: requestShape
+                requestShape: requestShape,
+                correlationID: correlationID
             )
         }
 
@@ -3214,7 +3220,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     callerRequestID: callerRequestID,
                     callerSessionID: callerSessionID,
                     requestShape: requestShape,
-                    errorBodySnippet: snippet
+                    errorBodySnippet: snippet,
+                    correlationID: correlationID
                 )
             }
 
@@ -3241,7 +3248,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 callerSessionID: callerSessionID,
                 requestShape: requestShape,
                 negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol,
-                errorBodySnippet: snippet
+                errorBodySnippet: snippet,
+                correlationID: correlationID
             )
         }
 
@@ -3263,7 +3271,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             callerSessionID: callerSessionID,
             requestShape: requestShape,
             negotiatedApplicationProtocol: attempt.negotiatedApplicationProtocol,
-            errorBodySnippet: snippet
+            errorBodySnippet: snippet,
+            correlationID: correlationID
         )
     }
 
@@ -10558,6 +10567,7 @@ class ThinkingProxy {
         let callerRequestID: String?
         let callerSessionID: String?
         let requestShape: String
+        let correlationID: String
 
         var responseHeaders: [String: String] {
             var headers = ["X-VibeProxy-Request-ID": proxyRequestID]
@@ -10568,6 +10578,7 @@ class ThinkingProxy {
                 headers["X-VibeProxy-Caller-Session-ID"] = callerSessionID
             }
             headers["X-VibeProxy-Request-Shape"] = requestShape
+            headers["X-VibeProxy-Correlation-ID"] = correlationID
             return headers
         }
     }
@@ -14233,6 +14244,14 @@ class ThinkingProxy {
         }
         Self.lastTerminalWorkerOutcome = terminalOutcomeRecord
 
+        if terminalOutcomeRecord.outcome != "success" && terminalOutcomeRecord.outcome != "terminal_response" {
+            NSLog("[ThinkingProxy] Terminal failure for %@ — outcome: %@, failureClass: %@, model: %@, correlationID: %@",
+                publicAlias,
+                terminalOutcomeRecord.outcome,
+                terminalOutcomeRecord.failureClass ?? "none",
+                terminalOutcomeRecord.requestModel,
+                requestTrace?.correlationID ?? "untracked")
+        }
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
@@ -15017,7 +15036,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace.proxyRequestID,
                 callerRequestID: requestTrace.callerRequestID,
                 callerSessionID: requestTrace.callerSessionID,
-                requestShape: requestTrace.requestShape
+                requestShape: requestTrace.requestShape,
+                correlationID: requestTrace.correlationID
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -15241,7 +15261,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace.proxyRequestID,
                 callerRequestID: requestTrace.callerRequestID,
                 callerSessionID: requestTrace.callerSessionID,
-                requestShape: requestTrace.requestShape
+                requestShape: requestTrace.requestShape,
+                correlationID: requestTrace.correlationID
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -15576,7 +15597,8 @@ class ThinkingProxy {
                     proxyRequestID: requestTrace.proxyRequestID,
                     callerRequestID: requestTrace.callerRequestID,
                     callerSessionID: requestTrace.callerSessionID,
-                    requestShape: requestTrace.requestShape
+                    requestShape: requestTrace.requestShape,
+                    correlationID: requestTrace.correlationID
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -15886,7 +15908,8 @@ class ThinkingProxy {
                     proxyRequestID: requestTrace.proxyRequestID,
                     callerRequestID: requestTrace.callerRequestID,
                     callerSessionID: requestTrace.callerSessionID,
-                    requestShape: requestTrace.requestShape
+                    requestShape: requestTrace.requestShape,
+                    correlationID: requestTrace.correlationID
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -15924,7 +15947,8 @@ class ThinkingProxy {
                     proxyRequestID: requestTrace.proxyRequestID,
                     callerRequestID: requestTrace.callerRequestID,
                     callerSessionID: requestTrace.callerSessionID,
-                    requestShape: requestTrace.requestShape
+                    requestShape: requestTrace.requestShape,
+                    correlationID: requestTrace.correlationID
                 ),
                 requestedAlias: publicAlias,
                 failoverDepth: failoverDepth,
@@ -15973,7 +15997,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace.proxyRequestID,
                 callerRequestID: requestTrace.callerRequestID,
                 callerSessionID: requestTrace.callerSessionID,
-                requestShape: requestTrace.requestShape
+                requestShape: requestTrace.requestShape,
+                correlationID: requestTrace.correlationID
             ),
             requestedAlias: publicAlias,
             failoverDepth: failoverDepth,
@@ -16747,7 +16772,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace?.proxyRequestID,
                 callerRequestID: requestTrace?.callerRequestID,
                 callerSessionID: requestTrace?.callerSessionID,
-                requestShape: requestTrace?.requestShape
+                requestShape: requestTrace?.requestShape,
+                correlationID: requestTrace?.correlationID
             )
             return (
                 event: event,
@@ -16783,7 +16809,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace?.proxyRequestID,
                 callerRequestID: requestTrace?.callerRequestID,
                 callerSessionID: requestTrace?.callerSessionID,
-                requestShape: requestTrace?.requestShape
+                requestShape: requestTrace?.requestShape,
+                correlationID: requestTrace?.correlationID
             )
             return (
                 event: event,
@@ -16812,7 +16839,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace?.proxyRequestID,
                 callerRequestID: requestTrace?.callerRequestID,
                 callerSessionID: requestTrace?.callerSessionID,
-                requestShape: requestTrace?.requestShape
+                requestShape: requestTrace?.requestShape,
+                correlationID: requestTrace?.correlationID
             )
             return (
                 event: event,
@@ -17859,7 +17887,8 @@ class ThinkingProxy {
                     proxyRequestID: requestTrace.proxyRequestID,
                     callerRequestID: requestTrace.callerRequestID,
                     callerSessionID: requestTrace.callerSessionID,
-                    requestShape: requestTrace.requestShape
+                    requestShape: requestTrace.requestShape,
+                    correlationID: requestTrace.correlationID
                 )
                 OpenAICompatTemporaryShim.recordRouteFailure(forRequestModel: state.model, telemetryEvent: telemetryEvent)
                 NSLog(
@@ -18247,7 +18276,8 @@ class ThinkingProxy {
                 proxyRequestID: requestTrace.proxyRequestID,
                 callerRequestID: requestTrace.callerRequestID,
                 callerSessionID: requestTrace.callerSessionID,
-                requestShape: requestTrace.requestShape
+                requestShape: requestTrace.requestShape,
+                correlationID: requestTrace.correlationID
             )
 
             switch outcome {
@@ -19813,7 +19843,8 @@ class ThinkingProxy {
             callerSessionID: requestHeaderValue("X-Session-ID", in: headers)
                 ?? requestHeaderValue("X-Factory-Session-ID", in: headers)
                 ?? requestHeaderValue("X-Droid-Session-ID", in: headers),
-            requestShape: requestShapeDescriptor(method: method, path: path, body: body)
+            requestShape: requestShapeDescriptor(method: method, path: path, body: body),
+            correlationID: UUID().uuidString
         )
     }
 
