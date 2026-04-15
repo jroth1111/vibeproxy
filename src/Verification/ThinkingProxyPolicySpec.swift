@@ -2190,7 +2190,8 @@ struct ThinkingProxyPolicySpec {
                 )
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
-                    telemetryEvent: successEvent
+                    telemetryEvent: successEvent,
+                    at: now.addingTimeInterval(1)
                 )
 
                 var snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
@@ -2199,7 +2200,8 @@ struct ThinkingProxyPolicySpec {
 
                 OpenAICompatTemporaryShim.recordRouteSuccess(
                     forRequestModel: "glm5",
-                    telemetryEvent: successEvent
+                    telemetryEvent: successEvent,
+                    at: now.addingTimeInterval(2)
                 )
                 snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .closed, "enough clean successes should still restore the healthy state", recorder: recorder)
@@ -2964,6 +2966,11 @@ struct ThinkingProxyPolicySpec {
                     telemetryEvent: failureEvent,
                     at: now.addingTimeInterval(2)
                 )
+                OpenAICompatTemporaryShim.recordRouteFailure(
+                    forRequestModel: "glm5",
+                    telemetryEvent: failureEvent,
+                    at: now.addingTimeInterval(3)
+                )
 
                 let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
                 expectEqual(snapshot["z-ai/glm5"]?.status, .open, "repeated classified failure pressure should now quarantine the unhealthy NVIDIA route instead of leaving it merely suspect", recorder: recorder)
@@ -3635,21 +3642,21 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["effective_route_model"] as? String, nil, "healthz should stop advertising a single worker lane when single-tool and multi-tool request surfaces route differently", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should label divergent worker routing when tool cardinality changes dispatchability", recorder: recorder)
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should stop advertising a single worker provider when request-shape routing diverges", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "route_unavailable", "healthz should surface worker exhaustion once multi-tool typed worker traffic has no dispatchable lane left", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should stop marking the worker ready when multi-tool typed buckets can no longer dispatch", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should not surface worker exhaustion when multi-tool typed worker traffic has dispatchable NVIDIA lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should mark the worker ready when all request-shape buckets have at least one dispatchable lane", recorder: recorder)
                     expectEqual(dispatchableRequestShapes?.contains("multi_tool_string_content"), true, "healthz should expose the multi-tool string worker shape explicitly", recorder: recorder)
-                    expectEqual(dispatchableRequestShapes?.contains("multi_tool_typed_content"), false, "healthz should stop advertising multi-tool typed worker dispatch when only NVIDIA typed fallbacks remain", recorder: recorder)
-                    expectEqual(dispatchableRequestShapes?.contains("streaming_multi_tool_typed_content"), false, "healthz should stop advertising streaming multi-tool typed worker dispatch when only NVIDIA typed fallbacks remain", recorder: recorder)
+                    expectEqual(dispatchableRequestShapes?.contains("multi_tool_typed_content"), true, "healthz should advertise multi-tool typed worker dispatch when NVIDIA lanes can handle flattened typed content", recorder: recorder)
+                    expectEqual(dispatchableRequestShapes?.contains("streaming_multi_tool_typed_content"), true, "healthz should advertise streaming multi-tool typed worker dispatch when NVIDIA lanes can handle flattened typed content through buffered execution", recorder: recorder)
                     expectEqual(toolChat?["effective_route_model"] as? String, "muse-spark", "single-tool string worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
-                    expectEqual(toolChat?["dispatchable_candidate_models"] as? [String], ["muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "single-tool string worker health should expose every dispatchable native lane in preference order", recorder: recorder)
-                    expectEqual(multiToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool string worker health should skip Meta and fall through to NVIDIA", recorder: recorder)
-                    expectEqual(multiToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "multi-tool string worker health should exclude Meta while preserving both dispatchable NVIDIA fallbacks", recorder: recorder)
+                    expectEqual(toolChat?["dispatchable_candidate_models"] as? [String], ["muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "single-tool string worker health should expose muse-spark and all NVIDIA lanes in preference order", recorder: recorder)
+                    expectEqual(multiToolChat?["effective_route_model"] as? String, "glm5-nvidia", "multi-tool string worker health should prefer the first dispatchable NVIDIA lane", recorder: recorder)
+                    expectEqual(multiToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "multi-tool string worker health should expose all NVIDIA lanes when muse-spark is excluded from multi-tool candidates", recorder: recorder)
                     expectEqual(typedToolChat?["effective_route_model"] as? String, "muse-spark", "single-tool typed worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["ready"] as? Bool, false, "multi-tool typed worker health should report no dispatchable lane when only NVIDIA typed fallbacks remain", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool typed worker health should no longer advertise NVIDIA typed fallbacks as dispatchable", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["ready"] as? Bool, true, "multi-tool typed worker health should report dispatchable NVIDIA lanes when content flattening makes them eligible", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "multi-tool typed worker health should advertise only the trust-unblocked NVIDIA lane for typed content", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "muse-spark", "single-tool streaming typed worker health should keep the Meta lane when it remains dispatchable", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, false, "multi-tool streaming typed worker health should report no dispatchable lane when only NVIDIA typed fallbacks remain", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool streaming typed worker health should no longer advertise NVIDIA typed fallbacks as dispatchable", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, true, "multi-tool streaming typed worker health should report dispatchable NVIDIA lanes when buffered execution handles the streaming surface", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "multi-tool streaming typed worker health should advertise only the trust-unblocked NVIDIA lane for buffered typed content", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -10749,16 +10756,6 @@ struct ThinkingProxyPolicySpec {
                         telemetryEvent: event,
                         at: now.addingTimeInterval(6)
                     )
-                    OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: "glm5",
-                        telemetryEvent: event,
-                        at: now.addingTimeInterval(12)
-                    )
-                    OpenAICompatTemporaryShim.recordRouteFailure(
-                        forRequestModel: "glm5",
-                        telemetryEvent: event,
-                        at: now.addingTimeInterval(18)
-                    )
 
                     guard FileManager.default.fileExists(atPath: path) else {
                         recorder.recordFailure("expected persistent NVIDIA route-health cache file to be written")
@@ -10775,8 +10772,8 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(persisted?.isUnavailable(at: now), false, "startup reload should not keep the route unavailable purely from persisted state", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.transportOutcome, "send_error", "startup reload should retain the transport outcome", recorder: recorder)
                     expectEqual(persisted?.lastTelemetryEvent?.healthTransition, "suspect->open", "startup reload should retain the original health transition evidence", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":classified_500") }.count, 4, "startup reload should retain rolling failure counts in recent outcomes", recorder: recorder)
-                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 4, "startup reload should retain recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.filter { $0.hasSuffix(":classified_500") }.count, 2, "startup reload should retain rolling failure counts in recent outcomes", recorder: recorder)
+                    expectEqual(persisted?.rollingMetrics.recentOutcomes.count, 2, "startup reload should retain recent outcomes", recorder: recorder)
 
                     guard let rawData = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                         recorder.recordFailure("expected to read persisted route-health cache file")
@@ -10790,7 +10787,7 @@ struct ThinkingProxyPolicySpec {
                     let lastEvent = glm5?["last_event"] as? [String: Any]
                     expectEqual(lastEvent?["health_transition"] as? String, "suspect->open", "startup normalization should preserve the original health transition evidence on disk", recorder: recorder)
                     let rollingMetrics = glm5?["rolling_metrics"] as? [String: Any]
-                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":classified_500") }.count, 4, "startup normalization should preserve rolling failure counts in recent outcomes", recorder: recorder)
+                    expectEqual((rollingMetrics?["recent_outcomes"] as? [String])?.filter { $0.hasSuffix(":classified_500") }.count, 2, "startup normalization should preserve rolling failure counts in recent outcomes", recorder: recorder)
                     expectEqual(glm5?["open_until"] == nil, true, "startup normalization should drop persisted open-until timestamps so restart does not inherit unavailability", recorder: recorder)
                 }
             }
@@ -14637,11 +14634,11 @@ struct ThinkingProxyPolicySpec {
                     let typedToolChatModel = typedToolChat?["effective_route_model"] as? String
                     let streamingTypedToolChatModel = streamingTypedToolChat?["effective_route_model"] as? String
 
-                    expectEqual(effectiveWorkerModel == nil, true, "healthz should keep the top-level worker summary divergent when probe-backed NVIDIA recovery still leaves multi-tool typed buckets undispatchable", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should label probe-backed worker recovery as request-shape divergent when multi-tool typed buckets still cannot dispatch", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should omit the top-level worker provider when probe-backed NVIDIA recovery only restores a subset of worker buckets", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "route_unavailable", "healthz should keep surfacing worker exhaustion while multi-tool typed buckets remain undispatchable", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should keep the worker pool unready while multi-tool typed buckets remain undispatchable", recorder: recorder)
+                    expectEqual(effectiveWorkerModel == nil, true, "healthz should keep the top-level worker summary divergent when probe-backed NVIDIA recovery routes different shapes to different lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should label probe-backed worker recovery as request-shape divergent when shapes still route to different lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should omit the top-level worker provider when probe-backed NVIDIA recovery routes shapes to different providers", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should not surface worker exhaustion when probe-backed NVIDIA recovery makes all buckets dispatchable", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should mark the worker pool ready when probe-backed NVIDIA recovery makes all buckets dispatchable", recorder: recorder)
                     expectEqual(recoveredNVIDIAModels.contains(plainChatModel ?? ""), true, "plain chat worker health should still trust a recovered NVIDIA lane", recorder: recorder)
                     expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the recovered NVIDIA lane", recorder: recorder)
                     expectEqual(recoveredNVIDIAModels.contains(toolChatModel ?? ""), true, "tool-bearing string worker health should still trust a recovered NVIDIA lane", recorder: recorder)
@@ -14652,10 +14649,10 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should expose NVIDIA as the active provider once the buffered streaming surface is dispatchable", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should stop surfacing exhaustion once NVIDIA can serve that shape through buffered upstream execution", recorder: recorder)
                     expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should become ready once buffered upstream execution restores the streaming worker shape", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool typed worker health should keep NVIDIA excluded even after a probe-backed NVIDIA recovery", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["ready"] as? Bool, false, "multi-tool typed worker health should stay unready while only NVIDIA typed fallbacks remain", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "streaming multi-tool typed worker health should keep NVIDIA excluded even after a probe-backed NVIDIA recovery", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, false, "streaming multi-tool typed worker health should stay unready while only NVIDIA typed fallbacks remain", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "multi-tool typed worker health should advertise only the trust-unblocked NVIDIA lane after probe-backed recovery when content flattening handles typed arrays", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["ready"] as? Bool, true, "multi-tool typed worker health should be ready when probe-backed NVIDIA recovery and content flattening make the trust-unblocked lane dispatchable", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "streaming multi-tool typed worker health should advertise only the trust-unblocked NVIDIA lane after probe-backed recovery when buffered execution handles the streaming surface", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, true, "streaming multi-tool typed worker health should be ready when probe-backed NVIDIA recovery and buffered execution make lanes dispatchable", recorder: recorder)
                     expectEqual(nvidiaLiveness?["trusted"] as? Bool, true, "healthz should report NVIDIA inference liveness as trusted after a recent probe success", recorder: recorder)
                     expectEqual(nvidiaLiveness?["recent_probe_success"] as? Bool, true, "healthz should surface that the current NVIDIA liveness evidence comes from a recent probe", recorder: recorder)
                     expectEqual(nvidiaLiveness?["recent_live_success"] as? Bool, false, "healthz should distinguish probe-backed recovery from live request success", recorder: recorder)
@@ -15078,27 +15075,27 @@ struct ThinkingProxyPolicySpec {
                     let multiTypedToolChat = requestShapes?["multi_tool_typed_content"] as? [String: Any]
                     let streamingMultiTypedToolChat = requestShapes?["streaming_multi_tool_typed_content"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] == nil, true, "healthz should keep the top-level worker route divergent when only the multi-tool typed buckets lose dispatchability", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should mark the top-level worker route as divergent when only the multi-tool typed buckets remain unsupported", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should omit the top-level worker provider when only some buckets remain dispatchable on NVIDIA", recorder: recorder)
-                    expectEqual(factoryWorker?["route_health_status"] as? String, "route_unavailable", "healthz should surface worker exhaustion when multi-tool typed buckets have no dispatchable lane", recorder: recorder)
-                    expectEqual(factoryWorker?["ready"] as? Bool, false, "healthz should keep the worker pool unready when multi-tool typed buckets have no dispatchable lane", recorder: recorder)
-                    expectEqual(plainChat?["effective_route_model"] as? String, "glm5-nvidia", "plain chat worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
-                    expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
-                    expectEqual(toolChat?["effective_route_model"] as? String, "glm5-nvidia", "tool-bearing string-content worker health should still dispatch to the remaining NVIDIA lane", recorder: recorder)
-                    expectEqual(toolChat?["ready"] as? Bool, true, "tool-bearing string-content worker health should stay ready on the remaining NVIDIA lane", recorder: recorder)
-                    expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed-content worker health should stay on the remaining NVIDIA lane when the request is shimmed into a dispatchable form", recorder: recorder)
-                    expectEqual(typedToolChat?["ready"] as? Bool, true, "typed-content worker health should stay ready when the remaining NVIDIA lane can still dispatch the shimmed request", recorder: recorder)
-                    expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "typed-content worker health should expose every shim-dispatchable NVIDIA lane explicitly", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming typed worker health should stay on NVIDIA once buffered upstream execution restores that request shape", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should advertise NVIDIA once the buffered streaming worker surface is supported", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should stop classifying NVIDIA as exhausted once the buffered streaming shape is dispatchable", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should be ready when the remaining NVIDIA lane can dispatch that shape through buffered upstream execution", recorder: recorder)
-                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "streaming typed worker health should expose every buffered-dispatchable NVIDIA lane explicitly", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "multi-tool typed worker health should stop advertising NVIDIA when the remaining route is only a typed NVIDIA fallback", recorder: recorder)
-                    expectEqual(multiTypedToolChat?["ready"] as? Bool, false, "multi-tool typed worker health should stay unready when only typed NVIDIA fallbacks remain", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], [], "streaming multi-tool typed worker health should stop advertising NVIDIA when the remaining route is only a typed NVIDIA fallback", recorder: recorder)
-                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, false, "streaming multi-tool typed worker health should stay unready when only typed NVIDIA fallbacks remain", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] == nil, true, "healthz should keep the top-level worker route divergent when typed and non-typed buckets route to different NVIDIA lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "request_shape_divergent", "healthz should mark the top-level worker route as divergent when typed and non-typed shapes pick different NVIDIA lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] as? String, nil, "healthz should omit the top-level worker provider when shape buckets disagree on the active lane", recorder: recorder)
+                    expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should not surface worker exhaustion when multi-tool typed buckets have dispatchable NVIDIA lanes", recorder: recorder)
+                    expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the worker pool ready when all buckets have dispatchable NVIDIA lanes", recorder: recorder)
+                    expectEqual(plainChat?["effective_route_model"] as? String, "glm5-nvidia", "plain chat worker health should prefer the first NVIDIA lane when all non-NVIDIA routes are open", recorder: recorder)
+                    expectEqual(plainChat?["ready"] as? Bool, true, "plain chat worker health should stay ready on the first dispatchable NVIDIA lane", recorder: recorder)
+                    expectEqual(toolChat?["effective_route_model"] as? String, "glm5-nvidia", "tool-bearing string-content worker health should prefer the first NVIDIA lane when all non-NVIDIA routes are open", recorder: recorder)
+                    expectEqual(toolChat?["ready"] as? Bool, true, "tool-bearing string-content worker health should stay ready on the first dispatchable NVIDIA lane", recorder: recorder)
+                    expectEqual(typedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "typed-content worker health should prefer the first NVIDIA lane when all non-NVIDIA routes are open", recorder: recorder)
+                    expectEqual(typedToolChat?["ready"] as? Bool, true, "typed-content worker health should stay ready when a dispatchable NVIDIA lane can handle the shimmed request", recorder: recorder)
+                    expectEqual(typedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "typed-content worker health should expose all NVIDIA lanes when none are trust-blocked for single-tool typed content", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_model"] as? String, "glm5-nvidia", "streaming typed worker health should prefer the first NVIDIA lane when all non-NVIDIA routes are open", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["effective_route_provider"] as? String, "nvidia", "streaming typed worker health should advertise the nvidia provider for the first NVIDIA lane", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["route_health_status"] as? String, nil, "streaming typed worker health should not classify NVIDIA as exhausted when dispatchable lanes exist", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["ready"] as? Bool, true, "streaming typed worker health should be ready when a dispatchable NVIDIA lane can handle that shape", recorder: recorder)
+                    expectEqual(streamingTypedToolChat?["dispatchable_candidate_models"] as? [String], ["glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "streaming typed worker health should expose all NVIDIA lanes for single-tool streaming typed content", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "multi-tool typed worker health should advertise only the trust-unblocked NVIDIA lane when content flattening makes it dispatchable", recorder: recorder)
+                    expectEqual(multiTypedToolChat?["ready"] as? Bool, true, "multi-tool typed worker health should be ready when the trust-unblocked NVIDIA lane can dispatch flattened typed content", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["dispatchable_candidate_models"] as? [String], ["minimax-m2.7-nvidia"], "streaming multi-tool typed worker health should advertise only the trust-unblocked NVIDIA lane when buffered execution makes it dispatchable", recorder: recorder)
+                    expectEqual(streamingMultiTypedToolChat?["ready"] as? Bool, true, "streaming multi-tool typed worker health should be ready when the trust-unblocked NVIDIA lane can dispatch through buffered upstream execution", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -15298,15 +15295,15 @@ struct ThinkingProxyPolicySpec {
                     let requestShapes = factoryWorker?["request_shapes"] as? [String: Any]
                     let streamingMultiToolTyped = requestShapes?["streaming_multi_tool_typed_content"] as? [String: Any]
 
-                    expectEqual(factoryWorker?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should fall back to the best dispatchable non-NVIDIA worker lane when the recent live NVIDIA bucket is no longer dispatchable", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "dispatchable_prediction", "healthz should keep the top-level worker summary on dispatchable prediction when the recent live NVIDIA bucket is no longer dispatchable", recorder: recorder)
-                    expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should advertise the current dispatchable worker provider instead of the non-dispatchable recent live NVIDIA bucket", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model"] != nil, true, "healthz should populate the top-level worker summary when all shapes converge on the same dispatchable prediction", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_model_source"] as? String, "dispatchable_prediction", "healthz should use dispatchable prediction at the top level when the live NVIDIA winner is trust-blocked for typed content", recorder: recorder)
+                    expectEqual(factoryWorker?["effective_route_provider"] != nil, true, "healthz should populate the top-level worker provider when all shape buckets agree on the dispatchable lane", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_model"] as? String, "glm5-nvidia", "healthz should expose the recent live worker lane when it exists", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_route_provider"] as? String, "nvidia", "healthz should preserve the live worker provider even after a newer synthetic probe success on a different lane", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_caller_request_id"] as? String, "live-worker-req", "healthz should expose the recent live worker caller request id for correlation", recorder: recorder)
                     expectEqual(factoryWorker?["recent_live_request_shape"] as? String, "POST:chat:custom:Proxy-Worker-Smart-Router-8:stream:tools=21:tool_choice_auto:typed_content", "healthz should expose the recent live worker request shape for correlation", recorder: recorder)
-                    expectEqual(streamingMultiToolTyped?["dispatchable_candidate_models"] as? [String], ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro"], "matching streaming typed worker health should exclude NVIDIA and keep only the remaining dispatchable non-NVIDIA siblings", recorder: recorder)
-                    expectEqual(streamingMultiToolTyped?["effective_route_model_source"] as? String, "dispatchable_prediction", "matching streaming typed worker health should fall back to dispatchable prediction once the recent NVIDIA winner is no longer dispatchable for that bucket", recorder: recorder)
+                    expectEqual(streamingMultiToolTyped?["dispatchable_candidate_models"] as? [String], ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "minimax-m2.7-nvidia"], "matching streaming typed worker health should exclude trust-blocked public NVIDIA aliases from dispatchable candidates", recorder: recorder)
+                    expectEqual(streamingMultiToolTyped?["effective_route_model_source"] as? String, "dispatchable_prediction", "matching streaming typed worker health should use dispatchable prediction when the recent live NVIDIA winner is trust-blocked for typed content", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
