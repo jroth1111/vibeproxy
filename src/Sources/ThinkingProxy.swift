@@ -1282,18 +1282,35 @@ enum OpenAICompatTemporaryShim {
 
     fileprivate static let concurrencyRegistry = ProviderConcurrencyRegistry()
 
+    #if canImport(ProxyCore)
+    private static let concurrencyLimiter = RouteConcurrencyLimiter()
+    #endif
+
     // Public accessors for concurrency registry (used by ThinkingProxy main class)
     static func acquireConcurrencySlot(routeHealthKey: String) -> Bool {
-        concurrencyRegistry.acquireSlot(routeHealthKey: routeHealthKey)
+        #if canImport(ProxyCore)
+        return concurrencyLimiter.acquireSlot(routeHealthKey: routeHealthKey)
+        #else
+        return concurrencyRegistry.acquireSlot(routeHealthKey: routeHealthKey)
+        #endif
     }
 
     static func releaseConcurrencySlot(routeHealthKey: String) {
+        #if canImport(ProxyCore)
+        concurrencyLimiter.releaseSlot(routeHealthKey: routeHealthKey)
+        #else
         concurrencyRegistry.releaseSlot(routeHealthKey: routeHealthKey)
+        #endif
     }
 
     static func recordConcurrency429(routeHealthKey: String, inflightAtRequest: Int? = nil) {
+        #if canImport(ProxyCore)
+        let inflight = inflightAtRequest ?? concurrencyLimiter.inflightCount(forRouteHealthKey: routeHealthKey)
+        concurrencyLimiter.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
+        #else
         let inflight = inflightAtRequest ?? concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
         concurrencyRegistry.record429(routeHealthKey: routeHealthKey, inflightAtRequest: inflight)
+        #endif
     }
 
     static func shouldTreatProvider429AsConcurrency(
@@ -1340,19 +1357,35 @@ enum OpenAICompatTemporaryShim {
     }
 
     static func recordConcurrencySuccess(routeHealthKey: String, inflightAtRequest: Int? = nil) {
+        #if canImport(ProxyCore)
+        concurrencyLimiter.recordSuccess(routeHealthKey: routeHealthKey, inflightAtRequest: inflightAtRequest)
+        #else
         concurrencyRegistry.recordSuccess(routeHealthKey: routeHealthKey, inflightAtRequest: inflightAtRequest)
+        #endif
     }
 
     static func currentInflightConcurrency(routeHealthKey: String) -> Int {
-        concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+        #if canImport(ProxyCore)
+        return concurrencyLimiter.inflightCount(forRouteHealthKey: routeHealthKey)
+        #else
+        return concurrencyRegistry.currentInflight(routeHealthKey: routeHealthKey)
+        #endif
     }
 
     static func currentConcurrencyLimit(routeHealthKey: String) -> Int {
-        concurrencyRegistry.currentLimit(routeHealthKey: routeHealthKey)
+        #if canImport(ProxyCore)
+        return concurrencyLimiter.currentLimit(routeHealthKey: routeHealthKey)
+        #else
+        return concurrencyRegistry.currentLimit(routeHealthKey: routeHealthKey)
+        #endif
     }
 
     static func resetConcurrencyRegistryForTesting() {
+        #if canImport(ProxyCore)
+        concurrencyLimiter.resetForTesting()
+        #else
         concurrencyRegistry.resetForTesting()
+        #endif
         retryBackoffJitterProviderForTesting = nil
     }
 
@@ -6004,7 +6037,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         // Route cooldowns are runtime-only backpressure hints. Replaying them across restart can
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
+        #if canImport(ProxyCore)
+        concurrencyLimiter.loadLocked(from: json, persistedVersion: version)
+        #else
         concurrencyRegistry.loadLocked(from: json, persistedVersion: version)
+        #endif
         if prunedUnknownEntries || normalizedPersistedAvailability || version < 9 {
             persistRouteHealthLocked()
         }
@@ -6296,7 +6333,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             "provider_cooldowns": activeCooldowns,
             "route_cooldowns": activeCooldowns
         ]
+        #if canImport(ProxyCore)
+        concurrencyLimiter.persistLocked(into: &payload)
+        #else
         concurrencyRegistry.persistLocked(into: &payload)
+        #endif
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
             return
         }
