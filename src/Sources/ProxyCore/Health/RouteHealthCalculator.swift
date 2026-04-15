@@ -1,14 +1,5 @@
 import Foundation
 
-public struct ConcurrencySnapshot {
-    public let inflight: Int
-    public let limit: Int
-    public init(inflight: Int, limit: Int) {
-        self.inflight = inflight
-        self.limit = limit
-    }
-}
-
 public enum RouteHealthCalculator {
 
     // MARK: - Failure Path
