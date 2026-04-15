@@ -1571,7 +1571,6 @@ enum OpenAICompatTemporaryShim {
             return nil
         }
 
-        NSLog("[ThinkingProxy] Applied temporary provider mitigation request shim for %@", model)
         return modifiedString
     }
 
@@ -2276,16 +2275,11 @@ enum OpenAICompatTemporaryShim {
            Self.isAtConcurrencyCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
             return .skipped(reason: "concurrency_capacity")
         }
-        let transformedCandidateBody = transformRequest(
-            method: method,
-            path: path,
-            jsonString: candidateBody
-        ) ?? candidateBody
         let effectiveCandidateBody = smartAliasCompatibleCandidateBody(
             method: method,
             path: path,
             candidateModel: candidateModel,
-            candidateBody: transformedCandidateBody
+            candidateBody: candidateBody
         )
         let preflightCandidateBody: String
         let shouldBufferStreamingPreflight =
@@ -7215,10 +7209,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             return .flattened("")
         }
 
-        guard !collectedSegments.isEmpty else {
-            return .unsupported
-        }
-        return .flattened(collectedSegments.joined())
+        return .unsupported
     }
 
     private static func flattenedTextMessageContent(from dictionary: [String: Any]) -> String? {
