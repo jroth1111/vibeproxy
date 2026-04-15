@@ -610,11 +610,15 @@ enum OpenAICompatTemporaryShim {
         let providerEndpointsByProviderID: [String: ProviderEndpoint]
     }
 
+    #if canImport(ProxyCore)
+    private typealias RouteCircuitBreakerPolicy = ProxyCore.RouteCircuitBreakerPolicy
+    #else
     private struct RouteCircuitBreakerPolicy {
         let failureThreshold: Double
         let cooldown: TimeInterval
         let recoverySuccessThreshold: Int
     }
+    #endif
 
     private struct PersistentRouteHealthEntry {
         let status: RouteHealthStatus
@@ -2584,7 +2588,6 @@ enum OpenAICompatTemporaryShim {
 
         if isChatCompletionsPath(path),
            containsUnsupportedTypedMessageContent(in: json) {
-            NSLog("[PREFLIGHT-TYPED] model=%@ still has typed content after transform: %@", model, String(jsonString.prefix(300)))
             return ClientFacingNVIDIAFailure(
                 statusCode: 400,
                 message: "NVIDIA hosted chat completions currently require string message content; typed content arrays are not supported on this route.",
