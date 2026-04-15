@@ -135,6 +135,8 @@ def summarize_events(
         if failure_class is not None:
             failures[(source, provider, request_model, str(failure_class))] += 1
 
+    correlation_ids = {str(e["correlation_id"]) for e in events if e.get("correlation_id")}
+
     return {
         "traffic_split": dict(sorted(traffic_split.items())),
         "winner_distribution": {
@@ -155,6 +157,7 @@ def summarize_events(
                 failures.items(), key=lambda item: (-item[1], item[0])
             )
         },
+        "correlation_ids": sorted(correlation_ids),
     }
 
 
