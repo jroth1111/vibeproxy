@@ -73,6 +73,9 @@ enum OpenAICompatTemporaryShim {
         let requestShape: String?
         let negotiatedApplicationProtocol: String?
         let errorBodySnippet: String?
+        let terminalOutcomeMarker: String?
+        let failoverChain: String?
+        let firstSelectedCandidate: String?
 
         init(
             timestamp: Date,
@@ -98,7 +101,10 @@ enum OpenAICompatTemporaryShim {
             callerSessionID: String? = nil,
             requestShape: String? = nil,
             negotiatedApplicationProtocol: String? = nil,
-            errorBodySnippet: String? = nil
+            errorBodySnippet: String? = nil,
+            terminalOutcomeMarker: String? = nil,
+            failoverChain: String? = nil,
+            firstSelectedCandidate: String? = nil
         ) {
             self.timestamp = timestamp
             self.requestModel = requestModel
@@ -124,6 +130,9 @@ enum OpenAICompatTemporaryShim {
             self.requestShape = requestShape
             self.negotiatedApplicationProtocol = negotiatedApplicationProtocol
             self.errorBodySnippet = errorBodySnippet
+            self.terminalOutcomeMarker = terminalOutcomeMarker
+            self.failoverChain = failoverChain
+            self.firstSelectedCandidate = firstSelectedCandidate
         }
     }
 

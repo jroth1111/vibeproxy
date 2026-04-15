@@ -25,6 +25,9 @@ public struct RouteTelemetryEvent: Equatable {
     public let requestShape: String?
     public let negotiatedApplicationProtocol: String?
     public let errorBodySnippet: String?
+    public let terminalOutcomeMarker: String?
+    public let failoverChain: String?
+    public let firstSelectedCandidate: String?
 
     public init(
         timestamp: Date,
@@ -50,7 +53,10 @@ public struct RouteTelemetryEvent: Equatable {
         callerSessionID: String? = nil,
         requestShape: String? = nil,
         negotiatedApplicationProtocol: String? = nil,
-        errorBodySnippet: String? = nil
+        errorBodySnippet: String? = nil,
+        terminalOutcomeMarker: String? = nil,
+        failoverChain: String? = nil,
+        firstSelectedCandidate: String? = nil
     ) {
         self.timestamp = timestamp
         self.requestModel = requestModel
@@ -76,5 +82,8 @@ public struct RouteTelemetryEvent: Equatable {
         self.requestShape = requestShape
         self.negotiatedApplicationProtocol = negotiatedApplicationProtocol
         self.errorBodySnippet = errorBodySnippet
+        self.terminalOutcomeMarker = terminalOutcomeMarker
+        self.failoverChain = failoverChain
+        self.firstSelectedCandidate = firstSelectedCandidate
     }
 }
