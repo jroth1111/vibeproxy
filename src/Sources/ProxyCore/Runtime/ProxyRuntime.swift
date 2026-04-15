@@ -9,6 +9,7 @@ public final class ProxyRuntime {
     public let concurrencyLimiter: RouteConcurrencyLimiter
     public let telemetry: RouteTelemetryStore
     public let transport: TransportFacade
+    public let factoryResolver: FactoryContractResolver
 
     public init(
         catalog: RouteCatalog = RouteCatalog(),
@@ -18,7 +19,8 @@ public final class ProxyRuntime {
         healthStore: RouteHealthStore = RouteHealthStore(),
         concurrencyLimiter: RouteConcurrencyLimiter = RouteConcurrencyLimiter(),
         telemetry: RouteTelemetryStore = RouteTelemetryStore(),
-        transport: TransportFacade = TransportFacade()
+        transport: TransportFacade = TransportFacade(),
+        factoryResolver: FactoryContractResolver = FactoryContractResolver()
     ) {
         self.catalog = catalog
         self.modelPolicies = modelPolicies
@@ -28,5 +30,20 @@ public final class ProxyRuntime {
         self.concurrencyLimiter = concurrencyLimiter
         self.telemetry = telemetry
         self.transport = transport
+        self.factoryResolver = factoryResolver
+    }
+
+    /// Convenience factory that loads all services from ManagedRouteManifest defaults.
+    public static func fromManifest() -> ProxyRuntime {
+        let runtime = ProxyRuntime()
+        runtime.modelPolicies.load(
+            nvidiaPolicies: ManagedRouteManifest.nvidiaRoutePolicyEntries,
+            nonNVIDIAMitigationPolicies: ManagedRouteManifest.nonNVIDIAMitigationPolicyEntries,
+            modelTiers: ManagedRouteManifest.modelTierEntries,
+            inputPrices: ManagedRouteManifest.inputPricePerMillionTokensEntries,
+            legacyRewrites: ManagedRouteManifest.legacyRequestModelRewriteEntries,
+            workerSmartRoutePolicy: ManagedRouteManifest.workerSmartRouteRequestPolicy
+        )
+        return runtime
     }
 }

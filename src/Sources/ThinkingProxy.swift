@@ -880,6 +880,7 @@ enum OpenAICompatTemporaryShim {
     private static let routeCatalog = RouteCatalog()
     private static let credentialPool = CredentialPool()
     private static let factoryContractResolver = FactoryContractResolver()
+    private static let proxyRuntime = ProxyRuntime.fromManifest()
     #endif
 
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
