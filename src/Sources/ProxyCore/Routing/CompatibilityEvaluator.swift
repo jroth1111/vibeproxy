@@ -126,4 +126,37 @@ public final class CompatibilityEvaluator {
         }
         return false
     }
+
+    // MARK: - JSON Parsing Utilities
+
+    public static func rawModelName(forRequestJSON jsonString: String) -> String? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let model = json["model"] as? String else {
+            return nil
+        }
+        return model
+    }
+
+    public static func requiredToolParametersIndex(forRequestJSON jsonString: String) -> [String: [String]]? {
+        guard let jsonData = jsonString.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+              let tools = json["tools"] as? [[String: Any]],
+              !tools.isEmpty else {
+            return nil
+        }
+
+        var index: [String: [String]] = [:]
+        for tool in tools {
+            guard let function = tool["function"] as? [String: Any],
+                  let name = function["name"] as? String,
+                  let parameters = function["parameters"] as? [String: Any],
+                  let required = parameters["required"] as? [String],
+                  !required.isEmpty else {
+                continue
+            }
+            index[name] = required
+        }
+        return index.isEmpty ? nil : index
+    }
 }
