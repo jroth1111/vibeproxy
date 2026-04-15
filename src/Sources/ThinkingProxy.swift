@@ -846,6 +846,38 @@ enum OpenAICompatTemporaryShim {
         label: "nonNVIDIAMitigationPoliciesByRequestModel"
     )
 
+    // MARK: - Policy Registry (ProxyCore)
+    #if canImport(ProxyCore)
+    private static let modelPolicyRegistry: ModelPolicyRegistry = {
+        let registry = ModelPolicyRegistry()
+        registry.load(
+            nvidiaPolicies: ManagedRouteManifest.nvidiaRoutePolicyEntries,
+            nonNVIDIAMitigationPolicies: ManagedRouteManifest.nonNVIDIAMitigationPolicyEntries,
+            modelTiers: ManagedRouteManifest.modelTierEntries,
+            inputPrices: ManagedRouteManifest.inputPricePerMillionTokensEntries,
+            legacyRewrites: ManagedRouteManifest.legacyRequestModelRewriteEntries,
+            workerSmartRoutePolicy: ManagedRouteManifest.workerSmartRouteRequestPolicy
+        )
+        return registry
+    }()
+    private static let providerPolicyRegistry: ProviderPolicyRegistry = {
+        let registry = ProviderPolicyRegistry()
+        registry.load(
+            retryableHTTPStatusCodes: [408, 429, 500, 502, 503, 504],
+            retryableTransportErrorCodes: [
+                URLError.Code.timedOut.rawValue,
+                URLError.Code.cannotFindHost.rawValue,
+                URLError.Code.cannotConnectToHost.rawValue,
+                URLError.Code.networkConnectionLost.rawValue,
+                URLError.Code.dnsLookupFailed.rawValue,
+                URLError.Code.notConnectedToInternet.rawValue,
+                URLError.Code.resourceUnavailable.rawValue
+            ]
+        )
+        return registry
+    }()
+    #endif
+
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
     private static let retryableTransportErrorCodes: Set<Int> = [
         URLError.Code.timedOut.rawValue,
@@ -4664,7 +4696,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func shouldRetryNvidiaReasoningTransport(statusCode: Int? = nil, error: Error? = nil) -> Bool {
         if let statusCode {
+            #if canImport(ProxyCore)
+            return providerPolicyRegistry.isRetryableHTTPStatus(statusCode)
+            #else
             return retryableHTTPStatusCodes.contains(statusCode)
+            #endif
         }
 
         guard let nsError = error as NSError? else {
@@ -4673,7 +4709,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard nsError.domain == NSURLErrorDomain else {
             return false
         }
+        #if canImport(ProxyCore)
+        return providerPolicyRegistry.isRetryableTransportErrorCode(nsError.code)
+        #else
         return retryableTransportErrorCodes.contains(nsError.code)
+        #endif
     }
 
     static func isChatCompletionsPath(_ path: String) -> Bool {
@@ -5860,8 +5900,12 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         }
         let tier = modelTier(forRequestModel: requestModel)
         let momentum = state?.momentumBonus(at: now) ?? 0.0
+        #if canImport(ProxyCore)
+        let costFactor = modelPolicyRegistry.costFactor(forCanonicalModelID: route?.canonicalModelID ?? "")
+        #else
         let price = inputPriceByCanonicalModelID[route?.canonicalModelID ?? ""] ?? 0.0
         let costFactor = 1.0 / (price + 0.01)
+        #endif
         let adjustedScore = (ema.compositeScore + momentum) * tier.rawValue * pow(costFactor, costSensitivity)
         return (
             healthPriority: healthPriority,
@@ -7086,13 +7130,27 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     private static func policy(forModel model: String) -> RequestPolicy? {
         let model = normalizedRequestModel(model)
         if isWorkerPoolPublicAlias(model) {
+            #if canImport(ProxyCore)
+            return modelPolicyRegistry.workerSmartRouteRequestPolicy()
+            #else
             return workerSmartRouteRequestPolicy
+            #endif
         }
+        #if canImport(ProxyCore)
+        if let policy = modelPolicyRegistry.nonNVIDIAMitigationPolicy(forRequestModel: model) {
+            return policy
+        }
+        #else
         if let policy = nonNVIDIAMitigationPoliciesByRequestModel[model] {
             return policy
         }
+        #endif
         if let route = resolveNVIDIAHostedRoute(forRequestModel: model) {
+            #if canImport(ProxyCore)
+            return modelPolicyRegistry.nvidiaPolicy(forCanonicalModelID: route.canonicalModelID)
+            #else
             return knownNVIDIARoutePoliciesByCanonicalModelID[route.canonicalModelID]
+            #endif
         }
         return nil
     }
@@ -7103,13 +7161,26 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func modelTier(forRequestModel model: String) -> ModelTier {
         let normalized = normalizedRequestModel(model)
-        if let route = resolveConfiguredRoute(forRequestModel: normalized),
-           let tier = modelTierByCanonicalModelID[route.canonicalModelID] {
+        if let route = resolveConfiguredRoute(forRequestModel: normalized) {
+            #if canImport(ProxyCore)
+            if let tier = modelPolicyRegistry.modelTier(forCanonicalModelID: route.canonicalModelID) {
+                return tier
+            }
+            #else
+            if let tier = modelTierByCanonicalModelID[route.canonicalModelID] {
+                return tier
+            }
+            #endif
+        }
+        #if canImport(ProxyCore)
+        if let tier = modelPolicyRegistry.modelTier(forCanonicalModelID: normalized) {
             return tier
         }
+        #else
         if let tier = modelTierByCanonicalModelID[normalized] {
             return tier
         }
+        #endif
         return .standard
     }
 
@@ -7142,7 +7213,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     private static func normalizedRequestModel(_ model: String) -> String {
+        #if canImport(ProxyCore)
+        let legacyNormalized = modelPolicyRegistry.rewrittenModel(model) ?? model
+        #else
         let legacyNormalized = legacyRequestModelRewrites[model] ?? model
+        #endif
         if let resolved = ThinkingProxy.factoryResolvedRouteModel(forIncomingModelID: legacyNormalized) {
             return resolved
         }
