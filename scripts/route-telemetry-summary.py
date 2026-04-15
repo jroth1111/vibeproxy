@@ -248,6 +248,13 @@ def main() -> int:
 
     provider_map = fetch_provider_map(args.health_url)
     events, window_start, now = load_events(log_path, args.hours, pid_filter)
+
+    # Warn on any request models that map to "unknown"
+    all_models = {str(e.get("request_model") or "unknown") for e in events}
+    unmapped = {m for m in all_models if provider_details_for_event({"request_model": m}, provider_map)[0] == "unknown"}
+    if unmapped:
+        print(f"WARNING: Unmapped request models (no provider classification): {sorted(unmapped)}", file=sys.stderr)
+
     summary = summarize_events(events, provider_map)
 
     if args.json:
