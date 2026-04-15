@@ -876,6 +876,7 @@ enum OpenAICompatTemporaryShim {
         )
         return registry
     }()
+    private static let telemetryStore = RouteTelemetryStore()
     #endif
 
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
@@ -6517,6 +6518,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func logNVIDIARouteTelemetry(_ event: RouteTelemetryEvent) {
         routeTelemetryHookForTesting?(event)
+        #if canImport(ProxyCore)
+        telemetryStore.record(event)
+        #endif
         guard let jsonData = try? JSONSerialization.data(withJSONObject: telemetryEventDictionary(event), options: [.sortedKeys]),
               let jsonString = String(data: jsonData, encoding: .utf8) else {
             NSLog("[ThinkingProxy] Route telemetry encode failed for %@", event.requestModel)
