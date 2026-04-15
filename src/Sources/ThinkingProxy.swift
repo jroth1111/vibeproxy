@@ -1571,9 +1571,29 @@ enum OpenAICompatTemporaryShim {
         return transformRequest(method: method, path: path, jsonString: rewrittenJSONString) ?? rewrittenJSONString
     }
 
+    // MARK: - Config from ManagedRouteManifest (ProxyCore) or inline (standalone)
+    #if canImport(ProxyCore)
+    private static let publicFactoryWorkerSmartRouterAlias = ManagedRouteManifest.publicFactoryWorkerSmartRouterAlias
+    fileprivate static let publicGLM5NVIDIADirectAlias = ManagedRouteManifest.publicGLM5NVIDIADirectAlias
+    fileprivate static let publicKimiNVIDIADirectAlias = ManagedRouteManifest.publicKimiNVIDIADirectAlias
+    private static let publicGLM5NVIDIASmartAlias = ManagedRouteManifest.publicGLM5NVIDIASmartAlias
+    private static let publicKimiNVIDIASmartAlias = ManagedRouteManifest.publicKimiNVIDIASmartAlias
+    fileprivate static let debugGLM5NVIDIADirectAlias = ManagedRouteManifest.debugGLM5NVIDIADirectAlias
+    fileprivate static let debugKimiNVIDIADirectAlias = ManagedRouteManifest.debugKimiNVIDIADirectAlias
+    private static let directNVIDIAAccessHeader = ManagedRouteManifest.directNVIDIAAccessHeader
+    private static let publicDirectNVIDIAAliasByCanonicalModelID: [String: String] = ManagedRouteManifest.publicDirectNVIDIAAliasByCanonicalModelID
+    private static let publicDirectNVIDIAAliases: Set<String> = ManagedRouteManifest.publicDirectNVIDIAAliases
+    private static let debugDirectNVIDIAAliasByPublicAlias: [String: String] = ManagedRouteManifest.debugDirectNVIDIAAliasByPublicAlias
+    private static let publicDirectNVIDIAAliasByDebugAlias: [String: String] = ManagedRouteManifest.publicDirectNVIDIAAliasByDebugAlias
+    private static let debugDirectNVIDIAAliases: Set<String> = ManagedRouteManifest.debugDirectNVIDIAAliases
+    private static let publicSmartNVIDIACandidateModelsByAlias: [String: [String]] = ManagedRouteManifest.publicSmartNVIDIACandidateModelsByAlias
+    private static let publicSmartNVIDIAAliasByDirectAlias: [String: String] = ManagedRouteManifest.publicSmartNVIDIAAliasByDirectAlias
+    fileprivate static let canonicalFactoryWorkerModelID = ManagedRouteManifest.canonicalFactoryWorkerModelID
+    static let canonicalWorkerPoolCandidates = ManagedRouteManifest.canonicalWorkerPoolCandidates
+    private static let publicWorkerPoolAliases: Set<String> = ManagedRouteManifest.publicWorkerPoolAliases
+    fileprivate static let codeOwnedFactoryWorkerRescueModelIDs: Set<String> = ManagedRouteManifest.codeOwnedFactoryWorkerRescueModelIDs
+    #else
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
-    // Keep provider-backed direct aliases distinct from any resilient smart alias.
-    // Public direct NVIDIA routes are caller-visible only when the lane is freshly trusted.
     fileprivate static let publicGLM5NVIDIADirectAlias = "glm5-nvidia"
     fileprivate static let publicKimiNVIDIADirectAlias = "kimi-k2.5-nvidia"
     private static let publicGLM5NVIDIASmartAlias = "glm5-nvidia-smart"
@@ -1626,6 +1646,7 @@ enum OpenAICompatTemporaryShim {
         "custom:Factory-Worker-GPT-5.4-High-8",
         "custom:Proxy-WorkerPool-8"
     ]
+    #endif
     static func publicWorkerSmartRouterAlias() -> String {
         publicFactoryWorkerSmartRouterAlias
     }

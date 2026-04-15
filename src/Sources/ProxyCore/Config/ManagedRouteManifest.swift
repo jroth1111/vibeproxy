@@ -134,6 +134,7 @@ public enum ManagedRouteManifest {
             toolChoiceMode: .preserve,
             forcesKimiInstantMode: false
         )),
+        ("proxy-worker-smart-router", workerSmartRouteRequestPolicy),
         ("gpt-5.4(high)", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
