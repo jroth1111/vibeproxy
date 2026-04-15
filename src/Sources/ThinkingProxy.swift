@@ -877,6 +877,7 @@ enum OpenAICompatTemporaryShim {
         return registry
     }()
     private static let telemetryStore = RouteTelemetryStore()
+    private static let routeCatalog = RouteCatalog()
     #endif
 
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
@@ -2501,6 +2502,7 @@ enum OpenAICompatTemporaryShim {
 
         if isChatCompletionsPath(path),
            containsUnsupportedTypedMessageContent(in: json) {
+            NSLog("[PREFLIGHT-TYPED] model=%@ still has typed content after transform: %@", model, String(jsonString.prefix(300)))
             return ClientFacingNVIDIAFailure(
                 statusCode: 400,
                 message: "NVIDIA hosted chat completions currently require string message content; typed content arrays are not supported on this route.",
@@ -7207,13 +7209,25 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
         let normalized = normalizedRequestModel(model)
         if let publicAlias = publicDirectNVIDIAAlias(forDebugRequestModel: normalized) {
+            #if canImport(ProxyCore)
+            return routeCatalog.resolveDirectRoute(forRequestModel: publicAlias)
+            #else
             return resolvedRoutesByRequestModel()[publicAlias]
+            #endif
         }
+        #if canImport(ProxyCore)
+        return routeCatalog.resolveDirectRoute(forRequestModel: normalized)
+        #else
         return resolvedRoutesByRequestModel()[normalized]
+        #endif
     }
 
     static func providerEndpoint(forProviderID providerID: String) -> ProviderEndpoint? {
-        configuredRouteConfiguration().providerEndpointsByProviderID[providerID]
+        #if canImport(ProxyCore)
+        return routeCatalog.providerEndpoint(forProviderID: providerID)
+        #else
+        return configuredRouteConfiguration().providerEndpointsByProviderID[providerID]
+        #endif
     }
 
     private static func normalizedRequestModel(_ model: String) -> String {
@@ -7301,6 +7315,15 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 providerEndpointsByProviderID: loadedConfiguration.providerEndpointsByProviderID
             )
             cachedRouteConfiguration = cachedMap
+            #if canImport(ProxyCore)
+            routeCatalog.load(
+                routesByRequestModel: loadedConfiguration.routesByRequestModel,
+                nvidiaRoutesByRequestModel: loadedConfiguration.nvidiaRoutesByRequestModel,
+                endpointsByProviderID: loadedConfiguration.providerEndpointsByProviderID,
+                smartAliasesByAlias: loadedConfiguration.smartAliasesByAlias,
+                anthropicRequestModels: loadedConfiguration.anthropicRequestModels
+            )
+            #endif
             return cachedMap
         }
     }
