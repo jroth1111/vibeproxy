@@ -549,10 +549,21 @@ public enum RouteHealthCalculator {
         escalationWindow: TimeInterval,
         maxMultiplier: Int
     ) -> Date? {
-        guard currentOpenUntil != nil else { return nil }
-        guard recentFailureCount >= 3 else { return currentOpenUntil }
-        let multiplier = min(maxMultiplier, recentFailureCount)
-        return now.addingTimeInterval(policy.cooldown * Double(multiplier))
+        guard Double(recentFailureCount) >= policy.failureThreshold else {
+            return currentOpenUntil
+        }
+
+        let escalationExponent = max(0, recentFailureCount - Int(policy.failureThreshold))
+        let multiplier = min(
+            maxMultiplier,
+            Int(pow(2.0, Double(escalationExponent)))
+        )
+        let escalatedUntil = now.addingTimeInterval(policy.cooldown * TimeInterval(multiplier))
+
+        guard let currentOpenUntil else {
+            return escalatedUntil
+        }
+        return max(currentOpenUntil, escalatedUntil)
     }
 
     // MARK: - Adaptive Concurrency Deferral

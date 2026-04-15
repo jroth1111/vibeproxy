@@ -59,7 +59,7 @@ public final class ModelPolicyRegistry {
     }
 
     public func costFactor(forCanonicalModelID modelID: String) -> Double {
-        let price = inputPricesByCanonicalModelID[modelID] ?? 5.0
+        let price = inputPricesByCanonicalModelID[modelID] ?? 0.0
         return 1.0 / (price + 0.01)
     }
 
