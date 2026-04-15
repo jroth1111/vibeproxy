@@ -13,6 +13,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PROXYCORE_SOURCES=()
+collect_proxycore_sources() {
+    PROXYCORE_SOURCES=()
+    local proxycore_dir="$SRC_DIR/Sources/ProxyCore"
+    while IFS= read -r -d '' f; do
+        PROXYCORE_SOURCES+=("${f#$SRC_DIR/}")
+    done < <(find "$proxycore_dir" -name '*.swift' -print0 | sort -z)
+}
+collect_proxycore_sources
+
 PREPARED_SWIFT_SOURCES=()
 prepare_stable_sources() {
     local dest_dir="$1"
@@ -62,6 +72,7 @@ run_thinking_proxy_policy_spec() {
 
     prepare_stable_sources \
         "$TMP_BUILD_DIR/$name-sources" \
+        "${PROXYCORE_SOURCES[@]}" \
         "Sources/ObjCExceptionCatcher.swift" \
         "Sources/NVIDIAStreamParser.swift" \
         "Sources/NVIDIAStreamEngine.swift" \
@@ -100,6 +111,7 @@ run_meta_ai_web_adapter_spec() {
 
     prepare_stable_sources \
         "$TMP_BUILD_DIR/$name-sources" \
+        "${PROXYCORE_SOURCES[@]}" \
         "Sources/ObjCExceptionCatcher.swift" \
         "Sources/NVIDIAStreamParser.swift" \
         "Sources/NVIDIAStreamEngine.swift" \
