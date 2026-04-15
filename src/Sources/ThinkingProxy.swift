@@ -1390,6 +1390,30 @@ enum OpenAICompatTemporaryShim {
         retryBackoffJitterProviderForTesting = nil
     }
 
+    static func isAtConcurrencyCapacity(routeHealthKey: String) -> Bool {
+        #if canImport(ProxyCore)
+        return concurrencyLimiter.isAtCapacity(routeHealthKey: routeHealthKey)
+        #else
+        return concurrencyRegistry.isAtCapacity(routeHealthKey: routeHealthKey)
+        #endif
+    }
+
+    static func routeCooldownUntil(routeHealthKey: String, at now: Date = Date()) -> Date? {
+        #if canImport(ProxyCore)
+        guard let cooldownUntil = routeHealthStore.cooldown(forRouteHealthKey: routeHealthKey),
+              cooldownUntil > now else {
+            return nil
+        }
+        return cooldownUntil
+        #else
+        guard let cooldownUntil = routeCooldownsByRouteHealthKey[routeHealthKey],
+              cooldownUntil > now else {
+            return nil
+        }
+        return cooldownUntil
+        #endif
+    }
+
     static func resetRetryBackoffJitterForTesting() {
         retryBackoffJitterProviderForTesting = nil
     }
@@ -1956,6 +1980,26 @@ enum OpenAICompatTemporaryShim {
             return 0
         }
 
+        #if canImport(ProxyCore)
+        if let cooldownUntil = routeHealthStore.cooldown(forRouteHealthKey: route.routeHealthKey),
+           now < cooldownUntil {
+            return 4
+        }
+
+        switch routeHealthStore.healthStatus(forRouteHealthKey: route.routeHealthKey) {
+        case .closed:
+            return 0
+        case .suspect:
+            return 1
+        case .halfOpen:
+            return 2
+        case .open:
+            if routeHealthStore.isRouteUnavailable(route.routeHealthKey, at: now) {
+                return 3
+            }
+            return 2  // expired open — same tier as halfOpen
+        }
+        #else
         if let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
            now < cooldownUntil {
             return 4
@@ -1976,6 +2020,7 @@ enum OpenAICompatTemporaryShim {
             }
             return 2  // expired open — same tier as halfOpen
         }
+        #endif
     }
 
     static func forcedSmartAliasProbeCandidateModels(
@@ -2206,13 +2251,13 @@ enum OpenAICompatTemporaryShim {
         }
         if !forceAllowClosedModels.contains(candidateModel),
            let candidateRoute,
-           let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
+           let cooldownUntil = routeCooldownUntil(routeHealthKey: candidateRoute.routeHealthKey),
            Date() < cooldownUntil {
             return .skipped(reason: "provider_cooldown")
         }
         if !forceAllowClosedModels.contains(candidateModel),
            let candidateRoute,
-           Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
+           Self.isAtConcurrencyCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
             return .skipped(reason: "concurrency_capacity")
         }
         let transformedCandidateBody = transformRequest(
@@ -2379,13 +2424,13 @@ enum OpenAICompatTemporaryShim {
                 continue
             }
             if !forceAllowClosedModels.contains(candidateModel),
-               let cooldownUntil = routeCooldownsByRouteHealthKey[candidateRoute.routeHealthKey],
+               let cooldownUntil = routeCooldownUntil(routeHealthKey: candidateRoute.routeHealthKey),
                now < cooldownUntil {
                 retryDelays.append(max(0.05, cooldownUntil.timeIntervalSince(now)))
                 continue
             }
             if !forceAllowClosedModels.contains(candidateModel),
-               Self.concurrencyRegistry.isAtCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
+               Self.isAtConcurrencyCapacity(routeHealthKey: candidateRoute.routeHealthKey) {
                 retryDelays.append(1)
             }
         }
@@ -3553,7 +3598,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             return (max(1, Int(ceil(cooldownUntil.timeIntervalSince(now)))), "cooldown")
         }
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel),
-              concurrencyRegistry.isAtCapacity(routeHealthKey: route.routeHealthKey) else {
+              isAtConcurrencyCapacity(routeHealthKey: route.routeHealthKey) else {
             return nil
         }
         return (1, "concurrency")
@@ -7394,12 +7439,19 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     private static func unavailableRequestModelIDs(at now: Date) -> Set<String> {
         let routes = resolvedRoutesByRequestModel()
+        #if canImport(ProxyCore)
+        let allStates = routeHealthStore.allCircuitStates()
+        let openRouteHealthKeys = Set(allStates.compactMap { key, value in
+            value.isUnavailable(at: now) ? key : nil
+        })
+        #else
         let openRouteHealthKeys: Set<String> = routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return Set(routeCircuitStatesByRouteHealthKey.compactMap { key, value in
                 value.isUnavailable(at: now) ? key : nil
             })
         }
+        #endif
         guard !openRouteHealthKeys.isEmpty else {
             return []
         }
