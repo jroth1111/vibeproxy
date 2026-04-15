@@ -15,6 +15,13 @@ trap cleanup EXIT
 
 PREPARED_SWIFT_SOURCES=()
 prepare_stable_sources() {
+    # ── INVARIANT ──────────────────────────────────────────────────────
+    # Verification MUST compile against the real ThinkingProxy.swift from
+    # src/Sources/.  Only minimal sanitization (stripping ProxyCore import)
+    # is permitted.  Any future drift toward local source splits, synthetic
+    # stubs, or dedicated verification-only modules must be rejected — the
+    # goal is to catch divergence between production code and tests.
+    # ────────────────────────────────────────────────────────────────────
     local dest_dir="$1"
     shift
 
