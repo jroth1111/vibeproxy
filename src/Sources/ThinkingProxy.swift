@@ -3838,6 +3838,32 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             return
         }
 
+        #if canImport(ProxyCore)
+        let snapshot = ConcurrencySnapshot(
+            inflight: concurrencyLimiter.inflightCount(forRouteHealthKey: route.routeHealthKey),
+            limit: concurrencyLimiter.currentLimit(routeHealthKey: route.routeHealthKey)
+        )
+        let result = routeHealthStore.recordFailure(
+            routeHealthKey: route.routeHealthKey,
+            providerID: route.providerID,
+            telemetryEvent: telemetryEvent,
+            at: now,
+            forcedOpenUntil: forcedOpenUntil,
+            healthSensitivity: healthSensitivity,
+            policy: routeCircuitBreakerPolicy,
+            concurrency: snapshot
+        )
+        if result.previousStatus != result.nextStatus {
+            NSLog(
+                "[ThinkingProxy] Route health transition %@: %@ -> %@",
+                route.routeHealthKey,
+                result.previousStatus.rawValue,
+                result.nextStatus.rawValue
+            )
+        }
+        if result.needsPersist { scheduleRouteHealthPersistLocked() }
+        if let enriched = result.enrichedTelemetryEvent { logNVIDIARouteTelemetry(enriched) }
+        #else
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
@@ -4183,6 +4209,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
         }
+        #endif
     }
 
     static func recordRouteAvailabilityDeferral(
@@ -4212,6 +4239,36 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
+        #if canImport(ProxyCore)
+        let result = routeHealthStore.recordSuccess(
+            routeHealthKey: route.routeHealthKey,
+            providerID: route.providerID,
+            telemetryEvent: telemetryEvent,
+            at: now,
+            policy: routeCircuitBreakerPolicy,
+            requestModel: requestModel
+        )
+        concurrencyLimiter.recordSuccess(routeHealthKey: route.routeHealthKey)
+        if let smartAliasInfo = result.smartAliasInfo {
+            recentSmartAliasWinnerByRequestedAlias[smartAliasInfo.requestedAlias] = RecentSmartAliasWinner(
+                requestModel: smartAliasInfo.winningRequestModel,
+                timestamp: smartAliasInfo.timestamp,
+                requestShape: smartAliasInfo.requestShape,
+                callerRequestID: smartAliasInfo.callerRequestID,
+                callerSessionID: smartAliasInfo.callerSessionID
+            )
+        }
+        if result.mutationResult.previousStatus != result.mutationResult.nextStatus {
+            NSLog(
+                "[ThinkingProxy] Route health transition %@: %@ -> %@",
+                route.routeHealthKey,
+                result.mutationResult.previousStatus.rawValue,
+                result.mutationResult.nextStatus.rawValue
+            )
+        }
+        if result.mutationResult.needsPersist { scheduleRouteHealthPersistLocked() }
+        if let enriched = result.mutationResult.enrichedTelemetryEvent { logNVIDIARouteTelemetry(enriched) }
+        #else
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
@@ -4261,6 +4318,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 logNVIDIARouteTelemetry(enrichedTelemetryEvent)
             }
         }
+        #endif
     }
 
     static func clearRouteHealthForTesting() {
