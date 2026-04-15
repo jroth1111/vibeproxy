@@ -4221,6 +4221,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
               let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return
         }
+        #if canImport(ProxyCore)
+        routeHealthStore.recordAvailabilityDeferral(
+            routeHealthKey: route.routeHealthKey,
+            until: deferredUntil,
+            at: now
+        )
+        scheduleRouteHealthPersistLocked()
+        #else
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let current = routeCooldownsByRouteHealthKey[route.routeHealthKey]
@@ -4229,6 +4237,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 scheduleRouteHealthPersistLocked()
             }
         }
+        #endif
     }
 
     static func recordRouteSuccess(
@@ -6213,6 +6222,9 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             )
         }
         routeCircuitStatesByRouteHealthKey = loaded
+        #if canImport(ProxyCore)
+        routeHealthStore.loadSerializedState(loaded)
+        #endif
         // Route cooldowns are runtime-only backpressure hints. Replaying them across restart can
         // blackhole the worker pool before the new process has observed any live failures.
         routeCooldownsByRouteHealthKey = [:]
@@ -6464,7 +6476,14 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
 
         var routes: [String: [String: Any]] = [:]
-        for (routeHealthKey, state) in routeCircuitStatesByRouteHealthKey {
+        #if canImport(ProxyCore)
+        let statesToPersist = routeHealthStore.serializeState()
+        let cooldownsToPersist = routeHealthStore.serializeCooldowns()
+        #else
+        let statesToPersist = routeCircuitStatesByRouteHealthKey
+        let cooldownsToPersist = routeCooldownsByRouteHealthKey
+        #endif
+        for (routeHealthKey, state) in statesToPersist {
             var entry: [String: Any] = [
                 "status": state.status.rawValue,
                 "failure_score": jsonNumberPreservingIntegers(state.failureScore),
@@ -6505,7 +6524,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             routes[routeHealthKey] = entry
         }
 
-        let activeCooldowns = routeCooldownsByRouteHealthKey.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
+        let activeCooldowns = cooldownsToPersist.filter { $0.value > Date() }.mapValues { iso8601String(from: $0) }
         var payload: [String: Any] = [
             "version": 9,
             "routes": routes,
