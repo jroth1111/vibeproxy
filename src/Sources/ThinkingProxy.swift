@@ -7450,6 +7450,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func resolveConfiguredRoute(forRequestModel model: String) -> RouteIdentity? {
         let normalized = normalizedRequestModel(model)
+        _ = resolvedRoutesByRequestModel()
         if let publicAlias = publicDirectNVIDIAAlias(forDebugRequestModel: normalized) {
             #if canImport(ProxyCore)
             return routeCatalog.resolveDirectRoute(forRequestModel: publicAlias)
@@ -7466,6 +7467,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func providerEndpoint(forProviderID providerID: String) -> ProviderEndpoint? {
         #if canImport(ProxyCore)
+        _ = resolvedRoutesByRequestModel()
         return routeCatalog.providerEndpoint(forProviderID: providerID)
         #else
         return configuredRouteConfiguration().providerEndpointsByProviderID[providerID]
