@@ -27,8 +27,6 @@ enum OpenAICompatTemporaryShim {
     typealias RequestPolicy = ProxyCore.RequestPolicy
     typealias ClientStreamingMode = ProxyCore.ClientStreamingMode
     typealias ToolChoiceMode = ProxyCore.ToolChoiceMode
-#elseif FLAT_PROXYCORE
-    // Types resolve from global ProxyCore sources (compiled flat)
 #else
     // MARK: - Original inline types
     struct ClientFacingNVIDIAFailure {
