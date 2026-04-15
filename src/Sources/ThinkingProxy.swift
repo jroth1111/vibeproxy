@@ -10528,6 +10528,20 @@ class ThinkingProxy {
         let mergedConfigFingerprint: String?
     }
 
+    // B.4: Terminal worker outcome tracking for healthz
+    private struct LastTerminalWorkerOutcome {
+        let timestamp: Date
+        let failureClass: String?
+        let requestModel: String
+        let outcome: String
+    }
+    private static let lastTerminalWorkerOutcomeQueue = DispatchQueue(label: "last-terminal-worker-outcome")
+    private static var _lastTerminalWorkerOutcome: LastTerminalWorkerOutcome?
+    private static var lastTerminalWorkerOutcome: LastTerminalWorkerOutcome? {
+        get { lastTerminalWorkerOutcomeQueue.sync { _lastTerminalWorkerOutcome } }
+        set { lastTerminalWorkerOutcomeQueue.sync { _lastTerminalWorkerOutcome = newValue } }
+    }
+
     private struct RequestTraceContext {
         let proxyRequestID: String
         let callerRequestID: String?
@@ -14175,6 +14189,39 @@ class ThinkingProxy {
         guard requestController?.isCancelled() != true else { return }
         requestController?.clearCurrentCancel()
         defer { requestController?.cancel() }
+
+        // B.4: Record terminal outcome for healthz observability
+        let terminalOutcomeRecord: LastTerminalWorkerOutcome
+        switch outcome {
+        case .success(let requestModel, _, _, _, _):
+            terminalOutcomeRecord = LastTerminalWorkerOutcome(
+                timestamp: Date(), failureClass: nil, requestModel: requestModel, outcome: "success"
+            )
+        case .liveStreamDelivered(let requestModel, let telemetryEvent, _):
+            let isStreamSuccess = smartAliasLiveStreamTelemetryWasSuccessful(
+                OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(telemetryEvent, winnerAttemptLane: telemetryEvent.attemptLane)
+            )
+            terminalOutcomeRecord = LastTerminalWorkerOutcome(
+                timestamp: Date(),
+                failureClass: isStreamSuccess ? nil : telemetryEvent.failureClass,
+                requestModel: requestModel,
+                outcome: isStreamSuccess ? "success" : "stream_failure"
+            )
+        case .terminalResponse(let requestModel, _, _, _, _):
+            terminalOutcomeRecord = LastTerminalWorkerOutcome(
+                timestamp: Date(), failureClass: nil, requestModel: requestModel, outcome: "terminal_response"
+            )
+        case .terminalError(_, _, _, _, _):
+            terminalOutcomeRecord = LastTerminalWorkerOutcome(
+                timestamp: Date(), failureClass: "proxy_unavailable", requestModel: publicAlias, outcome: "proxy_unavailable"
+            )
+        case .retryableFailure(_, let telemetryEvent, _):
+            terminalOutcomeRecord = LastTerminalWorkerOutcome(
+                timestamp: Date(), failureClass: telemetryEvent.failureClass, requestModel: telemetryEvent.requestModel, outcome: "retryable_failure"
+            )
+        }
+        Self.lastTerminalWorkerOutcome = terminalOutcomeRecord
+
         let healthSensitivity = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: publicAlias)?.healthSensitivity
         switch outcome {
         case .liveStreamDelivered(let requestModel, let telemetryEvent, let cooldownUntil):
@@ -19864,6 +19911,15 @@ class ThinkingProxy {
                     if let routeHealthStatus = shapeContract.routeHealthStatus {
                         shapeDict["route_health_status"] = routeHealthStatus
                     }
+                    if let recentDispatchedRouteModel = shapeContract.recentDispatchedRouteModel {
+                        shapeDict["last_dispatched_route_model"] = recentDispatchedRouteModel
+                    }
+                    if let recentDispatchedRouteProvider = shapeContract.recentDispatchedRouteProvider {
+                        shapeDict["last_dispatched_route_provider"] = recentDispatchedRouteProvider
+                    }
+                    if let recentDispatchedRouteAt = shapeContract.recentDispatchedRouteAt {
+                        shapeDict["last_dispatched_at"] = ISO8601DateFormatter().string(from: recentDispatchedRouteAt)
+                    }
                     return (shapeContract.id, shapeDict)
                 }
             )
@@ -19926,6 +19982,26 @@ class ThinkingProxy {
         if !contract.blockingSnapshotDriftPaths.isEmpty {
             dict["snapshot_blocking_drift_paths"] = contract.blockingSnapshotDriftPaths
         }
+
+        // B.4: worker pressure summary — classify each pool candidate's pressure state
+        let pressureSummary = Self.workerPressureSummary()
+        if !pressureSummary.isEmpty {
+            dict["worker_pressure_summary"] = pressureSummary
+        }
+
+        // B.4: last terminal worker outcome
+        if let terminalOutcome = Self.lastTerminalWorkerOutcome {
+            var outcomeDict: [String: Any] = [
+                "timestamp": ISO8601DateFormatter().string(from: terminalOutcome.timestamp),
+                "request_model": terminalOutcome.requestModel,
+                "outcome": terminalOutcome.outcome
+            ]
+            if let failureClass = terminalOutcome.failureClass {
+                outcomeDict["failure_class"] = failureClass
+            }
+            dict["last_terminal_worker_outcome"] = outcomeDict
+        }
+
         return dict
     }
 
@@ -20688,6 +20764,36 @@ class ThinkingProxy {
                 customModels: customModels
             )
         )
+    }
+
+    // MARK: - B.4: Worker Pressure Summary
+
+    private static func workerPressureSummary() -> [String: String] {
+        let candidates = OpenAICompatTemporaryShim.canonicalWorkerPoolCandidates
+        var summary: [String: String] = [:]
+        for candidate in candidates {
+            guard let state = OpenAICompatTemporaryShim.routeHealthState(forRequestModel: candidate) else {
+                summary[candidate] = "untracked"
+                continue
+            }
+            if state.status == .closed {
+                summary[candidate] = "healthy"
+                continue
+            }
+            let failureClass = state.lastFailureClass ?? ""
+            if failureClass.contains("429_window") && (state.status == .open || state.status == .suspect) {
+                summary[candidate] = "quota_window"
+            } else if failureClass.contains("429_concurrency") {
+                summary[candidate] = "concurrency_pressure"
+            } else if failureClass == "empty_content" || failureClass == "reasoning_only_content_missing" {
+                summary[candidate] = "malformed_output_pressure"
+            } else if failureClass.hasPrefix("transport_timeout") {
+                summary[candidate] = "timeout_pressure"
+            } else {
+                summary[candidate] = state.status.rawValue
+            }
+        }
+        return summary
     }
 
     private static func factoryWorkerContract() -> FactoryWorkerContract? {
