@@ -17,8 +17,20 @@ public final class RouteHealthStore {
         queue.sync { circuitStatesByRouteHealthKey[key] = state }
     }
 
+    public func removeCircuitState(forRouteHealthKey key: String) {
+        queue.sync { circuitStatesByRouteHealthKey.removeValue(forKey: key) }
+    }
+
     public func allCircuitStates() -> [String: RouteCircuitState] {
         queue.sync { circuitStatesByRouteHealthKey }
+    }
+
+    public func setAllCircuitStates(_ states: [String: RouteCircuitState]) {
+        queue.sync { circuitStatesByRouteHealthKey = states }
+    }
+
+    public func circuitStateCount() -> Int {
+        queue.sync { circuitStatesByRouteHealthKey.count }
     }
 
     // MARK: - Cooldowns
@@ -35,6 +47,16 @@ public final class RouteHealthStore {
         queue.sync { cooldownsByRouteHealthKey.removeValue(forKey: key) }
     }
 
+    public func allCooldowns() -> [String: Date] {
+        queue.sync { cooldownsByRouteHealthKey }
+    }
+
+    public func activeCooldowns(at now: Date) -> [String: Date] {
+        queue.sync {
+            cooldownsByRouteHealthKey.filter { $0.value > now }
+        }
+    }
+
     // MARK: - Availability
 
     public func isRouteAvailable(_ key: String, at now: Date) -> Bool {
@@ -45,11 +67,63 @@ public final class RouteHealthStore {
         }
     }
 
+    public func isRouteUnavailable(_ key: String, at now: Date) -> Bool {
+        queue.sync {
+            circuitStatesByRouteHealthKey[key]?.isUnavailable(at: now) ?? false
+        }
+    }
+
     // MARK: - Health Status Query
 
     public func healthStatus(forRouteHealthKey key: String) -> RouteHealthStatus {
         queue.sync {
             circuitStatesByRouteHealthKey[key]?.status ?? .closed
         }
+    }
+
+    public func nonClosedHealthStatus(forRouteHealthKey key: String) -> RouteHealthStatus? {
+        queue.sync {
+            guard let state = circuitStatesByRouteHealthKey[key] else { return nil }
+            return state.status == .closed ? nil : state.status
+        }
+    }
+
+    // MARK: - Rolling Metrics
+
+    public func rollingMetrics(forRouteHealthKey key: String) -> RouteRollingMetrics? {
+        queue.sync {
+            circuitStatesByRouteHealthKey[key]?.rollingMetrics
+        }
+    }
+
+    // MARK: - Snapshot Queries
+
+    public func unavailableRouteMetrics(at now: Date) -> [RouteRollingMetrics] {
+        queue.sync {
+            circuitStatesByRouteHealthKey.values
+                .filter { $0.isUnavailable(at: now) }
+                .map(\.rollingMetrics)
+        }
+    }
+
+    public func routeHealthKeys() -> [String] {
+        queue.sync {
+            Array(circuitStatesByRouteHealthKey.keys)
+        }
+    }
+
+    // MARK: - Reset
+
+    public func clearAll() {
+        queue.sync {
+            circuitStatesByRouteHealthKey = [:]
+            cooldownsByRouteHealthKey = [:]
+        }
+    }
+
+    // MARK: - Testing
+
+    public func resetForTesting() {
+        clearAll()
     }
 }

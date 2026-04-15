@@ -1284,6 +1284,7 @@ enum OpenAICompatTemporaryShim {
 
     #if canImport(ProxyCore)
     private static let concurrencyLimiter = RouteConcurrencyLimiter()
+    private static let routeHealthStore = RouteHealthStore()
     #endif
 
     // Public accessors for concurrency registry (used by ThinkingProxy main class)
@@ -3482,37 +3483,56 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
+        #if canImport(ProxyCore)
+        return routeHealthStore.nonClosedHealthStatus(forRouteHealthKey: route.routeHealthKey)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else { return nil }
             return state.status == .closed ? nil : state.status
         }
+        #endif
     }
 
     static func rollingMetrics(forRequestModel requestModel: String) -> RouteRollingMetrics? {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
+        #if canImport(ProxyCore)
+        return routeHealthStore.rollingMetrics(forRouteHealthKey: route.routeHealthKey)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.rollingMetrics
         }
+        #endif
     }
 
     static func routeHealthState(forRequestModel requestModel: String) -> RouteCircuitState? {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
+        #if canImport(ProxyCore)
+        return routeHealthStore.circuitState(forRouteHealthKey: route.routeHealthKey)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]
         }
+        #endif
     }
 
     static func routeCooldownUntil(forRequestModel requestModel: String, at now: Date = Date()) -> Date? {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return nil
         }
+        #if canImport(ProxyCore)
+        guard let cooldownUntil = routeHealthStore.cooldown(forRouteHealthKey: route.routeHealthKey),
+              cooldownUntil > now else {
+            return nil
+        }
+        return cooldownUntil
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             guard let cooldownUntil = routeCooldownsByRouteHealthKey[route.routeHealthKey],
@@ -3521,6 +3541,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             }
             return cooldownUntil
         }
+        #endif
     }
 
     static func nextRetryHint(
@@ -3581,15 +3602,25 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return defaultSuspectHedgeDelay
         }
+        #if canImport(ProxyCore)
+        return recommendedNVIDIAHedgeDelay(
+            metrics: routeHealthStore.rollingMetrics(forRouteHealthKey: route.routeHealthKey)
+        )
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return recommendedNVIDIAHedgeDelay(
                 metrics: routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.rollingMetrics
             )
         }
+        #endif
     }
 
     static func recommendedCanaryInterval() -> TimeInterval {
+        #if canImport(ProxyCore)
+        let metrics = routeHealthStore.unavailableRouteMetrics(at: Date())
+        return recommendedCanaryInterval(metrics: metrics)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             let metrics = routeCircuitStatesByRouteHealthKey.values
@@ -3597,12 +3628,18 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 .map(\.rollingMetrics)
             return recommendedCanaryInterval(metrics: metrics)
         }
+        #endif
     }
 
     static func isConfiguredRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return false
         }
+        #if canImport(ProxyCore)
+        guard let state = routeHealthStore.circuitState(forRouteHealthKey: route.routeHealthKey) else { return false }
+        if state.status == .halfOpen { return false }
+        return state.isUnavailable(at: now)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             guard let state = routeCircuitStatesByRouteHealthKey[route.routeHealthKey] else { return false }
@@ -3611,16 +3648,21 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             if state.status == .halfOpen { return false }
             return state.isUnavailable(at: now)
         }
+        #endif
     }
 
     static func isNVIDIAHostedRouteOpen(forRequestModel requestModel: String, at now: Date = Date()) -> Bool {
         guard let route = resolveNVIDIAHostedRoute(forRequestModel: requestModel) else {
             return false
         }
+        #if canImport(ProxyCore)
+        return routeHealthStore.isRouteUnavailable(route.routeHealthKey, at: now)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCircuitStatesByRouteHealthKey[route.routeHealthKey]?.isUnavailable(at: now) ?? false
         }
+        #endif
     }
 
     // Concurrency-aware failure tracking: deduplicate failures within window per route
@@ -4190,7 +4232,10 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         routeFailureDedupQueue.sync {
             recentFailureTimestampsByRoute = [:]
         }
-        concurrencyRegistry.resetForTesting()
+        #if canImport(ProxyCore)
+        routeHealthStore.resetForTesting()
+        #endif
+        resetConcurrencyRegistryForTesting()
     }
 
     static func setSmartAliasExhaustionLogSinkForTesting(_ sink: ((String) -> Void)?) {
@@ -4201,16 +4246,39 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         guard let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel) else {
             return nil
         }
+        #if canImport(ProxyCore)
+        return routeHealthStore.cooldown(forRouteHealthKey: route.routeHealthKey)
+        #else
         return routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             return routeCooldownsByRouteHealthKey[route.routeHealthKey]
         }
+        #endif
     }
 
     static func forceOpenRouteForTesting(requestModel: String, until: Date) {
         guard let route = routeIdentityForHealthTracking(forRequestModel: requestModel) else {
             return
         }
+        #if canImport(ProxyCore)
+        let existingState = routeHealthStore.circuitState(forRouteHealthKey: route.routeHealthKey)
+        routeHealthStore.setCircuitState(
+            RouteCircuitState(
+                status: .open,
+                failureScore: routeCircuitBreakerPolicy.failureThreshold,
+                recoverySuccesses: 0,
+                openUntil: until,
+                lastScoreUpdatedAt: until,
+                lastTelemetryEvent: nil,
+                rollingMetrics: .empty,
+                emaMetrics: .empty,
+                recoveredAt: nil,
+                lastLiveSuccessAt: existingState?.lastLiveSuccessAt,
+                nvidiaInferenceProbe: existingState?.nvidiaInferenceProbe
+            ),
+            forRouteHealthKey: route.routeHealthKey
+        )
+        #else
         routeHealthQueue.sync {
             loadPersistedRouteHealthIfNeededLocked()
             routeCircuitStatesByRouteHealthKey[route.routeHealthKey] = RouteCircuitState(
@@ -4228,6 +4296,7 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             )
             persistRouteHealthLocked()
         }
+        #endif
     }
 
     static func routeHealthSnapshotByRequestModel() -> [String: RouteCircuitState] {
@@ -4450,7 +4519,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     static func routeHealthSnapshotForTesting() -> [String: RouteCircuitState] {
-        routeHealthSnapshot()
+        #if canImport(ProxyCore)
+        return routeHealthStore.allCircuitStates()
+        #else
+        return routeHealthSnapshot()
+        #endif
     }
 
     static func syntheticFactoryWorkerHealthRequestForTesting(
