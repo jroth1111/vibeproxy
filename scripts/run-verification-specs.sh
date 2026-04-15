@@ -84,6 +84,7 @@ run_thinking_proxy_policy_spec() {
 
     echo "▶ Compiling $name"
     swiftc \
+        -D FLAT_PROXYCORE \
         -I "$build_dir" \
         -I "$bridge_build_dir" \
         -o "$output" \
@@ -123,6 +124,7 @@ run_meta_ai_web_adapter_spec() {
 
     echo "▶ Compiling $name"
     swiftc \
+        -D FLAT_PROXYCORE \
         -I "$build_dir" \
         -I "$bridge_build_dir" \
         -o "$output" \
