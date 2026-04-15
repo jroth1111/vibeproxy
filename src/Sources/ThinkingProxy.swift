@@ -878,6 +878,8 @@ enum OpenAICompatTemporaryShim {
     }()
     private static let telemetryStore = RouteTelemetryStore()
     private static let routeCatalog = RouteCatalog()
+    private static let credentialPool = CredentialPool()
+    private static let factoryContractResolver = FactoryContractResolver()
     #endif
 
     private static let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
