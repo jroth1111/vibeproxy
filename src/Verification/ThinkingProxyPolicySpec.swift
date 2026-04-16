@@ -1588,6 +1588,41 @@ struct ThinkingProxyPolicySpec {
                     "direct NVIDIA routes without fresh live or probe evidence should cap the stale buffered-response budget",
                     recorder: recorder
                 )
+                let forcedPublicGLM5Request = """
+                {
+                  "model": "glm5-nvidia",
+                  "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                }
+                """
+                let explicitDirectHeaders = [("X-VibeProxy-Allow-Direct-NVIDIA", "1")]
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
+                        forRequestJSON: forcedPublicGLM5Request,
+                        routeHealthStatus: nil,
+                        headers: explicitDirectHeaders
+                    ),
+                    18_000,
+                    "explicit public direct NVIDIA diagnostics should lift the first-byte deadline to the five-hour operator window",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(
+                        forRequestJSON: forcedPublicGLM5Request,
+                        headers: explicitDirectHeaders
+                    ),
+                    18_000,
+                    "explicit public direct NVIDIA diagnostics should lift the buffered deadline to the five-hour operator window",
+                    recorder: recorder
+                )
+                expectEqual(
+                    OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(
+                        forRequestJSON: forcedPublicGLM5Request,
+                        headers: explicitDirectHeaders
+                    )?.seconds,
+                    18_000,
+                    "explicit public direct NVIDIA diagnostics should use the same five-hour watchdog as the direct transport",
+                    recorder: recorder
+                )
                 OpenAICompatTemporaryShim.recordRouteSuccess(forRequestModel: "glm5-nvidia-direct")
                 expectEqual(
                     OpenAICompatTemporaryShim.hasRecentNVIDIAInferenceEvidence(forRequestModel: "glm5-nvidia-direct"),
@@ -11156,6 +11191,7 @@ struct ThinkingProxyPolicySpec {
                 let delivered = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
                 var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let callerRequestID = "direct-meta-web-request-id"
                 let lock = NSLock()
 
                 OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
@@ -11193,6 +11229,7 @@ struct ThinkingProxyPolicySpec {
                     rawHTTPRequest(
                         method: "POST",
                         path: "/v1/chat/completions",
+                        headers: [("X-Request-ID", callerRequestID)],
                         body: """
                         {
                           "model": "muse-spark",
@@ -11214,7 +11251,9 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.source, "live_request", "direct meta-web success should record live-request telemetry", recorder: recorder)
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct meta-web success should be tracked as a successful response", recorder: recorder)
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.finalWinnerRequestModel, "muse-spark", "direct meta-web success should preserve the winning request model", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.callerRequestID, callerRequestID, "direct meta-web success telemetry should preserve caller request IDs for RCA", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "muse-spark" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct meta-web success should emit a route telemetry event", recorder: recorder)
+                expectEqual(recordedEvents.contains(where: { $0.requestModel == "muse-spark" && $0.callerRequestID == callerRequestID }), true, "direct meta-web emitted telemetry should keep caller request IDs", recorder: recorder)
             }
         }
 
@@ -11227,6 +11266,7 @@ struct ThinkingProxyPolicySpec {
                 let delivered = DispatchSemaphore(value: 0)
                 var deliveredStatus: Int?
                 var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let callerRequestID = "direct-proxied-request-id"
                 let lock = NSLock()
 
                 OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
@@ -11267,6 +11307,7 @@ struct ThinkingProxyPolicySpec {
                     rawHTTPRequest(
                         method: "POST",
                         path: "/v1/chat/completions",
+                        headers: [("X-Request-ID", callerRequestID)],
                         body: """
                         {
                           "model": "mimo-v2-pro-opencode",
@@ -11288,7 +11329,9 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.source, "live_request", "direct proxied success should record live-request telemetry", recorder: recorder)
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.requestModel, "mimo-v2-pro-opencode", "direct proxied success should preserve the original request model alias", recorder: recorder)
                 expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct proxied success should be tracked as a successful response", recorder: recorder)
+                expectEqual(snapshot["mimo-v2-pro-free"]?.lastTelemetryEvent?.callerRequestID, callerRequestID, "direct proxied success telemetry should preserve caller request IDs for RCA", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct proxied success should emit a route telemetry event", recorder: recorder)
+                expectEqual(recordedEvents.contains(where: { $0.requestModel == "mimo-v2-pro-opencode" && $0.callerRequestID == callerRequestID }), true, "direct proxied emitted telemetry should keep caller request IDs", recorder: recorder)
             }
         }
 

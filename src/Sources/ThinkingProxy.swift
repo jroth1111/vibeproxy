@@ -2793,6 +2793,8 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     private static let minimumAttemptTimeout: TimeInterval = scaledRequestTimeout(300)
     private static let untrustedNVIDIAProbeFirstResponseDeadline: TimeInterval = 15
     private static let untrustedNVIDIAProbeBufferedResponseDeadline: TimeInterval = 20
+    private static let explicitNVIDIADirectFirstResponseDeadline: TimeInterval = 5 * 60 * 60
+    private static let explicitNVIDIADirectBufferedResponseDeadline: TimeInterval = 5 * 60 * 60
     private static var untrustedNVIDIAProbeDeadlineOverrideForTesting: (firstResponse: TimeInterval, bufferedResponse: TimeInterval)?
 
     private static func enforcedAttemptTimeout(_ timeout: TimeInterval?) -> TimeInterval? {
@@ -2814,6 +2816,24 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         policy(forRequestJSON: jsonString)?.firstResponseDeadline
     }
 
+    private static func explicitPublicNVIDIADirectDeadlineCap(
+        forRequestJSON jsonString: String,
+        headers: [(String, String)] = []
+    ) -> (firstResponse: TimeInterval, bufferedResponse: TimeInterval)? {
+        guard let requestModel = modelName(forRequestJSON: jsonString).map(normalizedRequestModel),
+              isPublicNVIDIADirectAlias(requestModel),
+              allowsExplicitNVIDIADirectAccess(headers: headers),
+              let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
+              route.providerID == "nvidia",
+              !hasRecentStableNVIDIAInferenceSuccess(forRequestModel: requestModel) else {
+            return nil
+        }
+        return (
+            firstResponse: explicitNVIDIADirectFirstResponseDeadline,
+            bufferedResponse: explicitNVIDIADirectBufferedResponseDeadline
+        )
+    }
+
     private static func nvidiaUntrustedDeadlineCap(forRequestJSON jsonString: String) -> (firstResponse: TimeInterval, bufferedResponse: TimeInterval)? {
         guard let requestModel = modelName(forRequestJSON: jsonString).map(normalizedRequestModel),
               let route = resolveRouteIdentityForAnyProvider(forRequestModel: requestModel),
@@ -2831,9 +2851,11 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
     }
 
     static func untrustedNVIDIADirectRequestDeadline(
-        forRequestJSON jsonString: String
+        forRequestJSON jsonString: String,
+        headers: [(String, String)] = []
     ) -> (seconds: TimeInterval, stage: DeadlineStage)? {
-        guard nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) != nil else {
+        guard explicitPublicNVIDIADirectDeadlineCap(forRequestJSON: jsonString, headers: headers) != nil ||
+                nvidiaUntrustedDeadlineCap(forRequestJSON: jsonString) != nil else {
             return nil
         }
         if requestedStream(forRequestJSON: jsonString) {
@@ -2842,13 +2864,17 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     forRequestJSON: jsonString,
                     routeHealthStatus: modelName(forRequestJSON: jsonString).flatMap { requestModel in
                         routeHealthStatus(forRequestModel: requestModel)
-                    }
+                    },
+                    headers: headers
                 ) ?? untrustedNVIDIAProbeFirstResponseDeadline,
                 stage: .firstResponse
             )
         }
         return (
-            seconds: effectiveBufferedResponseDeadline(forRequestJSON: jsonString)
+            seconds: effectiveBufferedResponseDeadline(
+                forRequestJSON: jsonString,
+                headers: headers
+            )
                 ?? untrustedNVIDIAProbeBufferedResponseDeadline,
             stage: .bufferedResponse
         )
@@ -2881,9 +2907,17 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
 
     static func effectiveFirstResponseDeadline(
         forRequestJSON jsonString: String,
-        routeHealthStatus: RouteHealthStatus?
+        routeHealthStatus: RouteHealthStatus?,
+        headers: [(String, String)] = []
     ) -> TimeInterval? {
         let baseDeadline = firstResponseDeadline(forRequestJSON: jsonString)
+
+        if let explicitCap = explicitPublicNVIDIADirectDeadlineCap(
+            forRequestJSON: jsonString,
+            headers: headers
+        ) {
+            return max(baseDeadline ?? explicitCap.firstResponse, explicitCap.firstResponse)
+        }
 
         // If p95 first-byte latency history exists, use it for an adaptive deadline
         // regardless of trust status. This lets slow-but-functional routes get proportional
@@ -2902,8 +2936,17 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         return min(baseDeadline ?? cap.firstResponse, cap.firstResponse)
     }
 
-    static func effectiveBufferedResponseDeadline(forRequestJSON jsonString: String) -> TimeInterval? {
+    static func effectiveBufferedResponseDeadline(
+        forRequestJSON jsonString: String,
+        headers: [(String, String)] = []
+    ) -> TimeInterval? {
         let baseDeadline = bufferedResponseDeadline(forRequestJSON: jsonString)
+        if let explicitCap = explicitPublicNVIDIADirectDeadlineCap(
+            forRequestJSON: jsonString,
+            headers: headers
+        ) {
+            return max(baseDeadline ?? explicitCap.bufferedResponse, explicitCap.bufferedResponse)
+        }
         if let adaptiveCap = adaptiveBufferedResponseDeadlineCap(forRequestJSON: jsonString) {
             if let baseDeadline {
                 return min(baseDeadline, adaptiveCap)
@@ -17048,7 +17091,12 @@ class ThinkingProxy {
             source: source,
             firstByteLatencyMilliseconds: bufferedResponse.firstByteLatencyMilliseconds,
             totalLatencyMilliseconds: bufferedResponse.totalLatencyMilliseconds,
-            inflightAtRequest: inflightAtRequest
+            inflightAtRequest: inflightAtRequest,
+            proxyRequestID: requestTrace?.proxyRequestID,
+            callerRequestID: requestTrace?.callerRequestID,
+            callerSessionID: requestTrace?.callerSessionID,
+            requestShape: requestTrace?.requestShape,
+            correlationID: requestTrace?.correlationID
         )
         return (
             event: event,
@@ -17961,6 +18009,7 @@ class ThinkingProxy {
         requestJSON: String,
         requestModel: String,
         clientRequestedStream: Bool,
+        deadlineHeaders: [(String, String)] = [],
         onChunk: ((Data, Date) -> Void)? = nil,
         completion: @escaping (NVIDIADirectTransportResponse) -> Void
     ) -> (() -> Void)? {
@@ -17983,11 +18032,15 @@ class ThinkingProxy {
             policy: effectiveNVIDIADirectTransportPolicy(),
             firstResponseSeconds: OpenAICompatTemporaryShim.effectiveFirstResponseDeadline(
                 forRequestJSON: requestJSON,
-                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: requestModel)
+                routeHealthStatus: OpenAICompatTemporaryShim.routeHealthStatus(forRequestModel: requestModel),
+                headers: deadlineHeaders
             ),
             bufferedResponseSeconds: clientRequestedStream
                 ? nil
-                : OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(forRequestJSON: requestJSON),
+                : OpenAICompatTemporaryShim.effectiveBufferedResponseDeadline(
+                    forRequestJSON: requestJSON,
+                    headers: deadlineHeaders
+                ),
             onChunk: onChunk ?? { _, _ in },
             completion: completion
         )
@@ -18017,7 +18070,10 @@ class ThinkingProxy {
             requestModel: state.model,
             requestTrace: requestTrace
         )
-        let requestDeadline = OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(forRequestJSON: body)
+        let requestDeadline = OpenAICompatTemporaryShim.untrustedNVIDIADirectRequestDeadline(
+            forRequestJSON: body,
+            headers: headers
+        )
         let requestDeadlineQueue = DispatchQueue(label: "io.automaze.vibeproxy.nvidia-direct-request-deadline")
         var requestDeadlineCompleted = false
         var requestDeadlineWorkItem: DispatchWorkItem?
@@ -18616,6 +18672,7 @@ class ThinkingProxy {
             requestJSON: body,
             requestModel: state.model,
             clientRequestedStream: clientRequestedStream,
+            deadlineHeaders: headers,
             onChunk: handleLiveStreamingChunk,
             completion: handleTransportResponse
         ) else {
