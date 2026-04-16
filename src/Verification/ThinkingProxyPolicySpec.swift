@@ -3642,6 +3642,88 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("unsupported Factory fallback models fail closed with explicit diagnostics and health visibility", recorder: recorder) {
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                ThinkingProxy.clearFactoryFallbackObservationsForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var deliveredStatus: Int?
+                var deliveredMessage: String?
+                var healthzBody: Data?
+
+                proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                    healthzBody = body
+                    delivered.signal()
+                }
+                proxy.deliveredErrorForTesting = { statusCode, message in
+                    deliveredStatus = statusCode
+                    deliveredMessage = message
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/api/llm/a/v1/messages",
+                        body: """
+                        {
+                          "model": "claude-sonnet-4-5-20250929",
+                          "max_tokens": 16,
+                          "messages": [
+                            {"role": "user", "content": "Return exactly OK"}
+                          ]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("unsupported Factory fallback requests should fail immediately")
+                    ThinkingProxy.clearFactoryFallbackObservationsForTesting()
+                    return
+                }
+
+                expectEqual(deliveredStatus, 502, "unsupported Factory fallback requests should fail closed with a gateway-style diagnostic", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("Unsupported Factory fallback model claude-sonnet-4-5-20250929"), true, "fallback diagnostics should name the unsupported model explicitly", recorder: recorder)
+                expectEqual(deliveredMessage?.contains("compactionModelMode"), true, "fallback diagnostics should point operators at the compaction model setting", recorder: recorder)
+
+                let healthDelivered = DispatchSemaphore(value: 0)
+                proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                    healthzBody = body
+                    healthDelivered.signal()
+                }
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                    connection: connection
+                )
+
+                guard healthDelivered.wait(timeout: .now() + 1) == .success else {
+                    recorder.recordFailure("healthz should surface recent Factory fallback diagnostics")
+                    ThinkingProxy.clearFactoryFallbackObservationsForTesting()
+                    return
+                }
+
+                let payload = parseDataJSONObject(healthzBody ?? Data(), recorder: recorder)
+                let factoryFallback = payload["factory_fallback"] as? [String: Any]
+                let lastRequest = factoryFallback?["last_request"] as? [String: Any]
+                let unsupportedModels = factoryFallback?["unsupported_models"] as? [String]
+
+                expectEqual(factoryFallback?["recent_request_count"] as? Int, 1, "healthz should count the recent unsupported Factory fallback request", recorder: recorder)
+                expectEqual(factoryFallback?["recent_unsupported_count"] as? Int, 1, "healthz should classify the recent fallback request as unsupported", recorder: recorder)
+                expectEqual(lastRequest?["path_class"] as? String, "anthropic", "healthz should preserve the fallback path class", recorder: recorder)
+                expectEqual(lastRequest?["request_model"] as? String, "claude-sonnet-4-5-20250929", "healthz should preserve the fallback request model", recorder: recorder)
+                expectEqual(lastRequest?["outcome"] as? String, "unsupported_model", "healthz should preserve the fallback outcome", recorder: recorder)
+                expectEqual(unsupportedModels?.contains("claude-sonnet-4-5-20250929"), true, "healthz should surface unsupported fallback models explicitly", recorder: recorder)
+
+                ThinkingProxy.clearFactoryFallbackObservationsForTesting()
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+            }
+        }
+
         run("healthz separates single-tool and multi-tool worker routing surfaces", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {

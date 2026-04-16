@@ -10787,12 +10787,107 @@ class ThinkingProxy {
         set { lastTerminalWorkerOutcomeQueue.sync { _lastTerminalWorkerOutcome = newValue } }
     }
 
+    private enum FactoryFallbackPathClass: String {
+        case openAI = "openai"
+        case anthropic = "anthropic"
+        case gemini = "gemini"
+    }
+
+    private struct FactoryFallbackObservation {
+        let timestamp: Date
+        let pathClass: FactoryFallbackPathClass
+        let originalPath: String
+        let rewrittenPath: String
+        let requestModel: String?
+        let proxyRequestID: String?
+        let callerSessionID: String?
+        let outcome: String
+        let detail: String?
+    }
+
+    private static let factoryFallbackObservationQueue = DispatchQueue(label: "factory-fallback-observations")
+    private static var _factoryFallbackObservations: [FactoryFallbackObservation] = []
+    private static let factoryFallbackObservationLimit = 64
+    private static let factoryFallbackObservationWindow: TimeInterval = 3600
+
+    private static func recordFactoryFallbackObservation(_ observation: FactoryFallbackObservation) {
+        factoryFallbackObservationQueue.sync {
+            _factoryFallbackObservations.append(observation)
+            if _factoryFallbackObservations.count > factoryFallbackObservationLimit {
+                _factoryFallbackObservations.removeFirst(_factoryFallbackObservations.count - factoryFallbackObservationLimit)
+            }
+        }
+    }
+
+    static func clearFactoryFallbackObservationsForTesting() {
+        factoryFallbackObservationQueue.sync {
+            _factoryFallbackObservations.removeAll()
+        }
+    }
+
+    private static func factoryFallbackSummary() -> [String: Any] {
+        factoryFallbackObservationQueue.sync {
+            let cutoff = Date().addingTimeInterval(-factoryFallbackObservationWindow)
+            let recent = _factoryFallbackObservations.filter { $0.timestamp >= cutoff }
+            guard !recent.isEmpty else { return [:] }
+
+            let countsByPathClass = recent.reduce(into: [String: Int]()) { result, observation in
+                result[observation.pathClass.rawValue, default: 0] += 1
+            }
+            let countsByOutcome = recent.reduce(into: [String: Int]()) { result, observation in
+                result[observation.outcome, default: 0] += 1
+            }
+            let unsupportedModels = Array(
+                Set(
+                    recent.compactMap { observation in
+                        observation.outcome == "unsupported_model" ? observation.requestModel : nil
+                    }
+                )
+            ).sorted()
+
+            var payload: [String: Any] = [
+                "window_seconds": Int(factoryFallbackObservationWindow),
+                "recent_request_count": recent.count,
+                "recent_unsupported_count": countsByOutcome["unsupported_model"] ?? 0,
+                "counts_by_path_class": countsByPathClass,
+                "counts_by_outcome": countsByOutcome
+            ]
+            if !unsupportedModels.isEmpty {
+                payload["unsupported_models"] = unsupportedModels
+            }
+            if let last = recent.last {
+                var lastPayload: [String: Any] = [
+                    "timestamp": ISO8601DateFormatter().string(from: last.timestamp),
+                    "path_class": last.pathClass.rawValue,
+                    "original_path": last.originalPath,
+                    "rewritten_path": last.rewrittenPath,
+                    "outcome": last.outcome
+                ]
+                if let requestModel = last.requestModel {
+                    lastPayload["request_model"] = requestModel
+                }
+                if let proxyRequestID = last.proxyRequestID {
+                    lastPayload["proxy_request_id"] = proxyRequestID
+                }
+                if let callerSessionID = last.callerSessionID {
+                    lastPayload["caller_session_id"] = callerSessionID
+                }
+                if let detail = last.detail {
+                    lastPayload["detail"] = detail
+                }
+                payload["last_request"] = lastPayload
+            }
+            return payload
+        }
+    }
+
     private struct RequestTraceContext {
         let proxyRequestID: String
         let callerRequestID: String?
         let callerSessionID: String?
         let requestShape: String
         let correlationID: String
+        let factoryFallbackPathClass: String?
 
         var responseHeaders: [String: String] {
             var headers = ["X-VibeProxy-Request-ID": proxyRequestID]
@@ -10804,6 +10899,9 @@ class ThinkingProxy {
             }
             headers["X-VibeProxy-Request-Shape"] = requestShape
             headers["X-VibeProxy-Correlation-ID"] = correlationID
+            if let factoryFallbackPathClass {
+                headers["X-VibeProxy-Factory-Fallback-Path-Class"] = factoryFallbackPathClass
+            }
             return headers
         }
     }
@@ -12554,9 +12652,11 @@ class ThinkingProxy {
         
         let bodyStart = requestString.distance(from: requestString.startIndex, to: bodyStartRange.upperBound)
         let bodyString = String(requestString[requestString.index(requestString.startIndex, offsetBy: bodyStart)...])
+        let factoryFallbackPathClass = classifyFactoryFallbackPath(path)
         let requestTrace = requestTraceContext(
             method: method,
             path: path,
+            factoryFallbackPathClass: factoryFallbackPathClass,
             headers: headers,
             body: bodyString
         )
@@ -12583,7 +12683,20 @@ class ThinkingProxy {
             rewrittenPath = "/api" + path
             NSLog("[ThinkingProxy] Rewriting Amp provider path: \(path) -> \(rewrittenPath)")
         }
-        
+
+        // Factory API path stripping: when FACTORY_API_BASE_URL points here,
+        // Droid sends /api/llm/o/v1/... paths on fallback. Strip to /v1/...
+        if factoryFallbackPathClass == .openAI {
+            rewrittenPath = "/v1/" + String(rewrittenPath.dropFirst("/api/llm/o/v1/".count))
+            NSLog("[ThinkingProxy] Factory OpenAI path rewrite: \(path) -> \(rewrittenPath)")
+        } else if factoryFallbackPathClass == .anthropic {
+            rewrittenPath = "/v1/messages"
+            NSLog("[ThinkingProxy] Factory Anthropic path rewrite: \(path) -> \(rewrittenPath)")
+        } else if factoryFallbackPathClass == .gemini {
+            rewrittenPath = "/v1/" + String(rewrittenPath.dropFirst("/api/llm/g/".count))
+            NSLog("[ThinkingProxy] Factory Gemini path rewrite: \(path) -> \(rewrittenPath)")
+        }
+
         // Check if this is an Amp management request (anything not targeting provider or /v1)
         // Note: /provider/ paths are already rewritten to /api/provider/ above
         let isProviderPath = rewrittenPath.starts(with: "/api/provider/")
@@ -12655,6 +12768,78 @@ class ThinkingProxy {
                 jsonString: modifiedBody
             ) {
                 modifiedBody = shimmed
+            }
+
+            if let factoryFallbackPathClass {
+                let effectiveRequestedModel = OpenAICompatTemporaryShim.rawModelName(forRequestJSON: modifiedBody)
+                    ?? callerVisibleRequestedModel
+                let hasSupportedFallbackRoute = effectiveRequestedModel.map { model in
+                    Self.factoryModelBinding(forIncomingModelID: model) != nil ||
+                    Self.factoryModelBindingByRouteModel(forRouteModel: model) != nil ||
+                    OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) != nil ||
+                    OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: model) != nil
+                } ?? false
+
+                if !hasSupportedFallbackRoute {
+                    let modelLabel = effectiveRequestedModel ?? "<missing model>"
+                    let diagnostic = "Unsupported Factory fallback model \(modelLabel) reached VibeProxy via \(path). This is Droid fallback traffic such as compaction/summarization, not the configured proxy-backed session/worker/validation route. Set Factory compactionModelMode to current-model or disable droid-proxy fallback for this path."
+                    Self.recordFactoryFallbackObservation(
+                        FactoryFallbackObservation(
+                            timestamp: Date(),
+                            pathClass: factoryFallbackPathClass,
+                            originalPath: path,
+                            rewrittenPath: rewrittenPath,
+                            requestModel: effectiveRequestedModel,
+                            proxyRequestID: requestTrace.proxyRequestID,
+                            callerSessionID: requestTrace.callerSessionID,
+                            outcome: "unsupported_model",
+                            detail: diagnostic
+                        )
+                    )
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(
+                        OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                            timestamp: Date(),
+                            requestModel: modelLabel,
+                            canonicalModelID: modelLabel,
+                            transportOutcome: "send_error",
+                            failureClass: "factory_fallback_unsupported_model",
+                            timeoutStage: .none,
+                            upstreamHTTPStatus: 502,
+                            retryCount: 0,
+                            source: "factory_fallback_live_request",
+                            proxyRequestID: requestTrace.proxyRequestID,
+                            callerRequestID: requestTrace.callerRequestID,
+                            callerSessionID: requestTrace.callerSessionID,
+                            requestShape: requestTrace.requestShape,
+                            errorBodySnippet: diagnostic,
+                            correlationID: requestTrace.correlationID
+                        )
+                    )
+                    var fallbackHeaders = requestTrace.responseHeaders
+                    fallbackHeaders["X-VibeProxy-Factory-Fallback-Model"] = modelLabel
+                    fallbackHeaders["X-VibeProxy-Factory-Fallback-Outcome"] = "unsupported_model"
+                    sendError(
+                        to: connection,
+                        statusCode: 502,
+                        message: diagnostic,
+                        overridingHeaders: fallbackHeaders
+                    )
+                    return
+                }
+
+                Self.recordFactoryFallbackObservation(
+                    FactoryFallbackObservation(
+                        timestamp: Date(),
+                        pathClass: factoryFallbackPathClass,
+                        originalPath: path,
+                        rewrittenPath: rewrittenPath,
+                        requestModel: effectiveRequestedModel,
+                        proxyRequestID: requestTrace.proxyRequestID,
+                        callerSessionID: requestTrace.callerSessionID,
+                        outcome: "forwarded",
+                        detail: nil
+                    )
+                )
             }
 
             coalescingSourceBody = modifiedBody
@@ -19879,6 +20064,11 @@ class ThinkingProxy {
             "provenance": provenanceDictionary(from: provenance)
         ]
 
+        let factoryFallback = Self.factoryFallbackSummary()
+        if !factoryFallback.isEmpty {
+            payload["factory_fallback"] = factoryFallback
+        }
+
         if let factoryWorkerContract = ThinkingProxy.factoryWorkerContract() {
             payload["factory_worker"] = factoryWorkerContractDictionary(
                 from: factoryWorkerContract,
@@ -20124,21 +20314,40 @@ class ThinkingProxy {
         return "\(method):\(surface):\(model):\(stream):tools=\(toolsCount):\(strictToolChoice):\(contentClass)"
     }
 
+    private func classifyFactoryFallbackPath(_ path: String) -> FactoryFallbackPathClass? {
+        if path.starts(with: "/api/llm/o/v1/") {
+            return .openAI
+        }
+        if path.starts(with: "/api/llm/a") {
+            return .anthropic
+        }
+        if path.starts(with: "/api/llm/g/") {
+            return .gemini
+        }
+        return nil
+    }
+
     private func requestTraceContext(
         method: String,
         path: String,
+        factoryFallbackPathClass: FactoryFallbackPathClass? = nil,
         headers: [(String, String)],
         body: String
     ) -> RequestTraceContext {
-        RequestTraceContext(
+        let baseRequestShape = requestShapeDescriptor(method: method, path: path, body: body)
+        let requestShape = factoryFallbackPathClass.map {
+            "factory_fallback:\($0.rawValue):\(baseRequestShape)"
+        } ?? baseRequestShape
+        return RequestTraceContext(
             proxyRequestID: UUID().uuidString,
             callerRequestID: requestHeaderValue("X-Request-ID", in: headers)
                 ?? requestHeaderValue("X-Client-Request-ID", in: headers),
             callerSessionID: requestHeaderValue("X-Session-ID", in: headers)
                 ?? requestHeaderValue("X-Factory-Session-ID", in: headers)
                 ?? requestHeaderValue("X-Droid-Session-ID", in: headers),
-            requestShape: requestShapeDescriptor(method: method, path: path, body: body),
-            correlationID: UUID().uuidString
+            requestShape: requestShape,
+            correlationID: UUID().uuidString,
+            factoryFallbackPathClass: factoryFallbackPathClass?.rawValue
         )
     }
 

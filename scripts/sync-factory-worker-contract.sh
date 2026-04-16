@@ -177,6 +177,7 @@ sync_json_file() {
     --arg session_model_id "$FACTORY_SESSION_MODEL" \
     --arg session_reasoning "$FACTORY_SESSION_REASONING" \
     --arg session_autonomy "$FACTORY_SESSION_AUTONOMY" \
+    --arg compaction_model_mode "$FACTORY_COMPACTION_MODEL_MODE" \
     --arg worker_reasoning "$FACTORY_WORKER_REASONING" \
     --arg validation_reasoning "$FACTORY_VALIDATION_REASONING" \
     --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" \
@@ -203,6 +204,7 @@ settings_filter='
   | .sessionDefaultSettings.model = $session_model_id
   | .sessionDefaultSettings.reasoningEffort = $session_reasoning
   | .sessionDefaultSettings.autonomyMode = $session_autonomy
+  | .general.compactionModelMode = $compaction_model_mode
   | .missionModelSettings.workerModel = $worker_id
   | .missionModelSettings.workerReasoningEffort = $worker_reasoning
   | .missionModelSettings.validationWorkerModel = $validation_worker_id
@@ -249,6 +251,7 @@ if [[ "$MODE" == "check" ]]; then
   echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
   echo "  worker: $FACTORY_WORKER_MODEL"
   echo "  validation: $FACTORY_VALIDATION_MODEL"
+  echo "  compaction-model-mode: $FACTORY_COMPACTION_MODEL_MODE"
   if [[ "$(jq 'length' <<<"$self_routed_managed_ids")" != "0" ]]; then
     echo "  exact proxy smart-aliases:"
     jq -r '.[] | "    " + .' <<<"$self_routed_managed_ids"
@@ -260,6 +263,7 @@ echo "synced factory role contract from $GLOBAL_SETTINGS_PATH"
 echo "  session/orchestrator: $FACTORY_SESSION_MODEL"
 echo "  worker: $FACTORY_WORKER_MODEL"
 echo "  validation: $FACTORY_VALIDATION_MODEL"
+echo "  compaction-model-mode: $FACTORY_COMPACTION_MODEL_MODE"
 if [[ "$(jq 'length' <<<"$self_routed_managed_ids")" != "0" ]]; then
   echo "  exact proxy smart-aliases:"
   jq -r '.[] | "    " + .' <<<"$self_routed_managed_ids"
