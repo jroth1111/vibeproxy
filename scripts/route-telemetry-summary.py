@@ -13,6 +13,7 @@ import urllib.request
 LINE_PATTERN = re.compile(
     r"CLIProxyMenuBar\[(?P<pid>\d+):[^\]]+\].*?\[ThinkingProxy\] Route telemetry (?P<json>\{.*\})\s*$"
 )
+DROID_TIMESTAMP_PATTERN = re.compile(r"^\[(?P<timestamp>[^\]]+)\]")
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of text",
+    )
+    parser.add_argument(
+        "--droid-log",
+        default=str(pathlib.Path.home() / ".factory" / "logs" / "droid-log-single.log"),
+        help="Path to the Droid log used for best-effort proxy bypass detection",
     )
     return parser.parse_args()
 
@@ -161,6 +167,122 @@ def summarize_events(
     }
 
 
+def parse_droid_context_line(line: str) -> tuple[dt.datetime, dict[str, object]] | None:
+    if "[LLM] sendMessage" not in line or " | Context: " not in line:
+        return None
+
+    timestamp_match = DROID_TIMESTAMP_PATTERN.match(line)
+    if not timestamp_match:
+        return None
+
+    try:
+        timestamp = parse_timestamp(timestamp_match.group("timestamp"))
+        context = json.loads(line.rsplit(" | Context: ", 1)[1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    return timestamp, context
+
+
+def load_droid_custom_model_activity(
+    log_path: pathlib.Path, window_start: dt.datetime
+) -> list[dict[str, object]]:
+    if not log_path.exists():
+        return []
+
+    activity: list[dict[str, object]] = []
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parsed = parse_droid_context_line(line)
+            if parsed is None:
+                continue
+
+            timestamp, context = parsed
+            if timestamp < window_start:
+                continue
+
+            tags = context.get("tags")
+            if not isinstance(tags, dict):
+                continue
+
+            tagged_model_id = str(tags.get("modelId") or "")
+            if not tagged_model_id.startswith("custom:"):
+                continue
+
+            activity.append(
+                {
+                    "timestamp": timestamp.isoformat(),
+                    "session_id": str(tags.get("sessionId") or ""),
+                    "tagged_model_id": tagged_model_id,
+                    "resolved_model_id": str(context.get("modelId") or ""),
+                    "tool_count": int(context.get("toolCount") or 0),
+                }
+            )
+
+    return activity
+
+
+def proxy_event_mentions_custom_model(event: dict[str, object], custom_model_id: str) -> bool:
+    return any(
+        custom_model_id == str(event.get(field) or "")
+        for field in ("request_model", "requested_alias")
+    ) or custom_model_id in str(event.get("request_shape") or "")
+
+
+def summarize_droid_proxy_fallthrough(
+    droid_activity: list[dict[str, object]], events: list[dict[str, object]]
+) -> dict[str, object]:
+    droid_counts = collections.Counter()
+    proxy_reference_counts = collections.Counter()
+    sample_sessions: dict[str, list[str]] = collections.defaultdict(list)
+    sample_resolved_models: dict[str, list[str]] = collections.defaultdict(list)
+
+    custom_model_ids = sorted(
+        {str(activity["tagged_model_id"]) for activity in droid_activity}
+    )
+
+    for activity in droid_activity:
+        custom_model_id = str(activity["tagged_model_id"])
+        droid_counts[custom_model_id] += 1
+
+        session_id = str(activity.get("session_id") or "")
+        if session_id and session_id not in sample_sessions[custom_model_id]:
+            if len(sample_sessions[custom_model_id]) < 3:
+                sample_sessions[custom_model_id].append(session_id)
+
+        resolved_model_id = str(activity.get("resolved_model_id") or "")
+        if (
+            resolved_model_id
+            and resolved_model_id not in sample_resolved_models[custom_model_id]
+            and len(sample_resolved_models[custom_model_id]) < 3
+        ):
+            sample_resolved_models[custom_model_id].append(resolved_model_id)
+
+    for custom_model_id in custom_model_ids:
+        proxy_reference_counts[custom_model_id] = sum(
+            1 for event in events if proxy_event_mentions_custom_model(event, custom_model_id)
+        )
+
+    possible_fallthrough = {
+        custom_model_id: {
+            "droid_send_count": droid_counts[custom_model_id],
+            "proxy_reference_count": proxy_reference_counts[custom_model_id],
+            "sample_session_ids": sample_sessions[custom_model_id],
+            "sample_resolved_model_ids": sample_resolved_models[custom_model_id],
+        }
+        for custom_model_id in custom_model_ids
+        if droid_counts[custom_model_id] > 0 and proxy_reference_counts[custom_model_id] == 0
+    }
+
+    return {
+        "droid_custom_send_distribution": dict(sorted(droid_counts.items())),
+        "proxy_custom_model_reference_distribution": dict(
+            sorted(proxy_reference_counts.items())
+        ),
+        "possible_byok_fallthrough": possible_fallthrough,
+    }
+
+
 def load_events(
     log_path: pathlib.Path,
     lookback_hours: float,
@@ -226,6 +348,32 @@ def emit_text(
         print(f"  {key}: {count}")
     if not summary["failure_distribution"]:
         print("  <none>")
+    print()
+
+    print("Droid custom-model sends:")
+    for key, count in summary["droid_custom_send_distribution"].items():
+        print(f"  {key}: {count}")
+    if not summary["droid_custom_send_distribution"]:
+        print("  <none>")
+    print()
+
+    print("Proxy custom-model references:")
+    for key, count in summary["proxy_custom_model_reference_distribution"].items():
+        print(f"  {key}: {count}")
+    if not summary["proxy_custom_model_reference_distribution"]:
+        print("  <none>")
+    print()
+
+    print("Possible BYOK fallthrough:")
+    for key, payload in summary["possible_byok_fallthrough"].items():
+        print(
+            f"  {key}: droid_send_count={payload['droid_send_count']} "
+            f"proxy_reference_count={payload['proxy_reference_count']} "
+            f"sample_sessions={payload['sample_session_ids']} "
+            f"sample_resolved_models={payload['sample_resolved_model_ids']}"
+        )
+    if not summary["possible_byok_fallthrough"]:
+        print("  <none>")
 
 
 def main() -> int:
@@ -248,6 +396,9 @@ def main() -> int:
 
     provider_map = fetch_provider_map(args.health_url)
     events, window_start, now = load_events(log_path, args.hours, pid_filter)
+    droid_activity = load_droid_custom_model_activity(
+        pathlib.Path(args.droid_log), window_start
+    )
 
     # Warn on any request models that map to "unknown"
     all_models = {str(e.get("request_model") or "unknown") for e in events}
@@ -256,6 +407,7 @@ def main() -> int:
         print(f"WARNING: Unmapped request models (no provider classification): {sorted(unmapped)}", file=sys.stderr)
 
     summary = summarize_events(events, provider_map)
+    summary.update(summarize_droid_proxy_fallthrough(droid_activity, events))
 
     if args.json:
         print(
@@ -265,6 +417,7 @@ def main() -> int:
                     "window_end": now.isoformat(),
                     "pid_filter": pid_filter,
                     "event_count": len(events),
+                    "droid_event_count": len(droid_activity),
                     **summary,
                 },
                 indent=2,
