@@ -12782,7 +12782,7 @@ class ThinkingProxy {
 
                 if !hasSupportedFallbackRoute {
                     let modelLabel = effectiveRequestedModel ?? "<missing model>"
-                    let diagnostic = "Unsupported Factory fallback model \(modelLabel) reached VibeProxy via \(path). This is Droid fallback traffic such as compaction/summarization, not the configured proxy-backed session/worker/validation route. Set Factory compactionModelMode to current-model or disable droid-proxy fallback for this path."
+                    let diagnostic = "Unsupported Factory fallback model \(modelLabel) reached VibeProxy via \(path). This is Factory fallback traffic such as compaction/summarization, not the configured proxy-backed session/worker/validation route. Set Factory compactionModelMode to current-model or ensure Factory fallback traffic does not target this proxy."
                     Self.recordFactoryFallbackObservation(
                         FactoryFallbackObservation(
                             timestamp: Date(),
