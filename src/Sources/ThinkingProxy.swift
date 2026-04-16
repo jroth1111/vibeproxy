@@ -7041,7 +7041,12 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
             callerRequestID: event.callerRequestID,
             callerSessionID: event.callerSessionID,
             requestShape: event.requestShape,
-            errorBodySnippet: event.errorBodySnippet
+            negotiatedApplicationProtocol: event.negotiatedApplicationProtocol,
+            errorBodySnippet: event.errorBodySnippet,
+            terminalOutcomeMarker: event.terminalOutcomeMarker,
+            failoverChain: event.failoverChain,
+            firstSelectedCandidate: event.firstSelectedCandidate,
+            correlationID: event.correlationID
         )
     }
 
@@ -11282,8 +11287,15 @@ class ThinkingProxy {
     }
 
     final class RequestCancellationController {
+        enum CancellationReason: Equatable {
+            case internalRequest
+            case clientDisconnected
+        }
+
         private let stateQueue = DispatchQueue(label: "io.automaze.vibeproxy.smart-alias-candidate")
         private var cancelled = false
+        private var cancellationReason: CancellationReason?
+        private var clientDisconnectTelemetryClaimed = false
         private var currentCancel: (() -> Void)?
         private var cancelHooks: [() -> Void] = []
         private var scheduledRetryWorkItem: DispatchWorkItem?
@@ -11331,10 +11343,11 @@ class ThinkingProxy {
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay, execute: workItem)
         }
 
-        func cancel() {
+        func cancel(reason: CancellationReason = .internalRequest) {
             let cancellationWork: (canceler: (() -> Void)?, hooks: [() -> Void])? = stateQueue.sync {
                 guard !cancelled else { return nil }
                 cancelled = true
+                cancellationReason = reason
                 let currentCancel = self.currentCancel
                 self.currentCancel = nil
                 let hooks = cancelHooks
@@ -11351,10 +11364,25 @@ class ThinkingProxy {
             stateQueue.sync { cancelled }
         }
 
+        func cancellationReasonValue() -> CancellationReason? {
+            stateQueue.sync { cancellationReason }
+        }
+
+        func claimClientDisconnectTelemetry() -> Bool {
+            stateQueue.sync {
+                guard cancellationReason == .clientDisconnected,
+                      !clientDisconnectTelemetryClaimed else {
+                    return false
+                }
+                clientDisconnectTelemetryClaimed = true
+                return true
+            }
+        }
+
         func observeConnectionState(_ state: NWConnection.State) {
             switch state {
             case .failed, .cancelled:
-                cancel()
+                cancel(reason: .clientDisconnected)
             default:
                 break
             }
@@ -11408,11 +11436,11 @@ class ThinkingProxy {
                 } else {
                     NSLog("[ThinkingProxy] Client connection receive failed before proxy delivery completed: \(error)")
                 }
-                controller.cancel()
+                controller.cancel(reason: .clientDisconnected)
                 return
             }
             if isComplete || (data?.isEmpty ?? true) {
-                controller.cancel()
+                controller.cancel(reason: .clientDisconnected)
                 return
             }
             self.monitorClientDisconnect(on: connection, controller: controller, requestTrace: requestTrace)
@@ -18414,8 +18442,6 @@ class ThinkingProxy {
                 permit.release()
                 coordinator.finishAttemptWithoutWinning(attemptLane: attemptLane)
             }
-            guard requestController.isCancelled() != true else { return }
-
             let effectiveTransportResponse: NVIDIADirectTransportResponse = attemptStateQueue.sync {
                 liveStreamFinished = true
                 cancelStreamingTimersLocked()
@@ -18430,6 +18456,40 @@ class ThinkingProxy {
                     )
                 }
                 return transportResponse
+            }
+            if requestController.isCancelled() == true {
+                if requestController.cancellationReasonValue() == .clientDisconnected,
+                   requestController.claimClientDisconnectTelemetry() {
+                    let retryCount = max(0, state.initialTransportRetries - state.transportRetriesRemaining) +
+                        max(0, state.initialSemanticRetries - state.semanticRetriesRemaining)
+                    let route = OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: state.model)
+                    let telemetryEvent = OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                        timestamp: Date(),
+                        requestModel: state.model,
+                        canonicalModelID: route?.canonicalModelID ?? state.model,
+                        transportOutcome: "send_error",
+                        attemptLane: attemptLane,
+                        failureClass: "client_cancelled",
+                        timeoutStage: effectiveTransportResponse.deadlineStage,
+                        upstreamHTTPStatus: effectiveTransportResponse.response?.statusCode,
+                        retryCount: retryCount,
+                        source: "live_request",
+                        firstByteLatencyMilliseconds: effectiveTransportResponse.firstByteLatencyMilliseconds,
+                        totalLatencyMilliseconds: effectiveTransportResponse.totalLatencyMilliseconds,
+                        inflightAtRequest: permit.inflightAtRequest,
+                        proxyRequestID: requestTrace.proxyRequestID,
+                        callerRequestID: requestTrace.callerRequestID,
+                        callerSessionID: requestTrace.callerSessionID,
+                        requestShape: requestTrace.requestShape,
+                        negotiatedApplicationProtocol: effectiveTransportResponse.negotiatedApplicationProtocol,
+                        errorBodySnippet: OpenAICompatTemporaryShim.sanitizeErrorBodySnippet(
+                            effectiveTransportResponse.bodyData
+                        ),
+                        correlationID: requestTrace.correlationID
+                    )
+                    OpenAICompatTemporaryShim.logNVIDIARouteTelemetry(telemetryEvent)
+                }
+                return
             }
 
             let processedAttempt = self.processNVIDIAStreamingAttemptResponse(

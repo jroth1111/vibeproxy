@@ -3024,7 +3024,13 @@ struct ThinkingProxyPolicySpec {
                 timeoutStage: .none,
                 upstreamHTTPStatus: 200,
                 retryCount: 0,
-                source: "live_request"
+                source: "live_request",
+                negotiatedApplicationProtocol: "h2",
+                errorBodySnippet: "{\"ok\":true}",
+                terminalOutcomeMarker: "success",
+                failoverChain: "glm5->muse-spark",
+                firstSelectedCandidate: "glm5",
+                correlationID: "corr-winner-lane"
             )
             let winningEvent = OpenAICompatTemporaryShim.telemetryEventWithWinnerAttemptLane(
                 event,
@@ -3033,6 +3039,12 @@ struct ThinkingProxyPolicySpec {
 
             expectEqual(winningEvent.attemptLane, 2, "telemetry should preserve the attempt lane that produced the response", recorder: recorder)
             expectEqual(winningEvent.winnerAttemptLane, 2, "telemetry should record which hedge lane ultimately won", recorder: recorder)
+            expectEqual(winningEvent.negotiatedApplicationProtocol, "h2", "winner telemetry should preserve the negotiated upstream application protocol", recorder: recorder)
+            expectEqual(winningEvent.errorBodySnippet, "{\"ok\":true}", "winner telemetry should preserve error/body snippets for RCA", recorder: recorder)
+            expectEqual(winningEvent.terminalOutcomeMarker, "success", "winner telemetry should preserve terminal outcome markers", recorder: recorder)
+            expectEqual(winningEvent.failoverChain, "glm5->muse-spark", "winner telemetry should preserve failover chain annotations", recorder: recorder)
+            expectEqual(winningEvent.firstSelectedCandidate, "glm5", "winner telemetry should preserve the first selected candidate annotation", recorder: recorder)
+            expectEqual(winningEvent.correlationID, "corr-winner-lane", "winner telemetry should preserve correlation IDs", recorder: recorder)
         }
 
         run("temporary nvidia coalescing registry shares one in-flight slot across duplicate safe requests", recorder: recorder) {
@@ -11797,6 +11809,165 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(timeoutObserved, true, "direct NVIDIA inter-chunk timeout should actively cancel the live transport", recorder: recorder)
                 expectEqual(timeoutEvent?.timeoutStage, .interChunkRead, "direct NVIDIA inter-chunk timeout should be attributed to the live transport chunk-gap watchdog", recorder: recorder)
             }
+        }
+
+        run("direct NVIDIA client disconnect emits terminal telemetry without mutating route health", recorder: recorder) {
+            #if DEBUG
+            withMergedConfig(defaultMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let accepted = DispatchSemaphore(value: 0)
+                let clientReady = DispatchSemaphore(value: 0)
+                let transportStarted = DispatchSemaphore(value: 0)
+                let upstreamCancelled = DispatchSemaphore(value: 0)
+                let telemetryRecorded = DispatchSemaphore(value: 0)
+                let unexpectedDelivery = DispatchSemaphore(value: 0)
+                let listenerQueue = DispatchQueue(label: "thinkingproxy-policy.direct-nvidia.disconnect.listener")
+                let connectionQueue = DispatchQueue(label: "thinkingproxy-policy.direct-nvidia.disconnect.connection")
+                let lock = NSLock()
+                let callerRequestID = "direct-nvidia-client-disconnect"
+                let correlationID = "corr-direct-nvidia-client-disconnect"
+                var serverConnection: NWConnection?
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+
+                guard let listener = try? NWListener(using: .tcp, on: .any) else {
+                    recorder.recordFailure("direct NVIDIA disconnect testing should create a local listener")
+                    return
+                }
+
+                listener.newConnectionHandler = { connection in
+                    serverConnection = connection
+                    connection.start(queue: connectionQueue)
+                    accepted.signal()
+                }
+                listener.start(queue: listenerQueue)
+
+                guard let port = listener.port else {
+                    recorder.recordFailure("direct NVIDIA disconnect testing should expose an ephemeral listener port")
+                    listener.cancel()
+                    return
+                }
+
+                let client = NWConnection(host: "127.0.0.1", port: port, using: .tcp)
+                client.stateUpdateHandler = { state in
+                    if case .ready = state {
+                        clientReady.signal()
+                    }
+                }
+                client.start(queue: connectionQueue)
+
+                guard clientReady.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client should connect before direct NVIDIA disconnect testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                guard accepted.wait(timeout: .now() + 2) == .success,
+                      let serverConnection else {
+                    recorder.recordFailure("listener should accept the client before direct NVIDIA disconnect testing begins")
+                    client.cancel()
+                    listener.cancel()
+                    return
+                }
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    guard event.requestModel == "glm5-nvidia-direct",
+                          event.failureClass == "client_cancelled" else { return }
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                    telemetryRecorded.signal()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    client.cancel()
+                    serverConnection.cancel()
+                    listener.cancel()
+                }
+
+                proxy.nvidiaDirectTransportForTesting = { _, completion in
+                    transportStarted.signal()
+                    return {
+                        upstreamCancelled.signal()
+                        completion(
+                            ThinkingProxy.NVIDIADirectTransportResponse(
+                                chunks: [Data("{\"partial\":true}".utf8)],
+                                response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                                error: URLError(.cancelled),
+                                firstByteLatencyMilliseconds: 11,
+                                totalLatencyMilliseconds: 77,
+                                negotiatedApplicationProtocol: "h2"
+                            )
+                        )
+                    }
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    unexpectedDelivery.signal()
+                }
+                proxy.deliveredErrorForTesting = { _, _ in
+                    unexpectedDelivery.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        headers: [
+                            ("X-Request-ID", callerRequestID),
+                            ("X-VibeProxy-Correlation-ID", correlationID)
+                        ],
+                        body: """
+                        {
+                          "model": "glm5-nvidia-direct",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: serverConnection
+                )
+
+                guard transportStarted.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA request should reach the injected transport before disconnect")
+                    return
+                }
+
+                client.cancel()
+
+                guard upstreamCancelled.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("client disconnect should invoke the registered direct NVIDIA cancel closure")
+                    return
+                }
+
+                guard telemetryRecorded.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("direct NVIDIA client disconnect should emit terminal telemetry")
+                    return
+                }
+
+                if unexpectedDelivery.wait(timeout: .now() + 0.4) == .success {
+                    recorder.recordFailure("direct NVIDIA requests should not deliver a late response after the client disconnects")
+                }
+
+                lock.lock()
+                let cancellationEvent = recordedEvents.last
+                lock.unlock()
+                expectEqual(cancellationEvent?.transportOutcome, "send_error", "direct NVIDIA client disconnect telemetry should be terminal", recorder: recorder)
+                expectEqual(cancellationEvent?.upstreamHTTPStatus, 200, "direct NVIDIA client disconnect telemetry should preserve upstream status when available", recorder: recorder)
+                expectEqual(cancellationEvent?.callerRequestID, callerRequestID, "direct NVIDIA client disconnect telemetry should preserve caller request IDs", recorder: recorder)
+                expectEqual(cancellationEvent?.correlationID, correlationID, "direct NVIDIA client disconnect telemetry should preserve correlation IDs", recorder: recorder)
+                expectEqual(cancellationEvent?.negotiatedApplicationProtocol, "h2", "direct NVIDIA client disconnect telemetry should preserve the negotiated protocol", recorder: recorder)
+                expectEqual(cancellationEvent?.totalLatencyMilliseconds, 77, "direct NVIDIA client disconnect telemetry should preserve total latency", recorder: recorder)
+                expectEqual(
+                    OpenAICompatTemporaryShim.routeHealthSnapshotForTesting().isEmpty,
+                    true,
+                    "client disconnect telemetry should not mutate route health state",
+                    recorder: recorder
+                )
+            }
+            #endif
         }
 
         run("direct NVIDIA first-response deadlines stay active without transport test overrides", recorder: recorder) {
