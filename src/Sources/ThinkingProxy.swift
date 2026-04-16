@@ -21547,8 +21547,6 @@ class ThinkingProxy {
         let fileManager = FileManager.default
         let factoryRoot = ((settingsPath as NSString).deletingLastPathComponent as NSString).standardizingPath
         var driftedPaths: [String] = []
-        let retiredWorkerModelIDs = retiredFactoryWorkerModelIDs(excluding: workerModelID)
-
         func recordDrift(_ path: String) {
             driftedPaths.append((path as NSString).standardizingPath)
         }
@@ -21572,15 +21570,6 @@ class ThinkingProxy {
             canonicalJSONData(for: lhs) == canonicalJSONData(for: rhs)
         }
 
-        func containsRetiredWorkerModelID(_ customModels: [[String: Any]]) -> Bool {
-            customModels.contains { model in
-                guard let id = model["id"] as? String else {
-                    return false
-                }
-                return retiredWorkerModelIDs.contains(id)
-            }
-        }
-
         func expectedMissionSettingsMatch(_ object: [String: Any]) -> Bool {
             object["workerModel"] as? String == workerModelID &&
                 object["validationWorkerModel"] as? String == validationWorkerModelID &&
@@ -21602,7 +21591,6 @@ class ThinkingProxy {
             }
 
             guard let customModels = object["customModels"] as? [[String: Any]],
-                  !containsRetiredWorkerModelID(customModels),
                   jsonObjectsEqual(customModels, canonicalCustomModels) else {
                 return false
             }
@@ -21619,7 +21607,6 @@ class ThinkingProxy {
 
         func expectedRuntimeCatalogMatch(_ object: [String: Any]) -> Bool {
             guard let customModels = object["customModels"] as? [[String: Any]],
-                  !containsRetiredWorkerModelID(customModels),
                   jsonObjectsEqual(customModels, canonicalCustomModels),
                   let definedWorkerModel = customModels.first(where: { ($0["id"] as? String) == workerModelID }) else {
                 return false

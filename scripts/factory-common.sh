@@ -9,6 +9,10 @@ LOCAL_SETTINGS_PATH="${LOCAL_SETTINGS_PATH:-$FACTORY_ROOT/settings.local.json}"
 FRONTEND_URL="${VIBEPROXY_FRONTEND_URL:-http://127.0.0.1:8317}"
 HEALTH_URL="$FRONTEND_URL/healthz"
 API_KEY="${FACTORY_PROXY_API_KEY:-factory-local-proxy}"
+FACTORY_PROXY_BASE_URL="${FACTORY_PROXY_BASE_URL:-$FRONTEND_URL/v1/}"
+FACTORY_PUBLIC_WORKER_ROUTE_MODEL="${FACTORY_PUBLIC_WORKER_ROUTE_MODEL:-proxy-worker-smart-router}"
+FACTORY_CANONICAL_WORKER_MODEL_ID="${FACTORY_CANONICAL_WORKER_MODEL_ID:-custom:Proxy-Worker-Smart-Router-8}"
+FACTORY_CODE_OWNED_WORKER_MODEL_IDS_JSON="${FACTORY_CODE_OWNED_WORKER_MODEL_IDS_JSON:-[\"custom:Proxy-Worker-Smart-Router-8\",\"custom:Factory-Worker-GPT-5.4-High-8\",\"custom:Proxy-WorkerPool-8\"]}"
 DROID_LOG_PATH="${DROID_LOG_PATH:-$FACTORY_ROOT/logs/droid-log-single.log}"
 MISSIONS_ROOT="${MISSIONS_ROOT:-$FACTORY_ROOT/missions}"
 ROUTE_HEALTH_PATH="${ROUTE_HEALTH_PATH:-$HOME/.cli-proxy-api/route-health.json}"
@@ -28,6 +32,47 @@ require_global_settings() {
     echo "missing global settings: $GLOBAL_SETTINGS_PATH" >&2
     return 1
   fi
+}
+
+normalized_factory_custom_models() {
+  local settings="$1"
+
+  jq -c \
+    --arg canonical_worker_id "$FACTORY_CANONICAL_WORKER_MODEL_ID" \
+    --arg worker_route_model "$FACTORY_PUBLIC_WORKER_ROUTE_MODEL" \
+    --arg proxy_base_url "$FACTORY_PROXY_BASE_URL" \
+    --arg api_key "$API_KEY" \
+    --arg retired_worker_id "custom:Factory-Worker-GPT-5.4-High-8" \
+    --arg retired_worker_display_name "Factory Worker GPT-5.4 High" \
+    --argjson retired_worker_index '8' \
+    --arg retired_pool_id "custom:Proxy-WorkerPool-8" \
+    --arg retired_pool_display_name "Proxy WorkerPool" \
+    --argjson retired_pool_index '8' \
+    '
+      def seed_for($models; $canonical_worker_id; $id):
+        (($models[]? | select(.id == $id)) // ($models[]? | select(.id == $canonical_worker_id)) // {});
+      def normalized_worker_entry($models; $canonical_worker_id; $worker_route_model; $proxy_base_url; $api_key; $id; $display_name; $index):
+          (seed_for($models; $canonical_worker_id; $id) + {
+            id: $id,
+            model: $worker_route_model,
+            provider: "generic-chat-completion-api",
+            displayName: $display_name,
+            baseUrl: $proxy_base_url,
+            apiKey: $api_key,
+            noImageSupport: (seed_for($models; $canonical_worker_id; $id).noImageSupport // true),
+            maxOutputTokens: (seed_for($models; $canonical_worker_id; $id).maxOutputTokens // 32768),
+            index: (seed_for($models; $canonical_worker_id; $id).index // $index)
+          });
+      def upsert($entry):
+          map(if .id == $entry.id then . + $entry else . end)
+          | if any(.[]; .id == $entry.id) then . else . + [$entry] end;
+      (.customModels // []) as $models
+      | $models
+      | upsert(normalized_worker_entry($models; $canonical_worker_id; $worker_route_model; $proxy_base_url; $api_key; $canonical_worker_id; "Proxy Worker Smart Router"; 8))
+      | upsert(normalized_worker_entry($models; $canonical_worker_id; $worker_route_model; $proxy_base_url; $api_key; $retired_worker_id; $retired_worker_display_name; $retired_worker_index))
+      | upsert(normalized_worker_entry($models; $canonical_worker_id; $worker_route_model; $proxy_base_url; $api_key; $retired_pool_id; $retired_pool_display_name; $retired_pool_index))
+    ' \
+    "$settings"
 }
 
 # --- settings reader ---
@@ -77,6 +122,8 @@ load_factory_models() {
     return 1
   fi
 
+  FACTORY_CANONICAL_CUSTOM_MODELS="$(normalized_factory_custom_models "$settings")"
+
   # Resolve custom-model IDs to their route model + provider.
   # For non-custom models (e.g. "gpt-5.4"), try:
   #   1. Exact custom model ID match
@@ -86,25 +133,25 @@ load_factory_models() {
     local model_id="$1"
     local reasoning="${2:-}"
     jq -r --arg id "$model_id" --arg model_name "$model_id" --arg reasoning "$reasoning" '
-      (.customModels[] | select(.id == $id) | .model) //
+      (.[] | select(.id == $id) | .model) //
       (if ($reasoning | length) > 0 then
-        (.customModels[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .model)
+        (.[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .model)
       else empty end) //
-      (.customModels[] | select($model_name | startswith(.model)) | .model) //
+      (.[] | select($model_name | startswith(.model)) | .model) //
       empty
-    ' "$settings"
+    ' <<<"$FACTORY_CANONICAL_CUSTOM_MODELS"
   }
   resolve_custom_provider() {
     local model_id="$1"
     local reasoning="${2:-}"
     jq -r --arg id "$model_id" --arg model_name "$model_id" --arg reasoning "$reasoning" '
-      (.customModels[] | select(.id == $id) | .provider) //
+      (.[] | select(.id == $id) | .provider) //
       (if ($reasoning | length) > 0 then
-        (.customModels[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .provider)
+        (.[] | select(.model == ($model_name + "(" + $reasoning + ")")) | .provider)
       else empty end) //
-      (.customModels[] | select($model_name | startswith(.model)) | .provider) //
+      (.[] | select($model_name | startswith(.model)) | .provider) //
       empty
-    ' "$settings"
+    ' <<<"$FACTORY_CANONICAL_CUSTOM_MODELS"
   }
   FACTORY_WORKER_ROUTE_MODEL="$(resolve_custom_model "$FACTORY_WORKER_MODEL" "$FACTORY_WORKER_REASONING")"
   FACTORY_WORKER_ROUTE_PROVIDER="$(resolve_custom_provider "$FACTORY_WORKER_MODEL" "$FACTORY_WORKER_REASONING")"
@@ -120,9 +167,6 @@ load_factory_models() {
   FACTORY_SESSION_ROUTE_PROVIDER="${FACTORY_SESSION_ROUTE_PROVIDER/null/}"
   FACTORY_VALIDATION_ROUTE_MODEL="${FACTORY_VALIDATION_ROUTE_MODEL/null/}"
   FACTORY_VALIDATION_ROUTE_PROVIDER="${FACTORY_VALIDATION_ROUTE_PROVIDER/null/}"
-
-  FACTORY_CANONICAL_CUSTOM_MODELS="$(jq -c '(.customModels // [])' "$settings")"
-
   export \
     FACTORY_SESSION_MODEL FACTORY_SESSION_REASONING FACTORY_SESSION_AUTONOMY \
     FACTORY_WORKER_MODEL FACTORY_WORKER_REASONING \
@@ -130,7 +174,9 @@ load_factory_models() {
     FACTORY_WORKER_ROUTE_MODEL FACTORY_WORKER_ROUTE_PROVIDER \
     FACTORY_SESSION_ROUTE_MODEL FACTORY_SESSION_ROUTE_PROVIDER \
     FACTORY_VALIDATION_ROUTE_MODEL FACTORY_VALIDATION_ROUTE_PROVIDER \
-    FACTORY_CANONICAL_CUSTOM_MODELS
+    FACTORY_CANONICAL_CUSTOM_MODELS FACTORY_PROXY_BASE_URL \
+    FACTORY_PUBLIC_WORKER_ROUTE_MODEL FACTORY_CANONICAL_WORKER_MODEL_ID \
+    FACTORY_CODE_OWNED_WORKER_MODEL_IDS_JSON
 }
 
 # --- provider helpers ---

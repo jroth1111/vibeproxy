@@ -15007,6 +15007,61 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("healthz treats canonical rescue worker aliases as snapshot-sync when local snapshots match", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                let settingsJSON = factorySettingsJSON(
+                    contract: genericCompatFactoryWorkerContract,
+                    additionalCustomModels: factoryWorkerRescueCustomModelsJSON()
+                )
+                let runtimeCatalogJSON = factoryRuntimeCustomModelsJSON(
+                    contract: genericCompatFactoryWorkerContract,
+                    additionalCustomModels: factoryWorkerRescueCustomModelsJSON()
+                )
+                withFactorySettings(
+                    settingsJSON,
+                    extraFiles: [
+                        "settings.local.json": settingsJSON,
+                        "missions/test/runtime-custom-models.json": runtimeCatalogJSON
+                    ]
+                ) {
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    let proxy = ThinkingProxy()
+                    let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                    let delivered = DispatchSemaphore(value: 0)
+                    var deliveredBody: Data?
+
+                    proxy.deliveredHTTPResponseForTesting = { _, _, body in
+                        deliveredBody = body
+                        delivered.signal()
+                    }
+
+                    proxy.processRequestForTesting(
+                        rawHTTPRequest(method: "GET", path: "/healthz", body: ""),
+                        connection: connection
+                    )
+
+                    guard delivered.wait(timeout: .now() + 1) == .success else {
+                        recorder.recordFailure("rescue-aware worker healthz should return a response")
+                        return
+                    }
+
+                    let payload = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
+                    let factoryWorker = payload["factory_worker"] as? [String: Any]
+                    let acceptedRequestModelIDs = factoryWorker?["accepted_request_model_ids"] as? [String]
+                    let rescuedRequestModelIDs = factoryWorker?["rescued_request_model_ids"] as? [String]
+
+                    expectEqual(factoryWorker?["snapshot_sync_ok"] as? Bool, true, "healthz should treat synced rescue worker aliases as canonical rather than drift", recorder: recorder)
+                    expectEqual(factoryWorker?["snapshot_drift_count"] as? Int, 0, "healthz should clear snapshot drift when the local snapshots match the canonical rescue-aware worker contract", recorder: recorder)
+                    expectEqual(acceptedRequestModelIDs?.contains("custom:Factory-Worker-GPT-5.4-High-8"), true, "healthz should continue exposing the hidden Factory worker alias as an accepted rescue input", recorder: recorder)
+                    expectEqual(acceptedRequestModelIDs?.contains("custom:Proxy-WorkerPool-8"), true, "healthz should continue exposing the retired pooled worker alias as an accepted rescue input", recorder: recorder)
+                    expectEqual(rescuedRequestModelIDs?.contains("custom:Factory-Worker-GPT-5.4-High-8"), true, "healthz should continue marking the hidden Factory worker alias as rescued", recorder: recorder)
+                    expectEqual(rescuedRequestModelIDs?.contains("custom:Proxy-WorkerPool-8"), true, "healthz should continue marking the retired pooled worker alias as rescued", recorder: recorder)
+
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
         run("healthz resolves self-routed smart-router worker IDs onto the worker pool without duplicate merged-config aliases", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: selfRoutedGenericCompatFactoryWorkerContract)) {
@@ -18558,7 +18613,7 @@ private struct FactoryWorkerSpecContract {
     let effectiveRouteProvider: String
 }
 
-private func factorySettingsJSON(contract: FactoryWorkerSpecContract) -> String {
+private func factorySettingsJSON(contract: FactoryWorkerSpecContract, additionalCustomModels: String = "") -> String {
     """
     {
       "sessionDefaultSettings": {
@@ -18586,9 +18641,51 @@ private func factorySettingsJSON(contract: FactoryWorkerSpecContract) -> String 
           "provider": "openai",
           "displayName": "Factory Validation via Proxy",
           "baseUrl": "http://127.0.0.1:8317/v1"
-        }
+        }\(additionalCustomModels.isEmpty ? "" : ",\n\(additionalCustomModels)")
       ]
     }
+    """
+}
+
+private func factoryRuntimeCustomModelsJSON(contract: FactoryWorkerSpecContract, additionalCustomModels: String = "") -> String {
+    """
+    {
+      "customModels": [
+        {
+          "id": "\(contract.workerModelID)",
+          "model": "\(contract.routeModel)",
+          "provider": "\(contract.routeProvider)",
+          "displayName": "Factory Worker via Proxy",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        },
+        {
+          "id": "\(contract.validationWorkerModelID)",
+          "model": "gpt-5.4(high)",
+          "provider": "openai",
+          "displayName": "Factory Validation via Proxy",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        }\(additionalCustomModels.isEmpty ? "" : ",\n\(additionalCustomModels)")
+      ]
+    }
+    """
+}
+
+private func factoryWorkerRescueCustomModelsJSON() -> String {
+    """
+        {
+          "id": "custom:Factory-Worker-GPT-5.4-High-8",
+          "model": "proxy-worker-smart-router",
+          "provider": "generic-chat-completion-api",
+          "displayName": "Factory Worker GPT-5.4 High",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        },
+        {
+          "id": "custom:Proxy-WorkerPool-8",
+          "model": "proxy-worker-smart-router",
+          "provider": "generic-chat-completion-api",
+          "displayName": "Proxy WorkerPool",
+          "baseUrl": "http://127.0.0.1:8317/v1"
+        }
     """
 }
 

@@ -29,12 +29,12 @@ managed_custom_ids="$(jq -c '
   | map(select(type == "string" and startswith("custom:")))
   | unique
 ' "$GLOBAL_SETTINGS_PATH")"
-managed_models_json="$(jq -c --argjson ids "$managed_custom_ids" '
-  (.customModels // [])
+managed_models_json="$(jq -cn --argjson ids "$managed_custom_ids" --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" '
+  $canonical_custom_models
   | map(select(.id as $id | ($ids | index($id)) != null))
-' "$GLOBAL_SETTINGS_PATH")"
-managed_model_id_mismatches="$(jq -c --argjson ids "$managed_custom_ids" '
-  (.customModels // [])
+' )"
+managed_model_id_mismatches="$(jq -cn --argjson ids "$managed_custom_ids" --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" '
+  $canonical_custom_models
   | to_entries
   | map(select(.value.id as $id | ($ids | index($id)) != null))
   | map({
@@ -51,7 +51,27 @@ managed_model_id_mismatches="$(jq -c --argjson ids "$managed_custom_ids" '
       )
     })
   | map(select(.id != .expectedId))
-' "$GLOBAL_SETTINGS_PATH")"
+' )"
+
+worker_contract_mismatches="$(
+  jq -cn \
+    --arg worker_id "$FACTORY_WORKER_MODEL" \
+    --arg worker_route_model "$FACTORY_PUBLIC_WORKER_ROUTE_MODEL" \
+    --arg proxy_base_url "$FACTORY_PROXY_BASE_URL" \
+    --argjson code_owned_worker_ids "$FACTORY_CODE_OWNED_WORKER_MODEL_IDS_JSON" \
+    --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" '
+      if ($code_owned_worker_ids | index($worker_id)) == null then
+        []
+      else
+        (($canonical_custom_models[] | select(.id == $worker_id)) // {}) as $worker
+        | [
+            (if ($worker.model // "") != $worker_route_model then "model=\($worker.model // "<missing>")" else empty end),
+            (if ($worker.provider // "") != "generic-chat-completion-api" then "provider=\($worker.provider // "<missing>")" else empty end),
+            (if ($worker.baseUrl // "") != $proxy_base_url then "baseUrl=\($worker.baseUrl // "<missing>")" else empty end)
+          ]
+      end
+    '
+)"
 
 expected_managed_count="$(jq 'length' <<<"$managed_custom_ids")"
 actual_managed_count="$(jq 'length' <<<"$managed_models_json")"
@@ -70,6 +90,13 @@ fi
 if [[ "$(jq 'length' <<<"$managed_model_id_mismatches")" != "0" ]]; then
   echo "global settings contain Droid-incompatible managed custom model ids:" >&2
   jq -r '.[] | "  \(.id) != \(.expectedId) (displayName: \(.displayName))"' <<<"$managed_model_id_mismatches" >&2
+  exit 1
+fi
+
+if [[ "$(jq 'length' <<<"$worker_contract_mismatches")" != "0" ]]; then
+  echo "global settings worker contract is not Droid-safe:" >&2
+  jq -r '.[] | "  " + .' <<<"$worker_contract_mismatches" >&2
+  echo "  expected model=$FACTORY_PUBLIC_WORKER_ROUTE_MODEL provider=generic-chat-completion-api baseUrl=$FACTORY_PROXY_BASE_URL" >&2
   exit 1
 fi
 
@@ -109,9 +136,27 @@ required_alias_mismatches="$(
     '
 )"
 
+worker_alias_missing="$(
+  jq -cn \
+    --arg worker_id "$FACTORY_WORKER_MODEL" \
+    --argjson code_owned_worker_ids "$FACTORY_CODE_OWNED_WORKER_MODEL_IDS_JSON" \
+    --argjson merged_root "$(ruby -e 'require "yaml"; require "json"; puts((YAML.load_file(ARGV[0]) || {}).to_json)' "$MERGED_CONFIG_PATH")" '
+      if ($code_owned_worker_ids | index($worker_id)) == null then
+        false
+      else
+        (((($merged_root["smart-aliases"] // {})["worker"] // {})["candidates"] // []) | length) == 0
+      end
+    '
+)"
+
 if [[ "$(jq 'length' <<<"$required_alias_mismatches")" != "0" ]]; then
   echo "merged proxy config is missing exact smart-alias entries for self-routed managed custom ids:" >&2
   jq -r '.[] | "  \(.)"' <<<"$required_alias_mismatches" >&2
+  exit 1
+fi
+
+if [[ "$worker_alias_missing" == "true" ]]; then
+  echo "merged proxy config is missing the worker smart-alias candidate list required by the Droid-safe Factory worker contract" >&2
   exit 1
 fi
 
@@ -169,6 +214,7 @@ runtime_filter='
   .customModels = $canonical_custom_models
 '
 
+sync_json_file "$GLOBAL_SETTINGS_PATH" "$settings_filter"
 sync_json_file "$LOCAL_SETTINGS_PATH" "$settings_filter"
 
 for path in "${PROJECT_SETTINGS[@]}"; do
