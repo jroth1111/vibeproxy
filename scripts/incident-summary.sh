@@ -29,7 +29,7 @@ echo ""
 
 # ── Winner distribution (last N hours) ──────────────────────────────────
 echo "▸ Winner distribution (last ${HOURS}h)"
-"$ROOT_DIR/scripts/route-telemetry-summary.py" --hours "$HOURS" --pid current 2>/dev/null \
+"$ROOT_DIR/scripts/route-telemetry-summary.py" --hours "$HOURS" --pid current --json 2>/dev/null \
     | python3 -c "
 import sys, json
 try:
@@ -85,12 +85,33 @@ import sys, json
 try:
     d = json.load(sys.stdin)
     fw = d.get('factory_worker', {})
-    for alias, info in fw.items():
-        if isinstance(info, dict) and 'effective_route_model' in info:
-            print(f'  {alias}: {info.get(\"effective_route_model\")} (source: {info.get(\"effective_route_model_source\", \"unknown\")})')
+    if isinstance(fw, dict) and 'effective_route_model' in fw:
+        print(f'  {fw.get(\"effective_route_model\")} (source: {fw.get(\"effective_route_model_source\", \"unknown\")})')
 except Exception:
     print('  <no healthz data>')
 " 2>/dev/null || echo "  <healthz not reachable>"
+echo ""
+
+# ── Possible BYOK fallthrough ───────────────────────────────────────────
+echo "▸ Possible BYOK fallthrough"
+"$ROOT_DIR/scripts/route-telemetry-summary.py" --hours "$HOURS" --pid current --json 2>/dev/null \
+    | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    fallthrough = d.get('possible_byok_fallthrough', {})
+    if not fallthrough:
+        print('  <none>')
+    else:
+        for model_id, payload in sorted(fallthrough.items()):
+            print(
+                f'  {model_id}: droid_send_count={payload.get(\"droid_send_count\", 0)} '
+                f'proxy_reference_count={payload.get(\"proxy_reference_count\", 0)} '
+                f'sessions={payload.get(\"sample_session_ids\", [])}'
+            )
+except Exception:
+    print('  <no data>')
+" 2>/dev/null || echo "  <no data>"
 echo ""
 
 # ── Route health summary ────────────────────────────────────────────────
@@ -113,14 +134,31 @@ echo ""
 
 # ── Mission worker_failed count ─────────────────────────────────────────
 echo "▸ Mission worker_failed (last ${HOURS}h from mission logs)"
-MISSION_LOG="$HOME/.cli-proxy-api/mission-worker.log"
-if [ -f "$MISSION_LOG" ]; then
-    CUTOFF=$(python3 -c "import datetime as dt; print((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=$HOURS)).strftime('%Y-%m-%dT%H:%M'))" 2>/dev/null)
-    COUNT=$(grep -c "worker_failed" "$MISSION_LOG" 2>/dev/null || echo "0")
-    echo "  $COUNT events"
-else
-    echo "  <no mission log at $MISSION_LOG>"
-fi
+python3 - <<PY 2>/dev/null || echo "  <no mission data>"
+import datetime as dt
+import glob
+import json
+from pathlib import Path
+
+hours = float("${HOURS}")
+window_start = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+count = 0
+
+for path in glob.glob(str(Path.home() / ".factory" / "missions" / "*" / "progress_log.jsonl")):
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+                if event.get("type") != "worker_failed":
+                    continue
+                timestamp = dt.datetime.fromisoformat(str(event["timestamp"]).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if timestamp >= window_start:
+                count += 1
+
+print(f"  {count} events")
+PY
 echo ""
 
 echo "══════════════════════════════════════════════════════"

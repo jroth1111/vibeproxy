@@ -49,6 +49,7 @@ health_json="$FACTORY_TMP_DIR/health.json"
 route_health_json="$FACTORY_TMP_DIR/route-health.json"
 doctor_stdout="$FACTORY_TMP_DIR/doctor.stdout"
 doctor_stderr="$FACTORY_TMP_DIR/doctor.stderr"
+route_summary_json="$FACTORY_TMP_DIR/route-telemetry-summary.json"
 
 actions_json='[]'
 
@@ -174,6 +175,18 @@ fi
 
 echo "==> Auditing Factory and mission logs"
 
+python3 "$SCRIPT_DIR/route-telemetry-summary.py" \
+  --hours 0.5 \
+  --pid all \
+  --json >"$route_summary_json"
+
+byok_fallthrough_count="$(
+  jq '(.possible_byok_fallthrough // {}) | length' "$route_summary_json"
+)"
+if [[ "$byok_fallthrough_count" -gt 0 ]]; then
+  record_action "possible_byok_fallthrough_observed" "Detected $byok_fallthrough_count custom model ids with Droid sends but no matching proxy ingress in the last 30 minutes."
+fi
+
 unknown_model_fallback_count=0
 connection_error_count=0
 backend_unavailable_count=0
@@ -284,7 +297,9 @@ root_causes_json="$(
     --argjson connection_error_count "$connection_error_count" \
     --argjson backend_unavailable_count "$backend_unavailable_count" \
     --argjson claude_alias_count "$claude_alias_count" \
+    --argjson byok_fallthrough_count "$byok_fallthrough_count" \
     --argjson route_statuses "$route_statuses_json" \
+    --slurpfile route_summary "$route_summary_json" \
     --argjson codex_valid "$codex_valid_count" \
     --argjson codex_expiring "$codex_expiring_count" \
     --argjson codex_expired "$codex_expired_count" \
@@ -309,6 +324,19 @@ root_causes_json="$(
         key: "historical_claude_alias_drift",
         present: ($claude_alias_count > 0),
         detail: ("Historical claude-opus-4-6-fast references in Droid log: " + ($claude_alias_count|tostring))
+      },
+      {
+        key: "possible_byok_fallthrough",
+        present: ($byok_fallthrough_count > 0),
+        detail: (
+          "Recent Droid custom-model sends without matching proxy ingress: "
+          + (
+              (
+                (($route_summary[0].possible_byok_fallthrough // {}) | to_entries)
+                | map(.key + " (droid=" + (.value.droid_send_count | tostring) + ", proxy=" + (.value.proxy_reference_count | tostring) + ")")
+              ) | join(", ")
+            )
+        )
       },
       {
         key: "suspect_route_health",
@@ -356,6 +384,7 @@ report_json="$(
     --argjson root_causes "$root_causes_json" \
     --argjson mission_summary "$mission_summary_json" \
     --slurpfile health "$health_json" \
+    --slurpfile route_summary "$route_summary_json" \
     --argjson route_statuses "$route_statuses_json" \
     '{
       timestamp_utc: $timestamp,
@@ -379,6 +408,7 @@ report_json="$(
       repair_actions: $actions,
       root_causes: $root_causes,
       mission_summary: $mission_summary,
+      route_telemetry_summary: ($route_summary[0] // {}),
       proxy_health: $health[0],
       route_statuses: $route_statuses
     }'
