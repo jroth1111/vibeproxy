@@ -680,7 +680,7 @@ enum OpenAICompatTemporaryShim {
     }
 
     private static let knownNVIDIARoutePolicyEntries: [(String, RequestPolicy)] = [
-        ("z-ai/glm5", RequestPolicy(
+        ("z-ai/glm-5.1", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: ["reasoning_effort", "response_format", "stop", "frequency_penalty", "presence_penalty", "ignore_eos", "max_completion_tokens", "max_output_tokens", "stream_options"],
@@ -740,7 +740,7 @@ enum OpenAICompatTemporaryShim {
         label: "knownNVIDIARoutePoliciesByCanonicalModelID"
     )
     private static let modelTierEntries: [(String, ModelTier)] = [
-        ("z-ai/glm5", .reasoning),
+        ("z-ai/glm-5.1", .reasoning),
         ("moonshotai/kimi-k2.5", .reasoning),
         ("minimaxai/minimax-m2.7", .standard),
     ]
@@ -751,7 +751,7 @@ enum OpenAICompatTemporaryShim {
     // Input price per million tokens (0.0 = free tier).  costFactor = 1/(price+0.01)
     // gives free models ~100x routing advantage over paid ($5/M) ones.
     private static let inputPricePerMillionTokensEntries: [(String, Double)] = [
-        ("z-ai/glm5", 0.0),
+        ("z-ai/glm-5.1", 0.0),
         ("moonshotai/kimi-k2.5", 0.0),
         ("minimaxai/minimax-m2.7", 0.0),
         ("ollama-pro/glm-5.1", 0.0),
@@ -838,7 +838,7 @@ enum OpenAICompatTemporaryShim {
             forcesKimiInstantMode: false
         )),
         ("proxy-worker-smart-router", workerSmartRouteRequestPolicy),
-        ("gpt-5.4(high)", RequestPolicy(
+        ("gpt-5.5(high)", RequestPolicy(
             minimumMaxTokens: nil,
             maximumMaxTokens: nil,
             strippedFields: [],
@@ -1025,11 +1025,16 @@ enum OpenAICompatTemporaryShim {
     private static let repeatedSingleFlightConcurrency429Deferral: TimeInterval = 15
     private static let retryableMetaAdapterDeferral: TimeInterval = 60
     private static let legacyRequestModelRewriteEntries: [(String, String)] = [
+        ("glm5", "glm-5.1"),
+        ("glm5-nvidia", "glm-5.1-nvidia"),
+        ("glm5-nvidia-direct", "glm-5.1-nvidia-direct"),
+        ("glm5-nvidia-smart", "glm-5.1-nvidia-smart"),
+        ("z-ai/glm5", "glm-5.1-nvidia"),
         ("glm-5", "glm-5.1"),
         ("glm-5-turbo", "glm-5.1"),
         // Canonical GLM requests should stabilize onto the public direct alias, not the
         // probe/debug-only alias.
-        ("z-ai/glm5", "glm5-nvidia"),
+        ("z-ai/glm-5.1", "glm-5.1-nvidia"),
         ("moonshotai/kimi-k2.5", "kimi-k2.5-nvidia")
     ]
     private static let legacyRequestModelRewrites: [String: String] = deduplicatedStaticLookup(
@@ -1704,15 +1709,15 @@ enum OpenAICompatTemporaryShim {
     fileprivate static let codeOwnedFactoryWorkerRescueModelIDs: Set<String> = ManagedRouteManifest.codeOwnedFactoryWorkerRescueModelIDs
     #else
     private static let publicFactoryWorkerSmartRouterAlias = "proxy-worker-smart-router"
-    fileprivate static let publicGLM5NVIDIADirectAlias = "glm5-nvidia"
+    fileprivate static let publicGLM5NVIDIADirectAlias = "glm-5.1-nvidia"
     fileprivate static let publicKimiNVIDIADirectAlias = "kimi-k2.5-nvidia"
-    private static let publicGLM5NVIDIASmartAlias = "glm5-nvidia-smart"
+    private static let publicGLM5NVIDIASmartAlias = "glm-5.1-nvidia-smart"
     private static let publicKimiNVIDIASmartAlias = "kimi-k2.5-nvidia-smart"
-    fileprivate static let debugGLM5NVIDIADirectAlias = "glm5-nvidia-direct"
+    fileprivate static let debugGLM5NVIDIADirectAlias = "glm-5.1-nvidia-direct"
     fileprivate static let debugKimiNVIDIADirectAlias = "kimi-k2.5-nvidia-direct"
     private static let directNVIDIAAccessHeader = "X-VibeProxy-Allow-Direct-NVIDIA"
     private static let publicDirectNVIDIAAliasByCanonicalModelID: [String: String] = [
-        "z-ai/glm5": publicGLM5NVIDIADirectAlias,
+        "z-ai/glm-5.1": publicGLM5NVIDIADirectAlias,
         "moonshotai/kimi-k2.5": publicKimiNVIDIADirectAlias
     ]
     private static let publicDirectNVIDIAAliases: Set<String> = Set(publicDirectNVIDIAAliasByCanonicalModelID.values)
@@ -1746,13 +1751,16 @@ enum OpenAICompatTemporaryShim {
         publicKimiNVIDIADirectAlias: publicKimiNVIDIASmartAlias
     ]
     fileprivate static let canonicalFactoryWorkerModelID = "custom:Proxy-Worker-Smart-Router-8"
-    static let canonicalWorkerPoolCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
+    static let canonicalWorkerPoolCandidates = ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm-5.1-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
     private static let publicWorkerPoolAliases: Set<String> = [
         "worker",
         "glm-5.1",
         publicFactoryWorkerSmartRouterAlias
     ]
     fileprivate static let codeOwnedFactoryWorkerRescueModelIDs: Set<String> = [
+        "custom:GPT-5.5-High-Proxy-2",
+        "custom:GPT-5.4-High-Proxy-2",
+        "custom:Factory-Worker-GPT-5.5-High-8",
         "custom:Factory-Worker-GPT-5.4-High-8",
         "custom:Proxy-WorkerPool-8"
     ]
@@ -1895,7 +1903,7 @@ enum OpenAICompatTemporaryShim {
         case .deferToNative:
             return moveCandidate(
                 MetaAIWebAdapter.modelAlias,
-                after: "glm5-nvidia",
+                after: "glm-5.1-nvidia",
                 in: candidateModels
             )
         case .exclude:
@@ -2079,7 +2087,7 @@ enum OpenAICompatTemporaryShim {
               metaRoute.canonicalModelID == MetaAIWebAdapter.modelAlias,
               let terminalFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[4]),
               terminalFallbackRoute.providerID == "nvidia",
-              terminalFallbackRoute.canonicalModelID == "z-ai/glm5",
+              terminalFallbackRoute.canonicalModelID == "z-ai/glm-5.1",
               let rescueFallbackRoute = resolveConfiguredRoute(forRequestModel: canonicalCandidates[5]),
               rescueFallbackRoute.providerID == "nvidia",
               rescueFallbackRoute.canonicalModelID == "moonshotai/kimi-k2.5",
@@ -2088,7 +2096,7 @@ enum OpenAICompatTemporaryShim {
               minimaxRescueRoute.canonicalModelID == "minimaxai/minimax-m2.7" else {
             return ClientFacingNVIDIAFailure(
                 statusCode: 500,
-                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm5-nvidia, then kimi-k2.5-nvidia, then minimax-m2.7-nvidia."
+                message: "The \(requestModel) pooled alias is misconfigured: candidates must be glm-5.1-zai, then glm-5.1-ollama-pro, then minimax-m2.7-ollama-pro, then muse-spark, then glm-5.1-nvidia, then kimi-k2.5-nvidia, then minimax-m2.7-nvidia."
             )
         }
 
@@ -2692,7 +2700,7 @@ enum OpenAICompatTemporaryShim {
         }
 
         // Only NVIDIA-hosted routes enter the NVIDIA reasoning path.
-        // Non-NVIDIA models (e.g. gpt-5.4(high)) may have retryableFailureClasses
+        // Non-NVIDIA models (e.g. gpt-5.5(high)) may have retryableFailureClasses
         // in their policy but must NOT enter this path.
         guard resolveNVIDIAHostedRoute(forRequestModel: normalizedRequestModel(model)) != nil else {
             return false
@@ -3622,6 +3630,15 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
         let normalized = normalizedRequestModel(requestModel)
         if let factoryBinding = ThinkingProxy.factoryModelBinding(forIncomingModelID: requestModel)
             ?? ThinkingProxy.factoryModelBinding(forIncomingModelID: normalized) {
+            if let resolvedBoundRoute = resolveConfiguredRoute(forRequestModel: factoryBinding.routeModel) {
+                return resolvedBoundRoute
+            }
+            return RouteIdentity(
+                providerID: factoryBinding.routeProvider,
+                canonicalModelID: factoryBinding.routeModel
+            )
+        }
+        if let factoryBinding = ThinkingProxy.factoryModelBindingByRouteModel(forRouteModel: normalized) {
             if let resolvedBoundRoute = resolveConfiguredRoute(forRequestModel: factoryBinding.routeModel) {
                 return resolvedBoundRoute
             }
@@ -12690,7 +12707,7 @@ class ThinkingProxy {
             rewrittenPath = "/v1/" + String(rewrittenPath.dropFirst("/api/llm/o/v1/".count))
             NSLog("[ThinkingProxy] Factory OpenAI path rewrite: \(path) -> \(rewrittenPath)")
         } else if factoryFallbackPathClass == .anthropic {
-            rewrittenPath = "/v1/messages"
+            rewrittenPath = "/v1/chat/completions"
             NSLog("[ThinkingProxy] Factory Anthropic path rewrite: \(path) -> \(rewrittenPath)")
         } else if factoryFallbackPathClass == .gemini {
             rewrittenPath = "/v1/" + String(rewrittenPath.dropFirst("/api/llm/g/".count))
@@ -12729,6 +12746,11 @@ class ThinkingProxy {
                     ? Self.factoryModelBindingByRouteModel(forRouteModel: model)
                     : nil
             }
+        if factoryFallbackPathClass != nil,
+           let callerVisibleRequestedModel,
+           let fallbackRescueBinding = Self.factoryBuiltinFallbackRescueBinding(forIncomingModelID: callerVisibleRequestedModel) {
+            factoryModelBinding = fallbackRescueBinding
+        }
 
         // Telemetry: log model resolution path for factory-bound requests
         if let binding = factoryModelBinding, let incoming = callerVisibleRequestedModel {
@@ -12776,6 +12798,7 @@ class ThinkingProxy {
                 let hasSupportedFallbackRoute = effectiveRequestedModel.map { model in
                     Self.factoryModelBinding(forIncomingModelID: model) != nil ||
                     Self.factoryModelBindingByRouteModel(forRouteModel: model) != nil ||
+                    Self.factoryBuiltinFallbackRescueBinding(forIncomingModelID: model) != nil ||
                     OpenAICompatTemporaryShim.resolveConfiguredRoute(forRequestModel: model) != nil ||
                     OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: model) != nil
                 } ?? false
@@ -13064,10 +13087,10 @@ class ThinkingProxy {
             // path. Factory bindings for openai/xai/etc. previously bypassed failover entirely,
             // pinning requests to a dead upstream with no fallback.
             if let routeSmartAlias = OpenAICompatTemporaryShim.smartAliasDefinition(forRequestModel: factoryModelBinding.routeModel),
-               let routeExecutionPlan = smartAliasExecutionPlan(
-                path: rewrittenPath,
-                body: factoryBoundExecutionPlan.body,
-                clientRequestedStream: OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
+               let routeExecutionPlan = factoryBoundSmartAliasExecutionPlan(
+                    path: rewrittenPath,
+                    body: modifiedBody,
+                    clientRequestedStream: OpenAICompatTemporaryShim.requestedStream(forRequestJSON: modifiedBody)
                ) {
                 let routeCandidateModels = OpenAICompatTemporaryShim.effectiveSmartAliasCandidateModels(
                     forPublicAlias: factoryModelBinding.routeModel,
@@ -13550,6 +13573,44 @@ class ThinkingProxy {
             path: path,
             body: body,
             deliveryMode: .bufferedJSON
+        )
+    }
+
+    private func factoryBoundSmartAliasExecutionPlan(
+        path: String,
+        body: String,
+        clientRequestedStream: Bool
+    ) -> (path: String, body: String, deliveryMode: SmartAliasDeliveryMode)? {
+        guard OpenAICompatTemporaryShim.isResponsesPath(path) else {
+            return smartAliasExecutionPlan(
+                path: path,
+                body: body,
+                clientRequestedStream: clientRequestedStream
+            )
+        }
+
+        guard let chatBody = OpenAICompatTemporaryShim.chatCompletionsRequestJSON(
+            fromResponsesRequestJSON: body
+        ) else {
+            let bodyPreview = String(body.prefix(500))
+            NSLog("[ThinkingProxy] factoryBoundSmartAliasExecutionPlan: failed to convert /v1/responses body (first 500 chars): %@", bodyPreview)
+            return nil
+        }
+
+        let finalBody: String
+        if clientRequestedStream {
+            guard let bufferedBody = Self.forcingNonStreamChatRequestBody(from: chatBody) else {
+                return nil
+            }
+            finalBody = bufferedBody
+        } else {
+            finalBody = chatBody
+        }
+
+        return (
+            path: OpenAICompatTemporaryShim.chatCompletionsPath(matching: path),
+            body: finalBody,
+            deliveryMode: clientRequestedStream ? .syntheticResponsesSSE : .bufferedResponsesJSON
         )
     }
 
@@ -14915,9 +14976,9 @@ class ThinkingProxy {
     }
 
     /// Rewrites the model name in the request body for upstream consumption.
-    /// Factory bindings may carry reasoning-effort annotations like "gpt-5.4(high)"
+    /// Factory bindings may carry reasoning-effort annotations like "gpt-5.5(high)"
     /// that the upstream backend does not recognise.  Strips the parenthesised
-    /// suffix so the upstream only sees the base model name (e.g. "gpt-5.4").
+    /// suffix so the upstream only sees the base model name (e.g. "gpt-5.5").
     private static func rewriteModelForUpstream(
         body: String,
         routeModel: String,
@@ -17623,7 +17684,11 @@ class ThinkingProxy {
             headers["X-Resolved-Provider"] = route.providerID
             headers["X-Resolved-Canonical-Model"] = route.canonicalModelID
         }
-        if let factoryBinding = Self.factoryModelBinding(forIncomingModelID: publicAlias) {
+        let factoryBinding =
+            requestTrace?.factoryFallbackPathClass != nil
+            ? (Self.factoryBuiltinFallbackRescueBinding(forIncomingModelID: publicAlias) ?? Self.factoryModelBinding(forIncomingModelID: publicAlias))
+            : Self.factoryModelBinding(forIncomingModelID: publicAlias)
+        if let factoryBinding {
             headers["X-Factory-Authoritative-Model-ID"] = factoryBinding.authoritativeModelID
             headers["X-Factory-Model-Binding"] = factoryBinding.source
             headers["X-Factory-Request-Surface"] = factoryBinding.requestSurface
@@ -21256,16 +21321,20 @@ class ThinkingProxy {
     ) -> FactoryRoleContract? {
         guard let modelID,
               let customModel = customModels.first(where: { ($0["id"] as? String) == modelID }),
-              let routeModel = customModel["model"] as? String,
-              let routeProvider = customModel["provider"] as? String else {
+              let configuredRouteModel = customModel["model"] as? String,
+              let configuredRouteProvider = customModel["provider"] as? String else {
             return nil
         }
 
+        let binding = factoryModelBinding(forIncomingModelID: modelID)
+        let routeModel = binding?.routeModel ?? configuredRouteModel
+        let routeProvider = binding?.routeProvider ?? configuredRouteProvider
         let requestSurface = factoryWorkerRequestSurface(forProvider: routeProvider)
         let directEffectiveRouteModel = effectiveFactoryRouteModel(
             routeModel: routeModel,
             routeProvider: routeProvider,
-            requestSurface: requestSurface
+            requestSurface: requestSurface,
+            requestedAlias: modelID
         )
         let directEffectiveRouteProvider =
             OpenAICompatTemporaryShim.resolveRouteIdentityForAnyProvider(forRequestModel: directEffectiveRouteModel)?.providerID
@@ -21281,8 +21350,8 @@ class ThinkingProxy {
             effectiveRouteModel: directEffectiveRouteModel,
             effectiveRouteModelSource: .configuredRoute,
             effectiveRouteProvider: directEffectiveRouteProvider,
-            displayName: customModel["displayName"] as? String,
-            baseURL: customModel["baseUrl"] as? String,
+            displayName: binding?.displayName ?? customModel["displayName"] as? String,
+            baseURL: binding?.baseURL ?? customModel["baseUrl"] as? String,
             routeHealthStatus: directRouteHealthStatus
         )
     }
@@ -21548,6 +21617,47 @@ class ThinkingProxy {
         return bindingsByIncomingModelID
     }
 
+    private static let factoryBuiltinFallbackRescueModelIDs: Set<String> = [
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+        "claude-haiku-4-5-20251001",
+        "gpt-5.5",
+        "gpt-5.5(high)"
+    ]
+
+    private static func factoryBuiltinFallbackRescueBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
+        guard factoryBuiltinFallbackRescueModelIDs.contains(incomingModelID) else {
+            return nil
+        }
+        let settingsPath = factorySettingsPath() ?? "src/Sources/ThinkingProxy.swift"
+        return factoryBuiltinFallbackRescueBinding(
+            forIncomingModelID: incomingModelID,
+            settingsPath: settingsPath
+        )
+    }
+
+    private static func factoryBuiltinFallbackRescueBinding(
+        forIncomingModelID incomingModelID: String,
+        settingsPath: String
+    ) -> FactoryModelBinding? {
+        guard factoryBuiltinFallbackRescueModelIDs.contains(incomingModelID) else {
+            return nil
+        }
+        let routeProvider = "generic-chat-completion-api"
+        return FactoryModelBinding(
+            incomingModelID: incomingModelID,
+            authoritativeModelID: incomingModelID,
+            routeModel: OpenAICompatTemporaryShim.publicWorkerSmartRouterAlias(),
+            routeProvider: routeProvider,
+            requestSurface: factoryWorkerRequestSurface(forProvider: routeProvider),
+            displayName: "Factory fallback rescue: \(incomingModelID)",
+            baseURL: nil,
+            authoritativeSettingsPath: settingsPath,
+            source: "factory_builtin_rescue"
+        )
+    }
+
     static func factoryResolvedRouteModel(forIncomingModelID incomingModelID: String) -> String? {
         factoryModelBinding(forIncomingModelID: incomingModelID)?.routeModel
     }
@@ -21563,7 +21673,10 @@ class ThinkingProxy {
             retiredWorkerModelIDs = retiredFactoryWorkerModelIDs(excluding: contract.workerModelID)
         } else {
             retiredWorkerModelIDs = [
+                "custom:GPT-5.5-High-Proxy-2",
+                "custom:GPT-5.4-High-Proxy-2",
                 "custom:Proxy-WorkerPool-8",
+                "custom:Factory-Worker-GPT-5.5-High-8",
                 "custom:Factory-Worker-GPT-5.4-High-8",
                 "custom:Proxy-Worker-Smart-Router-8"
             ]
@@ -21603,13 +21716,20 @@ class ThinkingProxy {
     }
 
     private static func factoryWorkerBindingContractError(for binding: FactoryModelBinding) -> String? {
-        guard let contract = factoryWorkerContract(),
-              binding.authoritativeModelID == contract.workerModelID else {
+        guard let contract = factoryWorkerContract() else {
+            return nil
+        }
+
+        let isWorkerOwnedBinding =
+            binding.authoritativeModelID == contract.workerModelID ||
+            OpenAICompatTemporaryShim.isCodeOwnedFactoryWorkerIncomingModelID(binding.incomingModelID)
+        guard isWorkerOwnedBinding else {
             return nil
         }
 
         let blockingDriftPaths: [String]
-        if binding.incomingModelID == contract.workerModelID {
+        if binding.incomingModelID == contract.workerModelID ||
+            OpenAICompatTemporaryShim.isCodeOwnedFactoryWorkerIncomingModelID(binding.incomingModelID) {
             blockingDriftPaths = contract.blockingSnapshotDriftPaths
         } else {
             blockingDriftPaths = contract.snapshotDriftPaths

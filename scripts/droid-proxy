@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# droid-proxy: wrapper that redirects Droid's Factory fallback to local vibeproxy.
+#
+# When Droid's findCustomModel() fails, it falls back to Factory's API at
+# https://api.factory.ai/api/llm/... The FACTORY_API_BASE_URL env var overrides
+# this, sending fallback requests to vibeproxy instead, where path stripping
+# rewrites them to normal /v1/ proxy paths.
+
+if ! nc -z 127.0.0.1 8317 2>/dev/null; then
+    echo "[droid-proxy] WARNING: vibeproxy not listening on :8317" >&2
+fi
+
+export FACTORY_API_BASE_URL="http://127.0.0.1:8317"
+
+exec /Users/gwizz/.local/bin/droid "$@"

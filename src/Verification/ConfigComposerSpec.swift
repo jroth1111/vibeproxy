@@ -29,7 +29,7 @@ struct ConfigComposerSpec {
                         "display-name": "NVIDIA",
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
-                            ["name": "z-ai/glm5", "alias": "glm5"]
+                            ["name": "z-ai/glm-5.1", "alias": "glm-5.1"]
                         ]
                     ]
                 ]
@@ -54,11 +54,11 @@ struct ConfigComposerSpec {
             let worker = dictionary(smartAliases["worker"])
 
             expectEqual(patched["max-retry-credentials"] as? Int, 0, "temporary NVIDIA patch should default max-retry-credentials to zero", recorder: recorder)
-            expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm5", "glm5-nvidia", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose both glm5 aliases plus kimi-k2.5-nvidia", recorder: recorder)
+            expectEqual(modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]), ["glm-5.1", "glm-5.1-nvidia", "kimi-k2.5-nvidia"], "temporary NVIDIA pool should expose both glm-5.1 aliases plus kimi-k2.5-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "nvidia-minimax", in: patched) ?? [:]), ["minimax-m2.7-nvidia"], "temporary NVIDIA MiniMax pool should isolate minimax-m2.7-nvidia", recorder: recorder)
             expectEqual(modelAliases(in: provider(named: "meta-web", in: patched) ?? [:]), ["muse-spark"], "managed patches should also expose the Meta web muse-spark alias", recorder: recorder)
             expectEqual(worker["request-class"] as? String, "plain-chat", "managed patches should ship the default worker smart alias", recorder: recorder)
-            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5, then NVIDIA Kimi K2.5, then NVIDIA MiniMax", recorder: recorder)
+            expectEqual(stringArray(worker["candidates"]), ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm-5.1-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"], "managed worker alias should prefer ZAI GLM first, then Ollama GLM, then Ollama MiniMax, then Muse Spark, then NVIDIA GLM5, then NVIDIA Kimi K2.5, then NVIDIA MiniMax", recorder: recorder)
             expectNil(patched["policies"], "runtime NVIDIA mitigations should not be advertised as merged config policies", recorder: recorder)
         }
 
@@ -101,7 +101,7 @@ struct ConfigComposerSpec {
                             ["api-key": "inline-a"]
                         ],
                         "models": [
-                            ["name": "z-ai/glm5", "alias": "glm5"],
+                            ["name": "z-ai/glm-5.1", "alias": "glm-5.1"],
                             ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5"]
                         ]
                     ],
@@ -129,7 +129,7 @@ struct ConfigComposerSpec {
 
             expectEqual(
                 modelAliases(in: provider(named: "nvidia", in: patched) ?? [:]),
-                ["glm5", "glm5-nvidia", "kimi-k2.5-nvidia"],
+                ["glm-5.1", "glm-5.1-nvidia", "kimi-k2.5-nvidia"],
                 "managed NVIDIA aliases should replace stale user-defined aliases while preserving auth entries",
                 recorder: recorder
             )
@@ -141,7 +141,7 @@ struct ConfigComposerSpec {
             )
             expectEqual(
                 stringArray(worker["candidates"]),
-                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"],
+                ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm-5.1-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"],
                 "managed worker ordering should replace stale user-defined fallback candidates with the managed ZAI/Ollama/NVIDIA/Meta worker chain plus the Kimi and MiniMax rescue lanes",
                 recorder: recorder
             )
@@ -343,7 +343,7 @@ struct ConfigComposerSpec {
                             ["api-key": "inline-a"]
                         ],
                         "models": [
-                            ["name": "z-ai/glm5", "alias": "glm5"]
+                            ["name": "z-ai/glm-5.1", "alias": "glm-5.1"]
                         ]
                     ]
                 ]
@@ -359,7 +359,7 @@ struct ConfigComposerSpec {
             expectEqual(providers.first?.title, "NVIDIA", "display-name should drive provider title", recorder: recorder)
             expectEqual(providers.first?.helpText, "OpenAI-compatible NVIDIA endpoint", "help text should be preserved for UI", recorder: recorder)
             expectEqual(providers.first?.iconSystemName, "bolt.fill", "icon metadata should be preserved for UI", recorder: recorder)
-            expectEqual(providers.first?.modelAliases, ["glm5"], "model aliases should be extracted", recorder: recorder)
+            expectEqual(providers.first?.modelAliases, ["glm-5.1"], "model aliases should be extracted", recorder: recorder)
             expectEqual(providers.first?.inlineKeyCount, 1, "inline key count should deduplicate repeated config keys", recorder: recorder)
         }
 
@@ -401,7 +401,7 @@ struct ConfigComposerSpec {
                             ["api-key": "inline-b"]
                         ],
                         "models": [
-                            ["name": "z-ai/glm5", "alias": "glm5"]
+                            ["name": "z-ai/glm-5.1", "alias": "glm-5.1"]
                         ]
                     ]
                 ]
@@ -576,7 +576,7 @@ struct ConfigComposerSpec {
                         "name": "nvidia",
                         "base-url": "https://integrate.api.nvidia.com/v1",
                         "models": [
-                            ["name": "z-ai/glm5", "alias": "glm5"]
+                            ["name": "z-ai/glm-5.1", "alias": "glm-5.1"]
                         ]
                     ]
                 ]

@@ -20,15 +20,14 @@ make_temp_dir factory-sync
 
 mismatches=()
 
-managed_custom_ids="$(jq -c '
-  [
-    .sessionDefaultSettings.model,
-    .missionModelSettings.workerModel,
-    .missionModelSettings.validationWorkerModel
-  ]
-  | map(select(type == "string" and startswith("custom:")))
-  | unique
-' "$GLOBAL_SETTINGS_PATH")"
+managed_custom_ids="$(jq -cn \
+  --arg session_model_id "$FACTORY_SESSION_MODEL" \
+  --arg worker_id "$FACTORY_WORKER_MODEL" \
+  --arg validation_worker_id "$FACTORY_VALIDATION_MODEL" '
+    [$session_model_id, $worker_id, $validation_worker_id]
+    | map(select(type == "string" and startswith("custom:")))
+    | unique
+  ')"
 managed_models_json="$(jq -cn --argjson ids "$managed_custom_ids" --argjson canonical_custom_models "$FACTORY_CANONICAL_CUSTOM_MODELS" '
   $canonical_custom_models
   | map(select(.id as $id | ($ids | index($id)) != null))

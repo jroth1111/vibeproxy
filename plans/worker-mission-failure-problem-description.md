@@ -35,23 +35,23 @@ Factory mission workers across 4 active projects (songbird4, voc, merchant-warri
 - Only affected the smart alias path (`proxy-worker-smart-router`); direct model requests worked fine
 - This created the illusion of "sometimes working" — direct requests succeeded while worker pool requests crashed
 
-### 3. gpt-5.4(high) Dead Upstream with Silent Rescue
+### 3. gpt-5.5(high) Dead Upstream with Silent Rescue
 
 **OpenAI workspace deactivated, but failures were silently rescued to GLM.**
 
-- `gpt-5.4(high)` returns 402 "deactivated_workspace" from OpenAI
+- `gpt-5.5(high)` returns 402 "deactivated_workspace" from OpenAI
 - VibeProxy intercepted 500 "auth_not_found" and silently rescued to `glm-5.1-zai` via `shouldFallbackFactoryDirectBindingToWorkerSmartAlias`
-- Caller received 200 OK with `"model": "gpt-5.4(high)"` — completely unaware the response came from GLM
+- Caller received 200 OK with `"model": "gpt-5.5(high)"` — completely unaware the response came from GLM
 - Only hints were in response headers (`X-Factory-Model-Binding: raw_managed_route_rescue`, `X-Resolved-Model: glm-5.1-zai`) that Droid doesn't check
 - Made debugging impossible — healthy-looking responses from a completely different model
 
-### 4. gpt-5.4(high) Pinned as Tool-Heavy Primary
+### 4. gpt-5.5(high) Pinned as Tool-Heavy Primary
 
 **Tool-heavy worker requests were pinned to a dead upstream.**
 
-- Tool-heavy requests (the most common Factory worker pattern) hardcoded `gpt-5.4(high)` as the primary candidate
+- Tool-heavy requests (the most common Factory worker pattern) hardcoded `gpt-5.5(high)` as the primary candidate
 - Despite 402/500 failures, the smart router kept routing tool-heavy requests there first
-- Only after exhausting gpt-5.4(high) retries would it fall through to the healthy pool candidates
+- Only after exhausting gpt-5.5(high) retries would it fall through to the healthy pool candidates
 - No failover for the pinned model — circuit breaker state was irrelevant
 
 ### 5. NVIDIA Race Path Intercepted by Wrong Code Path
@@ -112,8 +112,8 @@ Factory mission workers across 4 active projects (songbird4, voc, merchant-warri
 
 | Source | Worker Model | Provider |
 |--------|-------------|----------|
-| Factory `settings.json` | `gpt-5.4(high)` | `openai` |
-| Mission `runtime-custom-models.json` | `gpt-5.4(high)` | `openai` |
+| Factory `settings.json` | `gpt-5.5(high)` | `openai` |
+| Mission `runtime-custom-models.json` | `gpt-5.5(high)` | `openai` |
 | Proxy source code | `gpt-4.1-mini` (factory-safe alias) | varies |
 | Historical BYOK config | `claude-opus-4-6-fast` | `generic-chat-completion-api` |
 
@@ -181,8 +181,8 @@ Under concurrent requests, multiple goroutines independently pick the next crede
 | `0b701f9` | Duplicate-key assertions, URLSession pooling, self-heal tests |
 
 Additional fixes (in uncommitted/working tree):
-- Removed `gpt-5.4(high)` as tool-heavy primary (uses health-ranked pool instead)
-- Removed silent rescue of `gpt-5.4(high)` failures to worker smart alias (errors now surfaced)
+- Removed `gpt-5.5(high)` as tool-heavy primary (uses health-ranked pool instead)
+- Removed silent rescue of `gpt-5.5(high)` failures to worker smart alias (errors now surfaced)
 - Updated tests from "verify rescue succeeds" to "verify error is surfaced"
 
 ---
@@ -238,7 +238,7 @@ Mission breakdown:
 **Resolved:**
 - Duplicate key crash loop fixed (rebuilt from source, build 652)
 - Circuit breaker recovery functional (halfOpen no longer dead-end)
-- gpt-5.4(high) no longer pinned for tool-heavy requests
+- gpt-5.5(high) no longer pinned for tool-heavy requests
 - Silent rescue removed — errors surfaced to caller
 - NVIDIA candidates raced at all failover depths
 - EMA-based ranking with stickiness replacing lexicographic sort

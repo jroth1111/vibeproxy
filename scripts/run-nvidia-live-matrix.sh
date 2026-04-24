@@ -23,7 +23,7 @@ direct_timeout = int(direct_timeout)
 proxy_timeout = int(proxy_timeout)
 
 MODELS = [
-    ("glm5", "z-ai/glm5"),
+    ("glm-5.1", "z-ai/glm-5.1"),
     ("kimi-k2.5-nvidia", "moonshotai/kimi-k2.5"),
     ("minimax-m2.5-nvidia", "minimaxai/minimax-m2.5"),
 ]
@@ -153,7 +153,7 @@ nvidia_provider = providers.get("nvidia", {})
 minimax_provider = providers.get("nvidia-minimax", {})
 
 provider_keys = {
-    "glm5": nvidia_provider.get("keys", []),
+    "glm-5.1": nvidia_provider.get("keys", []),
     "kimi-k2.5-nvidia": nvidia_provider.get("keys", []),
     "minimax-m2.5-nvidia": minimax_provider.get("keys", []),
 }

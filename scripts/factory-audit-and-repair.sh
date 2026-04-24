@@ -362,7 +362,7 @@ root_causes_json="$(
       {
         key: "codex_tokens_all_expired",
         present: ($codex_valid + $codex_expiring == 0 and $codex_expired > 0),
-        detail: "ALL codex OAuth tokens are expired — GPT-5.4 requests will fail"
+        detail: "ALL codex OAuth tokens are expired — GPT-5.5 requests will fail"
       }
     ]'
 )"

@@ -736,8 +736,8 @@ enum ConfigComposer {
                 "icon-system": "bolt.fill",
                 "base-url": "https://integrate.api.nvidia.com/v1",
                 "models": [
-                    ["name": "z-ai/glm5", "alias": "glm5"],
-                    ["name": "z-ai/glm5", "alias": "glm5-nvidia"],
+                    ["name": "z-ai/glm-5.1", "alias": "glm-5.1"],
+                    ["name": "z-ai/glm-5.1", "alias": "glm-5.1-nvidia"],
                     ["name": "moonshotai/kimi-k2.5", "alias": "kimi-k2.5-nvidia"]
                 ]
             ],
@@ -770,7 +770,7 @@ enum ConfigComposer {
             "worker": [
                 "request-class": "plain-chat",
                 "failover": "silent",
-                "candidates": ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm5-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
+                "candidates": ["glm-5.1-zai", "glm-5.1-ollama-pro", "minimax-m2.7-ollama-pro", "muse-spark", "glm-5.1-nvidia", "kimi-k2.5-nvidia", "minimax-m2.7-nvidia"]
             ]
         ]
     }
