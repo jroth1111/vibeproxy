@@ -5741,6 +5741,140 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
+        run("observed worker smart-router plain chat request emits live request-shape telemetry", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
+                    expectEqual(path, "/v1/chat/completions", "observed plain worker chat should stay on chat-completions upstream", recorder: recorder)
+                    let forwardedJSON = parseJSONObject(body, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "observed plain worker chat should forward to the health-ranked primary candidate", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-worker-plain","object":"chat.completion","model":"glm-5.1-zai","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        body: """
+                        {
+                          "model": "custom:Proxy-Worker-Smart-Router-8",
+                          "stream": false,
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("observed plain worker chat should return a response")
+                    return
+                }
+
+                let event = recordedEvents.first { $0.requestedAlias == "custom:Proxy-Worker-Smart-Router-8" }
+                expectEqual(event?.source, "smart_alias", "observed plain worker chat should be classified as real smart-alias traffic", recorder: recorder)
+                expectEqual(event?.requestShape, "POST:chat:custom:Proxy-Worker-Smart-Router-8:buffered:tools=0:tool_choice_auto:string_content", "observed plain worker chat should preserve the log request-shape descriptor", recorder: recorder)
+                expectEqual(event?.finalWinnerRequestModel, "glm-5.1-zai", "observed plain worker chat should record the winning worker candidate", recorder: recorder)
+            }
+        }
+
+        run("observed worker smart-router tool probe emits probe request-shape telemetry", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+
+                let proxy = ThinkingProxy()
+                let connection = NWConnection(to: .hostPort(host: "127.0.0.1", port: 1), using: .tcp)
+                let delivered = DispatchSemaphore(value: 0)
+                var recordedEvents: [OpenAICompatTemporaryShim.RouteTelemetryEvent] = []
+                let lock = NSLock()
+
+                OpenAICompatTemporaryShim.routeTelemetryHookForTesting = { event in
+                    lock.lock()
+                    recordedEvents.append(event)
+                    lock.unlock()
+                }
+                defer {
+                    OpenAICompatTemporaryShim.routeTelemetryHookForTesting = nil
+                    OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+
+                proxy.bufferedProxyTransportForTesting = { _, _, _, body, _, completion in
+                    let forwardedJSON = parseJSONObject(body, recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "glm-5.1-zai", "observed worker tool probes should forward to the health-ranked primary candidate", recorder: recorder)
+                    completion(
+                        ThinkingProxy.BufferedProxyResponse(
+                            data: Data("""
+                            {"id":"chatcmpl-worker-tool-probe","object":"chat.completion","model":"glm-5.1-zai","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}
+                            """.utf8),
+                            response: httpURLResponse(statusCode: 200, headerFields: ["Content-Type": "application/json"]),
+                            error: nil
+                        )
+                    )
+                }
+                proxy.deliveredHTTPResponseForTesting = { _, _, _ in
+                    delivered.signal()
+                }
+
+                proxy.processRequestForTesting(
+                    rawHTTPRequest(
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        headers: [("X-VibeProxy-Probe", "factory-worker-preflight")],
+                        body: """
+                        {
+                          "model": "custom:Proxy-Worker-Smart-Router-8",
+                          "stream": false,
+                          "tools": [
+                            {"type": "function", "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}}
+                          ],
+                          "tool_choice": "auto",
+                          "messages": [{"role": "user", "content": "Return exactly: OK"}]
+                        }
+                        """
+                    ),
+                    connection: connection
+                )
+
+                guard delivered.wait(timeout: .now() + 2) == .success else {
+                    recorder.recordFailure("observed worker tool probe should return a response")
+                    return
+                }
+
+                let event = recordedEvents.first { $0.requestedAlias == "custom:Proxy-Worker-Smart-Router-8" }
+                expectEqual(event?.source, "smart_alias_probe", "observed worker tool probes should be separated from real client traffic", recorder: recorder)
+                expectEqual(event?.requestShape, "POST:chat:custom:Proxy-Worker-Smart-Router-8:buffered:tools=1:tool_choice_auto:string_content", "observed worker tool probes should preserve the log request-shape descriptor", recorder: recorder)
+                expectEqual(event?.finalWinnerRequestModel, "glm-5.1-zai", "observed worker tool probes should record the winning worker candidate", recorder: recorder)
+            }
+        }
+
         run("Factory openai custom model IDs preserve caller-visible identity on direct routes", recorder: recorder) {
             withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
                 let proxy = ThinkingProxy()
@@ -11476,6 +11610,7 @@ struct ThinkingProxyPolicySpec {
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.transportOutcome, "send_response", "direct meta-web success should be tracked as a successful response", recorder: recorder)
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.finalWinnerRequestModel, "muse-spark", "direct meta-web success should preserve the winning request model", recorder: recorder)
                 expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.callerRequestID, callerRequestID, "direct meta-web success telemetry should preserve caller request IDs for RCA", recorder: recorder)
+                expectEqual(snapshot["muse-spark"]?.lastTelemetryEvent?.requestShape, "POST:chat:muse-spark:buffered:tools=0:tool_choice_auto:string_content", "direct meta-web success telemetry should preserve the observed plain chat request-shape descriptor", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "muse-spark" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "direct meta-web success should emit a route telemetry event", recorder: recorder)
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "muse-spark" && $0.callerRequestID == callerRequestID }), true, "direct meta-web emitted telemetry should keep caller request IDs", recorder: recorder)
             }
@@ -11645,6 +11780,7 @@ struct ThinkingProxyPolicySpec {
                     recorder: recorder
                 )
                 expectEqual(recordedEvents.contains(where: { $0.requestModel == "glm-5.1-nvidia" && $0.source == "live_request" && $0.transportOutcome == "send_response" }), true, "public glm-5.1-nvidia buffered requests should emit live-request telemetry instead of smart-alias telemetry", recorder: recorder)
+                expectEqual(recordedEvents.contains(where: { $0.requestModel == "glm-5.1-nvidia" && $0.requestShape == "POST:chat:glm-5.1-nvidia:buffered:tools=0:tool_choice_auto:string_content" }), true, "public glm-5.1-nvidia buffered telemetry should preserve the observed direct NVIDIA request-shape descriptor", recorder: recorder)
             }
         }
 
@@ -13400,6 +13536,58 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(invocationCount, 1, "quota-window canary failures should suppress immediate reprobes until the reset window expires", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                }
+            }
+        }
+
+        run("canary skips OpenAI OAuth Factory routes that require the native Responses surface", recorder: recorder) {
+            withMergedConfig(workerMergedConfigYAML()) {
+                withFactorySettings(factorySettingsJSON(contract: openAIFactoryWorkerContract)) {
+                    withRouteHealthPath { _ in
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                        OpenAICompatTemporaryShim.recordRouteFailure(
+                            forRequestModel: openAIFactoryWorkerContract.workerModelID,
+                            telemetryEvent: OpenAICompatTemporaryShim.RouteTelemetryEvent(
+                                timestamp: Date(),
+                                requestModel: openAIFactoryWorkerContract.routeModel,
+                                canonicalModelID: openAIFactoryWorkerContract.routeModel,
+                                transportOutcome: "send_error",
+                                failureClass: "classified_502",
+                                timeoutStage: .none,
+                                upstreamHTTPStatus: 502,
+                                retryCount: 0,
+                                source: "live_request",
+                                requestShape: "POST:responses:custom:GPT-5.5-High-Proxy-2:buffered:tools=0:tool_choice_auto:string_content"
+                            )
+                        )
+
+                        let probeModels = OpenAICompatTemporaryShim.canaryProbeRequestModels()
+                        expectEqual(probeModels.contains(openAIFactoryWorkerContract.workerModelID), false, "canaries should not probe the caller-visible OpenAI Factory alias through the backend chat path", recorder: recorder)
+                        expectEqual(probeModels.contains(openAIFactoryWorkerContract.routeModel), false, "canaries should not probe the OpenAI route model through the backend chat path", recorder: recorder)
+
+                        let proxy = ThinkingProxy()
+                        var invocationCount = 0
+                        proxy.nvidiaCanaryTransportForTesting = { _, _, _ in
+                            invocationCount += 1
+                        }
+
+                        let semaphore = DispatchSemaphore(value: 0)
+                        proxy.performCanariesOnce {
+                            semaphore.signal()
+                        }
+                        let waitResult = semaphore.wait(timeout: .now() + 2)
+                        expectEqual(waitResult, .success, "canary sweep should complete when only an OpenAI OAuth route is unhealthy", recorder: recorder)
+                        expectEqual(invocationCount, 0, "OpenAI OAuth Factory routes should not be sent to the backend canary transport", recorder: recorder)
+
+                        let snapshot = OpenAICompatTemporaryShim.routeHealthSnapshotForTesting()
+                        let openAIState = snapshot.values.first {
+                            $0.lastTelemetryEvent?.canonicalModelID == openAIFactoryWorkerContract.routeModel
+                        }
+                        expectEqual(openAIState?.lastTelemetryEvent?.source, "live_request", "skipped OpenAI canaries should preserve the original live failure evidence", recorder: recorder)
+                        expectEqual(openAIState?.lastTelemetryEvent?.requestShape, "POST:responses:custom:GPT-5.5-High-Proxy-2:buffered:tools=0:tool_choice_auto:string_content", "skipped OpenAI canaries should not overwrite the live Responses request shape with synthetic chat telemetry", recorder: recorder)
+
+                        OpenAICompatTemporaryShim.clearRouteHealthForTesting()
+                    }
                 }
             }
         }

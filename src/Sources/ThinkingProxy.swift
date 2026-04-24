@@ -3499,12 +3499,18 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                 return nil
             }
             if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
-                return preferredCanaryProbeRequestModel(
+                guard let requestModel = preferredCanaryProbeRequestModel(
                     from: candidates,
                     routes: routes
-                )
+                ) else {
+                    return nil
+                }
+                return canaryProbeIsCompatible(requestModel: requestModel, routes: routes) ? requestModel : nil
             }
-            return routeHealthKey.components(separatedBy: "::").last
+            guard let requestModel = routeHealthKey.components(separatedBy: "::").last else {
+                return nil
+            }
+            return canaryProbeIsCompatible(requestModel: requestModel, routes: routes) ? requestModel : nil
         }.sorted()
         #else
         return routeHealthQueue.sync {
@@ -3523,15 +3529,40 @@ private static func sanitizeErrorBody(_ bodyData: Data) -> String {
                     return nil
                 }
                 if let candidates = requestModelsByRouteHealthKey[routeHealthKey] {
-                    return preferredCanaryProbeRequestModel(
+                    guard let requestModel = preferredCanaryProbeRequestModel(
                         from: candidates,
                         routes: routes
-                    )
+                    ) else {
+                        return nil
+                    }
+                    return canaryProbeIsCompatible(requestModel: requestModel, routes: routes) ? requestModel : nil
                 }
-                return routeHealthKey.components(separatedBy: "::").last
+                guard let requestModel = routeHealthKey.components(separatedBy: "::").last else {
+                    return nil
+                }
+                return canaryProbeIsCompatible(requestModel: requestModel, routes: routes) ? requestModel : nil
             }.sorted()
         }
         #endif
+    }
+
+    private static func canaryProbeIsCompatible(
+        requestModel: String,
+        routes: [String: RouteIdentity]
+    ) -> Bool {
+        let route = routes[requestModel] ?? resolveRouteIdentityForAnyProvider(forRequestModel: requestModel)
+        guard let route else {
+            return false
+        }
+        guard !canaryDisabledCanonicalModelIDs.contains(route.canonicalModelID) else {
+            return false
+        }
+        switch route.providerID {
+        case "openai", "xai", "anthropic", MetaAIWebAdapter.providerID:
+            return false
+        default:
+            return true
+        }
     }
 
     private static func preferredRouteHealthDisplayRequestModel(
