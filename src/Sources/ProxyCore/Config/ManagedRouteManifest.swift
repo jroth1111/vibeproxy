@@ -248,7 +248,6 @@ public enum ManagedRouteManifest {
         publicFactoryWorkerSmartRouterAlias
     ]
     public static let codeOwnedFactoryWorkerRescueModelIDs: Set<String> = [
-        "custom:GPT-5.5-High-Proxy-2",
         "custom:GPT-5.4-High-Proxy-2",
         "custom:Factory-Worker-GPT-5.5-High-8",
         "custom:Factory-Worker-GPT-5.4-High-8",

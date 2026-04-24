@@ -1758,7 +1758,6 @@ enum OpenAICompatTemporaryShim {
         publicFactoryWorkerSmartRouterAlias
     ]
     fileprivate static let codeOwnedFactoryWorkerRescueModelIDs: Set<String> = [
-        "custom:GPT-5.5-High-Proxy-2",
         "custom:GPT-5.4-High-Proxy-2",
         "custom:Factory-Worker-GPT-5.5-High-8",
         "custom:Factory-Worker-GPT-5.4-High-8",
@@ -13264,13 +13263,16 @@ class ThinkingProxy {
         let preservesNativeResponsesSurface =
             binding.requestSurface == "responses" && OpenAICompatTemporaryShim.isResponsesPath(path)
         let preservesQualifiedGenericChatRouteModel = binding.routeProvider == "generic-chat-completion-api"
+        let stripsQualifiedOAuthRouteModel = binding.routeProvider == "openai" || binding.routeProvider == "xai"
 
         // Only strip reasoning-effort suffixes when bridging onto a chat-completions
-        // execution core. Native responses routes own their qualified model IDs.
+        // execution core or an OAuth provider. Native Responses routes for non-OAuth
+        // providers own their qualified model IDs; OpenAI/XAI OAuth model routers do not.
         let upstreamBody = Self.rewriteModelForUpstream(
             body: body,
             routeModel: binding.routeModel,
-            preserveQualifiedRouteModel: preservesNativeResponsesSurface || preservesQualifiedGenericChatRouteModel
+            preserveQualifiedRouteModel: preservesQualifiedGenericChatRouteModel ||
+                (preservesNativeResponsesSurface && !stripsQualifiedOAuthRouteModel)
         )
 
         let upstreamPath = preservesNativeResponsesSurface
@@ -21621,9 +21623,7 @@ class ThinkingProxy {
         "claude-sonnet-4-5-20250929",
         "claude-sonnet-4-20250514",
         "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251001",
-        "gpt-5.5",
-        "gpt-5.5(high)"
+        "claude-haiku-4-5-20251001"
     ]
 
     private static func factoryBuiltinFallbackRescueBinding(forIncomingModelID incomingModelID: String) -> FactoryModelBinding? {
@@ -21673,7 +21673,6 @@ class ThinkingProxy {
             retiredWorkerModelIDs = retiredFactoryWorkerModelIDs(excluding: contract.workerModelID)
         } else {
             retiredWorkerModelIDs = [
-                "custom:GPT-5.5-High-Proxy-2",
                 "custom:GPT-5.4-High-Proxy-2",
                 "custom:Proxy-WorkerPool-8",
                 "custom:Factory-Worker-GPT-5.5-High-8",

@@ -3728,7 +3728,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("Factory fallback GPT built-ins are rescued onto the worker smart router", recorder: recorder) {
+        run("Factory fallback GPT built-ins stay on the OpenAI OAuth route", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
                     let proxy = ThinkingProxy()
@@ -3747,7 +3747,7 @@ struct ThinkingProxyPolicySpec {
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-factory-fallback-gpt-rescue",
+                                  "id": "chatcmpl-factory-fallback-gpt-direct",
                                   "object": "chat.completion",
                                   "model": "\(json["model"] as? String ?? "")",
                                   "choices": [
@@ -3789,16 +3789,17 @@ struct ThinkingProxyPolicySpec {
                     )
 
                     guard delivered.wait(timeout: .now() + 1) == .success else {
-                        recorder.recordFailure("Factory fallback GPT built-in should be rescued by the worker smart router")
+                        recorder.recordFailure("Factory fallback GPT built-in should stay on the direct OpenAI route")
                         return
                     }
 
-                    expectEqual(forwardedPaths, ["/v1/chat/completions"], "Factory fallback GPT built-ins should use the chat-completions worker surface", recorder: recorder)
-                    expectEqual(forwardedModels.first, "glm-5.1-zai", "Factory fallback GPT built-ins should enter the worker smart-router candidate pool instead of the raw OpenAI lane", recorder: recorder)
-                    expectEqual(deliveredStatus, 200, "Factory fallback GPT rescue should return the worker response", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "gpt-5.5(high)", "Factory fallback GPT rescue should preserve the caller-visible model", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "Factory fallback GPT rescue should expose the selected worker candidate", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "factory_builtin_rescue", "Factory fallback GPT rescue should expose the fallback rescue binding", recorder: recorder)
+                    expectEqual(forwardedPaths, ["/v1/chat/completions"], "Factory fallback GPT built-ins should preserve the rewritten chat-completions fallback surface", recorder: recorder)
+                    expectEqual(forwardedModels.first, "gpt-5.5", "Factory fallback GPT built-ins should strip reasoning suffixes before OpenAI OAuth dispatch", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "Factory fallback GPT direct routing should return the OpenAI response", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Public-Model"] as? String, "gpt-5.5(high)", "Factory fallback GPT direct routing should preserve the caller-visible model", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.5(high)", "Factory fallback GPT direct routing should expose the configured route model", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "Factory fallback GPT direct routing should expose the OpenAI provider", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "raw_managed_route_rescue", "Factory fallback GPT direct routing should use the managed OpenAI route binding", recorder: recorder)
                 }
             }
         }
@@ -5160,7 +5161,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("Factory GPT orchestration alias is rescued onto the worker smart-router responses bridge", recorder: recorder) {
+        run("Factory GPT orchestration alias uses the OpenAI OAuth responses route", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
                     let proxy = ThinkingProxy()
@@ -5180,15 +5181,18 @@ struct ThinkingProxyPolicySpec {
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-worker",
-                                  "object": "chat.completion",
+                                  "id": "resp-openai-gpt55",
+                                  "object": "response",
                                   "created": 0,
-                                  "model": "glm-5.1-zai",
-                                  "choices": [
+                                  "model": "gpt-5.5",
+                                  "output": [
                                     {
-                                      "index": 0,
-                                      "message": {"role": "assistant", "content": "OK"},
-                                      "finish_reason": "stop"
+                                      "type": "message",
+                                      "role": "assistant",
+                                      "status": "completed",
+                                      "content": [
+                                        {"type": "output_text", "text": "OK", "annotations": []}
+                                      ]
                                     }
                                   ]
                                 }
@@ -5219,25 +5223,25 @@ struct ThinkingProxyPolicySpec {
                     )
 
                     guard delivered.wait(timeout: .now() + 1) == .success else {
-                        recorder.recordFailure("Factory GPT orchestration alias should return through the worker smart-router")
+                        recorder.recordFailure("Factory GPT orchestration alias should return through OpenAI OAuth")
                         return
                     }
 
-                    expectEqual(forwardedPaths, ["/v1/chat/completions"], "Factory GPT orchestration should bridge Responses input onto the worker chat-completions lane", recorder: recorder)
-                    expectEqual(forwardedModels, ["glm-5.1-zai"], "Factory GPT orchestration should execute on the worker smart-router primary instead of unsupported GPT provider routing", recorder: recorder)
-                    expectEqual(deliveredStatus, 200, "Factory GPT orchestration should recover through the worker smart-router", recorder: recorder)
+                    expectEqual(forwardedPaths, ["/v1/responses"], "Factory GPT orchestration should preserve the native OpenAI Responses route", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.5"], "Factory GPT orchestration should strip the proxy reasoning suffix before OpenAI OAuth dispatch", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "Factory GPT orchestration should return through the OpenAI OAuth route", recorder: recorder)
 
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                     expectEqual(deliveredJSON["object"] as? String, "response", "Factory GPT orchestration should preserve the caller's Responses surface", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "Factory GPT orchestration should preserve the caller-visible model header", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "Factory GPT orchestration should expose the worker candidate that actually ran", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "Factory GPT orchestration should expose the worker candidate provider", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "retired_worker_alias_rescue", "Factory GPT orchestration should report the proxy-owned rescue binding source", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.5(high)", "Factory GPT orchestration should expose the configured OpenAI route model", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "Factory GPT orchestration should expose the OpenAI provider", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "Factory GPT orchestration should report the authoritative OpenAI binding source", recorder: recorder)
                 }
             }
         }
 
-        run("streaming Factory GPT orchestration alias is rescued onto worker synthetic Responses SSE", recorder: recorder) {
+        run("streaming Factory GPT orchestration alias uses OpenAI OAuth synthetic Responses SSE", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
                     let proxy = ThinkingProxy()
@@ -5257,15 +5261,19 @@ struct ThinkingProxyPolicySpec {
                             ThinkingProxy.BufferedProxyResponse(
                                 data: Data("""
                                 {
-                                  "id": "chatcmpl-worker",
-                                  "object": "chat.completion",
+                                  "id": "resp-openai-gpt55-stream",
+                                  "object": "response",
                                   "created": 0,
-                                  "model": "glm-5.1-zai",
-                                  "choices": [
+                                  "model": "gpt-5.5",
+                                  "output": [
                                     {
-                                      "index": 0,
-                                      "message": {"role": "assistant", "content": "OK"},
-                                      "finish_reason": "stop"
+                                      "type": "message",
+                                      "id": "msg-openai-gpt55-stream",
+                                      "role": "assistant",
+                                      "status": "completed",
+                                      "content": [
+                                        {"type": "output_text", "text": "OK", "annotations": []}
+                                      ]
                                     }
                                   ]
                                 }
@@ -5297,18 +5305,18 @@ struct ThinkingProxyPolicySpec {
                     )
 
                     guard delivered.wait(timeout: .now() + 1) == .success else {
-                        recorder.recordFailure("streaming Factory GPT orchestration alias should return through the worker smart-router")
+                        recorder.recordFailure("streaming Factory GPT orchestration alias should return through OpenAI OAuth")
                         return
                     }
 
-                    expectEqual(forwardedPaths, ["/v1/chat/completions"], "streaming Factory GPT orchestration should bridge Responses input onto the worker chat-completions lane", recorder: recorder)
-                    expectEqual(forwardedModels, ["glm-5.1-zai"], "streaming Factory GPT orchestration should execute on the worker smart-router primary instead of unsupported GPT provider routing", recorder: recorder)
-                    expectEqual(deliveredStatus, 200, "streaming Factory GPT orchestration should recover through the worker smart-router", recorder: recorder)
-                    expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streaming Factory GPT orchestration should return synthetic Responses SSE from the worker result", recorder: recorder)
+                    expectEqual(forwardedPaths, ["/v1/responses"], "streaming Factory GPT orchestration should preserve the native OpenAI Responses route", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.5"], "streaming Factory GPT orchestration should strip the proxy reasoning suffix before OpenAI OAuth dispatch", recorder: recorder)
+                    expectEqual(deliveredStatus, 200, "streaming Factory GPT orchestration should return through OpenAI OAuth", recorder: recorder)
+                    expectEqual(deliveredHeaders?["Content-Type"] as? String, "text/event-stream; charset=utf-8", "streaming Factory GPT orchestration should return synthetic Responses SSE from the OpenAI result", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Public-Model"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "streaming Factory GPT orchestration should preserve the caller-visible model header", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "glm-5.1-zai", "streaming Factory GPT orchestration should expose the worker candidate that actually ran", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "zai", "streaming Factory GPT orchestration should expose the worker candidate provider", recorder: recorder)
-                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "retired_worker_alias_rescue", "streaming Factory GPT orchestration should report the proxy-owned rescue binding source", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.5(high)", "streaming Factory GPT orchestration should expose the configured OpenAI route model", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "streaming Factory GPT orchestration should expose the OpenAI provider", recorder: recorder)
+                    expectEqual(deliveredHeaders?["X-Factory-Model-Binding"] as? String, "authoritative_custom_model", "streaming Factory GPT orchestration should report the authoritative OpenAI binding source", recorder: recorder)
                 }
             }
         }
@@ -5399,7 +5407,7 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     expectEqual(forwardedPaths, ["/v1/responses"], "raw managed GPT should only attempt the direct route without silent rescue", recorder: recorder)
-                    expectEqual(forwardedModels, ["gpt-5.5(high)"], "raw managed GPT should forward the original model without rescue", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.5"], "raw managed GPT should strip reasoning suffixes for OpenAI OAuth dispatch without rescue", recorder: recorder)
                     expectEqual(deliveredStatus, 500, "raw managed GPT auth failures should surface the upstream error status to the caller", recorder: recorder)
 
                     let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -5495,7 +5503,7 @@ struct ThinkingProxyPolicySpec {
                     }
 
                     expectEqual(forwardedPaths, ["/v1/responses"], "streaming raw managed GPT should only attempt the direct route without silent rescue", recorder: recorder)
-                    expectEqual(forwardedModels, ["gpt-5.5(high)"], "streaming raw managed GPT should forward the original model without rescue", recorder: recorder)
+                    expectEqual(forwardedModels, ["gpt-5.5"], "streaming raw managed GPT should strip reasoning suffixes for OpenAI OAuth dispatch without rescue", recorder: recorder)
                     expectEqual(deliveredStatus, 429, "streaming raw managed GPT quota failures should surface the upstream error status to the caller", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Resolved-Model"] as? String, "gpt-5.5(high)", "streaming raw managed GPT failure should expose the route model that failed", recorder: recorder)
                     expectEqual(deliveredHeaders?["X-Resolved-Provider"] as? String, "openai", "streaming raw managed GPT failure should expose the provider that failed", recorder: recorder)
@@ -5579,7 +5587,7 @@ struct ThinkingProxyPolicySpec {
                 withFactorySettings("""
                 {
                   "missionModelSettings": {
-                    "workerModel": "custom:GPT-5.5-High-Proxy-2"
+                    "workerModel": "custom:Proxy-Worker-Smart-Router-8"
                   },
                   "customModels": []
                 }
@@ -5799,7 +5807,7 @@ struct ThinkingProxyPolicySpec {
 
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
                 expectEqual(forwardedPath, "/v1/responses", "openai Factory custom IDs should preserve the responses API path", recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "openai Factory custom IDs should be rewritten to their configured route model before proxy forwarding", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "gpt-5.5", "openai Factory custom IDs should strip proxy reasoning suffixes before OAuth forwarding", recorder: recorder)
                 expectEqual(Int(forwardedTimeout ?? 0), 900, "direct Factory OpenAI attempts should also respect the 900-second per-attempt minimum", recorder: recorder)
 
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -5919,7 +5927,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "Factory direct auth failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "Factory direct auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "Factory direct auth failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 500, "Factory direct auth failures should surface the direct-lane error", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 let deliveredError = deliveredJSON["error"] as? [String: Any]
@@ -5986,7 +5994,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "Factory direct quota failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "Factory direct quota failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "Factory direct quota failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "Factory direct quota failures should surface the direct-lane error", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 let deliveredError = deliveredJSON["error"] as? [String: Any]
@@ -6069,7 +6077,7 @@ struct ThinkingProxyPolicySpec {
 
                 let forwardedJSON = parseJSONObject(forwardedBody, recorder: recorder)
                 expectEqual(forwardedPath, "/v1/responses", "streaming openai Factory custom IDs should preserve the responses API path", recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "streaming openai Factory custom IDs should be rewritten to their configured route model", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "gpt-5.5", "streaming openai Factory custom IDs should strip proxy reasoning suffixes before OAuth forwarding", recorder: recorder)
                 expectEqual(forwardedJSON["stream"] as? Bool, false, "streaming openai Factory custom IDs should buffer upstream direct routes with stream=false", recorder: recorder)
 
                 expectEqual(deliveredStatus, 200, "streaming openai Factory custom IDs should succeed", recorder: recorder)
@@ -6099,7 +6107,7 @@ struct ThinkingProxyPolicySpec {
                 proxy.bufferedProxyTransportForTesting = { _, path, _, body, _, completion in
                     let forwardedJSON = parseJSONObject(body, recorder: recorder)
                     expectEqual(path, "/v1/responses", "unknown Responses output item passthrough should stay on the responses API path", recorder: recorder)
-                    expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "unknown Responses output item passthrough should keep the configured direct route model", recorder: recorder)
+                    expectEqual(forwardedJSON["model"] as? String, "gpt-5.5", "unknown Responses output item passthrough should strip proxy reasoning suffixes before OAuth forwarding", recorder: recorder)
                     completion(
                         ThinkingProxy.BufferedProxyResponse(
                             data: Data("""
@@ -6224,7 +6232,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "streaming Factory direct auth failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "streaming Factory direct auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "streaming Factory direct auth failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 500, "streaming Factory direct auth failures should surface the direct-lane error", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming Factory direct auth failures should return the backend error body rather than synthetic SSE", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -6292,7 +6300,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "raw managed GPT route auth failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "raw managed GPT route auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "raw managed GPT route auth failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 500, "raw managed GPT route auth failures should surface the direct-lane error", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
                 let deliveredError = deliveredJSON["error"] as? [String: Any]
@@ -6366,7 +6374,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "streaming raw managed GPT auth failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "streaming raw managed GPT auth failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "streaming raw managed GPT auth failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 500, "streaming raw managed GPT auth failures should surface the direct-lane error", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming raw managed GPT auth failures should return the backend error body rather than synthetic SSE", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -6439,7 +6447,7 @@ struct ThinkingProxyPolicySpec {
                 }
 
                 expectEqual(forwardedPaths, ["/v1/responses"], "streaming Factory direct quota failures should stay on the direct responses lane", recorder: recorder)
-                expectEqual(forwardedModels, ["gpt-5.5(high)"], "streaming Factory direct quota failures should not spill into the worker smart-router chain", recorder: recorder)
+                expectEqual(forwardedModels, ["gpt-5.5"], "streaming Factory direct quota failures should strip reasoning suffixes and not spill into the worker smart-router chain", recorder: recorder)
                 expectEqual(deliveredStatus, 429, "streaming Factory direct quota failures should surface the direct-lane error", recorder: recorder)
                 expectEqual(deliveredHeaders?["Content-Type"] as? String, "application/json", "streaming Factory direct quota failures should return the backend error body rather than synthetic SSE", recorder: recorder)
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
@@ -15192,19 +15200,19 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(acceptedRequestModelIDs?.contains("custom:Proxy-WorkerPool-8"), true, "healthz should list the retired pooled worker ID as an accepted rescue input", recorder: recorder)
                     expectEqual(rescuedRequestModelIDs?.contains("custom:Factory-Worker-GPT-5.5-High-8"), true, "healthz should explicitly mark the hidden Factory worker ID as rescued", recorder: recorder)
                     expectEqual(orchestration?["model_id"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "healthz should expose the orchestration model id for generic-compatible workers", recorder: recorder)
-                    expectEqual(orchestration?["route_model"] as? String, "proxy-worker-smart-router", "healthz should expose the rescued orchestration worker route model for generic-compatible workers", recorder: recorder)
-                    expectEqual(orchestration?["route_provider"] as? String, "generic-chat-completion-api", "healthz should expose the rescued orchestration route provider for generic-compatible workers", recorder: recorder)
-                    expectEqual(orchestration?["request_surface"] as? String, "chat_completions", "healthz should expose the rescued orchestration request surface for generic-compatible workers", recorder: recorder)
-                    expectEqual(orchestration?["effective_route_model"] as? String, genericCompatFactoryWorkerContract.effectiveRouteModel, "healthz should route rescued orchestration through the worker smart-router", recorder: recorder)
-                    expectEqual(orchestration?["effective_route_provider"] as? String, genericCompatFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the rescued orchestration runtime provider", recorder: recorder)
-                    expectEqual(orchestration?["ready"] as? Bool, true, "healthz should keep rescued orchestration ready when a worker lane is healthy", recorder: recorder)
+                    expectEqual(orchestration?["route_model"] as? String, "gpt-5.5(high)", "healthz should expose the direct OpenAI orchestration route model for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["route_provider"] as? String, "openai", "healthz should expose the direct OpenAI orchestration route provider for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["request_surface"] as? String, "responses", "healthz should expose the OpenAI Responses request surface for generic-compatible workers", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.5(high)", "healthz should keep orchestration on the direct OpenAI route", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_provider"] as? String, "openai", "healthz should expose the direct OpenAI orchestration runtime provider", recorder: recorder)
+                    expectEqual(orchestration?["ready"] as? Bool, expectedReady, "healthz should derive direct OpenAI orchestration readiness from backend reachability and route health", recorder: recorder)
                     expectEqual(verification?["model_id"] as? String, genericCompatFactoryWorkerContract.validationWorkerModelID, "healthz should expose the verification model id for generic-compatible workers", recorder: recorder)
-                    expectEqual(verification?["route_model"] as? String, "proxy-worker-smart-router", "healthz should expose the rescued verification worker route model for generic-compatible workers", recorder: recorder)
-                    expectEqual(verification?["route_provider"] as? String, "generic-chat-completion-api", "healthz should expose the rescued verification route provider for generic-compatible workers", recorder: recorder)
-                    expectEqual(verification?["request_surface"] as? String, "chat_completions", "healthz should expose the rescued verification request surface for generic-compatible workers", recorder: recorder)
-                    expectEqual(verification?["effective_route_model"] as? String, genericCompatFactoryWorkerContract.effectiveRouteModel, "healthz should route rescued verification through the worker smart-router", recorder: recorder)
-                    expectEqual(verification?["effective_route_provider"] as? String, genericCompatFactoryWorkerContract.effectiveRouteProvider, "healthz should expose the rescued verification runtime provider", recorder: recorder)
-                    expectEqual(verification?["ready"] as? Bool, true, "healthz should keep rescued verification ready when a worker lane is healthy", recorder: recorder)
+                    expectEqual(verification?["route_model"] as? String, "gpt-5.5(high)", "healthz should expose the direct OpenAI verification route model for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["route_provider"] as? String, "openai", "healthz should expose the direct OpenAI verification route provider for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["request_surface"] as? String, "responses", "healthz should expose the OpenAI Responses request surface for generic-compatible workers", recorder: recorder)
+                    expectEqual(verification?["effective_route_model"] as? String, "gpt-5.5(high)", "healthz should keep verification on the direct OpenAI route", recorder: recorder)
+                    expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should expose the direct OpenAI verification runtime provider", recorder: recorder)
+                    expectEqual(verification?["ready"] as? Bool, expectedReady, "healthz should derive direct OpenAI verification readiness from backend reachability and route health", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -16224,7 +16232,7 @@ struct ThinkingProxyPolicySpec {
             }
         }
 
-        run("healthz keeps rescued GPT roles ready when the direct GPT lane is open but worker lanes remain healthy", recorder: recorder) {
+        run("healthz reports direct GPT roles unhealthy when the OpenAI lane is open", recorder: recorder) {
             withMergedConfig(workerMergedConfigYAML()) {
                 withFactorySettings(factorySettingsJSON(contract: genericCompatFactoryWorkerContract)) {
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
@@ -16264,14 +16272,14 @@ struct ThinkingProxyPolicySpec {
                     expectEqual(factoryWorker?["effective_route_provider"] as? String, "zai", "healthz should expose the worker provider when GPT is quarantined", recorder: recorder)
                     expectEqual(factoryWorker?["route_health_status"] as? String, nil, "healthz should stop reporting the worker contract as open when a fallback lane remains available", recorder: recorder)
                     expectEqual(factoryWorker?["ready"] as? Bool, true, "healthz should keep the smart-router worker ready when a fallback lane remains available", recorder: recorder)
-                    expectEqual(orchestration?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep rescued orchestration on the worker route despite direct GPT quarantine", recorder: recorder)
-                    expectEqual(orchestration?["effective_route_provider"] as? String, "zai", "healthz should expose the rescued orchestration worker provider", recorder: recorder)
-                    expectEqual(orchestration?["route_health_status"] as? String, nil, "healthz should ignore direct GPT route health for rescued orchestration roles", recorder: recorder)
-                    expectEqual(orchestration?["ready"] as? Bool, true, "healthz should keep rescued orchestration ready when a worker lane remains available", recorder: recorder)
-                    expectEqual(verification?["effective_route_model"] as? String, "glm-5.1-zai", "healthz should keep rescued verification on the worker route despite direct GPT quarantine", recorder: recorder)
-                    expectEqual(verification?["effective_route_provider"] as? String, "zai", "healthz should expose the rescued verification worker provider", recorder: recorder)
-                    expectEqual(verification?["route_health_status"] as? String, nil, "healthz should ignore direct GPT route health for rescued verification roles", recorder: recorder)
-                    expectEqual(verification?["ready"] as? Bool, true, "healthz should keep rescued verification ready when a worker lane remains available", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_model"] as? String, "gpt-5.5(high)", "healthz should keep orchestration on the direct GPT route despite quarantine", recorder: recorder)
+                    expectEqual(orchestration?["effective_route_provider"] as? String, "openai", "healthz should expose the direct OpenAI orchestration provider", recorder: recorder)
+                    expectEqual(orchestration?["route_health_status"] as? String, "open", "healthz should expose direct GPT route health for orchestration roles", recorder: recorder)
+                    expectEqual(orchestration?["ready"] as? Bool, false, "healthz should mark direct GPT orchestration unhealthy while its OpenAI lane is open", recorder: recorder)
+                    expectEqual(verification?["effective_route_model"] as? String, "gpt-5.5(high)", "healthz should keep verification on the direct GPT route despite quarantine", recorder: recorder)
+                    expectEqual(verification?["effective_route_provider"] as? String, "openai", "healthz should expose the direct OpenAI verification provider", recorder: recorder)
+                    expectEqual(verification?["route_health_status"] as? String, "open", "healthz should expose direct GPT route health for verification roles", recorder: recorder)
+                    expectEqual(verification?["ready"] as? Bool, false, "healthz should mark direct GPT verification unhealthy while its OpenAI lane is open", recorder: recorder)
 
                     OpenAICompatTemporaryShim.clearRouteHealthForTesting()
                 }
@@ -16869,7 +16877,7 @@ struct ThinkingProxyPolicySpec {
                 let deliveredJSON = parseDataJSONObject(deliveredBody ?? Data(), recorder: recorder)
 
                 expectEqual(forwardedPath, "/v1/responses", "authoritative worker requests should keep their direct path under advisory drift", recorder: recorder)
-                expectEqual(forwardedJSON["model"] as? String, openAIFactoryWorkerContract.routeModel, "authoritative worker requests should still be rewritten to the configured route model under advisory drift", recorder: recorder)
+                expectEqual(forwardedJSON["model"] as? String, "gpt-5.5", "authoritative worker requests should strip proxy reasoning suffixes under advisory drift", recorder: recorder)
                 expectEqual(deliveredHeaders?["X-Factory-Authoritative-Model-ID"] as? String, openAIFactoryWorkerContract.workerModelID, "authoritative worker responses should preserve the authoritative worker ID header under advisory drift", recorder: recorder)
                 expectEqual(deliveredJSON["model"] as? String, openAIFactoryWorkerContract.workerModelID, "authoritative worker responses should preserve caller-visible identity under advisory drift", recorder: recorder)
 
@@ -18896,8 +18904,8 @@ private func factoryWorkerRescueCustomModelsJSON() -> String {
 }
 
 private let openAIFactoryWorkerContract = FactoryWorkerSpecContract(
-    workerModelID: "custom:Direct-GPT-5.5-High-Proxy-2",
-    validationWorkerModelID: "custom:Direct-GPT-5.5-High-Proxy-2",
+    workerModelID: "custom:GPT-5.5-High-Proxy-2",
+    validationWorkerModelID: "custom:GPT-5.5-High-Proxy-2",
     routeModel: "gpt-5.5(high)",
     authoritativeRouteModel: "gpt-5.5(high)",
     routeProvider: "openai",
